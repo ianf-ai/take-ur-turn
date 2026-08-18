@@ -212,6 +212,10 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 - Notifier 按轮询粒度观察状态：轮询窗口内的中间态不被观察（版本号可见跳变）；状态以记录重放为准，任何中间态都可从日志复原
 - auto 模式下 decision 记录无法密码学验证「确实来自人」——当前靠通知审计 + by 字段追溯兜底，更结构化的解法留待多机部署场景
 
+## Credits
+
+Agent 承载由 [Herdr](https://github.com/herdrdev/herdr) 驱动——运行时前置、独立安装；本包不分发其代码。
+
 ## License
 
 [Apache-2.0](LICENSE)

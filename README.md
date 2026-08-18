@@ -214,6 +214,10 @@ Design docs and skills are currently Chinese-language; code, CLI output, and com
 - The Notifier observes state at polling granularity: intermediate states inside a polling window go unobserved (version numbers can be seen to jump); replaying the records is the source of truth, and any intermediate state can be reconstructed from the log
 - In auto mode there is no cryptographic way to verify that a decision record "really came from a human" — the current fallback is notification auditing plus tracing through the by field; a more structured solution is left for the multi-machine deployment scenario
 
+## Credits
+
+Agent hosting powered by [Herdr](https://github.com/herdrdev/herdr) — a runtime prerequisite installed separately; this package does not distribute its code.
+
 ## License
 
 [Apache-2.0](LICENSE)
