@@ -37,7 +37,8 @@
     "README.md",
     "LICENSE",
     "AGENTS.md",
-    "NOTICE"
+    "NOTICE",
+    "README.zh-CN.md"
   ],
   "scripts": {
     "build": "tsc && node -e \"const fs=require('fs');const f='dist/cli.js';let s=fs.readFileSync(f,'utf8');if(!s.startsWith('#!')){s='#!/usr/bin/env node\\n'+s;fs.writeFileSync(f,s);}fs.chmodSync(f,0o755)\"",
