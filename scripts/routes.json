@@ -1,0 +1,6 @@
+{
+  "$comment": "role → pane routing for auto mode and tut start-next. Pane names are Herdr pane titles. Note: agent work panes normally follow the pane-title=task_id convention (system-design 4.4); the role panes here are fixed per-role panes, which is why routing needs this table. Notifier's own pane is exempt from routing (8.2).",
+  "architect": "arch",
+  "executor": "exec",
+  "reviewer": "review"
+}

@@ -1,0 +1,8 @@
+{
+  "$comment": "Role → {label, agent} mapping. label = pane 标签（物理工位，经 herdr pane rename 管理）；agent = 坐在工位上的 Agent CLI（tut up 供给时启动、tut assign 修改）。launch.sh 解析顺序：本文件优先，routes.json 兜底（过渡并存，后续统一）。",
+  "roles": {
+    "architect": { "label": "arch", "agent": "codex" },
+    "executor": { "label": "exec", "agent": "pi" },
+    "reviewer": { "label": "review", "agent": "codex" }
+  }
+}

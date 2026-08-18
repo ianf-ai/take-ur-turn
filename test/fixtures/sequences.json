@@ -1,0 +1,4053 @@
+[
+  {
+    "$comment": "Golden vectors for the derive seam (per-flow suites per system-design 3.1). Each vector carries an optional 'flow' field: \"full\" (default — absent means full) | \"direct\" | \"solo\". Flow selects the transition table (system-design 3.1 three-table definition): full = create→designing, design designing→implementing, code_changes implementing→reviewing, review pass/fail_code/fail_design → pending_approval/revising/designing, revision revising→reviewing, reject pending_approval→revising; direct = create→implementing, design in implementing is a REFERENCE record (no transition, no warning) and out-of-table in every other state, review fail_design is OUT_OF_TABLE (no designing to return to), everything else as full; solo = create→designing, design designing→implementing, code_changes implementing→pending_approval (review phase skipped), review and revision records are OUT_OF_TABLE in ANY state (with OUT_OF_TABLE taking precedence over INVALID_VERDICT), reject pending_approval→implementing (rework). Warning code vocabulary (mirrors WarningCode in src/types.ts): OUT_OF_TABLE = record does not fit current state, no fold + needs_attention; CLOSED_ABSORB = non-note/non-close record after closed, stays closed + needs_attention; INVALID_VERDICT = review with missing/invalid verdict, no transition + needs_attention (full/direct only — in solo every review is out-of-table before the verdict is evaluated); VERSION_GAP = version skips a number, fold by version order anyway (warning attached to the record after the gap); VERSION_DUPLICATE = repeated version, fold by version order anyway (warning attached to the duplicated version). Structural warnings are flow-independent. Rules: create produces no record so derive([]) is the flow's initial state (designing for full/solo, implementing for direct); note never changes status and never warns; decision(close) is valid in any state, idempotent in closed; needs_attention overrides waiting_for to human in any status including closed; note with payload.ack === true clears all warnings accumulated so far (no-op when clean); warnings are asserted as {version, code} only, never as text; project scope (task_id 'project') derives to null."
+  },
+  {
+    "name": "empty-sequence-designing",
+    "task_id": "fresh-task",
+    "records": [],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "agent:architect",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "happy-path-full-lifecycle",
+    "task_id": "happy-path",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "happy-path",
+        "role": "architect",
+        "agent": "codex-cli",
+        "model": "gpt-5",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the auth refactor",
+          "body": "## Background\nRefactor token handling.\n## Selected approach\nWrap verify in middleware."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "happy-path",
+        "role": "executor",
+        "agent": "pi",
+        "model": "glm-5",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Implemented middleware per design",
+          "body": "## Implementation\nAdded middleware and tests.\n## Verification\nvitest green.",
+          "commits": ["a1b2c3d"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "happy-path",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "model": "gpt-5",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Implementation matches design",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nAll issues from earlier rounds closed."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "happy-path",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Approved the auth refactor",
+          "decision": "approve",
+          "body": "Review verdict accepted, the implementation is good to ship."
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "happy-path",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:04:00Z",
+        "payload": {
+          "summary": "Closed the auth refactor",
+          "decision": "close",
+          "body": "Shipped and verified, closing the task."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "review-fail-code-to-revising",
+    "task_id": "fail-code",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "fail-code",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the cache layer",
+          "body": "## Selected approach\nIn-memory LRU behind an interface."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "fail-code",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Cache layer implemented",
+          "body": "## Implementation\nLRU with TTL.\n## Verification\nvitest green.",
+          "commits": ["e4f5a6b"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "fail-code",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "TTL edge case mishandled",
+          "verdict": "fail_code",
+          "ref_version": 2,
+          "body": "## Issues\n1. TTL expiry races with get. Close condition: add a test covering expiry during read."
+        }
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "fail-code-revision-fail-code-loop",
+    "task_id": "review-loop",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "review-loop",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the retry helper",
+          "body": "## Selected approach\nExponential backoff helper."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "review-loop",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Retry helper implemented",
+          "body": "## Implementation\nBackoff with jitter.\n## Verification\nvitest green.",
+          "commits": ["c3d4e5f"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "review-loop",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Missing jitter test",
+          "verdict": "fail_code",
+          "ref_version": 2,
+          "body": "## Issues\n1. No test for jitter bounds. Close condition: add one."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "review-loop",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "revision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Added jitter bounds test",
+          "body": "## Response\nAdded the requested test, it passes.\n## Verification\nvitest green.",
+          "ref_version": 3,
+          "commits": ["b7c8d9e"]
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "review-loop",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:04:00Z",
+        "payload": {
+          "summary": "New issue found on re-review",
+          "verdict": "fail_code",
+          "ref_version": 4,
+          "body": "## Issues\n1. Test asserts implementation detail. Close condition: assert behavior instead."
+        }
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "review-fail-design-to-designing",
+    "task_id": "fail-design",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "fail-design",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the config loader",
+          "body": "## Selected approach\nDotenv-style loader."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "fail-design",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Config loader implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["d9e0f1a"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "fail-design",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Design itself is unsound",
+          "verdict": "fail_design",
+          "ref_version": 2,
+          "body": "## Issues\nThe loader cannot express nested keys; the design must be reworked."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "agent:architect",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "decision-reject-to-revising",
+    "task_id": "reject",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "reject",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the logger",
+          "body": "## Selected approach\nStructured JSON logger."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "reject",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Logger implemented",
+          "body": "## Implementation\nJSON lines to stdout.\n## Verification\nvitest green.",
+          "commits": ["f1a2b3c"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "reject",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass with deferred candidates",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nFine to ship. Deferral candidates listed for the human."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "reject",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Rejected: deferred issues are real",
+          "decision": "reject",
+          "body": "The deferred issues must be fixed before shipping, sending back for revision."
+        }
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "decision-approve-waits-for-human",
+    "task_id": "approved-wait",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "approved-wait",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the health endpoint",
+          "body": "## Selected approach\nGET /healthz with dependency checks."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "approved-wait",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Health endpoint implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["a4b5c6d"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "approved-wait",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "approved-wait",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Approved",
+          "decision": "approve",
+          "body": "Implementation approved, awaiting close."
+        }
+      }
+    ],
+    "expected": {
+      "status": "approved",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-designing",
+    "task_id": "close-designing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-designing",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Closed before design started",
+          "decision": "close",
+          "body": "Requirements changed, abandoning this task."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-implementing",
+    "task_id": "close-implementing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-implementing",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the metrics client",
+          "body": "## Selected approach\nCounter and histogram primitives."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "close-implementing",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Closed mid-implementation",
+          "decision": "close",
+          "body": "Scope moved to another team, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-reviewing",
+    "task_id": "close-reviewing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-reviewing",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the rate limiter",
+          "body": "## Selected approach\nToken bucket."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "close-reviewing",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Rate limiter implemented",
+          "body": "## Implementation\nToken bucket with tests.\n## Verification\nvitest green.",
+          "commits": ["b8c9d0e"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "close-reviewing",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Closed while awaiting review",
+          "decision": "close",
+          "body": "Reviewer unavailable, closing the task."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-revising",
+    "task_id": "close-revising",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-revising",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the input validator",
+          "body": "## Selected approach\nSchema-driven validation."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "close-revising",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Validator implemented",
+          "body": "## Implementation\nSchema walker.\n## Verification\nvitest green.",
+          "commits": ["c0d1e2f"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "close-revising",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Two issues found",
+          "verdict": "fail_code",
+          "ref_version": 2,
+          "body": "## Issues\n1. Unknown types throw. 2. Error messages lack paths."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "close-revising",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Closed during revision",
+          "decision": "close",
+          "body": "The remaining issues are moot after the pivot, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-pending-approval",
+    "task_id": "close-pending",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-pending",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the CLI flags parser",
+          "body": "## Selected approach\nHand-rolled parser, no deps."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "close-pending",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Flags parser implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["d2e3f4a"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "close-pending",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "close-pending",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Closed instead of approve/reject",
+          "decision": "close",
+          "body": "Superseded by an upstream change, closing without approval."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-approved",
+    "task_id": "close-approved",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-approved",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the debounce util",
+          "body": "## Selected approach\nTrailing-edge debounce."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "close-approved",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Debounce util implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["e5f6a7b"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "close-approved",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "close-approved",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Approved",
+          "decision": "approve",
+          "body": "Implementation approved."
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "close-approved",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:04:00Z",
+        "payload": {
+          "summary": "Closed after approval",
+          "decision": "close",
+          "body": "Shipped, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "close-from-closed-idempotent-no-warning",
+    "task_id": "close-twice",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "close-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "close-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Closed again by mistake",
+          "decision": "close",
+          "body": "Duplicate close, should be idempotent without warning."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-in-designing-no-change",
+    "task_id": "note-designing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-designing",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Constraint discovered mid-design",
+          "body": "Note: the parser must stay under 100 lines."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "agent:architect",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-in-reviewing-no-change",
+    "task_id": "note-reviewing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-reviewing",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the migration runner",
+          "body": "## Selected approach\nSequential runner with a lock file."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "note-reviewing",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Migration runner implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["f8a9b0c"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "note-reviewing",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Context for the reviewer",
+          "body": "Note: commit f8a9b0c also includes the lock-file test the design required."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-in-revising-no-change",
+    "task_id": "note-revising",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-revising",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the sort helpers",
+          "body": "## Selected approach\nPure comparators, no mutation."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "note-revising",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Sort helpers implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["a0b1c2d"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "note-revising",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Mutation found",
+          "verdict": "fail_code",
+          "ref_version": 2,
+          "body": "## Issues\n1. sortBy mutates its input. Close condition: return a new array."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "note-revising",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Deferral ruling for issue 1",
+          "body": "Note: issue 1 is deferred, accepted as documented behavior for v1."
+        }
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-in-approved-no-change",
+    "task_id": "note-approved",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-approved",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the env check",
+          "body": "## Selected approach\nFail fast on missing env vars."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "note-approved",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Env check implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["b2c3d4e"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "note-approved",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "note-approved",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Approved",
+          "decision": "approve",
+          "body": "Implementation approved."
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "note-approved",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:04:00Z",
+        "payload": {
+          "summary": "Post-approval addendum",
+          "body": "Note: added the env var to the example .env in a follow-up commit outside this task."
+        }
+      }
+    ],
+    "expected": {
+      "status": "approved",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "out-of-table-review-in-designing",
+    "task_id": "oob-review",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "oob-review",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Premature review",
+          "verdict": "pass",
+          "body": "## Overall\nReviewed the design sketch informally; recorded here for the record."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "out-of-table-decision-approve-in-implementing",
+    "task_id": "oob-approve",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "oob-approve",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the date utils",
+          "body": "## Selected approach\nThin wrappers over Date."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "oob-approve",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Approval before review",
+          "decision": "approve",
+          "body": "Approved without a review pass, out of sequence."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "out-of-table-design-in-reviewing",
+    "task_id": "oob-design",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "oob-design",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the id generator",
+          "body": "## Selected approach\n ULID."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "oob-design",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "ID generator implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["c4d5e6f"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "oob-design",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Revised design published mid-review",
+          "body": "## Selected approach\nSwitching to monotonic ULIDs; the review should target this revision."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "out-of-table-code-changes-in-revising",
+    "task_id": "oob-code-changes",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "oob-code-changes",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the throttle util",
+          "body": "## Selected approach\nLeading-edge throttle."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "oob-code-changes",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Throttle util implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["d6e7f8a"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "oob-code-changes",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Cancel semantics wrong",
+          "verdict": "fail_code",
+          "ref_version": 2,
+          "body": "## Issues\n1. cancel() does not clear the timer. Close condition: clear it and test."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "oob-code-changes",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Fix published as code_changes instead of revision",
+          "body": "## Implementation\nFixed the timer; used the wrong content type.\n## Verification\nvitest green.",
+          "commits": ["e8f9a0b"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 4, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "closed-absorbs-note-no-warning",
+    "task_id": "closed-note",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "closed-note",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "closed-note",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Post-close note",
+          "body": "Note: the fix also landed in the release branch, link in the body."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "closed-absorb-code-changes-attention-overrides-waiting",
+    "task_id": "closed-code-changes",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "closed-code-changes",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "closed-code-changes",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Changes after close",
+          "body": "## Implementation\nExecutor missed the close and published changes.\n## Verification\nvitest green.",
+          "commits": ["f0a1b2c"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "CLOSED_ABSORB" }]
+    }
+  },
+  {
+    "name": "closed-absorb-decision-approve",
+    "task_id": "closed-approve",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "closed-approve",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "closed-approve",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Approval after close",
+          "decision": "approve",
+          "body": "Approved after the task was already closed, out of sequence."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "CLOSED_ABSORB" }]
+    }
+  },
+  {
+    "name": "review-missing-verdict-needs-attention",
+    "task_id": "missing-verdict",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "missing-verdict",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the path utils",
+          "body": "## Selected approach\nPOSIX-only helpers."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "missing-verdict",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Path utils implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["a3b4c5d"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "missing-verdict",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Review without a verdict",
+          "ref_version": 2,
+          "body": "## Overall\nReviewer forgot the verdict field, no transition possible."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "INVALID_VERDICT" }]
+    }
+  },
+  {
+    "name": "review-invalid-verdict-needs-attention",
+    "task_id": "invalid-verdict",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "invalid-verdict",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the diff printer",
+          "body": "## Selected approach\nUnified diff formatting."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "invalid-verdict",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Diff printer implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["b5c6d7e"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "invalid-verdict",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Review with a bogus verdict",
+          "verdict": "meh",
+          "ref_version": 2,
+          "body": "## Overall\nVerdict is not one of pass/fail_code/fail_design, no transition possible."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "INVALID_VERDICT" }]
+    }
+  },
+  {
+    "name": "attention-persists-through-normal-transition",
+    "task_id": "attention-persist",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "attention-persist",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the timer utils",
+          "body": "## Selected approach\nFakeable clock wrapper."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "attention-persist",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Review published too early",
+          "verdict": "pass",
+          "body": "## Overall\nReviewed before implementation existed, out of sequence."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "attention-persist",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Timer utils implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["c7d8e9f"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "ack-note-clears-warnings",
+    "task_id": "ack-clear",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "ack-clear",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the seed script",
+          "body": "## Selected approach\nIdempotent seeder."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "ack-clear",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Review published too early",
+          "verdict": "pass",
+          "body": "## Overall\nOut of sequence, flagged for the human."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "ack-clear",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Acknowledged the stray review",
+          "body": "Note: I reviewed the stray record, no action needed.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "re-anomaly-after-ack",
+    "task_id": "re-anomaly",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "re-anomaly",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the slug utils",
+          "body": "## Selected approach\n ASCII-fold then kebab-case."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "re-anomaly",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Review published too early",
+          "verdict": "pass",
+          "body": "## Overall\nOut of sequence, flagged for the human."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "re-anomaly",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Acknowledged the stray review",
+          "body": "Note: reviewed, no action needed.",
+          "ack": true
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "re-anomaly",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Approval before review, again",
+          "decision": "approve",
+          "body": "Second out-of-sequence record after the earlier ack."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 4, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "waiting-for-implementing-executor",
+    "task_id": "wait-implementing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "wait-implementing",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the deep-equal util",
+          "body": "## Selected approach\nRecursive compare with typed-array support."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "waiting-for-reviewing-reviewer",
+    "task_id": "wait-reviewing",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "wait-reviewing",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the chunker",
+          "body": "## Selected approach\nGenerator-based chunking."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "wait-reviewing",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Chunker implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["d9e0f1b"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "waiting-for-pending-approval-human",
+    "task_id": "wait-pending",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "wait-pending",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the pluralize util",
+          "body": "## Selected approach\nRule table with irregulars."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "wait-pending",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Pluralize util implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["e1f2a3b"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "wait-pending",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "out-of-order-two-records-fold-by-version",
+    "task_id": "out-of-order-two",
+    "records": [
+      {
+        "version": 2,
+        "task_id": "out-of-order-two",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Url utils implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["f3a4b5c"]
+        }
+      },
+      {
+        "version": 1,
+        "task_id": "out-of-order-two",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the url utils",
+          "body": "## Selected approach\nWHATWG URL wrappers."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "out-of-order-three-records-fold-by-version",
+    "task_id": "out-of-order-three",
+    "records": [
+      {
+        "version": 3,
+        "task_id": "out-of-order-three",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 1,
+        "task_id": "out-of-order-three",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the template engine",
+          "body": "## Selected approach\nToken substitution, no eval."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "out-of-order-three",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Template engine implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["a6b7c8d"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "project-scope-empty-null",
+    "task_id": "project",
+    "records": [],
+    "expected": null
+  },
+  {
+    "name": "project-scope-records-skipped",
+    "task_id": "project",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "project",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Deferred issue registered",
+          "body": "Note: sortBy mutation deferred from task note-revising, close condition: return a new array.",
+          "ref_version": 3
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "project",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "custom_report",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Weekly architecture digest",
+          "body": "Custom report: summary of design activity for the week."
+        }
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "version-gap-folds-with-warning",
+    "task_id": "version-gap",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "version-gap",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the queue",
+          "body": "## Selected approach\nUnbounded FIFO with backpressure hook."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "version-gap",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Queue implemented, v2 missing on disk",
+          "body": "## Implementation\nAs designed; v2 was lost to an external edit.\n## Verification\nvitest green.",
+          "commits": ["b8c9d0f"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "VERSION_GAP" }]
+    }
+  },
+  {
+    "name": "version-duplicate-folds-with-warning",
+    "task_id": "version-duplicate",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "version-duplicate",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the stack",
+          "body": "## Selected approach\nArray-backed LIFO."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "version-duplicate",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Stack implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["c0d1e2a"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "version-duplicate",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Note carrying a duplicated version",
+          "body": "Note: external edit duplicated this version number."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "VERSION_DUPLICATE" }]
+    }
+  },
+  {
+    "name": "stray-verdict-on-design-ignored",
+    "task_id": "stray-verdict",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "stray-verdict",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design carrying a stray verdict field",
+          "verdict": "pass",
+          "body": "## Selected approach\nPayload allows free extension; the stray verdict must be ignored by derive."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "unknown-content-type-out-of-table",
+    "task_id": "unknown-type",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "unknown-type",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "custom_report",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Custom report published to a fresh task",
+          "body": "Custom report: unknown content types are accepted and treated as out-of-table."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "ack-on-clean-state-no-op",
+    "task_id": "ack-clean",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "ack-clean",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the round util",
+          "body": "## Selected approach\nDecimal-based rounding."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "ack-clean",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Ack with nothing to acknowledge",
+          "body": "Note: ack on a clean state must be a no-op without warning.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "second-consecutive-ack-no-op",
+    "task_id": "ack-twice",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "ack-twice",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the clamp util",
+          "body": "## Selected approach\nSingle-expression clamp."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "ack-twice",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Review published too early",
+          "verdict": "pass",
+          "body": "## Overall\nOut of sequence, flagged for the human."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "ack-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Acknowledged",
+          "body": "Note: reviewed, no action needed.",
+          "ack": true
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "ack-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Acknowledged again",
+          "body": "Note: second consecutive ack must be a no-op.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "ack-in-closed-clears-warnings",
+    "task_id": "ack-closed",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "ack-closed",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "ack-closed",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Changes after close",
+          "body": "## Implementation\nPublished after close, absorbed with a warning.\n## Verification\nvitest green.",
+          "commits": ["d2e3f4b"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "ack-closed",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Acknowledged the post-close changes",
+          "body": "Note: reviewed the post-close record, closing the loop.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "review-verdict-constructor-prototype-safe",
+    "task_id": "verdict-constructor",
+    "$comment": "verdict values that collide with Object prototype members ('constructor', '__proto__', 'toString') must be treated as unknown verdicts, not resolved through the prototype chain.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "verdict-constructor",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the ring buffer",
+          "body": "## Selected approach\nFixed-size circular buffer."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "verdict-constructor",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Ring buffer implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["a7b8c9e"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "verdict-constructor",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Review with a prototype-member verdict",
+          "verdict": "constructor",
+          "ref_version": 2,
+          "body": "## Overall\nVerdict collides with a built-in property name; must be INVALID_VERDICT, not a transition."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "INVALID_VERDICT" }]
+    }
+  },
+  {
+    "name": "ack-note-keeps-own-structural-warning",
+    "task_id": "ack-dup",
+    "$comment": "per plan decision 2 an ack clears warnings accumulated by PRECEDING records only; the ack note's own VERSION_DUPLICATE (it reuses v2) survives.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "ack-dup",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the interner",
+          "body": "## Selected approach\nBounded string interning table."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "ack-dup",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Interner implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["b9c0d1f"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "ack-dup",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Ack note carrying a duplicated version",
+          "body": "Note: external edit duplicated this version number; the ack cannot clear its own anomaly.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "VERSION_DUPLICATE" }]
+    }
+  },
+  {
+    "name": "decision-without-value-out-of-table",
+    "task_id": "decision-empty",
+    "$comment": "Accepted judgment call: a decision record with no payload.decision fits no table row — OUT_OF_TABLE, status stays pending_approval.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "decision-empty",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design for the hash wrapper",
+          "body": "## Selected approach\nSHA-256 streaming helper."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "decision-empty",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-15T09:01:00Z",
+        "payload": {
+          "summary": "Hash wrapper implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["c1d2e3a"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "decision-empty",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-15T09:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "decision-empty",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-15T09:03:00Z",
+        "payload": {
+          "summary": "Decision record without a decision value",
+          "body": "The human published a decision record but forgot the decision field; no table row fits."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 4, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "version-gap-at-sequence-start",
+    "task_id": "gap-start",
+    "$comment": "Accepted judgment call: a first record at version 5 (no v1-v4 on disk) warns VERSION_GAP on that record and still folds normally.",
+    "records": [
+      {
+        "version": 5,
+        "task_id": "gap-start",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-15T09:00:00Z",
+        "payload": {
+          "summary": "Design published at version 5",
+          "body": "## Selected approach\nExternal tooling wrote v5 first; versions 1-4 never existed on disk."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 5, "code": "VERSION_GAP" }]
+    }
+  },
+  {
+    "name": "direct-empty-sequence-implementing",
+    "task_id": "direct-fresh",
+    "flow": "direct",
+    "records": [],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-design-reference-noop",
+    "task_id": "direct-design-ref",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-design-ref",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Reference design attached at implementation start",
+          "body": "## Selected approach\nThe design predates this task; recorded here as reference for the executor."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-full-lifecycle",
+    "task_id": "direct-lifecycle",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-lifecycle",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Reference design",
+          "body": "## Selected approach\nPre-existing design, recorded as reference."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-lifecycle",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Implemented per the reference design",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["aa11bb2"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "direct-lifecycle",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:02:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "direct-lifecycle",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:03:00Z",
+        "payload": {
+          "summary": "Approved",
+          "decision": "approve",
+          "body": "Implementation approved."
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "direct-lifecycle",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:04:00Z",
+        "payload": {
+          "summary": "Closed",
+          "decision": "close",
+          "body": "Shipped, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-review-fail-code-revision-loop",
+    "task_id": "direct-fail-code",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-fail-code",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented straight from the pre-existing design",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["bb22cc3"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-fail-code",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Edge case unhandled",
+          "verdict": "fail_code",
+          "ref_version": 1,
+          "body": "## Issues\n1. Empty input crashes. Close condition: guard clause plus a test."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "direct-fail-code",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "revision",
+        "timestamp": "2026-08-17T10:02:00Z",
+        "payload": {
+          "summary": "Guard added with test",
+          "body": "## Response\nAdded the guard and the test.\n## Verification\nvitest green.",
+          "ref_version": 2,
+          "commits": ["cc33dd4"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-review-fail-design-out-of-table",
+    "task_id": "direct-fail-design",
+    "flow": "direct",
+    "$comment": "direct has no designing state: a fail_design verdict fits no table row — out-of-table, the human adjudicates (close, or supply a design).",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-fail-design",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented per the pre-existing design",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["dd44ee5"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-fail-design",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "The underlying design is unsound",
+          "verdict": "fail_design",
+          "ref_version": 1,
+          "body": "## Issues\nThe pre-existing design cannot express the requirement; out-of-table in direct, the human must adjudicate."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "direct-design-in-reviewing-out-of-table",
+    "task_id": "direct-design-late",
+    "flow": "direct",
+    "$comment": "direct design row: reference no-op applies in implementing ONLY; in every other state the record is out-of-table (same semantics as full's non-designing states).",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-design-late",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ee55ff6"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-design-late",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Design published mid-review",
+          "body": "## Selected approach\nRevised approach published while the task was already reviewing — out-of-table."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "direct-decision-reject-to-revising",
+    "task_id": "direct-reject",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-reject",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ff66aa1"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-reject",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Pass with deferred candidates",
+          "verdict": "pass",
+          "ref_version": 1,
+          "body": "## Overall\nFine to ship; deferral candidates listed."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "direct-reject",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:02:00Z",
+        "payload": {
+          "summary": "Rejected: deferred issues are real",
+          "decision": "reject",
+          "body": "The deferred issues must be fixed, sending back for revision."
+        }
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-reject-revision-reapprove-close-loop",
+    "task_id": "direct-reject-loop",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-reject-loop",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["aa77bb8"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-reject-loop",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 1,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "direct-reject-loop",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:02:00Z",
+        "payload": {
+          "summary": "Rejected",
+          "decision": "reject",
+          "body": "One issue must be fixed before shipping."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "direct-reject-loop",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "revision",
+        "timestamp": "2026-08-17T10:03:00Z",
+        "payload": {
+          "summary": "Fixed the rejected issue",
+          "body": "## Response\nFixed.\n## Verification\nvitest green.",
+          "ref_version": 3,
+          "commits": ["bb88cc9"]
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "direct-reject-loop",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:04:00Z",
+        "payload": {
+          "summary": "Pass on re-review",
+          "verdict": "pass",
+          "ref_version": 4,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 6,
+        "task_id": "direct-reject-loop",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:05:00Z",
+        "payload": {
+          "summary": "Approved",
+          "decision": "approve",
+          "body": "Implementation approved."
+        }
+      },
+      {
+        "version": 7,
+        "task_id": "direct-reject-loop",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:06:00Z",
+        "payload": {
+          "summary": "Closed",
+          "decision": "close",
+          "body": "Shipped, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-close-from-implementing",
+    "task_id": "direct-close-fresh",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-close-fresh",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Closed before any work",
+          "decision": "close",
+          "body": "Requirements changed, abandoning before implementation started."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-close-from-reviewing",
+    "task_id": "direct-close-reviewing",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-close-reviewing",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["cc99dd0"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-close-reviewing",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Closed while awaiting review",
+          "decision": "close",
+          "body": "Reviewer unavailable, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-close-from-pending-approval",
+    "task_id": "direct-close-pending",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-close-pending",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["dd00ee1"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-close-pending",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Pass",
+          "verdict": "pass",
+          "ref_version": 1,
+          "body": "## Overall\nNo open issues."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "direct-close-pending",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:02:00Z",
+        "payload": {
+          "summary": "Closed instead of approve/reject",
+          "decision": "close",
+          "body": "Superseded upstream, closing without approval."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-close-idempotent",
+    "task_id": "direct-close-twice",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-close-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-close-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Closed again by mistake",
+          "decision": "close",
+          "body": "Duplicate close, idempotent without warning."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-note-no-change",
+    "task_id": "direct-note",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-note",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Constraint discovered mid-implementation",
+          "body": "Note: keep the diff under 50 lines."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-code-changes-in-reviewing-out-of-table",
+    "task_id": "direct-cc-twice",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-cc-twice",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ee11ff2"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-cc-twice",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Follow-up published as code_changes again",
+          "body": "## Implementation\nWrong content type for a follow-up while reviewing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "direct-approve-before-pending-out-of-table",
+    "task_id": "direct-approve-early",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-approve-early",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Approval before any review",
+          "decision": "approve",
+          "body": "Approved straight from the initial state, out of sequence."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "direct-review-missing-verdict-invalid",
+    "task_id": "direct-no-verdict",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-no-verdict",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ff22aa3"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-no-verdict",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Review without a verdict",
+          "ref_version": 1,
+          "body": "## Overall\nReviewer forgot the verdict field; verdict validation is retained in direct."
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "INVALID_VERDICT" }]
+    }
+  },
+  {
+    "name": "direct-ack-clears-fail-design-warning",
+    "task_id": "direct-ack",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-ack",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["aa33bb4"]
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-ack",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Design premise overturned",
+          "verdict": "fail_design",
+          "ref_version": 1,
+          "body": "## Issues\nOut-of-table in direct; flagged for the human."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "direct-ack",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-17T10:02:00Z",
+        "payload": {
+          "summary": "Acknowledged the fail_design ruling",
+          "body": "Note: reviewed with the architect out of band; proceeding, no action needed.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-closed-absorb-code-changes",
+    "task_id": "direct-absorb",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-absorb",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "direct-absorb",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T10:01:00Z",
+        "payload": {
+          "summary": "Changes after close",
+          "body": "## Implementation\nExecutor missed the close and published changes."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "CLOSED_ABSORB" }]
+    }
+  },
+  {
+    "name": "direct-unknown-content-type-out-of-table",
+    "task_id": "direct-unknown-type",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-unknown-type",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "custom_report",
+        "timestamp": "2026-08-17T10:00:00Z",
+        "payload": {
+          "summary": "Custom report on a fresh direct task",
+          "body": "Custom report: unknown content types stay out-of-table in every flow."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-empty-sequence-designing",
+    "task_id": "solo-fresh",
+    "flow": "solo",
+    "records": [],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "agent:architect",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-design-to-implementing",
+    "task_id": "solo-design",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-design",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design for the small change",
+          "body": "## Selected approach\nOne-line fix in the existing helper."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-code-changes-to-pending-approval",
+    "task_id": "solo-cc-pending",
+    "flow": "solo",
+    "$comment": "solo's key row: the review phase is skipped — code_changes goes straight to the human approval gate.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-cc-pending",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-cc-pending",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ab12cd3"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-full-lifecycle",
+    "task_id": "solo-lifecycle",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-lifecycle",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-lifecycle",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["bc23de4"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-lifecycle",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Approved without review",
+          "decision": "approve",
+          "body": "Small change, human reviewed directly; approved."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "solo-lifecycle",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:03:00Z",
+        "payload": {
+          "summary": "Closed",
+          "decision": "close",
+          "body": "Shipped, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-reject-returns-to-implementing",
+    "task_id": "solo-reject",
+    "flow": "solo",
+    "$comment": "solo reject: send back for rework (implementing), not the revision loop — revising is unreachable in solo.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-reject",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-reject",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["cd34ef5"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-reject",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Rejected: wrong scope",
+          "decision": "reject",
+          "body": "The fix touches the wrong module; rework from implementing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-reject-rework-approve-close-loop",
+    "task_id": "solo-reject-loop",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-reject-loop",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-reject-loop",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["de45fa6"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-reject-loop",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Rejected: wrong scope",
+          "decision": "reject",
+          "body": "Rework needed; back to implementing."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "solo-reject-loop",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:03:00Z",
+        "payload": {
+          "summary": "Reworked in the right module",
+          "body": "## Implementation\nFixed the scope.\n## Verification\nvitest green.",
+          "commits": ["ef56ab7"]
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "solo-reject-loop",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:04:00Z",
+        "payload": {
+          "summary": "Approved",
+          "decision": "approve",
+          "body": "Rework accepted, approved."
+        }
+      },
+      {
+        "version": 6,
+        "task_id": "solo-reject-loop",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:05:00Z",
+        "payload": {
+          "summary": "Closed",
+          "decision": "close",
+          "body": "Shipped, closing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-review-pass-out-of-table",
+    "task_id": "solo-review-pass",
+    "flow": "solo",
+    "$comment": "solo: publishing a review in a review-free flow is a deviation — visible via OUT_OF_TABLE + needs_attention.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-review-pass",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-review-pass",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["fa67bc8"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-review-pass",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Review published into a solo task",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nReviewer did not notice the task is review-free; out-of-table."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-review-fail-code-out-of-table",
+    "task_id": "solo-review-fail-code",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-review-fail-code",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-review-fail-code",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ab78cd9"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-review-fail-code",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Fail_code into a solo task",
+          "verdict": "fail_code",
+          "ref_version": 2,
+          "body": "## Issues\nOut-of-table in solo regardless of verdict."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-review-fail-design-out-of-table",
+    "task_id": "solo-review-fail-design",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-review-fail-design",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-review-fail-design",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["bc89de0"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-review-fail-design",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Fail_design into a solo task",
+          "verdict": "fail_design",
+          "ref_version": 2,
+          "body": "## Issues\nOut-of-table in solo regardless of verdict."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-review-before-design-out-of-table",
+    "task_id": "solo-review-early",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-review-early",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Premature review",
+          "verdict": "pass",
+          "body": "## Overall\nReviewed before anything existed; out-of-table in any state of solo."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-review-invalid-verdict-still-out-of-table",
+    "task_id": "solo-review-bogus",
+    "flow": "solo",
+    "$comment": "Judgment call locked by a vector: in solo OUT_OF_TABLE takes precedence over INVALID_VERDICT — the verdict is never evaluated because the record type itself fits no table row.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-review-bogus",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-review-bogus",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Review with a bogus verdict",
+          "verdict": "meh",
+          "ref_version": 1,
+          "body": "## Overall\nVerdict is nonsense AND the flow has no review phase; OUT_OF_TABLE wins."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-revision-out-of-table",
+    "task_id": "solo-revision",
+    "flow": "solo",
+    "$comment": "solo: revising is unreachable (no review loop), so a revision record can only be a deviation.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-revision",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-revision",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["cd90ef1"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-revision",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "revision",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Revision into a solo task",
+          "body": "## Response\nUsed the review-loop content type in a review-free flow; out-of-table."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-code-changes-before-design-out-of-table",
+    "task_id": "solo-cc-early",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-cc-early",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Changes published before the design",
+          "body": "## Implementation\nSkipped the design step; out-of-table in designing."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-code-changes-while-pending-out-of-table",
+    "task_id": "solo-cc-again",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-cc-again",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-cc-again",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["de01fa2"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-cc-again",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Second code_changes while pending approval",
+          "body": "## Implementation\nMore changes after the task already reached the gate."
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-approve-before-pending-out-of-table",
+    "task_id": "solo-approve-early",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-approve-early",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-approve-early",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Approval before reaching the gate",
+          "decision": "approve",
+          "body": "Approved while still implementing, out of sequence."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-design-after-implementing-out-of-table",
+    "task_id": "solo-design-late",
+    "flow": "solo",
+    "$comment": "Contrast with direct: in solo the design row is NOT a reference no-op — only designing folds a design.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-design-late",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-design-late",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Second design while implementing",
+          "body": "## Selected approach\nFollow-up design after implementation started; out-of-table."
+        }
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+    }
+  },
+  {
+    "name": "solo-close-from-designing",
+    "task_id": "solo-close-designing",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-close-designing",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Closed before design started",
+          "decision": "close",
+          "body": "Requirements changed, abandoning."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-close-from-pending-approval",
+    "task_id": "solo-close-pending",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-close-pending",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-close-pending",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["ef12ab3"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-close-pending",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Closed instead of approve/reject",
+          "decision": "close",
+          "body": "Superseded upstream, closing without approval."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-close-idempotent",
+    "task_id": "solo-close-twice",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-close-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Closed the task",
+          "decision": "close",
+          "body": "Done, closing."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-close-twice",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Closed again by mistake",
+          "decision": "close",
+          "body": "Duplicate close, idempotent without warning."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-note-no-change",
+    "task_id": "solo-note",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-note",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "note",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Constraint noted mid-design",
+          "body": "Note: the fix must not change the public API."
+        }
+      }
+    ],
+    "expected": {
+      "status": "designing",
+      "waiting_for": "agent:architect",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-ack-clears-review-warning",
+    "task_id": "solo-ack",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-ack",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-ack",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Small change implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": ["fa23bc4"]
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-ack",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Stray review into a solo task",
+          "verdict": "pass",
+          "ref_version": 2,
+          "body": "## Overall\nOut-of-table deviation, flagged for the human."
+        }
+      },
+      {
+        "version": 4,
+        "task_id": "solo-ack",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "note",
+        "timestamp": "2026-08-17T11:03:00Z",
+        "payload": {
+          "summary": "Acknowledged the stray review",
+          "body": "Note: the informal review was accurate anyway; proceeding to the approval gate.",
+          "ack": true
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-closed-absorb-review",
+    "task_id": "solo-absorb",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-absorb",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 2,
+        "task_id": "solo-absorb",
+        "role": "human",
+        "agent": "alice",
+        "content_type": "decision",
+        "timestamp": "2026-08-17T11:01:00Z",
+        "payload": {
+          "summary": "Closed mid-implementation",
+          "decision": "close",
+          "body": "Scope cancelled, closing."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-absorb",
+        "role": "reviewer",
+        "agent": "codex-cli",
+        "content_type": "review",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Review after close",
+          "verdict": "pass",
+          "body": "## Overall\nReviewer missed the close; absorbed with a warning."
+        }
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "CLOSED_ABSORB" }]
+    }
+  },
+  {
+    "name": "solo-version-gap-folds-with-warning",
+    "task_id": "solo-version-gap",
+    "flow": "solo",
+    "$comment": "Structural anomalies are flow-independent: the gap warns AND the solo fold still applies (code_changes → pending_approval). Externally edited storage (v2 missing on disk) — the store-side external-write channel in seam.test.ts replays this.",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-version-gap",
+        "role": "architect",
+        "agent": "codex-cli",
+        "content_type": "design",
+        "timestamp": "2026-08-17T11:00:00Z",
+        "payload": {
+          "summary": "Brief design",
+          "body": "## Selected approach\nSmall fix as designed."
+        }
+      },
+      {
+        "version": 3,
+        "task_id": "solo-version-gap",
+        "role": "executor",
+        "agent": "pi",
+        "content_type": "code_changes",
+        "timestamp": "2026-08-17T11:02:00Z",
+        "payload": {
+          "summary": "Implemented, v2 missing on disk",
+          "body": "## Implementation\nAs designed; v2 was lost to an external edit.\n## Verification\nvitest green.",
+          "commits": ["ab34cd5"]
+        }
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [{ "version": 3, "code": "VERSION_GAP" }]
+    }
+  }
+]

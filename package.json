@@ -1,0 +1,57 @@
+{
+  "name": "take-ur-turn",
+  "version": "0.1.0",
+  "description": "TUT (Take Ur Turn): multi coding-agent collaboration via a local Context Hub — append-only shared memory, derived task state, human approval gates",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "multi-agent",
+    "workflow",
+    "code-review",
+    "coding-agent",
+    "agent-orchestration"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "tut": "dist/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ianf-ai/take-ur-turn.git"
+  },
+  "homepage": "https://github.com/ianf-ai/take-ur-turn#readme",
+  "bugs": {
+    "url": "https://github.com/ianf-ai/take-ur-turn/issues"
+  },
+  "files": [
+    "dist/",
+    "skills/",
+    "scripts/launch.sh",
+    "scripts/on-agent-event.sh",
+    "scripts/workspace.json",
+    "scripts/routes.json",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"const fs=require('fs');const f='dist/cli.js';let s=fs.readFileSync(f,'utf8');if(!s.startsWith('#!')){s='#!/usr/bin/env node\\n'+s;fs.writeFileSync(f,s);}fs.chmodSync(f,0o755)\"",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.2.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "~1.30.0",
+    "zod": "^3.25"
+  }
+}

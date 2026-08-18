@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+// Herdr CLI fixture for tut-up tests: PATH injection stubs
+// the real binary — no mock of process internals, runUp spawns this like any
+// herdr. Every invocation is logged (argv space-joined, one line) to
+// $TUT_HERDR_LOG; outputs mirror the REAL herdr JSON verified live:
+//   pane list   → {"id":"cli:pane:list","result":{"panes":[...],"type":"pane_list"}}
+//   pane split  → {"result":{"pane":{"pane_id":...},"type":"pane_info"}} (new pane)
+//   tab create  → {"id":"cli:tab:create","result":{"root_pane":{pane_id,tab_id},
+//                 "tab":{label,tab_id,pane_count},"type":"tab_created"}}
+//                 (ships an EMPTY root pane)
+//   pane move   → {"result":{"move_result":{changed,pane},"type":"pane_move"}}
+//   pane close  → {"result":{"type":"ok"}}
+//   pane rename → {"result":{"pane":{"pane_id","label"},"type":"pane_info"}}
+//   pane run    → {"result":{"type":"ok"}}
+//   pane send-text → {"result":{"type":"ok"}}
+//   pane send-keys → {"result":{"type":"ok"}}
+//   pane read   → RAW TEXT (no JSON envelope — mirrors real herdr): the value
+//                 of TUT_HERDR_PANE_READ; when TUT_HERDR_READ_EMPTY_POLLS=N
+//                 the first N reads return empty (simulates the born pane's
+//                 boot window before the receiver UI paints)
+// Env:
+//   TUT_HERDR_LOG   — log file path (one line per invocation)
+//   TUT_HERDR_PANES — JSON array of pane objects returned by `pane list`
+//   TUT_HERDR_FAIL  — comma list of "sub:verb" keys (e.g. "pane:move") whose
+//                     calls fail: stderr line + exit 1 (failure-path tests)
+//   TUT_HERDR_PANE_READ      — text `pane read` serves (default "")
+//   TUT_HERDR_READ_EMPTY_POLLS — first N `pane read` calls serve "" (boot)
+// Split hands out fresh ids FIX:p1, FIX:p2, ... (count = split lines logged);
+// tab create hands out FIX:t<n> / root FIX:root<n> the same way.
+// Plain JS on purpose: this file is executed directly by node, not vitest.
+import { appendFileSync, readFileSync } from "node:fs";
+
+const argv = process.argv.slice(2);
+const log = process.env.TUT_HERDR_LOG ?? "";
+if (log.length > 0) appendFileSync(log, `${argv.join(" ")}\n`, "utf8");
+
+const emit = (value) => {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+};
+
+const sub = argv[1];
+if ((process.env.TUT_HERDR_FAIL ?? "").split(",").includes(`${argv[0]}:${sub ?? ""}`)) {
+  process.stderr.write(`fixture: simulated ${argv[0]} ${sub} failure\n`);
+  process.exit(1);
+}
+
+/** How many already-logged invocations start with $1 (this call is logged). */
+const loggedCount = (prefix) => {
+  try {
+    return readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith(prefix)).length;
+  } catch {
+    return 1; // no log yet — first invocation
+  }
+};
+
+if (argv[0] === "pane" && sub === "list") {
+  const panes = process.env.TUT_HERDR_PANES ? JSON.parse(process.env.TUT_HERDR_PANES) : [];
+  emit({ id: "cli:pane:list", result: { panes, type: "pane_list" } });
+} else if (argv[0] === "pane" && sub === "split") {
+  emit({ id: "cli:pane:split", result: { pane: { pane_id: `FIX:p${loggedCount("pane split")}` }, type: "pane_info" } });
+} else if (argv[0] === "tab" && sub === "create") {
+  const n = loggedCount("tab create");
+  const labelIdx = argv.indexOf("--label");
+  const label = labelIdx >= 0 ? argv[labelIdx + 1] : "";
+  const tabId = `FIX:t${n}`;
+  emit({
+    id: "cli:tab:create",
+    result: {
+      root_pane: { pane_id: `FIX:root${n}`, tab_id: tabId },
+      tab: { label, tab_id: tabId, pane_count: 1 },
+      type: "tab_created",
+    },
+  });
+} else if (argv[0] === "pane" && sub === "move") {
+  emit({ id: "cli:pane:move", result: { move_result: { changed: 1, pane: argv[2] }, type: "pane_move" } });
+} else if (argv[0] === "pane" && sub === "close") {
+  emit({ id: "cli:pane:close", result: { type: "ok" } });
+} else if (argv[0] === "pane" && sub === "rename") {
+  emit({ id: "cli:pane:rename", result: { pane: { pane_id: argv[2], label: argv[3] }, type: "pane_info" } });
+} else if (argv[0] === "pane" && sub === "run") {
+  emit({ id: "cli:pane:run", result: { type: "ok" } });
+} else if (argv[0] === "pane" && sub === "send-text") {
+  emit({ id: "cli:pane:send-text", result: { type: "ok" } });
+} else if (argv[0] === "pane" && sub === "send-keys") {
+  emit({ id: "cli:pane:send-keys", result: { type: "ok" } });
+} else if (argv[0] === "pane" && sub === "read") {
+  // Raw text, no JSON envelope (real herdr pane read prints terminal text).
+  const emptyPolls = Number(process.env.TUT_HERDR_READ_EMPTY_POLLS ?? "0") || 0;
+  if (loggedCount("pane read") > emptyPolls) {
+    process.stdout.write(process.env.TUT_HERDR_PANE_READ ?? "");
+  }
+} else {
+  emit({ id: "cli:pane:fixture", result: { type: "ok" } });
+}
