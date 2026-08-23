@@ -1,0 +1,17 @@
+{
+  "$comment": "SEED / shape example only — NOT read at runtime. The live resolution chain is: <project>/.context-hub/workspace.json → ~/.config/tut/workspace.json (or $TUT_USER_CONFIG_DIR) → built-in defaults. To customize, copy this file to one of those locations (mkdir -p first) and edit; tut assign writes the project-level file. Placeholders in naming.tab_label: {role} {task} {agent}; the pane label stays the fixed <task_id>.<role> addressing key and is never templated. Legacy {label, agent} entries are tolerated on read (only .agent is read).",
+  "roles": {
+    "architect": {
+      "agent": "codex"
+    },
+    "executor": {
+      "agent": "pi"
+    },
+    "reviewer": {
+      "agent": "codex"
+    }
+  },
+  "naming": {
+    "tab_label": "TUT {role}"
+  }
+}

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fixture agent CLI: exists for tut up's `which` check; does nothing.
+exit 0

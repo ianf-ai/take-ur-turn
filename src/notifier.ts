@@ -1,0 +1,892 @@
+/**
+ * Notifier (system-design ch. 6). `tut notify` runs runNotify below as a daemon in a
+ * dedicated pane (8.2): stdout/stderr is the log, crashes are visible.
+ *
+ * State routing remains a pure HTTP consumer of GET {url}/state (flow_mode AND
+ * the optional `notify` channel config both come from /state, each cycle).
+ * The auto launch branch additionally uses the shared launch module to read
+ * and append launch provenance in the Hub before it invokes the launcher.
+ * In-memory state is still only a snapshot: restart re-baselines
+ * and the first successful fetch establishes it with NO notifications,
+ * afterwards changes are edge-triggered.
+ *
+ * Execution model: ONE async queue serializes all "compare + gate + act" — the
+ * poll interval and agent events both only enqueue "run one compare"; requests
+ * arriving in the same macrotask coalesce into a single run. Concurrent entry
+ * points therefore cannot double-notify or double-launch.
+ *
+ * Auto-mode gate: waiting_for "agent:*" with
+ * needs_attention false ALREADY fully encodes "launchable" — a task awaiting a
+ * human decision always carries waiting_for "human", which never reaches the
+ * launch branch. The only legal pending_approval → revising path is
+ * decision(reject), i.e. a human HAS acted, so auto-launch must fire there or
+ * the review-revision loop breaks every round. Transitions INTO waiting_for
+ * "human" notify the human ("pending human decision") instead.
+ *
+ * Launch whitelist: the auto branch checks /state's
+ * `auto.launch_roles` (role-keyed) AFTER the gate and BEFORE the duplicate
+ * check / marker append — not whitelisted ⇒ no launch, NO launch marker (a
+ * withheld round must never block the human's `tut start-next`), notify the
+ * human instead. Absent/empty list withholds everything (conservative default).
+ */
+
+import { spawn } from "node:child_process";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { fileURLToPath } from "node:url";
+import { createChannels, type Channel, type Notification } from "./channels.js";
+import {
+  launchBlocked,
+  latestRecordVersion,
+  markLaunched as appendLaunchMarker,
+  readLaunchLog,
+  resolveLaunchTarget,
+  type LaunchVia,
+} from "./launch.js";
+import type { Cast, ContextRecord } from "./types.js";
+import { KNOWN_ROLES, resolveAgent } from "./workspace.js";
+
+export interface NotifyOptions {
+  /** Hub BASE url (default http://127.0.0.1:3001); /state is appended. */
+  url: string;
+  /** Poll interval in seconds (default 5). */
+  interval: number;
+  /** Local port for the agent-event listener (default 3002). */
+  eventPort: number;
+  /** Stall timeout in minutes for agent:*-waiting tasks (default 30). */
+  stallTimeoutMin: number;
+}
+
+/** The frozen /state task fields (notify is top-level). `version`
+ *  is optional so an older hub without it —
+ *  or a test fixture — still type-checks; the merge log below simply no-ops. */
+export interface StateTask {
+  task_id: string;
+  title: string;
+  status: string;
+  updated_at: string;
+  needs_attention: boolean;
+  waiting_for: string;
+  version?: number;
+  /** Task's per-role cast overrides (absent on older hubs/fixtures). */
+  cast?: Cast;
+}
+
+/** The optional /state `auto` section: the launch whitelist.
+ *  launch_roles is optional only for tolerance — an older hub or a fixture
+ *  without it behaves as an empty whitelist (withhold all). */
+export interface StateAuto {
+  launch_roles?: string[];
+}
+
+export interface StateResponse {
+  flow_mode: string;
+  tasks: StateTask[];
+  /** Optional channel config; interpreted by createChannels. */
+  notify?: unknown;
+  /** Optional auto-enablement config; the launch whitelist. */
+  auto?: StateAuto;
+}
+
+export interface AgentEvent {
+  event: "working" | "blocked" | "done";
+  agent: string;
+  pane: string;
+}
+
+export interface NotifierDeps {
+  fetchState(url: string): Promise<StateResponse>;
+  launch(taskId: string, role: string, agent: string): Promise<string>;
+  /** Full task log used by auto launch de-duplication; injectable for tests. */
+  readLog(taskId: string): Promise<ContextRecord[]>;
+  /** Append the optimistic launch marker before calling launch.sh. */
+  markLaunched(taskId: string, role: string, baseVersion: number, via: LaunchVia): Promise<unknown>;
+  channelsFor(notifyCfg: unknown): Channel[];
+  now(): number;
+  log(line: string): void;
+  /**
+   * Pre-check for the auto door: resolve the launch target (cast →
+   * workspace → routes) and verify the agent is on PATH. Runs BEFORE the
+   * launch marker — a failure must leave no trace. Injectable for tests.
+   */
+  resolveTarget?(taskId: string, role: string): Promise<string>;
+  /**
+   * Routing maps for the event→task mapping (agent-keyed). Refreshed
+   * every poll so workspace.json edits apply without a notifier restart.
+   * Injectable for tests.
+   */
+  loadRouting?(): Promise<RoutingMaps>;
+}
+
+// --- defaults --------------------------------------------------------------------
+
+function stateUrlOf(url: string): string {
+  return `${url.replace(/\/+$/, "")}/state`;
+}
+
+async function defaultFetchState(url: string): Promise<StateResponse> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`);
+  return (await res.json()) as StateResponse;
+}
+
+/** Plain-name CLI presence check via `which` — never runs the agent itself. */
+function commandOnPath(name: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn("which", [name], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("exit", (code) => resolve(code === 0));
+  });
+}
+
+/** Auto-door pre-check: resolve the routed agent, require it on PATH. */
+async function defaultResolveTarget(url: string, taskId: string, role: string): Promise<string> {
+  const { agent } = await resolveLaunchTarget(url, taskId, role);
+  if (!(await commandOnPath(agent))) {
+    throw new Error(`routed agent '${agent}' is not on PATH`);
+  }
+  return agent;
+}
+
+/**
+ * Runs scripts/launch.sh <task_id> <role>. The environment is passed through
+ * unchanged so TUT_DRY_RUN=1 makes launch.sh print the command instead of
+ * calling Herdr (the script tests use exactly this).
+ * Resolves with captured stdout (the DRY-RUN line / launcher output).
+ *
+ * Path note: one directory up from this module (../scripts/launch.sh —
+ * module-relative, resolving inside the repo from both src/ and dist/).
+ */
+const LAUNCH_SCRIPT_URL = new URL("../scripts/launch.sh", import.meta.url);
+
+async function spawnLaunch(taskId: string, role: string, agent: string): Promise<string> {
+  const script = fileURLToPath(LAUNCH_SCRIPT_URL);
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(script, [taskId, role, agent], {
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+      } else {
+        const tail = stderr.trim();
+        reject(new Error(`launch.sh ${taskId} ${role} exited ${code ?? `signal ${signal}`}${tail ? `: ${tail}` : ""}`));
+      }
+    });
+  });
+}
+
+function defaultLog(line: string): void {
+  process.stderr.write(line.endsWith("\n") ? line : `${line}\n`);
+}
+
+/**
+ * Event→task routing maps (agent-keyed). Empirically (herdr 0.8) the
+ * pane.agent_status_changed payload carries NO task_id — the herdr plugin
+ * resolves pane_id → pane label and passes it as `pane`. Two maps:
+ *   - labelToAgent: pane label → agent identity. Agent-named panes (label ==
+ *     agent, the fresh-session convention): identity is the label itself.
+ *     Legacy workspace labels are RETIRED — the round
+ *     pane prefix lookup (a½) and agent names cover every live consumer.
+ *   - roleToAgent: role → default-lineup agent (cast-less tasks), resolved
+ *     through the three-level chain (cwd as project root).
+ */
+export interface RoutingMaps {
+  labelToAgent: Map<string, string>;
+  roleToAgent: Map<string, string>;
+}
+
+/** Default routing loader — exported for the fixture-driven chain test. */
+export async function defaultLoadRouting(): Promise<RoutingMaps> {
+  const labelToAgent = new Map<string, string>();
+  const roleToAgent = new Map<string, string>();
+  for (const role of KNOWN_ROLES) {
+    const agent = await resolveAgent(role); // three-level chain from cwd; never throws
+    roleToAgent.set(role, agent);
+    labelToAgent.set(agent, agent); // agent-named pane → identity
+  }
+  return { labelToAgent, roleToAgent };
+}
+
+// --- loopback Host guard (mirrors src/http.ts) -------------------------------------
+// Duplicated rather than imported: http.ts is a Hub-side module and the
+// notifier must stay an independent consumer.
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+function hostHostname(host: string): string {
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    return end === -1 ? host : host.slice(0, end + 1);
+  }
+  const colon = host.lastIndexOf(":");
+  if (colon !== -1 && /^\d+$/.test(host.slice(colon + 1))) {
+    return host.slice(0, colon);
+  }
+  return host;
+}
+
+function isLoopbackHost(req: IncomingMessage): boolean {
+  const host = req.headers.host;
+  if (host === undefined) return true; // HTTP/1.0-style clients tolerated (same as http.ts)
+  return LOOPBACK_HOSTS.has(hostHostname(host.toLowerCase()));
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+const EVENT_BODY_LIMIT = 64 * 1024;
+
+function readBody(req: IncomingMessage, limit: number): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        req.destroy();
+        reject(new Error(`body exceeds ${limit} bytes`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+// --- notifier ----------------------------------------------------------------------
+
+/**
+ * Trust whitelist check: role-keyed array
+ * membership in /state's `auto.launch_roles`. Absent, empty, or structurally
+ * malformed (defensive against an older hub) → NOT whitelisted: the
+ * conservative default withholds every auto launch.
+ */
+function autoWhitelisted(auto: StateAuto | undefined, role: string): boolean {
+  const roles = auto?.launch_roles;
+  return Array.isArray(roles) && roles.includes(role);
+}
+
+export class Notifier {
+  private readonly stateUrl: string;
+  private readonly intervalMs: number;
+  private readonly stallMs: number;
+  private readonly eventPort: number;
+  private readonly deps: NotifierDeps;
+
+  private snapshot: Map<string, StateTask> | null = null;
+  private channels: Channel[] = createChannels(undefined);
+  private consecutiveFailures = 0;
+  /** Routing maps for the event reverse lookup; null until first load. */
+  private routing: RoutingMaps | null = null;
+
+  // Serial-compare queue: `pending` coalesces, `drain` is the in-flight cycle.
+  private pending = false;
+  private drain: Promise<void> | null = null;
+
+  // Stall watchdog (in-memory): updated_at is treated as an opaque
+  // string — ANY change (including note appends, accepted heuristic) resets.
+  private lastUpdatedAt = new Map<string, string>();
+  private lastProgressAt = new Map<string, number>();
+  private stallNotified = new Set<string>();
+
+  private server: Server | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private timers = new Set<ReturnType<typeof setTimeout>>();
+  /** Resolved (non-optional) loaders built from deps. */
+  private readonly routingLoader: () => Promise<RoutingMaps>;
+  private readonly targetResolver: (taskId: string, role: string) => Promise<string>;
+
+  constructor(options: NotifyOptions, deps: Partial<NotifierDeps> = {}) {
+    this.stateUrl = stateUrlOf(options.url);
+    this.intervalMs = Math.max(1, options.interval) * 1000;
+    this.stallMs = Math.max(0, options.stallTimeoutMin) * 60_000;
+    this.eventPort = options.eventPort;
+    this.routingLoader = deps.loadRouting ?? defaultLoadRouting;
+    this.targetResolver = deps.resolveTarget ?? ((taskId, role) => defaultResolveTarget(options.url, taskId, role));
+    this.deps = {
+      fetchState: deps.fetchState ?? defaultFetchState,
+      launch: deps.launch ?? spawnLaunch,
+      readLog: deps.readLog ?? ((taskId) => readLaunchLog(options.url, taskId)),
+      markLaunched: deps.markLaunched ?? ((taskId, role, baseVersion, via) => appendLaunchMarker(options.url, taskId, role, baseVersion, via)),
+      channelsFor: deps.channelsFor ?? createChannels,
+      now: deps.now ?? (() => Date.now()),
+      log: deps.log ?? defaultLog,
+    };
+  }
+
+  private log(line: string): void {
+    this.deps.log(`tut: notify: ${line}`);
+  }
+
+  /** Schedules one compare; same-macrotask requests coalesce into one run. */
+  requestCompare(): Promise<void> {
+    this.pending = true;
+    if (this.drain === null) {
+      this.drain = (async () => {
+        // Yield once so tick+event requests arriving in the same macrotask
+        // collapse into a single compare ("同拍只行动一次").
+        await Promise.resolve();
+        try {
+          while (this.pending) {
+            this.pending = false;
+            await this.compareAndAct();
+          }
+        } finally {
+          this.drain = null;
+        }
+      })();
+    }
+    return this.drain;
+  }
+
+  private async compareAndAct(): Promise<void> {
+    let state: StateResponse;
+    try {
+      state = await this.deps.fetchState(this.stateUrl);
+    } catch (e) {
+      // Poll failure: one stderr line per consecutive failure RUN, snapshot
+      // kept, same interval, no notification, no crash (§3).
+      if (this.consecutiveFailures === 0) {
+        this.log(`poll failed: ${(e as Error).message}; keeping snapshot, retrying next interval`);
+      }
+      this.consecutiveFailures += 1;
+      return;
+    }
+    this.consecutiveFailures = 0;
+    // Channel set rebuilt from /state's notify key EVERY poll.
+    this.channels = this.deps.channelsFor(state.notify);
+    // routing maps refreshed every poll too — workspace.json edits apply
+    // without restart; a failed load keeps the previous maps (events before
+    // the first successful load degrade to the no-mapping path).
+    try {
+      this.routing = await this.routingLoader();
+    } catch (e) {
+      this.log(`routing map reload failed: ${(e as Error).message}; keeping previous`);
+    }
+
+    const prev = this.snapshot;
+    const now = this.deps.now();
+    this.snapshot = new Map(state.tasks.map((t) => [t.task_id, t]));
+
+    if (prev === null) {
+      // First successful fetch: baseline, no notifications.
+      for (const t of state.tasks) {
+        this.lastUpdatedAt.set(t.task_id, t.updated_at);
+        this.lastProgressAt.set(t.task_id, now);
+      }
+      this.log(`baseline: ${state.tasks.length} task(s), flow_mode=${state.flow_mode}`);
+      return;
+    }
+
+    try {
+      for (const after of state.tasks) {
+        await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto);
+      }
+      this.checkStalls(state.tasks, now);
+    } catch (e) {
+      // compare/act itself should never throw; if it does, log and survive.
+      this.log(`compare failed unexpectedly: ${(e as Error).message}`);
+    }
+  }
+
+  private async diffTask(
+    before: StateTask | undefined,
+    after: StateTask,
+    flowMode: string,
+    auto: StateAuto | undefined,
+  ): Promise<void> {
+    // A task absent from the previous snapshot counts as waiting_for "none"
+    // before, so brand-new tasks notify (absent → agent:* is a change) but a
+    // snapshot-miss with waiting_for "none" stays silent.
+    const beforeWf = before?.waiting_for ?? "none";
+    const wfChanged = beforeWf !== after.waiting_for;
+    const attentionRising = after.needs_attention && before?.needs_attention !== true;
+
+    // Merge log (log-only, no behavior change): version jumped
+    // by more than 1 → intermediate rounds landed between polls and were never
+    // observed as separate snapshots — including same-endpoint merges (e.g.
+    // code_changes + fail review both landing: executor→reviewer→executor,
+    // waiting_for unchanged end-to-end, a full round silently swallowed).
+    // Not gated on wfChanged for exactly that reason.
+    // before absent (new task) or version field absent (older hub) → ignore.
+    if (
+      before?.version !== undefined &&
+      after.version !== undefined &&
+      after.version - before.version > 1
+    ) {
+      this.log(
+        `[${after.task_id}] ${after.version - before.version} transitions merged between polls (v${before.version}→v${after.version})`,
+      );
+    }
+
+    if (attentionRising) {
+      // Anomaly notification ONLY; suppresses the same-tick flow notification.
+      // Never contains warnings content — /state has none; the
+      // human runs `tut read` for the cause.
+      await this.sendAll({
+        title: `TUT ${after.task_id}: needs attention`,
+        body: `${after.title} — status: ${after.status}: run \`tut read ${after.task_id}\` for warnings`,
+        task_id: after.task_id,
+      });
+      return;
+    }
+    if (!wfChanged) return;
+    if (after.waiting_for === "none") return; // human closed / wound down — silent (§3)
+
+    if (flowMode !== "auto") {
+      // manual: notify only — task, status, who moves next. The round pane is
+      // named `<task_id>.<role>` (fresh-session convention, 4.4); human-waiting
+      // states have no agent pane, so the segment is omitted there.
+      const paneSeg = after.waiting_for.startsWith("agent:")
+        ? `; pane: ${after.task_id}.${after.waiting_for.slice("agent:".length)}`
+        : "";
+      await this.sendAll({
+        title: `TUT ${after.task_id}: waiting for ${after.waiting_for}`,
+        body: `${after.title} — status: ${after.status}; waiting for: ${after.waiting_for}${paneSeg}`,
+        task_id: after.task_id,
+      });
+      return;
+    }
+
+    // --- auto branch gate (see module doc for the exact rule) ---
+    const gated = this.autoGateReason(after);
+    if (gated !== null) {
+      await this.sendAll({
+        title: `TUT ${after.task_id}: human decision needed`,
+        body: `${after.title} — status: ${after.status}; waiting for: ${after.waiting_for}; auto launch withheld (${gated})`,
+        task_id: after.task_id,
+      });
+      return;
+    }
+    const role = after.waiting_for.slice("agent:".length);
+    // --- auto-mode launch whitelist ---
+    // Order is pinned: gate → WHITELIST → dedup (launch note) → markLaunched →
+    // launch. A withheld round must NOT append a launch marker — the human's
+    // `tut start-next` for the same round would hit ALREADY_LAUNCHED otherwise.
+    // Absent/empty/malformed whitelist withholds everything (conservative
+    // default; the enabler fills launch_roles in explicitly).
+    if (!autoWhitelisted(auto, role)) {
+      this.log(
+        `[${after.task_id}] auto launch withheld: role '${role}' not in launch whitelist (config.json auto.launch_roles)`,
+      );
+      await this.sendAll({
+        title: `TUT ${after.task_id}: auto launch withheld`,
+        body: `${after.title} — status: ${after.status}; waiting for: ${after.waiting_for}; auto launch withheld: role '${role}' not in launch whitelist (config.json auto.launch_roles)`,
+        task_id: after.task_id,
+      });
+      return;
+    }
+    await this.autoLaunch(after, role);
+  }
+
+  /**
+   * The auto gate, as one rule: launch ONLY when
+   *   (1) waiting_for starts with "agent:" (role = the suffix), and
+   *   (2) needs_attention is false.
+   * Everything else withholds: waiting_for "human" (a decision is pending —
+   * including pending_approval) reports "pending human decision". Previous
+   * status is deliberately NOT consulted: pending_approval → revising can only
+   * happen via decision(reject) — a human has already acted, and the only legal
+   * revising → reviewing → pending_approval cycle relies on the executor being
+   * auto-launched there. Returns the withhold reason, or null to launch.
+   */
+  private autoGateReason(after: StateTask): string | null {
+    if (after.needs_attention) return "needs_attention set";
+    if (!after.waiting_for.startsWith("agent:")) {
+      if (after.waiting_for === "human") return "pending human decision";
+      return `waiting_for ${after.waiting_for} is not launchable`;
+    }
+    return null;
+  }
+
+  private async autoLaunch(task: StateTask, role: string): Promise<void> {
+    let records: ContextRecord[];
+    try {
+      records = await this.deps.readLog(task.task_id);
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, e);
+      return;
+    }
+
+    const blocked = launchBlocked(records, role);
+    if (blocked.blocked) {
+      await this.autoLaunchSkipped(task, role, blocked.noteVersion);
+      return;
+    }
+
+    // Pre-check BEFORE the marker (order: dedup → precheck → mark → launch,
+    // same as tut start-next): resolve the routed agent (cast → workspace →
+    // routes) and require it on PATH. A failure leaves no trace — the human's
+    // start-next (or the next auto round) is not blocked.
+    let agent: string;
+    try {
+      agent = await this.targetResolver(task.task_id, role);
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, new Error(`precheck failed: ${(e as Error).message}`));
+      return;
+    }
+
+    const baseVersion = latestRecordVersion(records);
+    try {
+      await this.deps.markLaunched(task.task_id, role, baseVersion, "auto");
+    } catch (e) {
+      // A manual start-next or another notifier may have won the optimistic
+      // append race. Re-read once: if its marker is now present, converge on
+      // the same harmless skipped outcome instead of reporting a false error.
+      try {
+        const after = await this.deps.readLog(task.task_id);
+        const afterBlocked = launchBlocked(after, role);
+        if (afterBlocked.blocked) {
+          await this.autoLaunchSkipped(task, role, afterBlocked.noteVersion);
+          return;
+        }
+      } catch {
+        // Keep the original append error as the actionable failure.
+      }
+      await this.autoLaunchFailed(task, role, e);
+      return;
+    }
+
+    try {
+      const out = await this.deps.launch(task.task_id, role, agent);
+      // Dry-run output is often multi-line (provisioning preview + delivery
+      // preview); log EVERY line so the pane log shows the full launch preview.
+      for (const line of out.trim().split("\n")) {
+        this.log(`launch.sh (${task.task_id}, ${role})${line ? ` → ${line}` : ""}`);
+      }
+      await this.sendAll({
+        title: `TUT ${task.task_id}: auto-launched ${role}`,
+        body: `${task.title} — status: ${task.status}; launched ${role} via launch.sh (pane: ${task.task_id}.${role})`,
+        task_id: task.task_id,
+      });
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, e);
+    }
+  }
+
+  private async autoLaunchSkipped(task: StateTask, role: string, noteVersion: number | undefined): Promise<void> {
+    const suffix = noteVersion === undefined ? "" : ` at v${noteVersion}`;
+    this.log(`auto launch skipped (already launched): ${task.task_id} (${role}${suffix})`);
+    await this.sendAll({
+      title: `TUT ${task.task_id}: auto launch skipped (already launched)`,
+      body: `${task.title} — ${role} was already launched${suffix}; no new publish since`,
+      task_id: task.task_id,
+    });
+  }
+
+  private async autoLaunchFailed(task: StateTask, role: string, error: unknown): Promise<void> {
+    const message = (error as Error).message;
+    this.log(`launch failed for ${task.task_id} (${role}): ${message}`);
+    await this.sendAll({
+      title: `TUT ${task.task_id}: auto launch failed`,
+      body: `${task.title} — launch.sh ${role} failed: ${message}; intervene manually`,
+      task_id: task.task_id,
+    });
+  }
+
+  private async sendAll(msg: Notification): Promise<void> {
+    // stdout IS the run log for the dedicated pane (system-design 8.2) — every
+    // notification send is visible here, not only on the desktop banner.
+    this.log(`${msg.task_id ? `[${msg.task_id}] ` : ""}${msg.title}`);
+    for (const ch of this.channels) {
+      try {
+        await ch.send(msg);
+      } catch (e) {
+        this.log(`channel ${ch.name} failed: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  // --- stall watchdog (§3 超时兜底; no-signal-source degradation) -----------------
+
+  private markProgress(taskId: string, now: number): void {
+    this.lastProgressAt.set(taskId, now);
+    this.stallNotified.delete(taskId);
+  }
+
+  private checkStalls(tasks: readonly StateTask[], now: number): void {
+    for (const t of tasks) {
+      if (this.lastUpdatedAt.get(t.task_id) !== t.updated_at) {
+        // Any updated_at append resets the timer (note appends included —
+        // accepted heuristic).
+        this.lastUpdatedAt.set(t.task_id, t.updated_at);
+        this.markProgress(t.task_id, now);
+        continue;
+      }
+      if (!t.waiting_for.startsWith("agent:")) {
+        this.markProgress(t.task_id, now);
+        continue;
+      }
+      const last = this.lastProgressAt.get(t.task_id);
+      if (last === undefined) {
+        this.markProgress(t.task_id, now);
+        continue;
+      }
+      if (now - last >= this.stallMs && !this.stallNotified.has(t.task_id)) {
+        this.stallNotified.add(t.task_id);
+        void this.sendAll({
+          title: `TUT ${t.task_id}: possibly stalled`,
+          body: `${t.title} — waiting for ${t.waiting_for} with no update for ${Math.round(this.stallMs / 60_000)} min (updated_at ${t.updated_at})`,
+          task_id: t.task_id,
+        });
+      }
+    }
+  }
+
+  // --- agent events ------------------------------------------------------------------
+
+  /**
+   * Event→task mapping. The event pane is resolved as
+   *   (a) pane label IS a task_id (legacy work-pane convention; validated
+   *       against the snapshot, not string-guessed) → full mapping, else
+   *   (a½) fresh-session round pane `<task_id>.<role>` (4.4): task_ids carry
+   *       no dots (slug alphabet [a-z0-9-]), so the prefix before the LAST
+   *       dot is the task_id; validated against the snapshot like (a) →
+   *       direct hit — sharper than the identity chain (role is in the label,
+   *       no cast resolution), else
+   *   (b) agent identity: the pane label denotes an agent (agent-named pane
+   *       or a legacy label) → the tasks currently waiting_for agent:<role>
+   *       whose routed agent (task cast ?? default lineup) IS that identity;
+   *       unique → use it, several → latest updated_at with an ambiguity log
+   *       line, none → no mapping.
+   * Edge (4.4 note): an agent named exactly like a live task_id wins level
+   * (a) — accepted, priority declared, no anti-collision mechanism.
+   */
+  private resolveEventTask(pane: string): string | null {
+    const snap = this.snapshot;
+    if (snap === null) return null;
+    if (snap.has(pane)) return pane; // (a) 4.4: work pane named after its task
+    const lastDot = pane.lastIndexOf("."); // (a½) round pane <task_id>.<role>
+    if (lastDot > 0 && snap.has(pane.slice(0, lastDot))) return pane.slice(0, lastDot);
+    const identity = this.routing?.labelToAgent.get(pane);
+    if (identity === undefined) return null;
+    const roleToAgent = this.routing?.roleToAgent;
+    const waiting = [...snap.values()].filter((t) => {
+      if (!t.waiting_for.startsWith("agent:")) return false;
+      const role = t.waiting_for.slice("agent:".length);
+      const expected = t.cast?.[role as keyof Cast] ?? roleToAgent?.get(role);
+      return expected === identity;
+    });
+    if (waiting.length === 0) return null;
+    if (waiting.length > 1) {
+      // Ambiguity: take the most recently updated.
+      waiting.sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
+      this.log(
+        `event pane '${pane}' (agent '${identity}') has ${waiting.length} waiting tasks (${waiting
+          .map((t) => t.task_id)
+          .join(", ")}); using latest ${waiting[0]?.task_id}`,
+      );
+    }
+    return waiting[0]?.task_id ?? null;
+  }
+
+  /** Handles a validated event; safe to call from the HTTP handler directly. */
+  receiveEvent(evt: AgentEvent): void {
+    const taskId = this.resolveEventTask(evt.pane);
+    switch (evt.event) {
+      case "working":
+        if (taskId !== null) {
+          this.markProgress(taskId, this.deps.now());
+          if (taskId !== evt.pane) {
+            this.log(`working event pane '${evt.pane}' resolved to task ${taskId} (role-pane mapping)`);
+          }
+        } else {
+          // Degrade (option ii): no resolvable task → no stall refresh.
+          this.log(`working event pane '${evt.pane}' resolves to no task; stall refresh skipped`);
+        }
+        return;
+      case "blocked": {
+        // An observed signal refreshes the stall timer too (judgment: a stuck
+        // agent is alive; a stall reminder right after this would be noise).
+        const known = taskId !== null;
+        if (known) this.markProgress(taskId, this.deps.now());
+        else this.log(`blocked event pane '${evt.pane}' matches no task (4.4 convention broken)`);
+        // blocked is an追加触发 immediate compare (system-design 6.1):
+        // the stuck agent may have just published; a compare picks it up now.
+        void this.requestCompare();
+        void this.sendAll({
+          title: `TUT ${known ? taskId : evt.pane}: agent stuck`,
+          body: `Agent ${evt.agent} appears blocked in pane ${evt.pane}${known && taskId !== evt.pane ? ` (task ${taskId})` : ""}`,
+          // task_id only when a task was really resolved — an unmatched pane
+          // name is not a task id, and the body already carries it.
+          ...(known ? { task_id: taskId } : {}),
+        });
+        return;
+      }
+      case "done":
+        void this.handleDone(evt, taskId);
+        return;
+    }
+  }
+
+  /**
+   * done → immediate compare + cross-validation: first the event
+   * pane is resolved to a task (4.4 naming, or the role-pane reverse
+   * lookup). If that task's waiting_for did not advance, wait one interval
+   * (or ≥2s) and recheck — only still-no-advance notifies "Agent stopped but
+   * did not publish context". Unresolvable pane degrades to a single compare.
+   */
+  private async handleDone(evt: AgentEvent, taskId: string | null): Promise<void> {
+    if (taskId === null) {
+      this.log(`done event pane '${evt.pane}' matches no task (4.4 convention broken); degrading to compare`);
+      await this.requestCompare();
+      return;
+    }
+    const atEvent = this.snapshot?.get(taskId);
+    if (atEvent === undefined) {
+      // Resolved a moment ago but gone from the snapshot now — degrade.
+      this.log(`done event pane '${evt.pane}' resolved task ${taskId} no longer present; degrading to compare`);
+      await this.requestCompare();
+      return;
+    }
+    const via = taskId !== evt.pane ? ` (pane ${evt.pane})` : "";
+    const wfAtEvent = atEvent.waiting_for;
+    await this.requestCompare(); // may coalesce with a concurrent tick (one action)
+    const immediate = this.snapshot?.get(taskId);
+    if (immediate !== undefined && immediate.waiting_for !== wfAtEvent) return; // published in time
+    const delayMs = Math.max(this.intervalMs, 2000);
+    const timer = setTimeout(() => {
+      void this.requestCompare()
+        .then(() => {
+          const later = this.snapshot?.get(taskId);
+          if (later !== undefined && later.waiting_for === wfAtEvent) {
+            void this.sendAll({
+              title: `TUT ${taskId}: agent stopped without publishing`,
+              body: `Agent ${evt.agent} stopped but did not publish context${via} (waiting_for still ${wfAtEvent}); run \`tut read ${taskId}\``,
+              task_id: taskId,
+            });
+          }
+        })
+        .catch(() => undefined);
+    }, delayMs);
+    this.timers.add(timer);
+  }
+
+  // --- event HTTP listener (loopback Host guard mirrors src/http.ts) ---------------
+
+  async startEventServer(): Promise<void> {
+    if (this.server !== null) return;
+    const server = createServer((req, res) => {
+      void this.handleEventRequest(req, res).catch((e: unknown) => {
+        this.log(`event request failed: ${(e as Error).message}`);
+        if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+        if (!res.writableEnded) res.end();
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      const onListenError = (e: Error): void => {
+        const code = (e as NodeJS.ErrnoException).code;
+        // Visible in the dedicated pane: listener occupied is fatal (8.2).
+        reject(new Error(`cannot listen on 127.0.0.1:${this.eventPort}: ${code !== undefined ? `${code} — ` : ""}${e.message}`));
+      };
+      server.once("error", onListenError);
+      server.listen(this.eventPort, "127.0.0.1", () => {
+        server.off("error", onListenError);
+        server.on("error", (e) => this.log(`event listener error: ${(e as Error).message}`));
+        resolve();
+      });
+    });
+    this.server = server;
+    this.log(`listening for agent events on http://127.0.0.1:${this.eventPort}/agent-event`);
+  }
+
+  private async handleEventRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!isLoopbackHost(req)) {
+      sendJson(res, 403, { error: "forbidden: Host header must be a loopback host" });
+      return;
+    }
+    const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+    if (pathname !== "/agent-event") {
+      sendJson(res, 404, { error: `not found: ${req.method} ${pathname}` });
+      return;
+    }
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "method not allowed: use POST /agent-event" }));
+      return;
+    }
+    const raw = await readBody(req, EVENT_BODY_LIMIT);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.log("ignoring event with invalid JSON body");
+      sendJson(res, 400, { error: "invalid JSON" });
+      return;
+    }
+    const evt = parsed as { event?: unknown; agent?: unknown; pane?: unknown };
+    if (typeof evt.event !== "string" || typeof evt.agent !== "string" || typeof evt.pane !== "string") {
+      this.log("ignoring event with invalid shape (need string event/agent/pane)");
+      sendJson(res, 400, { error: "invalid event shape" });
+      return;
+    }
+    if (evt.event !== "working" && evt.event !== "blocked" && evt.event !== "done") {
+      this.log(`ignoring unknown event: ${evt.event}`);
+      sendJson(res, 200, { ok: true, ignored: true });
+      return;
+    }
+    this.receiveEvent({ event: evt.event, agent: evt.agent, pane: evt.pane });
+    sendJson(res, 200, { ok: true });
+  }
+
+  // --- lifecycle ---------------------------------------------------------------------
+
+  /** Starts the poll loop: one immediate baseline compare, then each interval. */
+  startPolling(): void {
+    if (this.pollTimer !== null) return;
+    void this.requestCompare();
+    this.pollTimer = setInterval(() => void this.requestCompare(), this.intervalMs);
+  }
+
+  async close(): Promise<void> {
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    for (const t of this.timers) clearTimeout(t);
+    this.timers.clear();
+    const server = this.server;
+    this.server = null;
+    if (server !== null) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+}
+
+// --- daemon entry -------------------------------------------------------------------
+
+/**
+ * `tut notify` daemon: starts the event listener first (EADDRINUSE rejects —
+ * caller prints and exits non-zero, visible in the dedicated pane), then the
+ * poll loop, then parks until SIGINT/SIGTERM.
+ */
+export async function runNotify(options: NotifyOptions): Promise<void> {
+  const notifier = new Notifier(options);
+  await notifier.startEventServer();
+  notifier.startPolling();
+  await new Promise<void>((resolve) => {
+    const onSignal = (): void => {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      void notifier.close().then(
+        () => resolve(),
+        () => resolve(),
+      );
+    };
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
+  });
+}
