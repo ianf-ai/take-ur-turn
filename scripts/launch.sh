@@ -108,12 +108,16 @@
 #     against (and incidentally outlasts the codex first-frame init window).
 #   verified submit: `herdr pane send-keys <pane> Enter`, then poll for ANY
 #     screen change vs the with-text snapshot (composer cleared / transcript
-#     grows / spinner) within TUT_SUBMIT_TIMEOUT_MS default 3000. No change →
-#     resend Enter ONLY (never the text — it already landed), at most
-#     TUT_SUBMIT_RETRIES default 2 resends; exhausted → stderr note with the
-#     manual fallback and STILL EXIT 0: the pane is up and the text sits in
-#     the input box, while a failure exit would trigger re-entry semantics
-#     (duplicate birth / duplicate delivery) and make things worse.
+#     grows / spinner) within TUT_SUBMIT_TIMEOUT_MS default 3000. No change
+#     does NOT start a fixed retry loop: wait for a post-submit readiness
+#     signal (Herdr agent_status idle/working when available) for
+#     TUT_SUBMIT_READY_TIMEOUT_MS (defaulting to TUT_READY_TIMEOUT_MS, 15000).
+#     A screen reaction during that wait counts as a late successful submit;
+#     otherwise, once the readiness signal arrives, send exactly one more
+#     Enter and verify it. If that post-ready attempt stays silent, or the
+#     signal never arrives, emit the manual fallback and STILL EXIT 0. The
+#     prompt is already in the input box, so a failure exit would trigger
+#     duplicate birth/delivery semantics.
 # Why the loop (7.2.1 root cause): the gate signal is "UI painted", which on
 # pi coincides with submit-readiness but on codex SPLITS from it — the first
 # frame is the shell (the composer renders send-text's text) while the async
@@ -135,6 +139,31 @@ TUT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 TUT_RESOLVE="$SCRIPT_DIR/tut-resolve.mjs"
 HUB_URL="${TUT_HUB_URL:-http://127.0.0.1:3001}"
 CHAIN_ROOT=""   # L1 root for the workspace chain: anchor cwd (set at entry)
+
+# Self-update suppression at launch (supply hardening): agent CLIs that
+# check for updates at startup race the delivery loop — the registered
+# incident is a codex npm self-update that held the pane for six minutes
+# and swallowed the delivered prompt. `herdr pane run` TYPES its argv into
+# the pane's shell, so every suppression form below must be PLAIN WORDS —
+# no quoting, no shell metacharacters (verified live). Per-agent forms:
+#   codex   `-c check_for_update_on_startup=false` — config override flag,
+#           kills the startup update check (the npm self-update trigger)
+#   pi      `env PI_SKIP_VERSION_CHECK=1` — documented update-check opt-out
+# Unknown agents pass through unchanged. TUT_SUPPRESS_AGENT_UPDATE=0
+# restores the raw agent command (escape knob, same spirit as
+# TUT_CONTINUITY_ROLES). The agent-presence check (command -v) always
+# probes the BARE agent name.
+suppress_agent_update() {
+  if [ "${TUT_SUPPRESS_AGENT_UPDATE:-1}" = "0" ]; then
+    printf '%s' "$1"
+    return 0
+  fi
+  case "$1" in
+    codex) printf '%s' "codex -c check_for_update_on_startup=false" ;;
+    pi) printf '%s' "env PI_SKIP_VERSION_CHECK=1 pi" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 
 # Continuity work seats (system-design 4.4): roles whose LIVE `<T>.<role>`
 # pane is continued into (deliver-only) rather than reaped and reborn at a
@@ -381,9 +410,11 @@ birth_pane() {
     echo "DRY-RUN: birth: herdr tab create --workspace $ANCHOR_WS --cwd $ANCHOR_CWD --label $BP_TAB_LABEL --no-focus"
     echo "DRY-RUN: birth: adopt the tab's root pane (response root_pane, else pane list by tab_id)"
     echo "DRY-RUN: birth: herdr pane rename <root> $BP_LABEL"
-    echo "DRY-RUN: birth: herdr pane run <root> $BP_AGENT"
+    echo "DRY-RUN: birth: herdr pane run <root> $(suppress_agent_update "$BP_AGENT")"
     return 0
   fi
+
+  BP_RUN_CMD=$(suppress_agent_update "$BP_AGENT")
 
   # Primary: adopt the root pane the tab create ships.
   BP_RAW=$(herdr tab create --workspace "$ANCHOR_WS" --cwd "$ANCHOR_CWD" --label "$BP_TAB_LABEL" --no-focus 2>/dev/null)
@@ -443,7 +474,7 @@ process.stdin.on("end", () => {
 ' "$BP_TAB" 2>/dev/null || true)
   fi
   if [ -n "$BP_ROOT" ]; then
-    if herdr pane rename "$BP_ROOT" "$BP_LABEL" >/dev/null 2>&1 && herdr pane run "$BP_ROOT" "$BP_AGENT" >/dev/null 2>&1; then
+    if herdr pane rename "$BP_ROOT" "$BP_LABEL" >/dev/null 2>&1 && herdr pane run "$BP_ROOT" $BP_RUN_CMD >/dev/null 2>&1; then
       echo "$BP_ROOT"
       return 0
     fi
@@ -499,7 +530,7 @@ process.stdin.on("end", () => {
     echo "launch: herdr pane rename $BP_NEW $BP_LABEL failed" >&2
     return 1
   }
-  herdr pane run "$BP_NEW" "$BP_AGENT" >/dev/null 2>&1 || {
+  herdr pane run "$BP_NEW" $BP_RUN_CMD >/dev/null 2>&1 || {
     echo "launch: herdr pane run $BP_NEW $BP_AGENT failed" >&2
     return 1
   }
@@ -550,6 +581,29 @@ process.stdin.on("end", () => {
 # snapshots proved UNRELIABLE on freshly born panes, see 7.2.1).
 pane_output() {
   herdr pane read "$1" --source visible --lines 40 2>/dev/null || true
+}
+
+# Herdr's lifecycle state is the strongest readiness signal available at the
+# launcher boundary: idle means the agent is ready for input, while working
+# means its input loop is alive and can queue a prompt. The helper is queried
+# only after an initial Enter has gone silent, so the normal first-submit path
+# keeps the old read-only verification shape. Missing/unknown status is a
+# conservative "not ready" and falls back to the bounded visible-screen
+# observation below.
+pane_agent_ready() {
+  PAR_PANE="$1"
+  pane_list_json | node -e '
+let raw = "";
+process.stdin.on("data", (d) => (raw += d));
+process.stdin.on("end", () => {
+  try {
+    const list = JSON.parse(raw);
+    const panes = list?.result?.panes ?? list?.panes ?? [];
+    const hit = panes.find((p) => p.pane_id === process.argv[1]);
+    if (["idle", "working"].includes(hit?.agent_status ?? "")) process.stdout.write("ready");
+  } catch {}
+});
+' "$PAR_PANE" 2>/dev/null || true
 }
 
 # Wait until the freshly born pane $1 shows its receiver: the output must
@@ -609,30 +663,69 @@ confirm_text_landed() {
   return 0
 }
 
-# Verified submit (7.2.1 closed loop): Enter on pane $1, then poll for ANY
-# screen change vs the with-text snapshot $2 — the receiver consumed the
-# prompt (composer cleared / transcript grows / spinner). Silent within
-# TUT_SUBMIT_TIMEOUT_MS → resend Enter ONLY (the text already landed;
-# re-sending it would duplicate the prompt in the composer), at most
-# TUT_SUBMIT_RETRIES resends (total Enters ≤ 1 + retries). A late render
-# after an actually-effective Enter is a harmless false negative: the extra
-# Enter lands on an already-cleared composer, a no-op on pi and codex alike.
-# Exhausted → stderr note with the manual fallback and return 0 — see the
-# header: a failure exit would re-enter (duplicate birth/delivery) and be
-# worse than one manual keypress. Known limit: on a WORKING pane the screen
-# changes on its own, so verification is trivially true — same semantics as
-# the old open loop (queued delivery never verified consumption anyway).
+# Wait after an initial silent Enter for the readiness boundary. Return 0
+# when Herdr reports the input loop ready, 2 when the visible screen reacts
+# late (that is already a successful submit), and 1 on a bounded timeout.
+wait_submit_ready() {
+  WSR_PANE="$1"; WSR_BASE="$2"
+  WSR_POLL_MS="${TUT_READY_POLL_MS:-250}"
+  WSR_TIMEOUT_MS="${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}"
+  WSR_MAX_POLLS=$(( WSR_TIMEOUT_MS / WSR_POLL_MS ))
+  [ "$WSR_MAX_POLLS" -gt 0 ] || WSR_MAX_POLLS=1
+  WSR_SLEEP=$(awk "BEGIN{printf \"%.3f\", $WSR_POLL_MS/1000}")
+  WSR_I=0
+  while [ "$WSR_I" -lt "$WSR_MAX_POLLS" ]; do
+    sleep "$WSR_SLEEP"
+    WSR_OUT=$(pane_output "$WSR_PANE")
+    # If the screen moved without a ready status, the original Enter's
+    # reaction finally rendered; do not add a second Enter to an empty
+    # composer. This is the safe late-render path.
+    if [ -n "$WSR_OUT" ] && [ "$WSR_OUT" != "$WSR_BASE" ]; then
+      return 2
+    fi
+    if [ "$(pane_agent_ready "$WSR_PANE")" = "ready" ]; then
+      return 0
+    fi
+    WSR_I=$(( WSR_I + 1 ))
+  done
+  return 1
+}
+
+# Verified submit (7.2.1 readiness-bound closed loop): Enter once, verify
+# promptly, then wait without burning retries until the readiness boundary.
+# Once ready, one final Enter is enough to establish "delivered or report";
+# there is no fixed-count × fixed-interval retry lottery anymore. $1 is the
+# pane and $2 is the with-text snapshot.
 verified_submit() {
   VS_PANE="$1"; VS_BASE="$2"
   VS_POLL_MS="${TUT_READY_POLL_MS:-250}"
   VS_MAX_POLLS=$(( ${TUT_SUBMIT_TIMEOUT_MS:-3000} / VS_POLL_MS ))
-  VS_TOTAL=$(( 1 + ${TUT_SUBMIT_RETRIES:-2} ))
+  [ "$VS_MAX_POLLS" -gt 0 ] || VS_MAX_POLLS=1
   VS_SLEEP=$(awk "BEGIN{printf \"%.3f\", $VS_POLL_MS/1000}")
-  VS_A=0
-  while [ "$VS_A" -lt "$VS_TOTAL" ]; do
-    VS_A=$(( VS_A + 1 ))
+  herdr pane send-keys "$VS_PANE" Enter >/dev/null 2>&1 || {
+    echo "launch: herdr pane send-keys $VS_PANE Enter failed (initial attempt)" >&2
+  }
+  VS_I=0
+  while [ "$VS_I" -lt "$VS_MAX_POLLS" ]; do
+    sleep "$VS_SLEEP"
+    VS_OUT=$(pane_output "$VS_PANE")
+    if [ -n "$VS_OUT" ] && [ "$VS_OUT" != "$VS_BASE" ]; then
+      return 0
+    fi
+    VS_I=$(( VS_I + 1 ))
+  done
+
+  wait_submit_ready "$VS_PANE" "$VS_BASE"
+  VS_READY_RC=$?
+  VS_READY_TIMEOUT="${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}"
+  if [ "$VS_READY_RC" -eq 2 ]; then
+    echo "launch: screen reaction arrived late on $VS_PANE — initial Enter eventually submitted" >&2
+    return 0
+  fi
+  if [ "$VS_READY_RC" -eq 0 ]; then
+    echo "launch: input readiness observed on $VS_PANE — resending Enter once (no retry before readiness)" >&2
     herdr pane send-keys "$VS_PANE" Enter >/dev/null 2>&1 || {
-      echo "launch: herdr pane send-keys $VS_PANE Enter failed (attempt $VS_A/$VS_TOTAL)" >&2
+      echo "launch: herdr pane send-keys $VS_PANE Enter failed (post-ready attempt)" >&2
     }
     VS_I=0
     while [ "$VS_I" -lt "$VS_MAX_POLLS" ]; do
@@ -643,17 +736,17 @@ verified_submit() {
       fi
       VS_I=$(( VS_I + 1 ))
     done
-    if [ "$VS_A" -lt "$VS_TOTAL" ]; then
-      echo "launch: no screen change after Enter on $VS_PANE (attempt $VS_A/$VS_TOTAL) — resending Enter (text stays, only the key repeats)" >&2
-    fi
-  done
-  echo "launch: submit not verified on $VS_PANE after $VS_TOTAL Enters — the prompt sits in the input box; press Enter there manually to start the round" >&2
+    echo "launch: submit not verified on $VS_PANE after readiness — the prompt sits in the input box; press Enter there manually to start the round" >&2
+    return 0
+  fi
+
+  echo "launch: submit readiness not observed on $VS_PANE within ${VS_READY_TIMEOUT}ms — no retry before readiness; the prompt sits in the input box; press Enter there manually to start the round" >&2
   return 0
 }
 
 # Deliver $2 to pane $1 (born branch). Every pane is born fresh, so the
 # readiness gate always applies; then the closed loop: literal send-text →
-# land-confirm → verified submit (bounded Enter resends, see above). Only a
+# land-confirm → readiness-bound verified submit (see above). Only a
 # send-text failure is fatal (nothing was delivered); the submit step never
 # fails the launch (see verified_submit).
 deliver_prompt() {
@@ -669,7 +762,7 @@ deliver_prompt() {
 
 # Deliver $2 to the LIVE pane $1 (same-role continuation): no readiness gate
 # (that is the born-pane mechanism — the seat's UI is already up), but the
-# SAME land-confirm + verified-submit closed loop as the born branch (one
+# SAME land-confirm + readiness-bound verified-submit loop as the born branch (one
 # delivery code path, no drift; a continuation Enter can be swallowed by the
 # same init/turn-taking windows). Failure is loud only for send-text (exit
 # 1); re-entry self-heals: a pane that died meanwhile is reaped and reborn
@@ -746,7 +839,7 @@ if [ "$FRESH" -ne 1 ] && is_continuity_role "$ROLE"; then
       echo "DRY-RUN: herdr pane send-text $CONT_PANE \"${PROMPT}\""
       echo "DRY-RUN: text-land check $CONT_PANE (timeout ${TUT_TEXT_LAND_TIMEOUT_MS:-5000}ms; on timeout submit anyway)"
       echo "DRY-RUN: herdr pane send-keys $CONT_PANE Enter"
-      echo "DRY-RUN: submit verify $CONT_PANE (timeout ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms; resend Enter ≤ ${TUT_SUBMIT_RETRIES:-2}x while the screen stays unchanged; on exhaustion a manual-fallback note, still exit 0)"
+      echo "DRY-RUN: submit verify $CONT_PANE (timeout ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms; wait for readiness up to ${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)"
       exit 0
     fi
     deliver_continuation "$CONT_PANE" "$PROMPT" || exit 1
@@ -784,7 +877,7 @@ if [ "${TUT_DRY_RUN:-0}" = "1" ]; then
   echo "DRY-RUN: herdr pane send-text ${TARGET} (agent '${AGENT}', label '${BIRTH_LABEL}') \"${PROMPT}\""
   echo "DRY-RUN: text-land check ${TARGET} (timeout ${TUT_TEXT_LAND_TIMEOUT_MS:-5000}ms; on timeout submit anyway)"
   echo "DRY-RUN: herdr pane send-keys ${TARGET} Enter"
-  echo "DRY-RUN: submit verify ${TARGET} (timeout ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms; resend Enter ≤ ${TUT_SUBMIT_RETRIES:-2}x while the screen stays unchanged; on exhaustion a manual-fallback note, still exit 0)"
+  echo "DRY-RUN: submit verify ${TARGET} (timeout ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms; wait for readiness up to ${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)"
   exit 0
 fi
 
