@@ -14,7 +14,7 @@
 ### ① 环境检查
 
 - 探活：`tut list`（打 Hub HTTP）。失败 = Hub 未起 → 请人跑 `tut up`（幂等）。**host 不代跑**——`tut up` 是电源开关（只起 hub + notify pane，agent pane 由启动器按需供给），开 pane 属人应有的显式环境动作。
-- 感知模式：`curl -s http://127.0.0.1:3001/state` 读 `flow_mode` 与 `auto.launch_roles`（/state 是文档化只读接口）；总览用 `tut status`。
+- 感知模式：`tut config get flow_mode` / `tut config get auto.launch_roles`（直读 config.json，Hub 未起也可用）或 `curl -s http://127.0.0.1:3001/state`（/state 是文档化只读接口）；总览用 `tut status`。
 - Notifier 不经 /state 暴露健康度：靠专属 pane 与通知是否到达判断，host 不代管。
 - pane 布局类摩擦（平铺难看、tab 空根 pane 等）如实转述给人，不代管归置。
 
@@ -24,11 +24,11 @@
 
 **需求磨句**：把人的诉求磨成 title + description。需求句公式：**问题 + 验收 + 档案指针**——问题与验收是光谱锚点，**档案指针**（指向既有设计文档、既往任务的链接）是可选的合法第三要素，把既有结论带进上下文而不在信里重述。磨句纪律不变——**验收写死、解法留白**（约束类要求属验收该写）：解法永远留白，想给现成解法就选 flow=direct，让解法躺在文档里被指针引用、不挤在需求信里——在需求里预置解法属过度规格化，会架空 architect。不再有「一句话」限制，description 可多行展开；**flow/cast 不得写进 description**——它们是建任务旗子，不是需求正文。
 
-**flow 判断口径**（沿用 architect.md / README 既有三句，不另造；与人商定后经 `--flow` 旗子落库，落库后不可变）：
+**flow 判断**：
 
-- **full**（缺省）：有设计含量、值得独立 review；
-- **direct**：repo 已有现成设计（活文档或既往任务已定方案），如「direct，按 design/Y.md 实施 Z」——**description 即指针**：必含档案指针（文档路径 + 节/单元），此为唯一形态，不另发 design 参考记录；
-- **solo**：小改动免审不免批，如「solo：修复 X」。
+1. 涉及新语义定义、并发时序、接口级变更 → **full**；
+2. 不复杂 → **solo**；
+3. 不复杂但改的是核心路径/门禁/公开面（错了贵）→ **direct**（solo 加一轮 review）。
 
 **阵容点将**（任务级 cast + 按需供给；`tut create` 的 `--cast` / MCP `cast` 字段随建时定、不可变，部分指定回落默认阵容）：
 
@@ -70,18 +70,27 @@
 - **auto**：白名单（`auto.launch_roles`，role 键控）内的轮次 Notifier 自动启动并通知；白名单外**不启动也不落 launch 痕**、回落通知人——host 此时补位代按 start-next（同样凭委托）。语义注意：role 键控粗粒度，`tut assign` 换将即继承该角色信任，要收紧先收白名单。auto 模式下 host 的职责重心移到审批点与异常点。
 - 推进后核对：`tut list` / `tut read <id> --since-version N` 确认派生状态与预期一致；等待期间靠通知与人唤起，host 不必常驻轮询。
 
-**盯梢模板（过渡）**：自写轮询循环易错（历史上有 pattern 写错致状态误报），官方 `tut watch` 落地前用标准模板，复制即用：
+**盯梢（官方命令）**：`tut watch [<task_id>]`（无参 = 唯一 agent 等待任务，取任务语义与 start-next 一致）阻塞到任务状态变化后按情形退出，取代自写轮询循环（历史上有 pattern 写错致状态误报）：
+
+| 退出码 | 情形 | 动作 |
+|-------|------|------|
+| 0 | 轮次边界（新记录落地，含 pending_approval 审批门） | `tut read <task_id>` 读新记录 → 轮到谁 → 推进；pending_approval → 审批汇报 |
+| 2 | 终态（approved / closed） | 收尾（close 仍需人点头） |
+| 3 | 异常（needs_attention） | `tut read` 拿 warnings → ⑤ 异常处置 |
+| 1 | 操作错误（Hub 不可达 / 任务不存在 / 多任务未指定） | 按 stderr 提示检查后重试 |
 
 ```bash
 id=<task_id>
-last=$(tut read "$id" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["versions"][-1]["version"])')
-while sleep 30; do
-  cur=$(tut read "$id" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["versions"][-1]["version"])')
-  [ "$cur" != "$last" ] && { tut read "$id" --since-version "$last"; break; }
-done
+tut watch "$id"; rc=$?
+case $rc in
+  0) ;;  # 轮次边界：读新记录后按状态分流（推进 / 审批汇报）
+  2) ;;  # 终态：收尾
+  3) ;;  # 异常：异常处置
+  *) ;;  # 操作错误：检查环境后重试
+esac
 ```
 
-间隔按任务节奏调；读到新记录后按状态分流（轮到谁 → 推进；pending_approval → 审批汇报；needs_attention → 异常处置）；多任务盯梢用 `tut status` 轮询。
+轮询间隔 `--interval <s>`（缺省 5s）按任务节奏调；起始已终态/已异常的任务立即退出，不需等待；多任务盯梢用 `tut status` 轮询。
 
 ### ④ 审批点汇报
 
@@ -117,7 +126,10 @@ CLI 语法照 `src/cli.ts` USAGE 一字不差（所有 flag 同时接受 `--flag
 tut status [--json] [--url <u>]
 tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
 tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
+tut watch [<task_id>] [--url <u>] [--interval <s>]
 tut mode <manual|auto> [--url <u>]
+tut config get <key> [--root <dir>]
+tut config set <key> <value> [--root <dir>]
 tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
 tut ack <task_id> [--note <text>] [--url <u>]
 tut assign <role> <agent>
@@ -127,10 +139,11 @@ tut list [--status <s>] [--json] [--url <u>]
 
 | 操作 | 命令 |
 |---|---|
-| 探活 / 总览 | `tut list`；`tut status`；`curl -s http://127.0.0.1:3001/state`（flow_mode / auto.launch_roles） |
+| 探活 / 总览 | `tut list`；`tut status`；`tut config get flow_mode` / `tut config get auto.launch_roles`（离线直读，等价 `curl -s http://127.0.0.1:3001/state` 的 flow_mode / auto 键） |
 | 建任务 | `tut create --title "…" --description "…" --creator <人名> --role human [--flow …] [--cast …]`（任务即刻存在） |
 | 投首轮 | manual：`tut start-next <task_id>`；auto：白名单内 Notifier 自动投递不代按，白名单外补位代按 |
-| 轮次推进 | `tut start-next <task_id>`（manual 代按 / auto 白名单外补位）；`tut mode <manual\|auto>` |
+| 轮次推进 | `tut start-next <task_id>`（manual 代按 / auto 白名单外补位）；`tut mode <manual\|auto>`；`tut config set <key> <value>`（离线改 flow_mode / auto.launch_roles，下轮询周期生效） |
+| 盯梢 | `tut watch <task_id>`（阻塞至状态变化，退出码 0/2/3/1 分流：轮次边界 / 终态 / 异常 / 操作错误）；多任务用 `tut status` 轮询 |
 | 审批 | `tut decide <task_id> --decision approve\|reject\|close --by <人名> [--reason "…"]`（人明确同意后） |
 | 异常处置 | `tut read <task_id>`（warnings）→ 呈现并等人点头 → `tut ack <task_id> --note "…"` |
 | 换将 | 二次 fail 时走「③ 轮次推进 · 二次 fail 处置」：呈现局面 → 人裁决（close＋新任务换 cast ／ `--fresh` 换会话 ／ 继续原班）→ 代跑人所选；新任务 description 首行带原任务 ID 单向指针 |
