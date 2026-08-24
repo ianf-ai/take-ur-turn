@@ -3,7 +3,17 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import os from "node:os";
 import path from "node:path";
 
-import { autoSectionOf, ensureConfig, readConfig, readFlowMode, writeFlowMode, type Config } from "../src/config.js";
+import {
+  autoSectionOf,
+  ensureConfig,
+  parseConfigValue,
+  readConfig,
+  readConfigFile,
+  readFlowMode,
+  writeConfigKey,
+  writeFlowMode,
+  type Config,
+} from "../src/config.js";
 
 let tmp: string;
 let root: string;
@@ -249,5 +259,91 @@ describe("writeFlowMode (POST /mode engine, key-preserving RMW)", () => {
     await expect(writeFlowMode(root, "auto")).rejects.toThrow(/unreadable or corrupt/);
     // the corrupt file is left exactly as it was
     expect(readFileSync(path.join(root, "config.json"), "utf8")).toBe("{ not json");
+  });
+});
+
+describe("parseConfigValue (tut config set validation)", () => {
+  it("accepts both flow_mode values", () => {
+    expect(parseConfigValue("flow_mode", "manual")).toEqual({ ok: true, assignment: { key: "flow_mode", value: "manual" } });
+    expect(parseConfigValue("flow_mode", "auto")).toEqual({ ok: true, assignment: { key: "flow_mode", value: "auto" } });
+  });
+
+  it("rejects an illegal flow_mode with the legal domain in the message", () => {
+    const result = parseConfigValue("flow_mode", "banana");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain('"manual" | "auto"');
+  });
+
+  it("trims and de-duplicates launch_roles while preserving order", () => {
+    const result = parseConfigValue("auto.launch_roles", "executor, reviewer ,executor");
+    expect(result).toEqual({ ok: true, assignment: { key: "auto.launch_roles", value: ["executor", "reviewer"] } });
+  });
+
+  it("empty string clears to the empty whitelist", () => {
+    expect(parseConfigValue("auto.launch_roles", "")).toEqual({
+      ok: true,
+      assignment: { key: "auto.launch_roles", value: [] },
+    });
+  });
+
+  it("rejects non-role names with the legal role list (roles, not agents)", () => {
+    const result = parseConfigValue("auto.launch_roles", "codex");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('"codex"');
+      expect(result.error).toContain("architect|executor|reviewer");
+    }
+  });
+});
+
+describe("readConfigFile (detailed outcome)", () => {
+  it("distinguishes ok / missing / invalid", async () => {
+    expect(await readConfigFile(root)).toEqual({ status: "missing" });
+
+    writeFileSync(path.join(root, "config.json"), '{"flow_mode":"auto"}', "utf8");
+    const ok = await readConfigFile(root);
+    expect(ok.status).toBe("ok");
+    if (ok.status === "ok") expect(ok.config.flow_mode).toBe("auto");
+
+    writeFileSync(path.join(root, "config.json"), "{ nope", "utf8");
+    expect(await readConfigFile(root)).toEqual({ status: "invalid" });
+  });
+});
+
+describe("writeConfigKey (tut config set engine)", () => {
+  it("flow_mode on a missing file starts from defaults", async () => {
+    const config = await writeConfigKey(root, { key: "flow_mode", value: "auto" });
+
+    expect(config.flow_mode).toBe("auto");
+    expect(JSON.parse(readFileSync(path.join(root, "config.json"), "utf8"))).toEqual({ flow_mode: "auto" });
+  });
+
+  it("nested launch_roles write lands under auto and preserves auto siblings", async () => {
+    writeFileSync(
+      path.join(root, "config.json"),
+      JSON.stringify({ flow_mode: "manual", auto: { launch_roles: ["executor"], extra: 7 }, notify: { channels: ["bell"] } }),
+      "utf8",
+    );
+
+    const config = await writeConfigKey(root, { key: "auto.launch_roles", value: ["reviewer"] });
+
+    expect(config.auto).toEqual({ launch_roles: ["reviewer"], extra: 7 });
+    const onDisk = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8")) as Config;
+    expect(onDisk.auto).toEqual({ launch_roles: ["reviewer"], extra: 7 });
+    expect(onDisk.notify).toEqual({ channels: ["bell"] }); // unknown keys all survive
+  });
+
+  it("throws instead of clobbering a corrupt existing config (nothing written)", async () => {
+    writeFileSync(path.join(root, "config.json"), "{ not json", "utf8");
+
+    await expect(writeConfigKey(root, { key: "flow_mode", value: "auto" })).rejects.toThrow(/unreadable or corrupt/);
+    expect(readFileSync(path.join(root, "config.json"), "utf8")).toBe("{ not json");
+  });
+
+  it("leaves no .tmp files behind", async () => {
+    await writeConfigKey(root, { key: "auto.launch_roles", value: ["executor"] });
+
+    const leftovers = readdirSync(root).filter((name) => name.endsWith(".tmp"));
+    expect(leftovers).toEqual([]);
   });
 });

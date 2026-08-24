@@ -120,6 +120,21 @@ describe("cli arg parsing (pure parseArgs)", () => {
     });
   });
 
+  it("notify accepts a configurable launch→working short fuse", () => {
+    expect(parseArgs(["notify", "--working-timeout=17"])).toEqual({
+      command: "notify",
+      url: "http://127.0.0.1:3001",
+      interval: 5,
+      eventPort: 3002,
+      stallTimeoutMin: 30,
+      workingTimeoutSec: 17,
+    });
+    expect(parseArgs(["notify", "--launch-working-timeout", "19"])).toMatchObject({
+      command: "notify",
+      workingTimeoutSec: 19,
+    });
+  });
+
   // --- mode / start-next -------------------------------------------------------
 
   it("mode parses both values and validates", () => {
@@ -1095,8 +1110,8 @@ describe("tut create --cast (parse + hubCreate wiring)", () => {
       parseArgs(["create", "--title", "T", "--description", "D", "--creator", "C", "--role", "R", "--cast", "executor=pi,reviewer=codex"]),
     ).toEqual({ command: "create", title: "T", description: "D", creator: "C", role: "R", cast: { executor: "pi", reviewer: "codex" } });
     expect(
-      (parseArgs(["create", "--title", "T", "--description", "D", "--creator", "C", "--role", "R", "--cast=architect=zcode"]) as { cast?: unknown }).cast,
-    ).toEqual({ architect: "zcode" });
+      (parseArgs(["create", "--title", "T", "--description", "D", "--creator", "C", "--role", "R", "--cast=architect=codex"]) as { cast?: unknown }).cast,
+    ).toEqual({ architect: "codex" });
   });
 
   it("rejects unknown roles, malformed pairs, and empty agents", () => {
