@@ -78,7 +78,7 @@ const env = (panes: unknown[], extra: Record<string, string> = {}, dryRun = fals
   TUT_READY_TIMEOUT_MS: "300",
   TUT_TEXT_LAND_TIMEOUT_MS: "200",
   TUT_SUBMIT_TIMEOUT_MS: "100",
-  TUT_SUBMIT_RETRIES: "2",
+  TUT_SUBMIT_READY_TIMEOUT_MS: "120",
   ...extra,
 });
 
@@ -184,7 +184,7 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
       // Closed-loop preview: land-confirm + verified-submit lines with
       // their knobs, both for the born branch.
       expect(stdout).toContain("DRY-RUN: text-land check <label:t2.reviewer> (timeout 5000ms; on timeout submit anyway)");
-      expect(stdout).toContain("DRY-RUN: submit verify <label:t2.reviewer> (timeout 3000ms; resend Enter ≤ 2x while the screen stays unchanged; on exhaustion a manual-fallback note, still exit 0)");
+      expect(stdout).toContain("DRY-RUN: submit verify <label:t2.reviewer> (timeout 3000ms; wait for readiness up to 15000ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)");
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }
@@ -301,7 +301,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
     expect(r.stdout).toContain("DRY-RUN: herdr pane send-text w11:p6");
     expect(r.stdout).toContain("DRY-RUN: text-land check w11:p6 (timeout 200ms; on timeout submit anyway)");
     expect(r.stdout).toContain("DRY-RUN: herdr pane send-keys w11:p6 Enter");
-    expect(r.stdout).toContain("DRY-RUN: submit verify w11:p6 (timeout 100ms; resend Enter ≤ 2x while the screen stays unchanged; on exhaustion a manual-fallback note, still exit 0)");
+    expect(r.stdout).toContain("DRY-RUN: submit verify w11:p6 (timeout 100ms; wait for readiness up to 120ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)");
     expect(r.stderr).toContain("same-role continuation");
     expect(r.lines.every((l) => l === "pane list")).toBe(true); // read-only discovery, nothing else
   });
@@ -443,6 +443,81 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
   });
 });
 
+// --- self-update suppression at launch (supply hardening) -------------------------
+
+describe("self-update suppression: the agent run command disables startup update checks", () => {
+  it("codex birth runs with the startup update check off — the registered self-update race cannot start; the closed-loop delivery completes", async () => {
+    // Fixture-level simulation of the incident scenario: the pane paints
+    // normally (BORN_SCREENS) BECAUSE the run command carries the
+    // suppression — the six-minute npm self-update window is prevented at
+    // the source, so the delivered prompt is not starved.
+    const r = await runLogged(["t1", "executor", "codex"], [HUB_PANE], {
+      TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+    });
+    expect(r.code).toBe(0);
+    expect(r.lines).toContain("pane run FIX:root1 codex -c check_for_update_on_startup=false");
+    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expectDelivered(r.lines, "FIX:root1");
+  });
+
+  it("pi birth carries the documented env opt-out (PI_SKIP_VERSION_CHECK)", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [HUB_PANE], {
+      TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+    });
+    expect(r.code).toBe(0);
+    expect(r.lines).toContain("pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+    expectDelivered(r.lines, "FIX:root1");
+  });
+
+  it("fallback split birth carries the same suppression (one run-command code path)", async () => {
+    const r = await runLogged(["t1", "executor", "codex"], [HUB_PANE], {
+      TUT_HERDR_FAIL: "pane:rename:1",
+      TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("falling back to the anchored split sequence");
+    expect(r.lines).toContain("pane run FIX:p1 codex -c check_for_update_on_startup=false");
+  });
+
+  it("unknown agents pass through unchanged; the presence check probes the BARE agent name", async () => {
+    // A temp bin with a stubagent stub: unknown to the suppression map → raw
+    // command; command -v must check 'stubagent', not the wrapped form.
+    const bin = mkdtempSync(path.join(os.tmpdir(), "tut-supp-unk-"));
+    try {
+      writeFileSync(path.join(bin, "stubagent"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const r = await runLogged(["t1", "executor", "stubagent"], [HUB_PANE], {
+        TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+        PATH: `${bin}:${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
+      });
+      expect(r.code).toBe(0);
+      expect(r.lines).toContain("pane run FIX:root1 stubagent");
+
+      // Presence check: an agent not on PATH fails the birth with the BARE
+      // name in the message (the wrapped form is never what is probed).
+      const miss = await runLogged(["t1", "executor", "ghost-agent"], [HUB_PANE], {});
+      expect(miss.code).toBe(1);
+      expect(miss.stderr).toContain("agent 'ghost-agent' not on PATH");
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("TUT_SUPPRESS_AGENT_UPDATE=0 restores the raw agent command (escape knob)", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [HUB_PANE], {
+      TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+      TUT_SUPPRESS_AGENT_UPDATE: "0",
+    });
+    expect(r.code).toBe(0);
+    expect(r.lines).toContain("pane run FIX:root1 pi");
+  });
+
+  it("dry-run preview shows the suppressed run command", async () => {
+    const r = await runLogged(["t1", "executor", "codex"], [HUB_PANE], {}, true);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("DRY-RUN: birth: herdr pane run <root> codex -c check_for_update_on_startup=false");
+  });
+});
+
 // --- adopt-root fallback ---------------------------------------------------------------
 
 describe("adopt-root fallback: anchored split sequence when root adoption fails", () => {
@@ -467,7 +542,7 @@ describe("adopt-root fallback: anchored split sequence when root adoption fails"
     expect(r.lines).toContain("pane move FIX:p1 --tab FIX:t1 --split down");
     // the fallback tab's stray panes are swept — FIX:root1 matches again (idempotent close, same target)
     expect(r.lines).toContain("pane rename FIX:p1 t1.executor");
-    expect(r.lines).toContain("pane run FIX:p1 pi");
+    expect(r.lines).toContain("pane run FIX:p1 env PI_SKIP_VERSION_CHECK=1 pi");
     expectDelivered(r.lines, "FIX:p1");
   });
 
@@ -501,7 +576,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     // Root discovery fell to channel 2 (pane list by tab_id) and the birth
     // sequence completed on the recovered tab's root pane.
     expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
-    expect(r.lines).toContain("pane run FIX:root1 pi");
+    expect(r.lines).toContain("pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
     expectDelivered(r.lines, "FIX:root1");
   });
 

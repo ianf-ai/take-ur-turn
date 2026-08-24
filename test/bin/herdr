@@ -27,6 +27,9 @@
 //   tab list    -> {"result":{"tabs":[...]}} from TUT_HERDR_TABS (JSON array
 //                 of {label, tab_id} objects) — the tab-id recovery
 //                 channel (tab create output unparseable, exit 0)
+//   Optional readiness injection: TUT_HERDR_AGENT_STATUS or
+//   TUT_HERDR_AGENT_STATUS_SCRIPT makes pane list expose a virtual FIX:root1
+//   agent_status after pane run, mirroring Herdr's lifecycle readiness signal.
 // Env:
 //   TUT_HERDR_LOG   — log file path (one line per invocation)
 //   TUT_HERDR_PANES — JSON array of pane objects returned by `pane list`
@@ -45,6 +48,9 @@
 //   TUT_HERDR_LIST_LAG_POLLS / TUT_HERDR_PANES_LAG — first N `pane list` calls
 //                 serve the LAG set instead of TUT_HERDR_PANES (list lag
 //                 behind a freshly created tab)
+//   TUT_HERDR_AGENT_PANE — virtual readiness target pane id (default FIX:root1)
+//   TUT_HERDR_AGENT_STATUS — static virtual agent_status after pane run
+//   TUT_HERDR_AGENT_STATUS_SCRIPT — JSON status timeline after pane run
 // Split hands out fresh ids FIX:p1, FIX:p2, ... (count = split lines logged);
 // tab create hands out FIX:t<n> / root FIX:root<n> the same way.
 // Plain JS on purpose: this file is executed directly by node, not vitest.
@@ -113,13 +119,39 @@ if (argv[0] === "pane" && sub === "list") {
   // line earlier in the log removes that pane from every later list (the
   // real herdr applies closes immediately; the static list would resurrect
   // corpses past the launcher's addressing-key guard).
+  const logText = readLogFile();
   const closed = new Set(
-    readLogFile()
+    logText
       .split("\n")
       .filter((l) => l.startsWith("pane close "))
       .map((l) => l.split(" ")[2]),
   );
-  emit({ id: "cli:pane:list", result: { panes: panes.filter((p) => !closed.has(p.pane_id)), type: "pane_list" } });
+  const runSeen = logText.split("\n").some((l) => l.startsWith("pane run "));
+  let visiblePanes = panes.filter((p) => !closed.has(p.pane_id));
+  // Optional lifecycle-status injection for the readiness-bound submit
+  // tests. The real Herdr pane list exposes this status on the newborn pane;
+  // the fixture adds a virtual target only after pane run so pre-birth anchor
+  // discovery remains unchanged. A JSON array advances once per pane-list
+  // call after the run, which lets tests model "unknown → idle" without
+  // encoding a TUI-specific screen string in launch.sh.
+  if (runSeen && (process.env.TUT_HERDR_AGENT_STATUS !== undefined || process.env.TUT_HERDR_AGENT_STATUS_SCRIPT !== undefined)) {
+    const target = process.env.TUT_HERDR_AGENT_PANE ?? "FIX:root1";
+    const logLines = logText.split("\n");
+    let lastRun = -1;
+    logLines.forEach((line, index) => {
+      if (line.startsWith("pane run ")) lastRun = index;
+    });
+    const afterRunLists = logLines.slice(lastRun + 1).filter((l) => l === "pane list").length;
+    let status = process.env.TUT_HERDR_AGENT_STATUS ?? "unknown";
+    if (process.env.TUT_HERDR_AGENT_STATUS_SCRIPT !== undefined) {
+      const statuses = JSON.parse(process.env.TUT_HERDR_AGENT_STATUS_SCRIPT);
+      status = statuses[Math.min(Math.max(afterRunLists - 1, 0), statuses.length - 1)] ?? "unknown";
+    }
+    if (!visiblePanes.some((p) => p.pane_id === target)) {
+      visiblePanes = [...visiblePanes, { pane_id: target, label: "", agent_status: status }];
+    }
+  }
+  emit({ id: "cli:pane:list", result: { panes: visiblePanes, type: "pane_list" } });
 } else if (argv[0] === "tab" && sub === "list") {
   const tabs = process.env.TUT_HERDR_TABS ? JSON.parse(process.env.TUT_HERDR_TABS) : [];
   emit({ id: "cli:tab:list", result: { tabs, type: "tab_list" } });

@@ -93,7 +93,7 @@ describe("resolveLaunchTarget", () => {
         json: async () => ({
           tasks: [
             { task_id: "other", cast: {} },
-            { task_id: "t-cast", cast: { executor: "codex", reviewer: "zcode" } },
+            { task_id: "t-cast", cast: { executor: "codex", reviewer: "codex" } },
           ],
         }),
       })),
@@ -113,7 +113,7 @@ describe("resolveLaunchTarget", () => {
       try {
         const hit = await resolveLaunchTarget("http://hub.test", "t-cast", "executor");
         expect(hit.agent).toBe("codex"); // from cast
-        expect(hit.cast).toEqual({ executor: "codex", reviewer: "zcode" });
+        expect(hit.cast).toEqual({ executor: "codex", reviewer: "codex" });
 
         const fallback = await resolveLaunchTarget("http://hub.test", "t-cast", "architect");
         expect(fallback.agent).toBe("codex"); // not in cast → DEFAULT_ROLES.architect

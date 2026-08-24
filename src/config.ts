@@ -1,5 +1,6 @@
 /**
- * .context-hub/config.json access (readConfig/writeFlowMode for POST /mode).
+ * .context-hub/config.json access (readConfig/writeFlowMode for POST /mode,
+ * plus the tut config get/set engine at the bottom of this file).
  *
  * Read side is per-request semantics: readFlowMode re-reads the file on every
  * call so `tut mode` can switch flow_mode without restarting serve.
@@ -15,6 +16,7 @@
 
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { KNOWN_ROLES } from "./workspace.js";
 
 export type FlowMode = "manual" | "auto";
 
@@ -124,9 +126,9 @@ function parseConfigStrict(raw: string, filePath: string): Config {
 }
 
 /** Distinguish the three read outcomes readConfig collapses to null (writeFlowMode needs the difference). */
-type ReadOutcome = { status: "ok"; config: Config } | { status: "missing" } | { status: "invalid" };
+export type ReadOutcome = { status: "ok"; config: Config } | { status: "missing" } | { status: "invalid" };
 
-async function readConfigFile(root: string): Promise<ReadOutcome> {
+export async function readConfigFile(root: string): Promise<ReadOutcome> {
   const filePath = configPath(root);
   let raw: string;
   try {
@@ -186,6 +188,86 @@ export async function writeFlowMode(root: string, mode: FlowMode): Promise<Confi
   }
   const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
   config.flow_mode = mode;
+  await mkdir(root, { recursive: true });
+  await writeConfigAtomic(configPath(root), config);
+  return config;
+}
+
+// --- tut config get/set engine -------------------------------------------------
+//
+// The CLI surface (tut config) edits the SAME file serve re-reads per request
+// (readConfig above), so a write is picked up by the next poll cycle with no
+// restart and no Hub round-trip — config get/set works with the Hub down too
+// (same discipline as tut assign editing workspace.json directly).
+
+/** Scalar-settable config keys exposed to `tut config set`. */
+export type ConfigKey = "flow_mode" | "auto.launch_roles";
+
+/** All keys `tut config set` accepts, in hint-listing order. */
+export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles"];
+
+/** One typed key/value pair ready to apply (discriminated so writeConfigKey narrows). */
+export type ConfigKeyAssignment = { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] };
+
+/** Legal-value domain hint for a key — used by `tut config` error text and help. */
+export function configKeyDomain(key: ConfigKey): string {
+  return key === "flow_mode"
+    ? '"manual" | "auto"'
+    : `comma-separated roles (${KNOWN_ROLES.join("|")}); "" clears the whitelist`;
+}
+
+/** Available-keys hint line shared by every `tut config` rejection path. */
+export function configKeysHint(): string {
+  const keys = CONFIG_KEYS.map((key) => `${key} (${configKeyDomain(key)})`).join(", ");
+  return `available keys: ${keys}; notify (get only — an object config, edit config.json by hand)`;
+}
+
+/**
+ * Validate and normalize a raw CLI string for one key. launch_roles: ""
+ * clears to the empty whitelist; comma-separated role names are trimmed and
+ * de-duplicated (order preserved) and must all be KNOWN_ROLES — the
+ * whitelist is role-keyed, so a typo must fail loudly, not silently withhold.
+ */
+export function parseConfigValue(
+  key: ConfigKey,
+  raw: string,
+): { ok: true; assignment: ConfigKeyAssignment } | { ok: false; error: string } {
+  if (key === "flow_mode") {
+    if (raw === "manual" || raw === "auto") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for flow_mode: "${raw}" (expected ${configKeyDomain("flow_mode")})` };
+  }
+  const roles: string[] = [];
+  for (const piece of raw.split(",")) {
+    const role = piece.trim();
+    if (role.length === 0) continue;
+    if (!(KNOWN_ROLES as readonly string[]).includes(role)) {
+      return { ok: false, error: `invalid role in auto.launch_roles: "${role}" (roles: ${KNOWN_ROLES.join("|")})` };
+    }
+    if (!roles.includes(role)) roles.push(role);
+  }
+  return { ok: true, assignment: { key, value: roles } };
+}
+
+/**
+ * Key-preserving write of ONE validated key — the same read-modify-write +
+ * atomic temp/rename discipline as writeFlowMode: unknown keys (notify, future
+ * sections) and sibling keys inside `auto` all survive. Missing file starts
+ * from defaults; a file that exists but cannot be parsed THROWS rather than
+ * clobber keys it cannot read (the CLI surfaces that as exit 1).
+ */
+export async function writeConfigKey(root: string, assignment: ConfigKeyAssignment): Promise<Config> {
+  const { key } = assignment;
+  const outcome = await readConfigFile(root);
+  if (outcome.status === "invalid") {
+    throw new Error(`cannot set ${key}: ${configPath(root)} is unreadable or corrupt`);
+  }
+  const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
+  if (assignment.key === "flow_mode") {
+    config.flow_mode = assignment.value;
+  } else {
+    const existing = typeof config.auto === "object" && config.auto !== null ? config.auto : {};
+    config.auto = { ...existing, launch_roles: assignment.value }; // siblings inside auto survive
+  }
   await mkdir(root, { recursive: true });
   await writeConfigAtomic(configPath(root), config);
   return config;

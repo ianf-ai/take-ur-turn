@@ -68,14 +68,29 @@ interface HarnessOpts {
   autoRoles?: string[];
   interval?: number;
   stallMin?: number;
+  workingTimeoutSec?: number;
   eventPort?: number;
   realLaunch?: boolean;
+  launch?: (taskId: string, role: string, agent: string) => Promise<string>;
+  readLog?: (taskId: string) => Promise<ContextRecord[]>;
   /** Agent the injected launch pre-check resolves (default "pi"). */
   agent?: string;
   /** Routing maps for event→task mapping tests; omitted = empty maps (no role panes). */
   routing?: { labelToAgent?: Record<string, string>; roleToAgent?: Record<string, string> };
   /** Use the REAL chain loader (defaultLoadRouting: cwd L1 + TUT_USER_CONFIG_DIR L2). */
   realRouting?: boolean;
+  /** Pane inventory served to the done-event sweep (default: none). */
+  panes?: { pane_id: string; label: string }[];
+  /** Screen content readPane serves per pane id (default: empty). */
+  screens?: Record<string, string>;
+  /** When set, listPanes rejects (degradation path). */
+  listPanesFails?: string;
+  /** Pane ids whose readPane rejects (per-pane degradation path). */
+  readPaneFails?: string[];
+  /** Shared ordering probe: milestone names pushed as they happen (sweep-list-start / sweep-read:<id> / marker / launch). */
+  order?: string[];
+  /** Artificial pane-list delay inside the done sweep, fake-timer ms (concurrency-barrier tests). */
+  sweepDelayMs?: number;
 }
 
 const openNotifiers: Notifier[] = [];
@@ -90,6 +105,8 @@ function makeHarness(opts: HarnessOpts = {}) {
   let nowMs = 0;
   const logs: string[] = [];
   const launches: { taskId: string; role: string; agent: string }[] = [];
+  const sweptReads: string[] = [];
+  let sweepLists = 0;
   let fetches = 0;
   const notifier = new Notifier(
     {
@@ -97,6 +114,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       interval: opts.interval ?? 5,
       eventPort: opts.eventPort ?? 3999,
       stallTimeoutMin: opts.stallMin ?? 30,
+      ...(opts.workingTimeoutSec !== undefined ? { workingTimeoutSec: opts.workingTimeoutSec } : {}),
     },
     {
       fetchState: async (url: string) => {
@@ -104,22 +122,38 @@ function makeHarness(opts: HarnessOpts = {}) {
         fetches += 1;
         return current;
       },
-      ...(opts.realLaunch === true
-        ? {}
-        : {
-            launch: async (taskId: string, role: string, agent: string) => {
-              launches.push({ taskId, role, agent });
-              return "launched";
-            },
-          }),
+      ...(opts.launch !== undefined
+        ? { launch: opts.launch }
+        : opts.realLaunch === true
+          ? {}
+          : {
+              launch: async (taskId: string, role: string, agent: string) => {
+                opts.order?.push("launch");
+                launches.push({ taskId, role, agent });
+                return "launched";
+              },
+            }),
       // launch pre-check (hermetic): the real default hits GET /state of the hub
       // url + `which` — tests inject a fixed resolution instead.
       resolveTarget: async () => opts.agent ?? "pi",
       // Auto-launch provenance is exercised with dedicated injected-deps
       // tests below; the legacy state-only harness keeps an empty log so its
       // synthetic state transitions remain independently focused.
-      readLog: async (_taskId: string): Promise<ContextRecord[]> => [],
-      markLaunched: async (_taskId: string, _role: string, _baseVersion: number, _via: "start-next" | "auto"): Promise<void> => undefined,
+      readLog: opts.readLog ?? (async (taskId: string): Promise<ContextRecord[]> => {
+        const version = current.tasks.find((candidate) => candidate.task_id === taskId)?.version ?? 0;
+        return Array.from({ length: version }, (_, index) => ({
+          version: index + 1,
+          task_id: taskId,
+          role: "human",
+          content_type: "note",
+          timestamp: U1,
+          payload: { summary: "synthetic state version", body: "synthetic state version" },
+        }));
+      }),
+      markLaunched: async (_taskId: string, _role: string, baseVersion: number, _via: "start-next" | "auto"): Promise<unknown> => {
+        opts.order?.push("marker");
+        return { version: baseVersion + 1 };
+      },
       // Hermetic event→task mapping: tests that don't declare routing get empty maps
       // (the real default reads the three-level chain — cwd L1 + TUT_USER_CONFIG_DIR L2).
       ...(opts.realRouting === true
@@ -133,6 +167,24 @@ function makeHarness(opts: HarnessOpts = {}) {
       now: () => nowMs,
       log: (line: string) => {
         logs.push(line);
+      },
+      // Done-event sweep (hermetic: never spawns the real herdr — the pane
+      // inventory is a fixture; reads are recorded for scoping assertions).
+      listPanes: async () => {
+        if (opts.listPanesFails !== undefined) throw new Error(opts.listPanesFails);
+        sweepLists += 1;
+        opts.order?.push("sweep-list-start");
+        if (opts.sweepDelayMs !== undefined) {
+          await new Promise((resolve) => setTimeout(resolve, opts.sweepDelayMs));
+        }
+        opts.order?.push("sweep-list-end");
+        return opts.panes ?? [];
+      },
+      readPane: async (paneId: string) => {
+        if (opts.readPaneFails?.includes(paneId)) throw new Error(`fixture read failure for ${paneId}`);
+        sweptReads.push(paneId);
+        opts.order?.push(`sweep-read:${paneId}`);
+        return opts.screens?.[paneId] ?? "";
       },
     },
   );
@@ -150,6 +202,8 @@ function makeHarness(opts: HarnessOpts = {}) {
     },
     logs,
     launches,
+    sweptReads,
+    sweepListCount: () => sweepLists,
     fetchCount: () => fetches,
     titles: () => h.sent.map((s) => s.msg.title),
     flush: async (rounds = 20): Promise<void> => {
@@ -387,6 +441,278 @@ describe("auto-mode gate", () => {
     expect(hz.launches).toEqual([{ taskId: "t1", role: "executor", agent: "pi" }]);
     expect(titlesMatching("auto-launched executor")).toHaveLength(1);
     expect(titlesMatching("waiting for")).toHaveLength(0); // manual-style notify not used in auto
+  });
+
+  it("reports auto launch and agent working as two separate stages", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], workingTimeoutSec: 5 });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    expect(titlesMatching("auto-launched executor")).toHaveLength(1);
+    expect(titlesMatching("agent working")).toHaveLength(0);
+    expect(hz.logs.some((line) => line.includes("launch succeeded") && line.includes("working signal"))).toBe(true);
+
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(1);
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    expect(hz.logs.some((line) => line.includes("working signal received"))).toBe(true);
+  });
+
+  it("alerts when a successful auto launch misses its short working fuse", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], workingTimeoutSec: 5 });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    await vi.advanceTimersByTimeAsync(4_999);
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(1);
+    expect(hz.logs.some((line) => line.includes("launch working timeout"))).toBe(true);
+  });
+
+  it("working before the fuse expires suppresses the timeout alert", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], workingTimeoutSec: 5 });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(1);
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+  });
+
+  it("keeps the launch watch across an ordinary note and still times out without working", async () => {
+    let records: ContextRecord[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      workingTimeoutSec: 5,
+      readLog: async () => records,
+    });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    records = [
+      {
+        version: 1,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U1,
+        payload: {
+          summary: "launch: executor (base v0)",
+          body: "launch",
+          launch: { role: "executor", base_version: 0, via: "auto" },
+        },
+      },
+      {
+        version: 2,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U2,
+        payload: { summary: "operator note", body: "still working" },
+      },
+    ];
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(1);
+  });
+
+  it("keeps the launch watch across an ordinary note so the current pane can clear it", async () => {
+    let records: ContextRecord[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      workingTimeoutSec: 5,
+      readLog: async () => records,
+    });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    records = [
+      {
+        version: 1,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U1,
+        payload: {
+          summary: "launch: executor (base v0)",
+          body: "launch",
+          launch: { role: "executor", base_version: 0, via: "auto" },
+        },
+      },
+      {
+        version: 2,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U2,
+        payload: { summary: "operator note", body: "still working" },
+      },
+    ];
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+  });
+
+  it("keeps a working signal that arrives while launch.sh is still returning", async () => {
+    let launchStarted!: () => void;
+    let finishLaunch!: (output: string) => void;
+    const started = new Promise<void>((resolve) => {
+      launchStarted = resolve;
+    });
+    const launchFinished = new Promise<string>((resolve) => {
+      finishLaunch = resolve;
+    });
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      workingTimeoutSec: 5,
+      launch: async () => {
+        launchStarted();
+        return launchFinished;
+      },
+    });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    const compare = hz.notifier.requestCompare();
+    await started;
+
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(0); // launch stage has not returned yet
+
+    finishLaunch("launched");
+    await compare;
+    await hz.flush();
+    expect(titlesMatching("auto-launched executor")).toHaveLength(1);
+    expect(titlesMatching("agent working")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+  });
+
+  it("retires an old-role watch before a late working event can refresh the task", async () => {
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor", "reviewer"],
+      workingTimeoutSec: 5,
+      stallMin: 0.001,
+    });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2, version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // executor watch
+
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3, version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // executor watch retired, reviewer watch armed
+
+    hz.at(50);
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(0);
+
+    // The stale executor event must not move the stall clock forward.
+    hz.at(61);
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(1);
+    expect(titlesMatching("agent working")).toHaveLength(0);
+  });
+
+  it("does not let a suffixed old same-role pane clear the new round watch", async () => {
+    let records: ContextRecord[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      workingTimeoutSec: 5,
+      readLog: async () => records,
+    });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2, version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // round 1 executor watch
+
+    records = [
+      {
+        version: 1,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U1,
+        payload: {
+          summary: "launch: executor (base v0)",
+          body: "launch",
+          launch: { role: "executor", base_version: 0, via: "auto" },
+        },
+      },
+    ];
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3, version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // retire round 1
+    records = [
+      ...records,
+      {
+        version: 2,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U2,
+        payload: {
+          summary: "launch: reviewer (base v1)",
+          body: "launch",
+          launch: { role: "reviewer", base_version: 1, via: "auto" },
+        },
+      },
+      {
+        version: 3,
+        task_id: "t1",
+        role: "reviewer",
+        content_type: "review",
+        timestamp: U3,
+        payload: { summary: "reviewed", body: "review" },
+      },
+      {
+        version: 4,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U3,
+        payload: { summary: "round handoff", body: "next executor round" },
+      },
+    ];
+    hz.set(state([task({ task_id: "t1", status: "revising", waiting_for: "agent:executor", updated_at: U3, version: 5 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // round 2 executor watch
+
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor.old" });
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(0);
+
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(titlesMatching("agent working")).toHaveLength(1);
   });
 
   it("auto mode skips a role whose launch marker is still the latest task action", async () => {
@@ -893,9 +1219,169 @@ describe("agent events", () => {
     await hz.flush();
     expect(hz.fetchCount()).toBe(2);
     expect(hz.logs.some((l) => l.includes("matches no task"))).toBe(true);
+    // No task resolved → no sweep: the pane inventory is never even listed.
+    expect(hz.sweepListCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(10_000);
     await hz.flush();
     expect(h.sent).toEqual([]);
+  });
+});
+
+// --- done-event pane sweep (supply hardening) ---------------------------------------
+
+describe("done-event pane sweep: final screens archived into the notify log", () => {
+  const T1_EXEC = { pane_id: "w11:p6", label: "t1.executor" };
+  const T1_REV = { pane_id: "w11:p3", label: "t1.reviewer" };
+  const INVENTORY = [
+    { pane_id: "w11:p2", label: "tut-hub" }, // system pane — never swept
+    T1_EXEC,
+    { pane_id: "w11:p7", label: "t2.executor" }, // ANOTHER task — never swept
+    { pane_id: "w11:p1", label: "" }, // the human's unlabeled pane — never swept
+    T1_REV,
+  ];
+
+  it("snapshots every <T>.* pane with timestamp + label into the log; other panes are never read", async () => {
+    const hz = makeHarness({
+      panes: INVENTORY,
+      screens: {
+        "w11:p6": "pi finished the round\n╭──────────╮\n│ done, published │",
+        "w11:p3": "idle reviewer seat",
+      },
+    });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.at(Date.parse("2026-08-23T13:45:02.000Z"));
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+
+    // Positive: BOTH t1.* panes archived, header carries timestamp + label + pane id.
+    const AT = "2026-08-23T13:45:02.000Z";
+    expect(hz.sweptReads).toEqual(["w11:p6", "w11:p3"]);
+    expect(hz.logs.some((l) => l.includes(`[t1] done sweep — pane 't1.executor' (w11:p6) final screen @ ${AT}:`))).toBe(true);
+    expect(hz.logs.some((l) => l === `tut: notify: [t1] sweep ${AT} t1.executor | pi finished the round`)).toBe(true);
+    expect(hz.logs.some((l) => l === `tut: notify: [t1] sweep ${AT} t1.executor | │ done, published │`)).toBe(true);
+    expect(hz.logs.some((l) => l === `tut: notify: [t1] sweep ${AT} t1.reviewer | idle reviewer seat`)).toBe(true);
+
+    // Per-line contract (design: 每行带时间戳与 pane 标签): EVERY screen-content
+    // line — multi-line and empty alike — carries a parseable ISO timestamp
+    // and the pane label itself; the header is never their only carrier.
+    const contentLines = hz.logs.filter((l) => l.includes("] sweep "));
+    expect(contentLines.length).toBeGreaterThanOrEqual(3);
+    for (const line of contentLines) {
+      const m = line.match(/\] sweep (\S+) (\S+) \| /);
+      expect(m).not.toBeNull();
+      expect(m?.[1]).toBe(AT);
+      expect(Number.isNaN(Date.parse(m?.[1] ?? ""))).toBe(false); // parseable ISO
+      expect(m?.[2]).toMatch(/^t1\.(executor|reviewer)$/); // pane label on every line
+    }
+
+    // Negative: the other task's pane, the system pane, and the unlabeled
+    // pane were never read (readPane was called for t1 panes only).
+    expect(hz.sweptReads.some((id) => id === "w11:p7" || id === "w11:p2" || id === "w11:p1")).toBe(false);
+    expect(hz.logs.some((l) => l.includes("t2.") || l.includes("tut-hub"))).toBe(false);
+
+    // The done flow itself is intact: immediate compare ran.
+    expect(hz.fetchCount()).toBe(2);
+  });
+
+  it("a task_id prefix never spans into a longer task's namespace (t1. ≠ t1-long.)", async () => {
+    const hz = makeHarness({
+      panes: [{ pane_id: "w11:p9", label: "t1-long.executor" }],
+      screens: { "w11:p9": "other task's seat" },
+    });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(hz.sweptReads).toEqual([]);
+    expect(hz.logs.some((l) => l.includes("no round panes left to snapshot"))).toBe(true);
+  });
+
+  it("an empty screen is logged as an explicit empty observation, not silence", async () => {
+    const hz = makeHarness({ panes: [T1_EXEC], screens: {} });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.at(Date.parse("2026-08-23T13:45:02.000Z"));
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(hz.sweptReads).toEqual(["w11:p6"]);
+    expect(hz.logs.some((l) => l === "tut: notify: [t1] sweep 2026-08-23T13:45:02.000Z t1.executor | (empty screen)")).toBe(true);
+    expect(Number.isNaN(Date.parse("2026-08-23T13:45:02.000Z"))).toBe(false); // parseable, same stamp as the header
+  });
+
+  it("pane list failure skips the sweep with a note — the done flow (compare + recheck) survives", async () => {
+    const hz = makeHarness({ listPanesFails: "herdr not found" });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(hz.logs.some((l) => l.includes("done sweep skipped: pane list failed"))).toBe(true);
+    expect(hz.fetchCount()).toBe(2); // immediate compare still ran
+    await vi.advanceTimersByTimeAsync(5_000); // recheck fires
+    await hz.flush();
+    expect(hz.fetchCount()).toBe(3);
+    const stopped = h.sent.find((s) => s.msg.title.includes("stopped without publishing"));
+    expect(stopped).toBeDefined(); // cross-validation intact
+  });
+
+  it("one pane's read failure logs per pane and does not block the others", async () => {
+    const hz = makeHarness({
+      panes: [T1_EXEC, T1_REV],
+      screens: { "w11:p3": "reviewer seat" },
+      readPaneFails: ["w11:p6"],
+    });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.at(Date.parse("2026-08-23T13:45:02.000Z"));
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(hz.logs.some((l) => l.includes("pane 't1.executor' (w11:p6) read failed"))).toBe(true);
+    expect(hz.logs.some((l) => l === "tut: notify: [t1] sweep 2026-08-23T13:45:02.000Z t1.reviewer | reviewer seat")).toBe(true);
+  });
+
+  it("concurrency barrier: a poll racing the delayed sweep cannot launch the next round first — sweep reads archive BEFORE marker/launch", async () => {
+    // The reviewer's probe scenario: done event starts its sweep (pane list
+    // blocked on a slow herdr), a poll compare fires concurrently and sees
+    // the publish — WITHOUT the barrier the auto launch (and its pane-reaping
+    // launcher) would overtake the sweep and the screen evidence is lost.
+    const order: string[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ALL_ROLES.launch_roles,
+      panes: [{ pane_id: "w11:p6", label: "t1.executor" }],
+      screens: { "w11:p6": "final screen" },
+      order,
+      sweepDelayMs: 50,
+    });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // baseline
+
+    // The publish lands (not yet observed) and the agent exits — the done
+    // sweep starts, and a poll compare fires while its pane list is in flight.
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    void hz.notifier.requestCompare(); // the racing poll
+    await hz.flush();
+
+    expect(order).toContain("sweep-list-start");
+    expect(order).not.toContain("marker"); // launch machinery parked behind the sweep
+    expect(order).not.toContain("launch");
+
+    await vi.advanceTimersByTimeAsync(50); // the delayed inventory lands; sweep completes
+    await hz.flush();
+
+    // THE closing order: sweep read archived BEFORE this task's marker and launch.
+    expect(order.indexOf("sweep-read:w11:p6")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("sweep-read:w11:p6")).toBeLessThan(order.indexOf("marker"));
+    expect(order.indexOf("marker")).toBeLessThan(order.indexOf("launch"));
+
+    // The existing done cross-validation is intact: the compare observed the
+    // advance → no "stopped without publishing".
+    await vi.advanceTimersByTimeAsync(10_000);
+    await hz.flush();
+    expect(titlesMatching("stopped without publishing")).toHaveLength(0);
+    expect(titlesMatching("auto-launched reviewer")).toHaveLength(1); // the parked round did launch
   });
 });
 
@@ -911,7 +1397,7 @@ describe("defaultLoadRouting: the real loader reads the three-level chain (cwd L
     const l2 = mkdtempSync(path.join(os.tmpdir(), "tut-nr-l2-"));
     mkdirSync(path.join(l1, ".context-hub"), { recursive: true });
     writeFileSync(path.join(l1, ".context-hub", "workspace.json"), JSON.stringify({
-      roles: { executor: { agent: "pi" }, architect: { label: "arch", agent: "zcode" } },
+      roles: { executor: { agent: "pi" }, architect: { label: "arch", agent: "codex" } },
     }));
     writeFileSync(path.join(l2, "workspace.json"), JSON.stringify({
       roles: { reviewer: { agent: "codex" } },
@@ -923,10 +1409,10 @@ describe("defaultLoadRouting: the real loader reads the three-level chain (cwd L
     try {
       const maps = await defaultLoadRouting();
       expect(maps.roleToAgent.get("executor")).toBe("pi"); // L1
-      expect(maps.roleToAgent.get("architect")).toBe("zcode"); // L1 (legacy shape tolerated, .agent read)
+      expect(maps.roleToAgent.get("architect")).toBe("codex"); // L1 (legacy shape tolerated, .agent read)
       expect(maps.roleToAgent.get("reviewer")).toBe("codex"); // L2 per-role fallback
       expect(maps.labelToAgent.get("pi")).toBe("pi"); // agent-named pane → identity
-      expect(maps.labelToAgent.get("zcode")).toBe("zcode");
+      expect(maps.labelToAgent.get("codex")).toBe("codex");
       // Legacy label mapping RETIRED — "arch" is not a key.
       expect(maps.labelToAgent.has("arch")).toBe(false);
     } finally {
@@ -1021,6 +1507,18 @@ describe("event→task mapping (agent-keyed panes)", () => {
     labelToAgent: { codex: "codex", pi: "pi" },
     roleToAgent: { architect: "codex", executor: "pi", reviewer: "codex" },
   };
+
+  it("retries a round-pane prefix after a working event beats the first state snapshot", async () => {
+    const hz = makeHarness({ routing: ROUTING });
+    // The task is already in the Hub, but the notifier has not polled it yet.
+    // This is the live fresh-pane race: the event carries the exact
+    // <task_id>.<role> label before the next /state snapshot exists locally.
+    hz.set(state([task({ task_id: "late-one", status: "implementing", waiting_for: "agent:executor" })]));
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "late-one.executor" });
+    await hz.flush();
+    expect(hz.logs.some((l) => l.includes("working event pane 'late-one.executor' resolved to task late-one"))).toBe(true);
+    expect(hz.logs.some((l) => l.includes("resolves to no task; stall refresh skipped"))).toBe(false);
+  });
 
   it("fresh round pane `<task_id>.<role>`: prefix hit maps directly — no cast/identity resolution needed", async () => {
     const hz = makeHarness({ routing: ROUTING });

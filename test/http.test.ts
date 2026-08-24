@@ -17,6 +17,7 @@ import path from "node:path";
 
 import { startServer, type RunningServer } from "../src/server.js";
 import { Store } from "../src/store.js";
+import { writeConfigKey } from "../src/config.js";
 
 let tmp: string;
 let root: string;
@@ -214,6 +215,21 @@ describe("GET /state optional auto key", () => {
     expect(res.status).toBe(200);
     expect(body.flow_mode).toBe("auto"); // a bad auto section does not invalidate the file
     expect(body).not.toHaveProperty("auto"); // …but its whitelist is not exposed either
+  });
+
+  it("picks up tut config set writes on the NEXT request — no restart (serve stays a compatible reader)", async () => {
+    const before = (await (await fetch(`${baseUrl}/state`)).json()) as { flow_mode: string; auto?: unknown };
+    expect(before.flow_mode).toBe("manual");
+    expect(before.auto).toBeUndefined();
+
+    // `tut config set` engine writes the file directly (no Hub round-trip);
+    // the running serve must reflect it on the very next /state read.
+    await writeConfigKey(root, { key: "flow_mode", value: "auto" });
+    await writeConfigKey(root, { key: "auto.launch_roles", value: ["executor", "reviewer"] });
+
+    const after = (await (await fetch(`${baseUrl}/state`)).json()) as { flow_mode: string; auto?: { launch_roles: string[] } };
+    expect(after.flow_mode).toBe("auto");
+    expect(after.auto).toEqual({ launch_roles: ["executor", "reviewer"] });
   });
 });
 

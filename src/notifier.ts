@@ -54,6 +54,14 @@ export interface NotifyOptions {
   eventPort: number;
   /** Stall timeout in minutes for agent:*-waiting tasks (default 30). */
   stallTimeoutMin: number;
+  /**
+   * Seconds after a successful launch with no matching working event before
+   * the launch is alerted (default 300).  This is intentionally independent
+   * from the long stall watchdog above: launch visibility is a short fuse.
+   */
+  workingTimeoutSec?: number;
+  /** Programmatic spelling kept as an additive alias for callers that name the launch stage. */
+  launchWorkingTimeoutSec?: number;
 }
 
 /** The frozen /state task fields (notify is top-level). `version`
@@ -93,6 +101,28 @@ export interface AgentEvent {
   pane: string;
 }
 
+/** A pane-list row consumed by the done-event sweep (system-design 4.4). */
+export interface PaneSnapshot {
+  pane_id: string;
+  label: string;
+}
+
+interface WorkingWatch {
+  task: StateTask;
+  role: string;
+  agent: string;
+  /** Version of the launch marker, when the Hub returned one. */
+  launchVersion?: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface InFlightLaunch {
+  task: StateTask;
+  role: string;
+  agent: string;
+  launchVersion?: number;
+}
+
 export interface NotifierDeps {
   fetchState(url: string): Promise<StateResponse>;
   launch(taskId: string, role: string, agent: string): Promise<string>;
@@ -115,6 +145,16 @@ export interface NotifierDeps {
    * Injectable for tests.
    */
   loadRouting?(): Promise<RoutingMaps>;
+  /**
+   * Pane inventory for the done-event sweep (herdr pane list). Injectable
+   * for tests; the default spawns the real CLI.
+   */
+  listPanes?(): Promise<PaneSnapshot[]>;
+  /**
+   * Visible-screen read of one pane for the done-event sweep (herdr pane
+   * read --source visible). Injectable for tests.
+   */
+  readPane?(paneId: string): Promise<string>;
 }
 
 // --- defaults --------------------------------------------------------------------
@@ -189,6 +229,12 @@ function defaultLog(line: string): void {
   process.stderr.write(line.endsWith("\n") ? line : `${line}\n`);
 }
 
+function versionOf(value: unknown): number | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const version = (value as { version?: unknown }).version;
+  return typeof version === "number" && Number.isSafeInteger(version) && version >= 0 ? version : undefined;
+}
+
 /**
  * Event→task routing maps (agent-keyed). Empirically (herdr 0.8) the
  * pane.agent_status_changed payload carries NO task_id — the herdr plugin
@@ -215,6 +261,55 @@ export async function defaultLoadRouting(): Promise<RoutingMaps> {
     labelToAgent.set(agent, agent); // agent-named pane → identity
   }
   return { labelToAgent, roleToAgent };
+}
+
+// --- done-event pane sweep (supply hardening) ---------------------------------------
+// The final screen of a task's round panes is archived into the notify log
+// when the agent's done event arrives — "agent did the work but never
+// published" stays traceable even after the next round's launcher reaps
+// the pane. Lines mirror the launcher's read primitive (--source visible,
+// the only source reliable from birth).
+
+const SWEEP_READ_LINES = 40;
+
+function runCapture(cmd: string, args: string[]): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${cmd} ${args.join(" ")} exited ${code ?? `signal ${signal}`}${stderr.trim() ? `: ${stderr.trim()}` : ""}`));
+    });
+  });
+}
+
+function parsePaneSnapshots(raw: string): PaneSnapshot[] {
+  try {
+    const out = JSON.parse(raw) as { result?: { panes?: unknown }; panes?: unknown };
+    const panes = (out?.result?.panes ?? out?.panes) as Array<{ pane_id?: unknown; label?: unknown }> | undefined;
+    if (!Array.isArray(panes)) return [];
+    return panes
+      .filter((p) => typeof p?.pane_id === "string")
+      .map((p) => ({ pane_id: p.pane_id as string, label: typeof p.label === "string" ? p.label : "" }));
+  } catch {
+    return [];
+  }
+}
+
+async function defaultListPanes(): Promise<PaneSnapshot[]> {
+  return parsePaneSnapshots(await runCapture("herdr", ["pane", "list"]));
+}
+
+async function defaultReadPane(paneId: string): Promise<string> {
+  return await runCapture("herdr", ["pane", "read", paneId, "--source", "visible", "--lines", String(SWEEP_READ_LINES)]);
 }
 
 // --- loopback Host guard (mirrors src/http.ts) -------------------------------------
@@ -283,6 +378,7 @@ export class Notifier {
   private readonly stateUrl: string;
   private readonly intervalMs: number;
   private readonly stallMs: number;
+  private readonly workingTimeoutMs: number;
   private readonly eventPort: number;
   private readonly deps: NotifierDeps;
 
@@ -302,20 +398,45 @@ export class Notifier {
   private lastProgressAt = new Map<string, number>();
   private stallNotified = new Set<string>();
 
+  /** Successful auto launches waiting for their first working signal. */
+  private workingWatches = new Map<string, WorkingWatch>();
+  /** Launches whose launcher promise has not returned yet. */
+  private inFlightLaunches = new Map<string, InFlightLaunch>();
+  /** Working signals observed while the launcher was still completing. */
+  private earlyWorkingSignals = new Map<string, AgentEvent>();
+  /** Working events that arrived before the next poll exposed their task. */
+  private unresolvedWorkingEvents = new Set<string>();
+  /**
+   * Done-sweep barriers, per task: taskId → in-flight sweep promise.
+   * autoLaunch awaits its OWN task's barrier at every launch-gating point,
+   * so a poll compare racing the sweep cannot launch the next round (whose
+   * launcher reaps the panes) before the screens are archived. The sweep
+   * itself runs OUTSIDE the compare queue on purpose: a queue-serialized
+   * sweep would deadlock against an in-flight compare whose autoLaunch is
+   * already parked on it (the job could never start — the queue is busy).
+   */
+  private sweepBarriers = new Map<string, Promise<void>>();
+
   private server: Server | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private timers = new Set<ReturnType<typeof setTimeout>>();
   /** Resolved (non-optional) loaders built from deps. */
   private readonly routingLoader: () => Promise<RoutingMaps>;
   private readonly targetResolver: (taskId: string, role: string) => Promise<string>;
+  private readonly paneLister: () => Promise<PaneSnapshot[]>;
+  private readonly paneReader: (paneId: string) => Promise<string>;
 
   constructor(options: NotifyOptions, deps: Partial<NotifierDeps> = {}) {
     this.stateUrl = stateUrlOf(options.url);
     this.intervalMs = Math.max(1, options.interval) * 1000;
     this.stallMs = Math.max(0, options.stallTimeoutMin) * 60_000;
+    const workingTimeoutSec = options.workingTimeoutSec ?? options.launchWorkingTimeoutSec ?? 300;
+    this.workingTimeoutMs = Math.max(0, Number.isFinite(workingTimeoutSec) ? workingTimeoutSec : 300) * 1000;
     this.eventPort = options.eventPort;
     this.routingLoader = deps.loadRouting ?? defaultLoadRouting;
     this.targetResolver = deps.resolveTarget ?? ((taskId, role) => defaultResolveTarget(options.url, taskId, role));
+    this.paneLister = deps.listPanes ?? defaultListPanes;
+    this.paneReader = deps.readPane ?? defaultReadPane;
     this.deps = {
       fetchState: deps.fetchState ?? defaultFetchState,
       launch: deps.launch ?? spawnLaunch,
@@ -380,6 +501,7 @@ export class Notifier {
     const prev = this.snapshot;
     const now = this.deps.now();
     this.snapshot = new Map(state.tasks.map((t) => [t.task_id, t]));
+    await this.retireObsoleteWorkingWatches(this.snapshot);
 
     if (prev === null) {
       // First successful fetch: baseline, no notifications.
@@ -513,6 +635,10 @@ export class Notifier {
   }
 
   private async autoLaunch(task: StateTask, role: string): Promise<void> {
+    // Done-sweep barrier (1/3, entry): this task's final-screen evidence must
+    // be archived (or its failure recorded) before this round's launch
+    // machinery starts — the launcher reaps the very panes the sweep reads.
+    await this.awaitSweepBarrier(task.task_id);
     let records: ContextRecord[];
     try {
       records = await this.deps.readLog(task.task_id);
@@ -539,9 +665,17 @@ export class Notifier {
       return;
     }
 
+    // Done-sweep barrier (2/3, post-precheck): a done event may have landed
+    // while readLog/precheck were in flight — re-check before the marker.
+    // From the resolution of this await to the markLaunched call the code is
+    // one synchronous continuation (no macrotask boundary), so a later done
+    // event can no longer slip between this check and the marker.
+    await this.awaitSweepBarrier(task.task_id);
     const baseVersion = latestRecordVersion(records);
+    let launchVersion: number | undefined;
     try {
-      await this.deps.markLaunched(task.task_id, role, baseVersion, "auto");
+      const marker = await this.deps.markLaunched(task.task_id, role, baseVersion, "auto");
+      launchVersion = versionOf(marker) ?? task.version;
     } catch (e) {
       // A manual start-next or another notifier may have won the optimistic
       // append race. Re-read once: if its marker is now present, converge on
@@ -560,19 +694,41 @@ export class Notifier {
       return;
     }
 
+    // Done-sweep barrier (3/3, pre-spawn): even if a razor-thin interleaving
+    // let the marker slip past, the LAUNCH itself (the pane-reaping action)
+    // still waits for the sweep.
+    await this.awaitSweepBarrier(task.task_id);
+    const launchKey = this.workingWatchKey(task.task_id, role);
+    this.inFlightLaunches.set(launchKey, { task, role, agent, ...(launchVersion !== undefined ? { launchVersion } : {}) });
     try {
       const out = await this.deps.launch(task.task_id, role, agent);
+      this.inFlightLaunches.delete(launchKey);
       // Dry-run output is often multi-line (provisioning preview + delivery
       // preview); log EVERY line so the pane log shows the full launch preview.
       for (const line of out.trim().split("\n")) {
         this.log(`launch.sh (${task.task_id}, ${role})${line ? ` → ${line}` : ""}`);
       }
+      this.armWorkingWatch(task, role, agent, launchVersion);
+      this.log(
+        `[${task.task_id}] launch succeeded for ${role}; waiting for working signal within ${Math.ceil(this.workingTimeoutMs / 1000)}s`,
+      );
       await this.sendAll({
         title: `TUT ${task.task_id}: auto-launched ${role}`,
-        body: `${task.title} — status: ${task.status}; launched ${role} via launch.sh (pane: ${task.task_id}.${role})`,
+        body: `${task.title} — status: ${task.status}; launch succeeded for ${role} via launch.sh (pane: ${task.task_id}.${role}); waiting for the agent's working signal`,
         task_id: task.task_id,
       });
+      // A real launcher can still be awaiting its final verification while
+      // the newborn agent has already emitted working. Preserve that event so
+      // the post-launch fuse is not armed after the useful signal and then
+      // allowed to fire falsely.
+      const early = this.earlyWorkingSignals.get(launchKey);
+      if (early !== undefined) {
+        this.earlyWorkingSignals.delete(launchKey);
+        await this.handleWorkingSignal(early, task.task_id);
+      }
     } catch (e) {
+      this.inFlightLaunches.delete(launchKey);
+      this.earlyWorkingSignals.delete(launchKey);
       await this.autoLaunchFailed(task, role, e);
     }
   }
@@ -595,6 +751,216 @@ export class Notifier {
       body: `${task.title} — launch.sh ${role} failed: ${message}; intervene manually`,
       task_id: task.task_id,
     });
+  }
+
+  // --- launch → working visibility -----------------------------------------------
+
+  private workingWatchKey(taskId: string, role: string): string {
+    return `${taskId}\u0000${role}`;
+  }
+
+  private armWorkingWatch(task: StateTask, role: string, agent: string, launchVersion?: number): void {
+    const key = this.workingWatchKey(task.task_id, role);
+    const previous = this.workingWatches.get(key);
+    if (previous !== undefined) {
+      clearTimeout(previous.timer);
+      this.timers.delete(previous.timer);
+    }
+
+    let watch!: WorkingWatch;
+    const timer = setTimeout(() => {
+      this.workingWatches.delete(key);
+      this.timers.delete(timer);
+      void this.handleWorkingTimeout(key, watch);
+    }, this.workingTimeoutMs);
+    watch = { task, role, agent, ...(launchVersion !== undefined ? { launchVersion } : {}), timer };
+    this.workingWatches.set(key, watch);
+    this.timers.add(timer);
+  }
+
+  private async launchGenerationSuperseded(taskId: string, launchVersion: number): Promise<boolean | undefined> {
+    try {
+      const records = await this.deps.readLog(taskId);
+      return records.some(
+        (record) => record.version > launchVersion && record.content_type !== "note",
+      );
+    } catch (e) {
+      this.log(
+        `[${taskId}] could not inspect launch generation v${launchVersion}: ${(e as Error).message}`,
+      );
+      return undefined;
+    }
+  }
+
+  private async retireObsoleteWorkingWatches(currentTasks: ReadonlyMap<string, StateTask>): Promise<void> {
+    for (const [key, watch] of this.workingWatches) {
+      const current = currentTasks.get(watch.task.task_id);
+      if (current === undefined || current.waiting_for !== `agent:${watch.role}`) {
+        this.clearWorkingWatch(key);
+        continue;
+      }
+      // The launch marker is the generation anchor. Ordinary task-scope notes
+      // also advance the task version but do not start a new round, so inspect
+      // the full log before retiring a watch. Only a later non-note record
+      // proves that the task has progressed beyond this launch generation.
+      const launchVersion = watch.launchVersion;
+      if (launchVersion === undefined || current.version === undefined || current.version <= launchVersion) continue;
+      const superseded = await this.launchGenerationSuperseded(watch.task.task_id, launchVersion);
+      // A failed diagnostic read must not turn a still-valid watch into a
+      // silent timeout. The timer remains armed and the next poll retries.
+      if (superseded !== true) continue;
+      this.clearWorkingWatch(key);
+      this.log(`[${watch.task.task_id}] retired stale ${watch.role} working watch at task version ${current.version}`);
+    }
+  }
+
+  private clearWorkingWatch(key: string): WorkingWatch | undefined {
+    const watch = this.workingWatches.get(key);
+    if (watch === undefined) return undefined;
+    clearTimeout(watch.timer);
+    this.timers.delete(watch.timer);
+    this.workingWatches.delete(key);
+    return watch;
+  }
+
+  private roundRoleFromPane(taskId: string, pane: string): string | undefined {
+    const label = pane.trim();
+    const prefix = `${taskId}.`;
+    if (!label.startsWith(prefix)) return undefined;
+    const role = label.slice(prefix.length).split(".", 1)[0];
+    return role !== undefined && role.length > 0 ? role : undefined;
+  }
+
+  private async workingWatchForEvent(evt: AgentEvent, taskId: string): Promise<{ key: string; watch: WorkingWatch } | undefined> {
+    const task = this.snapshot?.get(taskId);
+    const paneRole = this.roundRoleFromPane(taskId, evt.pane);
+    for (const [key, watch] of this.workingWatches) {
+      if (watch.task.task_id !== taskId) continue;
+      if (task?.waiting_for !== `agent:${watch.role}`) continue;
+      if (paneRole !== undefined && watch.role !== paneRole) continue;
+      // A prefix can still resolve a legacy/suffixed pane to the task, but a
+      // working watch may only be cleared by the exact current round key.
+      if (paneRole !== undefined && evt.pane.trim() !== `${taskId}.${watch.role}`) continue;
+      if (watch.launchVersion !== undefined && task?.version !== undefined && task.version > watch.launchVersion) {
+        const superseded = await this.launchGenerationSuperseded(taskId, watch.launchVersion);
+        // Notes advance task.version without changing the launch generation;
+        // a non-note after the marker retires the watch. Unknown generation
+        // status is treated as stale for event matching so no event can clear
+        // a fuse while its provenance is unreadable.
+        if (superseded !== false) continue;
+      }
+      // Herdr normally supplies the recognized agent identity. Empty is
+      // tolerated for older signal sources; a non-empty mismatch must not
+      // clear another agent's launch fuse.
+      if (evt.agent.length > 0 && evt.agent !== watch.agent) continue;
+      if (paneRole === undefined && task?.waiting_for !== `agent:${watch.role}`) continue;
+      if (this.workingWatches.get(key) !== watch) continue;
+      return { key, watch };
+    }
+    return undefined;
+  }
+
+  private async inFlightLaunchForEvent(evt: AgentEvent, taskId: string): Promise<{ key: string; launch: InFlightLaunch } | undefined> {
+    const task = this.snapshot?.get(taskId);
+    const paneRole = this.roundRoleFromPane(taskId, evt.pane);
+    for (const [key, launch] of this.inFlightLaunches) {
+      if (launch.task.task_id !== taskId) continue;
+      if (task?.waiting_for !== `agent:${launch.role}`) continue;
+      if (paneRole !== undefined && launch.role !== paneRole) continue;
+      if (paneRole !== undefined && evt.pane.trim() !== `${taskId}.${launch.role}`) continue;
+      if (launch.launchVersion !== undefined && task?.version !== undefined && task.version > launch.launchVersion) {
+        const superseded = await this.launchGenerationSuperseded(taskId, launch.launchVersion);
+        if (superseded !== false) continue;
+      }
+      if (evt.agent.length > 0 && evt.agent !== launch.agent) continue;
+      if (this.inFlightLaunches.get(key) !== launch) continue;
+      return { key, launch };
+    }
+    return undefined;
+  }
+
+  private workingEventMatchesCurrentTask(evt: AgentEvent, taskId: string): boolean {
+    const task = this.snapshot?.get(taskId);
+    if (task === undefined || !task.waiting_for.startsWith("agent:")) return false;
+    const currentRole = task.waiting_for.slice("agent:".length);
+    const paneRole = this.roundRoleFromPane(taskId, evt.pane);
+    if (paneRole !== undefined) {
+      return paneRole === currentRole && evt.pane.trim() === `${taskId}.${currentRole}`;
+    }
+    // Bare task-id panes and agent-named panes are the legacy/identity paths;
+    // resolveEventTask already validated the task/agent relationship before
+    // this helper is reached.
+    return true;
+  }
+
+  private async handleWorkingSignal(evt: AgentEvent, taskId: string): Promise<void> {
+    const hit = await this.workingWatchForEvent(evt, taskId);
+    if (hit === undefined) {
+      const inFlight = await this.inFlightLaunchForEvent(evt, taskId);
+      if (inFlight !== undefined) {
+        this.markProgress(taskId, this.deps.now());
+        if (taskId !== evt.pane) {
+          this.log(`working event pane '${evt.pane}' resolved to task ${taskId} (role-pane mapping)`);
+        }
+        this.earlyWorkingSignals.set(inFlight.key, evt);
+        this.log(`[${taskId}] working signal arrived while ${inFlight.launch.role} launch was still completing`);
+      } else if (this.workingEventMatchesCurrentTask(evt, taskId)) {
+        this.markProgress(taskId, this.deps.now());
+        if (taskId !== evt.pane) {
+          this.log(`working event pane '${evt.pane}' resolved to task ${taskId} (role-pane mapping)`);
+        }
+      }
+      return;
+    }
+    this.markProgress(taskId, this.deps.now());
+    if (taskId !== evt.pane) {
+      this.log(`working event pane '${evt.pane}' resolved to task ${taskId} (role-pane mapping)`);
+    }
+    this.clearWorkingWatch(hit.key);
+    this.log(`[${taskId}] working signal received for ${hit.watch.role} (agent ${evt.agent || hit.watch.agent})`);
+    void this.sendAll({
+      title: `TUT ${taskId}: agent working`,
+      body: `${hit.watch.task.title} — working signal received for ${hit.watch.role} in pane ${taskId}.${hit.watch.role}; launch hand-off is alive`,
+      task_id: taskId,
+    });
+  }
+
+  private async handleWorkingTimeout(key: string, watch: WorkingWatch): Promise<void> {
+    // A publish/decision may have advanced or closed the task while the
+    // signal was in flight. In that case the workflow itself is evidence of
+    // progress; do not raise a stale launch alarm.
+    const current = this.snapshot?.get(watch.task.task_id);
+    if (current === undefined || current.waiting_for !== `agent:${watch.role}`) return;
+    const seconds = Math.ceil(this.workingTimeoutMs / 1000);
+    this.log(`[${watch.task.task_id}] launch working timeout for ${watch.role} after ${seconds}s; no working signal observed`);
+    await this.sendAll({
+      title: `TUT ${watch.task.task_id}: launch succeeded but no working signal`,
+      body: `${watch.task.title} — ${watch.role} was launched via launch.sh, but no working signal arrived within ${seconds}s; intervene manually`,
+      task_id: watch.task.task_id,
+    });
+    // Keep the key in the method signature so a future repeated-watch policy
+    // cannot accidentally alert a replacement round.
+    void key;
+  }
+
+  private queueUnresolvedWorkingEvent(evt: AgentEvent): void {
+    const key = `${evt.agent}\u0000${evt.pane}`;
+    if (this.unresolvedWorkingEvents.has(key)) return;
+    this.unresolvedWorkingEvents.add(key);
+    void this.requestCompare()
+      .then(async () => {
+        this.unresolvedWorkingEvents.delete(key);
+        const taskId = this.resolveEventTask(evt.pane);
+        if (taskId !== null) {
+          await this.handleWorkingSignal(evt, taskId);
+          return;
+        }
+        this.log(`working event pane '${evt.pane}' resolves to no task; stall refresh skipped`);
+      })
+      .catch((e: unknown) => {
+        this.unresolvedWorkingEvents.delete(key);
+        this.log(`working event pane '${evt.pane}' could not be re-resolved: ${(e as Error).message}`);
+      });
   }
 
   private async sendAll(msg: Notification): Promise<void> {
@@ -668,10 +1034,17 @@ export class Notifier {
   private resolveEventTask(pane: string): string | null {
     const snap = this.snapshot;
     if (snap === null) return null;
-    if (snap.has(pane)) return pane; // (a) 4.4: work pane named after its task
-    const lastDot = pane.lastIndexOf("."); // (a½) round pane <task_id>.<role>
-    if (lastDot > 0 && snap.has(pane.slice(0, lastDot))) return pane.slice(0, lastDot);
-    const identity = this.routing?.labelToAgent.get(pane);
+    const label = pane.trim();
+    if (snap.has(label)) return label; // (a) 4.4: work pane named after its task
+    // (a½) round pane <task_id>.<role>. Slugs do not contain dots, but walk
+    // every dot from the right so a legacy label with an extra suffix still
+    // gets the strongest task-prefix hit instead of falling through to the
+    // less precise agent-identity map.
+    for (let dot = label.lastIndexOf("."); dot > 0; dot = label.lastIndexOf(".", dot - 1)) {
+      const prefix = label.slice(0, dot);
+      if (snap.has(prefix)) return prefix;
+    }
+    const identity = this.routing?.labelToAgent.get(label);
     if (identity === undefined) return null;
     const roleToAgent = this.routing?.roleToAgent;
     const waiting = [...snap.values()].filter((t) => {
@@ -699,13 +1072,14 @@ export class Notifier {
     switch (evt.event) {
       case "working":
         if (taskId !== null) {
-          this.markProgress(taskId, this.deps.now());
-          if (taskId !== evt.pane) {
-            this.log(`working event pane '${evt.pane}' resolved to task ${taskId} (role-pane mapping)`);
-          }
+          void this.handleWorkingSignal(evt, taskId).catch((e: unknown) => {
+            this.log(`working event handling failed: ${(e as Error).message}`);
+          });
         } else {
-          // Degrade (option ii): no resolvable task → no stall refresh.
-          this.log(`working event pane '${evt.pane}' resolves to no task; stall refresh skipped`);
+          // A signal can beat the next /state poll (especially on a fresh
+          // launch). Give the snapshot one compare to catch up before
+          // declaring the prefix reverse lookup broken.
+          this.queueUnresolvedWorkingEvent(evt);
         }
         return;
       case "blocked": {
@@ -733,11 +1107,16 @@ export class Notifier {
   }
 
   /**
-   * done → immediate compare + cross-validation: first the event
-   * pane is resolved to a task (4.4 naming, or the role-pane reverse
-   * lookup). If that task's waiting_for did not advance, wait one interval
-   * (or ≥2s) and recheck — only still-no-advance notifies "Agent stopped but
-   * did not publish context". Unresolvable pane degrades to a single compare.
+   * done → pane sweep + immediate compare + cross-validation: the sweep
+   * first — the task's round panes are archived into the log BEFORE the
+   * compare can trigger the next round's launcher (which reaps them); the
+   * per-task sweep barrier (see sweepBarriers) additionally parks any
+   * concurrently-running compare's autoLaunch for this task until the sweep
+   * settles, closing the poll-races-the-sweep window. Then the event pane is
+   * resolved to a task (4.4 naming, or the role-pane reverse lookup); if
+   * that task's waiting_for did not advance, wait one interval (or ≥2s) and
+   * recheck — only still-no-advance notifies "Agent stopped but did not
+   * publish context". Unresolvable pane degrades to a single compare.
    */
   private async handleDone(evt: AgentEvent, taskId: string | null): Promise<void> {
     if (taskId === null) {
@@ -752,6 +1131,7 @@ export class Notifier {
       await this.requestCompare();
       return;
     }
+    await this.runDoneSweep(taskId);
     const via = taskId !== evt.pane ? ` (pane ${evt.pane})` : "";
     const wfAtEvent = atEvent.waiting_for;
     await this.requestCompare(); // may coalesce with a concurrent tick (one action)
@@ -773,6 +1153,78 @@ export class Notifier {
         .catch(() => undefined);
     }, delayMs);
     this.timers.add(timer);
+  }
+
+  /**
+   * Runs the task's done sweep under a per-task barrier: the barrier is
+   * registered SYNCHRONOUSLY before the first await, so any autoLaunch that
+   * starts after the done event lands will see it. The sweep never rejects
+   * (best-effort semantics live inside sweepTaskPanes); an unexpected throw
+   * is still caught so a parked autoLaunch can never hang on it.
+   */
+  private async runDoneSweep(taskId: string): Promise<void> {
+    const sweep = this.sweepTaskPanes(taskId).catch((e: unknown) => {
+      this.log(`[${taskId}] done sweep failed unexpectedly: ${(e as Error).message}`);
+    });
+    this.sweepBarriers.set(taskId, sweep);
+    await sweep;
+    if (this.sweepBarriers.get(taskId) === sweep) this.sweepBarriers.delete(taskId);
+  }
+
+  /** Awaits the task's in-flight done sweep, if any (no-op otherwise). */
+  private async awaitSweepBarrier(taskId: string): Promise<void> {
+    const barrier = this.sweepBarriers.get(taskId);
+    if (barrier !== undefined) await barrier;
+  }
+
+  /**
+   * Done-event pane sweep (supply hardening): archive the final visible
+   * screen of every pane labeled `<taskId>.*` into the notify log — the
+   * "agent did the work but never published" evidence trail. EVERY content
+   * line carries the same parseable ISO timestamp and the pane label (the
+   * header is a separator, never the lines' only timestamp carrier — lines
+   * must stay self-describing when read away from their header). Scoped
+   * strictly to the task's round-pane namespace (4.4): panes of other
+   * tasks, system panes (tut-hub/tut-notify), and unlabeled panes are never
+   * read. Best-effort: a failed inventory logs a note; a failed read logs
+   * per pane and moves on — the sweep must never break the done flow (and
+   * settling — success OR recorded failure — is what releases the barrier).
+   */
+  private async sweepTaskPanes(taskId: string): Promise<void> {
+    let panes: PaneSnapshot[];
+    try {
+      panes = await this.paneLister();
+    } catch (e) {
+      this.log(`[${taskId}] done sweep skipped: pane list failed (${(e as Error).message})`);
+      return;
+    }
+    // Prefix match is exact at the namespace boundary: task slugs carry no
+    // dots (slug alphabet [a-z0-9-]), so `${taskId}.` cannot span into a
+    // longer task's namespace (t1. never matches t1-long.*).
+    const scoped = panes.filter((p) => p.label.startsWith(`${taskId}.`));
+    if (scoped.length === 0) {
+      this.log(`[${taskId}] done sweep: no round panes left to snapshot`);
+      return;
+    }
+    const at = new Date(this.deps.now()).toISOString();
+    for (const pane of scoped) {
+      let screen: string;
+      try {
+        screen = await this.paneReader(pane.pane_id);
+      } catch (e) {
+        this.log(`[${taskId}] done sweep: pane '${pane.label}' (${pane.pane_id}) read failed (${(e as Error).message})`);
+        continue;
+      }
+      this.log(`[${taskId}] done sweep — pane '${pane.label}' (${pane.pane_id}) final screen @ ${at}:`);
+      const lines = screen.replace(/\n+$/, "").split("\n");
+      if (lines.length === 1 && lines[0] === "") {
+        this.log(`[${taskId}] sweep ${at} ${pane.label} | (empty screen)`);
+        continue;
+      }
+      for (const line of lines) {
+        this.log(`[${taskId}] sweep ${at} ${pane.label} | ${line}`);
+      }
+    }
   }
 
   // --- event HTTP listener (loopback Host guard mirrors src/http.ts) ---------------
@@ -858,6 +1310,11 @@ export class Notifier {
     }
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
+    this.workingWatches.clear();
+    this.inFlightLaunches.clear();
+    this.earlyWorkingSignals.clear();
+    this.unresolvedWorkingEvents.clear();
+    this.sweepBarriers.clear();
     const server = this.server;
     this.server = null;
     if (server !== null) {

@@ -20,6 +20,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startServer } from "./server.js";
 import { runNotify } from "./notifier.js";
+import {
+  autoSectionOf,
+  CONFIG_KEYS,
+  configKeysHint,
+  configPath,
+  parseConfigValue,
+  readConfigFile,
+  writeConfigKey,
+  type Config,
+  type ReadOutcome,
+} from "./config.js";
 import { launchBlocked, latestRecordVersion, markLaunched, readLaunchLog, resolveLaunchTarget } from "./launch.js";
 import { KNOWN_ROLES, defaultUserConfigDir, resolveAgent } from "./workspace.js";
 import {
@@ -47,11 +58,24 @@ export const USAGE = `tut — Take Ur Turn Context Hub
 Usage:
   tut serve [--port <n>] [--root <dir>]
       Start the Context Hub (MCP + /state). Default 127.0.0.1:3001; port 0 = ephemeral.
-  tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>]
+  tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>] [--working-timeout <s>]
       Run the Notifier (poll /state, receive agent events, notify via channels).
-      Defaults: url http://127.0.0.1:3001, interval 5s, event-port 3002, stall-timeout 30min.
+      Defaults: url http://127.0.0.1:3001, interval 5s, event-port 3002,
+      stall-timeout 30min, launch-working timeout 300s.
   tut mode <manual|auto> [--url <u>]
       Switch flow_mode (takes effect on the next poll cycle).
+  tut config get <key> [--root <dir>]
+  tut config set <key> <value> [--root <dir>]
+      Read / write project runtime config (.context-hub/config.json — the
+      file serve re-reads every request, so writes take effect on the next
+      poll cycle, no restart; works with the Hub down, same discipline as
+      tut assign). Keys: flow_mode ("manual"|"auto" — the offline equivalent
+      of tut mode), auto.launch_roles (comma-separated role whitelist,
+      "" clears). get also reads notify (read-only: an object config,
+      edit config.json by hand). Unknown keys and illegal values are
+      rejected with the available keys and their value domains. Default
+      --root: .context-hub (relative to cwd — run from the project root,
+      the same root tut serve defaults to).
   tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
       Human-confirmed launch of the next agent. Without task_id: pick the single
       task waiting on an agent (none → list human-waiting tasks; ambiguous →
@@ -60,6 +84,17 @@ Usage:
       --force): force-close the task's same-role pane and birth a brand-new
       one — the explicit outside-perspective choice (system-design 4.4);
       the Notifier never passes it.
+  tut watch [<task_id>] [--url <u>] [--interval <s>]
+      Watch a task until its derived state changes, then exit with a code
+      for the situation: 0 = round boundary (a new record advanced the
+      state — someone's turn, including the pending_approval human gate),
+      2 = terminal state (approved / closed), 3 = needs attention,
+      1 = operational error (unreachable Hub, unknown task, ambiguous
+      selection). Baseline is the state at start; a task ALREADY terminal
+      or needs-attention exits immediately. Without task_id: the single
+      task waiting for an agent (same default selection as start-next).
+      Default interval 5s; transient fetch failures are retried with a
+      throttled warning.
   tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
       Create a task; prints task_id, status, version. flow picks the workflow
       (immutable after creation, default full): full = design → implement →
@@ -110,9 +145,19 @@ Usage:
 
 export type ParsedArgs =
   | { command: "serve"; port?: number; root: string }
-  | { command: "notify"; url: string; interval: number; eventPort: number; stallTimeoutMin: number }
+  | {
+      command: "notify";
+      url: string;
+      interval: number;
+      eventPort: number;
+      stallTimeoutMin: number;
+      /** Optional so the default parse shape remains backward compatible. */
+      workingTimeoutSec?: number;
+    }
   | { command: "mode"; mode: "manual" | "auto"; url: string }
+  | { command: "config"; action: "get" | "set"; key: string; value?: string; root: string }
   | { command: "start-next"; task_id?: string; url: string; force: boolean; fresh: boolean }
+  | { command: "watch"; task_id?: string; url: string; interval: number }
   | { command: "create"; title: string; description: string; creator: string; role: string; flow?: Flow; cast?: Cast; url?: string }
   | {
       command: "publish";
@@ -244,18 +289,33 @@ function parseServe(args: readonly string[]): ParsedArgs {
 }
 
 function parseNotify(args: readonly string[]): ParsedArgs {
-  const t = tokenize(args, { values: new Set(["url", "interval", "event-port", "stall-timeout"]) });
+  const t = tokenize(args, {
+    values: new Set(["url", "interval", "event-port", "stall-timeout", "working-timeout", "launch-working-timeout", "launch-timeout"]),
+  });
   if ("error" in t) return { command: "usage", error: t.error };
   for (const name of ["interval", "event-port", "stall-timeout"] as const) {
     const err = flagError(intFlag(t, name));
     if (err !== undefined) return { command: "usage", error: err };
   }
+  const workingFlags = ["working-timeout", "launch-working-timeout", "launch-timeout"] as const;
+  const workingValues: number[] = [];
+  for (const name of workingFlags) {
+    const err = flagError(intFlag(t, name));
+    if (err !== undefined) return { command: "usage", error: err };
+    const value = flagValue(intFlag(t, name));
+    if (value !== undefined) workingValues.push(value);
+  }
+  if (workingValues.length > 1) {
+    return { command: "usage", error: "notify accepts only one working-timeout flag" };
+  }
+  const workingTimeoutSec = workingValues[0];
   return {
     command: "notify",
     url: strFlag(t, "url") ?? "http://127.0.0.1:3001",
     interval: flagValue(intFlag(t, "interval")) ?? 5,
     eventPort: flagValue(intFlag(t, "event-port")) ?? 3002,
     stallTimeoutMin: flagValue(intFlag(t, "stall-timeout")) ?? 30,
+    ...(workingTimeoutSec !== undefined ? { workingTimeoutSec } : {}),
   };
 }
 
@@ -271,6 +331,31 @@ function parseMode(args: readonly string[]): ParsedArgs {
   return { command: "mode", mode, url: strFlag(t, "url") ?? "http://127.0.0.1:3001" };
 }
 
+function parseConfig(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(["root"]) });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const action = t.positionals[0];
+  if (action !== "get" && action !== "set") {
+    return { command: "usage", error: `config action must be get or set, got: ${action ?? "(missing)"}` };
+  }
+  const key = t.positionals[1];
+  if (key === undefined || key.length === 0) {
+    return { command: "usage", error: `config ${action} requires a key` };
+  }
+  if (action === "get") {
+    const extra = extraPositionalError(t, 2);
+    if (extra !== undefined) return { command: "usage", error: extra };
+    return { command: "config", action, key, root: strFlag(t, "root") ?? ".context-hub" };
+  }
+  const value = t.positionals[2];
+  if (value === undefined) {
+    return { command: "usage", error: "config set requires a value (use \"\" to clear a list)" };
+  }
+  const extra = extraPositionalError(t, 3);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  return { command: "config", action, key, value, root: strFlag(t, "root") ?? ".context-hub" };
+}
+
 function parseStartNext(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, { values: new Set(["url"]), bools: new Set(["force", "fresh"]) });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -283,6 +368,22 @@ function parseStartNext(args: readonly string[]): ParsedArgs {
     url: strFlag(t, "url") ?? "http://127.0.0.1:3001",
     force: t.bools.has("force"),
     fresh: t.bools.has("fresh"),
+  };
+}
+
+function parseWatch(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(["url", "interval"]) });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 1);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  const intervalErr = flagError(intFlag(t, "interval"));
+  if (intervalErr !== undefined) return { command: "usage", error: intervalErr };
+  const taskId = t.positionals[0]; // optional: same no-arg default selection as start-next
+  return {
+    command: "watch",
+    ...(taskId !== undefined ? { task_id: taskId } : {}),
+    url: strFlag(t, "url") ?? "http://127.0.0.1:3001",
+    interval: flagValue(intFlag(t, "interval")) ?? 5,
   };
 }
 
@@ -511,7 +612,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     case "serve": return parseServe(rest);
     case "notify": return parseNotify(rest);
     case "mode": return parseMode(rest);
+    case "config": return parseConfig(rest);
     case "start-next": return parseStartNext(rest);
+    case "watch": return parseWatch(rest);
     case "create": return parseCreate(rest);
     case "publish": return parsePublish(rest);
     case "read": return parseRead(rest);
@@ -526,7 +629,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
 }
 
 // --- handlers -----------------------------------------------------------------
-// All thirteen subcommands are wired (notify; mode/start-next/context;
+// All fifteen subcommands are wired (notify; mode/config/start-next/watch;
 // ack reuses the context publish path as a fixed human ack note; status is a
 // human overview over the context list path). Task creation is the
 // initiating side's action (tut create); the first round is an ordinary
@@ -611,9 +714,87 @@ async function runMode(parsed: Extract<ParsedArgs, { command: "mode" }>): Promis
   return 0;
 }
 
-/** Shape of GET /state consumed by start-next (six-field entries, see http.ts). */
+// --- tut config ------------------------------------------------------------------
+
+/**
+ * tut config get/set — validated read/write of the project runtime config
+ * (.context-hub/config.json, the file serve re-reads every request). get
+ * prints the EFFECTIVE value (what serve/notify would use this cycle:
+ * missing file = defaults); set is a key-preserving atomic write through
+ * config.ts (the writeFlowMode discipline). Both refuse a corrupt file
+ * rather than guessing at its contents.
+ */
+async function runConfig(parsed: Extract<ParsedArgs, { command: "config" }>): Promise<number> {
+  const root = parsed.root;
+  if (parsed.action === "get") {
+    const outcome: ReadOutcome = await readConfigFile(root);
+    if (outcome.status === "invalid") {
+      process.stderr.write(`tut: config: cannot read ${configPath(root)}: unreadable or corrupt — fix it by hand\n`);
+      return 1;
+    }
+    switch (parsed.key) {
+      case "flow_mode": {
+        const value = outcome.status === "ok" ? outcome.config.flow_mode : "manual";
+        process.stdout.write(`${value}\n`);
+        return 0;
+      }
+      case "auto.launch_roles": {
+        const value = autoSectionOf(outcome.status === "ok" ? outcome.config : null)?.launch_roles ?? [];
+        process.stdout.write(`${value.join(",")}\n`);
+        return 0;
+      }
+      case "notify": {
+        const cfg = outcome.status === "ok" ? outcome.config : null;
+        process.stdout.write(cfg !== null && "notify" in cfg ? `${JSON.stringify(cfg.notify)}\n` : "unset\n");
+        return 0;
+      }
+      default:
+        process.stderr.write(`tut: config: unknown key: ${parsed.key}\n`);
+        process.stderr.write(`tut: ${configKeysHint()}\n`);
+        return 1;
+    }
+  }
+  // set
+  if (parsed.key === "notify") {
+    process.stderr.write(`tut: config: notify is not settable here (an object config — edit ${configPath(root)} by hand)\n`);
+    return 1;
+  }
+  const key = CONFIG_KEYS.find((k) => k === parsed.key);
+  if (key === undefined) {
+    process.stderr.write(`tut: config: unknown key: ${parsed.key}\n`);
+    process.stderr.write(`tut: ${configKeysHint()}\n`);
+    return 1;
+  }
+  const parsedValue = parseConfigValue(key, parsed.value ?? "");
+  if (!parsedValue.ok) {
+    process.stderr.write(`tut: config: ${parsedValue.error}\n`);
+    return 1;
+  }
+  let config: Config;
+  try {
+    config = await writeConfigKey(root, parsedValue.assignment);
+  } catch (e) {
+    process.stderr.write(`tut: config: ${(e as Error).message}\n`);
+    return 1;
+  }
+  const rendered =
+    parsedValue.assignment.key === "flow_mode"
+      ? config.flow_mode
+      : (config.auto?.launch_roles ?? []).join(",");
+  process.stdout.write(`config: ${parsedValue.assignment.key} = ${rendered} (${configPath(root)})\n`);
+  return 0;
+}
+
+/** Shape of GET /state consumed by start-next/watch (six-field entries plus the additive version, see http.ts). */
 interface StateSnapshot {
-  tasks?: Array<{ task_id: string; status?: string; waiting_for?: string; needs_attention?: boolean }>;
+  tasks?: Array<{ task_id: string; status?: string; waiting_for?: string; needs_attention?: boolean; version?: number }>;
+}
+
+/** GET <hub>/state and status-check; throws on fetch/HTTP failure (callers own the message). */
+async function fetchStateSnapshot(url: string): Promise<StateSnapshot> {
+  const res = await fetch(new URL("/state", url));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as StateSnapshot;
 }
 
 /**
@@ -650,21 +831,19 @@ function runScript(
   });
 }
 
-async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" }>): Promise<number> {
-  let state: StateSnapshot;
-  try {
-    const res = await fetch(new URL("/state", parsed.url));
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    state = (await res.json()) as StateSnapshot;
-  } catch (e) {
-    process.stderr.write(`tut: cannot read state from ${parsed.url}: ${(e as Error).message}\n`);
-    return 1;
-  }
+/**
+ * Task selection shared by start-next and watch (watch's alignment
+ * requirement): explicit task_id wins (must exist in /state); no-arg default
+ * resolves the single task waiting for an agent (zero/multiple are
+ * list-and-fail branch exits — never guess). Prints its own diagnostics;
+ * `handled` is the process exit code.
+ */
+function selectTargetTask(
+  state: StateSnapshot,
+  explicitTaskId: string | undefined,
+): { entry: NonNullable<StateSnapshot["tasks"]>[number] } | { handled: number } {
   const tasks = state.tasks ?? [];
-  // No-arg default: resolve the task_id first (zero/multiple are branch
-  // exits), then fall through — the explicit path below is the ONLY path
-  // (guard via launch note, --force, spawn all unchanged for both ways in).
-  let taskId = parsed.task_id;
+  let taskId = explicitTaskId;
   if (taskId === undefined) {
     const candidates = agentWaitingTasks(state);
     if (candidates.length === 0) {
@@ -676,7 +855,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
         process.stderr.write("tasks waiting for a human:\n");
         for (const row of rows) process.stderr.write(`  ${padRow(row, widths)}\n`);
       }
-      return 1;
+      return { handled: 1 };
     }
     if (candidates.length > 1) {
       // List, never guess. The `!!` column mirrors
@@ -690,17 +869,35 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
       process.stderr.write(`tut: ${candidates.length} tasks are waiting for an agent — pass a task_id explicitly:\n`);
       process.stderr.write(`${padRow(["task_id", "waiting_for", "att"], widths)}\n`);
       for (const row of rows) process.stderr.write(`${padRow(row, widths)}\n`);
-      return 1;
+      return { handled: 1 };
     }
     const selected = candidates[0];
-    if (selected === undefined) return 1; // unreachable: length checked above
+    if (selected === undefined) return { handled: 1 }; // unreachable: length checked above
     taskId = selected.task_id;
   }
   const entry = tasks.find((t) => t.task_id === taskId);
   if (entry === undefined) {
     process.stderr.write(`tut: TASK_NOT_FOUND: no task ${taskId} in /state\n`);
+    return { handled: 1 };
+  }
+  return { entry };
+}
+
+async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" }>): Promise<number> {
+  let state: StateSnapshot;
+  try {
+    state = await fetchStateSnapshot(parsed.url);
+  } catch (e) {
+    process.stderr.write(`tut: cannot read state from ${parsed.url}: ${(e as Error).message}\n`);
     return 1;
   }
+  // No-arg default: resolve the task_id first (zero/multiple are branch
+  // exits), then fall through — the explicit path below is the ONLY path
+  // (guard via launch note, --force, spawn all unchanged for both ways in).
+  const target = selectTargetTask(state, parsed.task_id);
+  if ("handled" in target) return target.handled;
+  const entry = target.entry;
+  const taskId = entry.task_id;
   const waitingFor = entry.waiting_for ?? "none";
   const role = waitingFor.startsWith("agent:") ? waitingFor.slice("agent:".length) : "";
   if (role.length === 0) {
@@ -772,6 +969,116 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
   const attentionMark = entry.needs_attention === true ? ` [${ATTENTION_MARKER}]` : "";
   process.stdout.write(`start-next: launched ${role} for ${taskId} via launch.sh${attentionMark}\n`);
   return 0;
+}
+
+// --- tut watch -------------------------------------------------------------------
+
+/** Watch exit codes: three distinguishable situations + the shared operational-error code. */
+const WATCH_EXIT_ROUND = 0;
+const WATCH_EXIT_ERROR = 1;
+const WATCH_EXIT_TERMINAL = 2;
+const WATCH_EXIT_ATTENTION = 3;
+
+type WatchOutcome = "round" | "terminal" | "attention";
+
+/** terminal outranks attention: a closed task carrying leftover warnings is still over. */
+function classifyWatch(entry: NonNullable<StateSnapshot["tasks"]>[number]): WatchOutcome {
+  if (entry.status === "approved" || entry.status === "closed") return "terminal";
+  if (entry.needs_attention === true) return "attention";
+  return "round";
+}
+
+/** Any derived-field move counts as a change; version bumps on every append, so it is the primary signal. */
+function watchChanged(
+  before: NonNullable<StateSnapshot["tasks"]>[number],
+  after: NonNullable<StateSnapshot["tasks"]>[number],
+): boolean {
+  return (
+    before.version !== after.version ||
+    before.status !== after.status ||
+    before.waiting_for !== after.waiting_for ||
+    before.needs_attention !== after.needs_attention
+  );
+}
+
+/**
+ * tut watch [<task_id>] — the official round-watcher: polls /state until the
+ * task's derived state moves, then exits 0 (round boundary — someone's turn,
+ * the pending_approval human gate included), 2 (terminal approved/closed) or
+ * 3 (needs attention). Replaces the hand-written `while sleep` loops (whose
+ * pattern mistakes once misreported state): a transient fetch failure is
+ * retried (one throttled stderr line per outage), never mistaken for a state
+ * change, and the baseline snapshot is classified immediately — a task
+ * already terminal or flagged needs no waiting and exits at once.
+ */
+async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Promise<number> {
+  const intervalMs = parsed.interval * 1000;
+  let state: StateSnapshot;
+  try {
+    state = await fetchStateSnapshot(parsed.url);
+  } catch (e) {
+    process.stderr.write(`tut: cannot read state from ${parsed.url}: ${(e as Error).message}\n`);
+    return WATCH_EXIT_ERROR;
+  }
+  const target = selectTargetTask(state, parsed.task_id);
+  if ("handled" in target) return target.handled;
+  type Task = NonNullable<StateSnapshot["tasks"]>[number];
+  let entry: Task = target.entry;
+
+  const report = (outcome: WatchOutcome): number => {
+    const at = `v${entry.version ?? "?"}`;
+    const status = entry.status ?? "?";
+    if (outcome === "terminal") {
+      process.stdout.write(`watch: ${entry.task_id} reached terminal state: ${status} (${at})\n`);
+      return WATCH_EXIT_TERMINAL;
+    }
+    if (outcome === "attention") {
+      process.stdout.write(`watch: ${entry.task_id} needs attention (status=${status}, ${at}) — inspect with: tut read ${entry.task_id}\n`);
+      return WATCH_EXIT_ATTENTION;
+    }
+    process.stdout.write(
+      `watch: ${entry.task_id} advanced to ${at} (status=${status}, waiting_for=${entry.waiting_for ?? "?"}) — round boundary\n`,
+    );
+    return WATCH_EXIT_ROUND;
+  };
+
+  // Baseline classification: an already-terminal or already-flagged task has
+  // nothing to wait for — exit at once with the corresponding code.
+  const baseline = classifyWatch(entry);
+  if (baseline !== "round") return report(baseline);
+  process.stderr.write(
+    `watch: ${entry.task_id} v${entry.version ?? "?"} (status=${entry.status ?? "?"}, waiting_for=${entry.waiting_for ?? "?"}) — polling every ${parsed.interval}s\n`,
+  );
+
+  let fetchOk = true;
+  for (;;) {
+    await sleepMs(intervalMs);
+    let next: StateSnapshot;
+    try {
+      next = await fetchStateSnapshot(parsed.url);
+      fetchOk = true;
+    } catch (e) {
+      // A dead hub reads as "keep waiting", never as a state change (the
+      // classic hand-loop bug): one throttled warning per outage, then retry.
+      if (fetchOk) {
+        process.stderr.write(`watch: hub unreachable, retrying: ${(e as Error).message}\n`);
+        fetchOk = false;
+      }
+      continue;
+    }
+    const fresh = (next.tasks ?? []).find((t) => t.task_id === entry.task_id);
+    if (fresh === undefined) {
+      // Records are append-only; a task cannot leave /state. Fatal, not retryable.
+      process.stderr.write(`watch: task ${entry.task_id} disappeared from /state — aborting\n`);
+      return WATCH_EXIT_ERROR;
+    }
+    if (!watchChanged(entry, fresh)) {
+      entry = fresh; // re-baseline; updated_at churn alone is not a change signal
+      continue;
+    }
+    entry = fresh;
+    return report(classifyWatch(entry));
+  }
 }
 
 async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Promise<number> {
@@ -1622,6 +1929,7 @@ export const HANDLERS = {
         interval: parsed.interval,
         eventPort: parsed.eventPort,
         stallTimeoutMin: parsed.stallTimeoutMin,
+        ...(parsed.workingTimeoutSec !== undefined ? { workingTimeoutSec: parsed.workingTimeoutSec } : {}),
       });
     } catch (e: unknown) {
       // e.g. EADDRINUSE on the event port — fatal, visible in the dedicated pane.
@@ -1631,7 +1939,9 @@ export const HANDLERS = {
     return 0;
   }) as Handler<Extract<ParsedArgs, { command: "notify" }>>,
   mode: runMode,
+  config: runConfig,
   startNext: runStartNext,
+  watch: runWatch,
   create: runCreate,
   publish: runPublish,
   read: runRead,
@@ -1655,7 +1965,9 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     case "serve": return HANDLERS.serve(parsed);
     case "notify": return HANDLERS.notify(parsed);
     case "mode": return HANDLERS.mode(parsed);
+    case "config": return HANDLERS.config(parsed);
     case "start-next": return HANDLERS.startNext(parsed);
+    case "watch": return HANDLERS.watch(parsed);
     case "create": return HANDLERS.create(parsed);
     case "publish": return HANDLERS.publish(parsed);
     case "read": return HANDLERS.read(parsed);

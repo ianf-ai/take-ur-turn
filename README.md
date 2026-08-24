@@ -139,9 +139,12 @@ Running `tut` with no arguments prints the full USAGE. Quoted verbatim:
 
 ```
 tut serve [--port <n>] [--root <dir>]
-tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>]
+tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>] [--working-timeout <s>]
 tut mode <manual|auto> [--url <u>]
+tut config get <key> [--root <dir>]
+tut config set <key> <value> [--root <dir>]
 tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
+tut watch [<task_id>] [--url <u>] [--interval <s>]
 tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
 tut publish <task_id> --role <r> --content-type <t> --summary <s>
              (--body <text> | --payload-file <md>)
@@ -192,6 +195,8 @@ Governs Hub and Notifier behavior. Changes take effect on the next polling cycle
 | `notify` | Notification channels: `channels` (desktop / webhook, etc.) and `webhook_url` | unset = terminal bell plus notify-pane log |
 | `auto.launch_roles` | Launch whitelist for auto mode (keyed by role, e.g. `["executor","reviewer"]`). **Empty by default = every round falls back to notifying the human** — rounds not on the whitelist are never auto-launched and leave no launch trace; the human's manual starts are unaffected | `[]` |
 
+`flow_mode` and `auto.launch_roles` can also be managed without hand-editing JSON: `tut config get <key>` / `tut config set <key> <value>` (validated keys and value domains; `tut config set flow_mode auto` is the offline equivalent of `tut mode`, and it works with the Hub down — same discipline as `tut assign`). The Hub re-reads this file on every request, so writes take effect on the next poll cycle, no restart needed.
+
 ### ② Workspace lineup — three-level resolution chain (project → user → built-in)
 
 Which Agent CLI serves each role (for tasks created without an explicit `--cast`). Per-field fallback, level by level — a missing or corrupt file simply counts as that level being absent, and each role key falls back on its own:
@@ -224,6 +229,7 @@ File shape (only what you want to change needs to be present; entries may carry 
 | `--port <n>` | listen port for `tut serve` | `3001` |
 | `--url <u>` | Hub address override (for `tut up` and the context/approval commands; accepts loopback addresses with an explicit port only) | `http://127.0.0.1:3001` |
 | `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | polling interval / agent event port / stall timeout for `tut notify` | `5s` / `3002` / `30min` |
+| `--working-timeout <s>` | launch-to-working short-fuse timeout for `tut notify`; alerts when no working signal arrives | `300s` |
 | `--root <dir>` | storage root for `tut serve` | current directory |
 | env `TUT_UP_CLI_SELF` | path of the tut CLI itself, used when `tut up` provisions panes | auto-detected (dist layout) |
 | env `TUT_SPLIT_BASE` | birth-anchor escape hatch: pane id whose (workspace, cwd) anchors fresh-pane births when no tut-hub/tut-notify pane is reachable | auto-detected |

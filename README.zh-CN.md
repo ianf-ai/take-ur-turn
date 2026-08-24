@@ -139,9 +139,12 @@ url = "http://127.0.0.1:3001/mcp"
 
 ```
 tut serve [--port <n>] [--root <dir>]
-tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>]
+tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>] [--working-timeout <s>]
 tut mode <manual|auto> [--url <u>]
+tut config get <key> [--root <dir>]
+tut config set <key> <value> [--root <dir>]
 tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
+tut watch [<task_id>] [--url <u>] [--interval <s>]
 tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
 tut publish <task_id> --role <r> --content-type <t> --summary <s>
              (--body <text> | --payload-file <md>)
@@ -192,6 +195,8 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 | `notify` | 通知渠道：`channels`（desktop / webhook 等）与 `webhook_url` | 未配置 = 终端 bell 与 notify pane 日志 |
 | `auto.launch_roles` | auto 模式的启动白名单（按 role 键控，如 `["executor","reviewer"]`）。**缺省空 = 全部回落通知人**——不在白名单的轮次不自动启动、不落启动痕，人的手动启动不受影响 | `[]` |
 
+`flow_mode` 与 `auto.launch_roles` 无需手编 JSON：`tut config get <key>` / `tut config set <key> <value>`（键与值域均校验；`tut config set flow_mode auto` 即 `tut mode` 的离线等价，Hub 未起也能用——与 `tut assign` 同纪律）。Hub 每次请求现读此文件，写入下个轮询周期即生效，无需重启。
+
 ### ② 工作区阵容 — 三级解析链（项目 → 用户 → 内置）
 
 每个 role 由哪个 Agent CLI 出演（建单未显式指定 `--cast` 时按它解析）。逐字段逐级回退——文件缺失或损坏视为该级缺席，role 键各自独立回退：
@@ -224,6 +229,7 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 | `--port <n>` | `tut serve` 的监听端口 | `3001` |
 | `--url <u>` | Hub 地址覆盖（`tut up` 与上下文/审批命令；仅接受 loopback + 显式端口的地址） | `http://127.0.0.1:3001` |
 | `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | `tut notify` 的轮询间隔 / Agent 事件端口 / stall 超时 | `5s` / `3002` / `30min` |
+| `--working-timeout <s>` | `tut notify` 的 launch → working 短引信；超时未收到 working 信号时告警 | `300s` |
 | `--root <dir>` | `tut serve` 的存储根目录 | 当前目录 |
 | env `TUT_UP_CLI_SELF` | `tut up` 供给 panes 时用的自身 CLI 路径 | 自动解析（dist 布局） |
 | env `TUT_SPLIT_BASE` | birth 锚定逃生舱：无 tut-hub/tut-notify pane 可达时，以该 pane 的（workspace, cwd）锚定新 pane 诞生 | 自动解析 |
