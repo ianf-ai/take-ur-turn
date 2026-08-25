@@ -449,6 +449,10 @@ describe("tut up (behavior)", () => {
       expect(io.out()).toContain("up: hub already running");
       expect(io.out()).toContain("up: notify already listening");
       expect(io.out()).toContain("up: agent panes are on-demand");
+      // Tail activation block (final wording): pure intent, no paths.
+      expect(io.out()).toContain("up: activate a Host — tell any coding-agent session in this repo:");
+      expect(io.out()).toContain("「担任 TUT Host，全程驱动这个任务：<你的需求>」");
+      expect(io.out()).toContain("drive this task end to end");
     } finally {
       io.restore();
     }
@@ -483,6 +487,9 @@ describe("tut up (behavior)", () => {
       expect(out).toContain(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`);
       // No role-pane actions, just the on-demand note.
       expect(out).toContain("up: agent panes are on-demand — launchers raise them at hand-off");
+      // The activation block prints in dry-run too (ruling: --dry-run 同样打印).
+      expect(out).toContain("up: activate a Host — tell any coding-agent session in this repo:");
+      expect(out).toContain("「担任 TUT Host，全程驱动这个任务：<你的需求>」");
       expect(out).not.toContain("invariants seed"); // hub down → hint suppressed in dry-run
     } finally {
       io.restore();
