@@ -106,6 +106,22 @@ describe("GET /state (frozen shape)", () => {
     expect(body.tasks.map((t) => t.task_id)).not.toContain("project");
   });
 
+  it("exposes parameterized cast argv unchanged on the HTTP state seam", async () => {
+    const cast = { executor: { agent: "codex", args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] } };
+    const created = await store.createTask({
+      title: "Parameterized HTTP task",
+      description: "state route",
+      creator: "tester",
+      role: "architect",
+      cast,
+    });
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { tasks: Array<{ task_id: string; cast?: unknown }> };
+    expect(body.tasks.find((task) => task.task_id === created.task_id)?.cast).toEqual(cast);
+  });
+
   it("skips a task with a corrupt record file instead of 500ing ", async () => {
     // A second, healthy task so the listing still has derived content.
     const created = await store.createTask({

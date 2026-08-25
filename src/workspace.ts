@@ -24,7 +24,8 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { Cast } from "./types.js";
+import { AgentCommandError, formatAgentRoute, parseAgentRoute, validateAgentRoute } from "./agent-command.js";
+import type { AgentRoute, Cast } from "./types.js";
 
 /** Built-in default lineup (L3). Role → agent; values frozen. */
 export const DEFAULT_ROLES: Record<string, string> = {
@@ -57,8 +58,8 @@ export function defaultUserConfigDir(): string {
 
 /** Parsed workspace config file: roles per-key + naming.tab_label. */
 interface WorkspaceLevels {
-  /** role → agent, per level (index 0 = L1, 1 = L2). */
-  roles: [Record<string, string>, Record<string, string>];
+  /** role → route, per level (index 0 = L1, 1 = L2). */
+  roles: [Record<string, AgentRoute>, Record<string, AgentRoute>];
   tabLabel: [string | undefined, string | undefined];
 }
 
@@ -73,15 +74,29 @@ async function readJson(file: string): Promise<Record<string, unknown> | null> {
   }
 }
 
-/** roles.<role> entries → role → agent map (`.agent` only; extra keys ignored). */
-function parseRoles(raw: Record<string, unknown> | null): Record<string, string> {
-  const out: Record<string, string> = {};
+/**
+ * roles.<role> entries → role → route map. Legacy `{label, agent}` entries
+ * remain readable; new `{agent,args}` entries are normalized and invalid
+ * routes make only that role absent so the chain can fall through.
+ */
+function parseRoles(raw: Record<string, unknown> | null): Record<string, AgentRoute> {
+  const out: Record<string, AgentRoute> = {};
   const roles = raw?.roles;
   if (roles === undefined || typeof roles !== "object" || roles === null || Array.isArray(roles)) return out;
   for (const [role, entry] of Object.entries(roles as Record<string, unknown>)) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const agent = (entry as Record<string, unknown>).agent;
-    if (typeof agent === "string" && agent.length > 0) out[role] = agent;
+    const fields = entry as Record<string, unknown>;
+    const agent = fields.agent;
+    try {
+      if (typeof agent !== "string" || agent.length === 0) continue;
+      out[role] = fields.args === undefined
+        ? parseAgentRoute(agent, `workspace role '${role}'`)
+        : validateAgentRoute({ agent, args: fields.args }, `workspace role '${role}'`);
+    } catch (e) {
+      // Workspace files are external declarations: a malformed role is
+      // treated as absent and that role falls through to the next level.
+      if (!(e instanceof AgentCommandError)) continue;
+    }
   }
   return out;
 }
@@ -107,11 +122,30 @@ async function readLevels(opts: ResolveOptions): Promise<WorkspaceLevels> {
  * Resolve a role to its agent. Order (frozen): task cast → L1 project file
  * → L2 user file → DEFAULT_ROLES. Per-role fallback across levels.
  */
-export async function resolveAgent(role: string, cast?: Cast, opts: ResolveOptions = {}): Promise<string> {
+function parseRouteForResolution(route: AgentRoute, field: string): AgentRoute {
+  return typeof route === "string" ? parseAgentRoute(route, field) : validateAgentRoute(route, field);
+}
+
+export async function resolveAgentRoute(role: string, cast?: Cast, opts: ResolveOptions = {}): Promise<AgentRoute> {
   const fromCast = cast?.[role as keyof Cast];
-  if (typeof fromCast === "string" && fromCast.length > 0) return fromCast;
+  if (fromCast !== undefined) {
+    // A task cast is an explicit routing decision. Invalid input must stop at
+    // the launch pre-check; silently falling through to a workspace/default
+    // agent could launch the wrong executable and leave a misleading marker.
+    return parseRouteForResolution(fromCast, `cast role '${role}'`);
+  }
   const levels = await readLevels(opts);
   return levels.roles[0][role] ?? levels.roles[1][role] ?? DEFAULT_ROLES[role] ?? UNKNOWN_ROLE_AGENT;
+}
+
+/**
+ * Backward-compatible display wrapper. Existing callers that only know the
+ * old string contract receive a bare name for legacy routes and a stable
+ * shell-neutral display string for parameterized routes. Launch consumers use
+ * resolveAgentRoute so args never need to be reparsed.
+ */
+export async function resolveAgent(role: string, cast?: Cast, opts: ResolveOptions = {}): Promise<string> {
+  return formatAgentRoute(await resolveAgentRoute(role, cast, opts));
 }
 
 /**

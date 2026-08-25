@@ -9,6 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import http from "node:http";
 import net from "node:net";
 import type { AddressInfo } from "node:net";
+import { readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 // Recording mock for the channel factory: notifier.ts must build its channel
 // set from /state's notify value EVERY poll.
@@ -27,9 +30,9 @@ vi.mock("../src/channels.js", () => ({
   },
 }));
 
-import { Notifier, runNotify, type StateResponse, type StateTask } from "../src/notifier.js";
+import { Notifier, runNotify, spawnLaunch, type StateResponse, type StateTask } from "../src/notifier.js";
 import { launchBlocked } from "../src/launch.js";
-import type { ContextRecord } from "../src/types.js";
+import type { AgentRoute, ContextRecord } from "../src/types.js";
 import { HANDLERS, parseArgs } from "../src/cli.js";
 
 const U1 = "2026-08-15T10:00:00.000Z";
@@ -71,10 +74,12 @@ interface HarnessOpts {
   workingTimeoutSec?: number;
   eventPort?: number;
   realLaunch?: boolean;
-  launch?: (taskId: string, role: string, agent: string) => Promise<string>;
+  launch?: (taskId: string, role: string, agent: string, args?: string[]) => Promise<string>;
   readLog?: (taskId: string) => Promise<ContextRecord[]>;
   /** Agent the injected launch pre-check resolves (default "pi"). */
   agent?: string;
+  /** Complete route the injected launch pre-check resolves. */
+  route?: AgentRoute;
   /** Routing maps for event→task mapping tests; omitted = empty maps (no role panes). */
   routing?: { labelToAgent?: Record<string, string>; roleToAgent?: Record<string, string> };
   /** Use the REAL chain loader (defaultLoadRouting: cwd L1 + TUT_USER_CONFIG_DIR L2). */
@@ -104,7 +109,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   let failing = false;
   let nowMs = 0;
   const logs: string[] = [];
-  const launches: { taskId: string; role: string; agent: string }[] = [];
+  const launches: { taskId: string; role: string; agent: string; args?: string[] }[] = [];
   const sweptReads: string[] = [];
   let sweepLists = 0;
   let fetches = 0;
@@ -127,15 +132,15 @@ function makeHarness(opts: HarnessOpts = {}) {
         : opts.realLaunch === true
           ? {}
           : {
-              launch: async (taskId: string, role: string, agent: string) => {
+              launch: async (taskId: string, role: string, agent: string, args: string[] = []) => {
                 opts.order?.push("launch");
-                launches.push({ taskId, role, agent });
+                launches.push({ taskId, role, agent, ...(args.length > 0 ? { args: [...args] } : {}) });
                 return "launched";
               },
             }),
       // launch pre-check (hermetic): the real default hits GET /state of the hub
       // url + `which` — tests inject a fixed resolution instead.
-      resolveTarget: async () => opts.agent ?? "pi",
+      resolveTarget: async () => opts.route ?? opts.agent ?? "pi",
       // Auto-launch provenance is exercised with dedicated injected-deps
       // tests below; the legacy state-only harness keeps an empty log so its
       // synthetic state transitions remain independently focused.
@@ -441,6 +446,22 @@ describe("auto-mode gate", () => {
     expect(hz.launches).toEqual([{ taskId: "t1", role: "executor", agent: "pi" }]);
     expect(titlesMatching("auto-launched executor")).toHaveLength(1);
     expect(titlesMatching("waiting for")).toHaveLength(0); // manual-style notify not used in auto
+  });
+
+  it("passes a parameterized cast to the auto launcher with complete ordered args", async () => {
+    const route = { agent: "codex", args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] };
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], route });
+    await hz.notifier.requestCompare();
+    hz.set(
+      state(
+        [task({ task_id: "t-args", status: "implementing", waiting_for: "agent:executor", updated_at: U2, cast: { executor: route } })],
+        { flow_mode: "auto", auto: ALL_ROLES },
+      ),
+    );
+    await hz.notifier.requestCompare();
+
+    expect(hz.launches).toEqual([{ taskId: "t-args", role: "executor", agent: "codex", args: route.args }]);
+    expect(titlesMatching("auto-launched executor")).toHaveLength(1);
   });
 
   it("reports auto launch and agent working as two separate stages", async () => {
@@ -1508,6 +1529,25 @@ describe("event→task mapping (agent-keyed panes)", () => {
     roleToAgent: { architect: "codex", executor: "pi", reviewer: "codex" },
   };
 
+  it("matches a parameterized cast by its executable head for a bare agent pane", async () => {
+    const hz = makeHarness({ routing: ROUTING });
+    hz.set(
+      state([
+        task({
+          task_id: "cast-event",
+          status: "implementing",
+          waiting_for: "agent:executor",
+          cast: { executor: { agent: "codex", args: ["--model", "gpt-5.6", "--search"] } },
+        }),
+      ]),
+    );
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "working", agent: "codex", pane: "codex" });
+    await hz.flush();
+
+    expect(hz.logs.some((l) => l.includes("working event pane 'codex' resolved to task cast-event"))).toBe(true);
+  });
+
   it("retries a round-pane prefix after a working event beats the first state snapshot", async () => {
     const hz = makeHarness({ routing: ROUTING });
     // The task is already in the Hub, but the notifier has not polled it yet.
@@ -1888,4 +1928,64 @@ describe("runNotify and cli wiring", () => {
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
   });
+});
+
+describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", () => {
+  it(
+    "tees launch.sh stderr live while resolving stdout on success — tut-delivery lines survive a SUCCESSFUL launch",
+    async () => {
+      // rationale: the swallowed-Enter lottery is caught by the
+      // step-timestamped diagnostics on launch.sh's stderr — which the
+      // default launcher used to DISCARD on success. The tee forwards every
+      // chunk to this process's stderr (the notify pane, 8.2: stdio is the
+      // log) while the promise still resolves with stdout ("").
+      vi.useRealTimers();
+      const FIXTURE_BIN = path.join(path.resolve(import.meta.dirname, ".."), "test", "bin");
+      const log = path.join(os.tmpdir(), `tut-tee-${process.pid}.log`);
+      rmSync(log, { force: true });
+      const seen: string[] = [];
+      const spy = vi.spyOn(process.stderr, "write").mockImplementation(((c: unknown) => {
+        seen.push(String(c));
+        return true;
+      }) as typeof process.stderr.write);
+      try {
+        const out = await spawnLaunch("t-tee", "executor", "pi", [], {
+          ...process.env,
+          PATH: `${FIXTURE_BIN}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+          TUT_HERDR_LOG: log,
+          TUT_HERDR_PANES: JSON.stringify([
+            { pane_id: "w9:p0", label: "hub", workspace_id: "w9", cwd: "/x", agent_status: "idle" },
+          ]),
+          TUT_SPLIT_BASE: "w9:p0",
+          TUT_HUB_URL: "http://127.0.0.1:1", // hub down: file chain + stderr note
+          TUT_USER_CONFIG_DIR: path.join(os.tmpdir(), `tut-tee-l2-${process.pid}`),
+          TUT_READY_POLL_MS: "20",
+          TUT_READY_FLOOR_MS: "0",
+          TUT_READY_TIMEOUT_MS: "4000",
+          TUT_TEXT_LAND_TIMEOUT_MS: "200",
+          TUT_SUBMIT_TIMEOUT_MS: "100",
+          TUT_HERDR_READ_SCRIPT: JSON.stringify([
+            "",
+            "",
+            "pi TUI ready — status 0.0%",
+            "pi TUI ready — status 0.0%",
+            "pi TUI ready ▎prompt",
+            "working — round started",
+          ]),
+        });
+        expect(out).toBe(""); // stdout consumed as before
+        const text = seen.join("");
+        expect(text).toContain("tut-delivery t="); // diagnostics were tee'd
+        expect(text).toContain("gate-release pane=FIX:root1");
+        expect(text).toContain("submit-confirmed pane=FIX:root1 attempt=1");
+        // The birth really ran against the fixture (not a dry-run).
+        const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
+        expect(lines).toContain("pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+      } finally {
+        spy.mockRestore();
+        rmSync(log, { force: true });
+      }
+    },
+    20_000,
+  );
 });

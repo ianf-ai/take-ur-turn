@@ -42,8 +42,9 @@ import {
   resolveLaunchTarget,
   type LaunchVia,
 } from "./launch.js";
-import type { Cast, ContextRecord } from "./types.js";
-import { KNOWN_ROLES, resolveAgent } from "./workspace.js";
+import { commandHead, commandArgs } from "./agent-command.js";
+import type { AgentRoute, Cast, ContextRecord } from "./types.js";
+import { KNOWN_ROLES, resolveAgentRoute } from "./workspace.js";
 
 export interface NotifyOptions {
   /** Hub BASE url (default http://127.0.0.1:3001); /state is appended. */
@@ -125,7 +126,8 @@ interface InFlightLaunch {
 
 export interface NotifierDeps {
   fetchState(url: string): Promise<StateResponse>;
-  launch(taskId: string, role: string, agent: string): Promise<string>;
+  /** Launch with the same executable + ordered argv tail used by start-next. */
+  launch(taskId: string, role: string, agent: string, args?: string[]): Promise<string>;
   /** Full task log used by auto launch de-duplication; injectable for tests. */
   readLog(taskId: string): Promise<ContextRecord[]>;
   /** Append the optimistic launch marker before calling launch.sh. */
@@ -138,7 +140,7 @@ export interface NotifierDeps {
    * workspace → routes) and verify the agent is on PATH. Runs BEFORE the
    * launch marker — a failure must leave no trace. Injectable for tests.
    */
-  resolveTarget?(taskId: string, role: string): Promise<string>;
+  resolveTarget?(taskId: string, role: string): Promise<AgentRoute>;
   /**
    * Routing maps for the event→task mapping (agent-keyed). Refreshed
    * every poll so workspace.json edits apply without a notifier restart.
@@ -179,12 +181,12 @@ function commandOnPath(name: string): Promise<boolean> {
 }
 
 /** Auto-door pre-check: resolve the routed agent, require it on PATH. */
-async function defaultResolveTarget(url: string, taskId: string, role: string): Promise<string> {
-  const { agent } = await resolveLaunchTarget(url, taskId, role);
-  if (!(await commandOnPath(agent))) {
-    throw new Error(`routed agent '${agent}' is not on PATH`);
+async function defaultResolveTarget(url: string, taskId: string, role: string): Promise<AgentRoute> {
+  const target = await resolveLaunchTarget(url, taskId, role);
+  if (!(await commandOnPath(target.agent))) {
+    throw new Error(`routed agent '${target.agent}' is not on PATH`);
   }
-  return agent;
+  return target.args !== undefined ? { agent: target.agent, args: [...target.args] } : target.agent;
 }
 
 /**
@@ -198,11 +200,26 @@ async function defaultResolveTarget(url: string, taskId: string, role: string): 
  */
 const LAUNCH_SCRIPT_URL = new URL("../scripts/launch.sh", import.meta.url);
 
-async function spawnLaunch(taskId: string, role: string, agent: string): Promise<string> {
+/** Runs scripts/launch.sh <task_id> <role> <agent...>. The environment
+ *  defaults to this process's (passed through unchanged so TUT_DRY_RUN=1
+ *  makes launch.sh print the command instead of running it); injectable for
+ *  tests. The child's stderr is TEED live to this process's stderr (the
+ *  notify pane — 8.2: stdout/stderr is the log): launch.sh's delivery
+ *  diagnostics (`tut-delivery t=<ms> …`) must survive a SUCCESSFUL launch
+ *  too, or the next swallowed-Enter incident leaves no timeline. On
+ *  failure the reject message still carries the tail (duplicated in the
+ *  pane on that rare path — loud is fine). */
+export async function spawnLaunch(
+  taskId: string,
+  role: string,
+  agent: string,
+  args: string[] = [],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
   const script = fileURLToPath(LAUNCH_SCRIPT_URL);
   return await new Promise<string>((resolve, reject) => {
-    const child = spawn(script, [taskId, role, agent], {
-      env: { ...process.env },
+    const child = spawn(script, [taskId, role, agent, ...args], {
+      env: { ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -211,7 +228,9 @@ async function spawnLaunch(taskId: string, role: string, agent: string): Promise
       stdout += chunk.toString("utf8");
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      stderr += text;
+      process.stderr.write(text);
     });
     child.on("error", reject);
     child.on("exit", (code, signal) => {
@@ -256,7 +275,8 @@ export async function defaultLoadRouting(): Promise<RoutingMaps> {
   const labelToAgent = new Map<string, string>();
   const roleToAgent = new Map<string, string>();
   for (const role of KNOWN_ROLES) {
-    const agent = await resolveAgent(role); // three-level chain from cwd; never throws
+    const route = await resolveAgentRoute(role); // three-level chain from cwd; never throws
+    const agent = commandHead(route);
     roleToAgent.set(role, agent);
     labelToAgent.set(agent, agent); // agent-named pane → identity
   }
@@ -422,7 +442,7 @@ export class Notifier {
   private timers = new Set<ReturnType<typeof setTimeout>>();
   /** Resolved (non-optional) loaders built from deps. */
   private readonly routingLoader: () => Promise<RoutingMaps>;
-  private readonly targetResolver: (taskId: string, role: string) => Promise<string>;
+  private readonly targetResolver: (taskId: string, role: string) => Promise<AgentRoute>;
   private readonly paneLister: () => Promise<PaneSnapshot[]>;
   private readonly paneReader: (paneId: string) => Promise<string>;
 
@@ -657,13 +677,15 @@ export class Notifier {
     // same as tut start-next): resolve the routed agent (cast → workspace →
     // routes) and require it on PATH. A failure leaves no trace — the human's
     // start-next (or the next auto round) is not blocked.
-    let agent: string;
+    let route: AgentRoute;
     try {
-      agent = await this.targetResolver(task.task_id, role);
+      route = await this.targetResolver(task.task_id, role);
     } catch (e) {
       await this.autoLaunchFailed(task, role, new Error(`precheck failed: ${(e as Error).message}`));
       return;
     }
+    const agent = commandHead(route);
+    const args = commandArgs(route);
 
     // Done-sweep barrier (2/3, post-precheck): a done event may have landed
     // while readLog/precheck were in flight — re-check before the marker.
@@ -701,7 +723,9 @@ export class Notifier {
     const launchKey = this.workingWatchKey(task.task_id, role);
     this.inFlightLaunches.set(launchKey, { task, role, agent, ...(launchVersion !== undefined ? { launchVersion } : {}) });
     try {
-      const out = await this.deps.launch(task.task_id, role, agent);
+      const out = args.length > 0
+        ? await this.deps.launch(task.task_id, role, agent, args)
+        : await this.deps.launch(task.task_id, role, agent);
       this.inFlightLaunches.delete(launchKey);
       // Dry-run output is often multi-line (provisioning preview + delivery
       // preview); log EVERY line so the pane log shows the full launch preview.
@@ -1050,7 +1074,8 @@ export class Notifier {
     const waiting = [...snap.values()].filter((t) => {
       if (!t.waiting_for.startsWith("agent:")) return false;
       const role = t.waiting_for.slice("agent:".length);
-      const expected = t.cast?.[role as keyof Cast] ?? roleToAgent?.get(role);
+      const castRoute = t.cast?.[role as keyof Cast];
+      const expected = castRoute !== undefined ? commandHead(castRoute) : roleToAgent?.get(role);
       return expected === identity;
     });
     if (waiting.length === 0) return null;

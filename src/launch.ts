@@ -8,8 +8,9 @@
  */
 
 import { hubPublish, hubRead, type HubPublishResult } from "./hub-client.js";
-import { resolveAgent } from "./workspace.js";
-import type { Cast, ContextRecord } from "./types.js";
+import { commandHead, commandArgs } from "./agent-command.js";
+import { resolveAgentRoute } from "./workspace.js";
+import type { AgentRoute, Cast, ContextRecord } from "./types.js";
 
 export type LaunchVia = "start-next" | "auto";
 
@@ -79,8 +80,10 @@ export async function readLaunchLog(url: string, taskId: string): Promise<Contex
 }
 
 export interface LaunchTarget {
-  /** Agent name the launcher should raise for the role. */
+  /** Agent executable name the launcher should raise for the role. */
   agent: string;
+  /** Ordered route arguments; omitted for legacy bare routes. */
+  args?: string[];
   /** The task's cast, when /state exposes one (for callers that want the whole picture). */
   cast?: Cast;
 }
@@ -99,7 +102,14 @@ export async function resolveLaunchTarget(url: string, taskId: string, role: str
   const entry = state.tasks?.find((t) => t.task_id === taskId);
   if (entry === undefined) throw new Error(`task ${taskId} not in /state`);
   const cast = entry.cast;
-  return { agent: await resolveAgent(role, cast), ...(cast !== undefined ? { cast } : {}) };
+  const route: AgentRoute = await resolveAgentRoute(role, cast);
+  const normalizedAgent = commandHead(route);
+  const args = commandArgs(route);
+  return {
+    agent: normalizedAgent,
+    ...(args.length > 0 ? { args } : {}),
+    ...(cast !== undefined ? { cast } : {}),
+  };
 }
 
 /**

@@ -32,7 +32,7 @@ export interface HubCreateInput {
   role: string;
   /** Workflow variant: mirrors context.create's flow? — absent = "full". */
   flow?: Flow;
-  /** Per-task cast: mirrors context.create's cast? — absent = default lineup. */
+  /** Per-task cast routes: mirrors context.create's cast? — absent = default lineup. */
   cast?: Cast;
 }
 export interface HubCreateResult {
@@ -72,7 +72,7 @@ export interface HubReadResult {
   description?: string;
   /** Workflow variant, always present for task scope, normalized to "full". */
   flow?: Flow;
-  /** Per-task cast: present only when the task carries one. */
+  /** Per-task cast routes: present only when the task carries one. */
   cast?: Cast;
   status?: string;
   versions: ContextRecord[];
@@ -90,7 +90,7 @@ export interface HubListEntry {
   scope?: "project";
   /** Workflow variant, always present for task scope, normalized to "full". */
   flow?: Flow;
-  /** Per-task cast: present only when the task carries one. */
+  /** Per-task cast routes: present only when the task carries one. */
   cast?: Cast;
 }
 export interface HubListResult {

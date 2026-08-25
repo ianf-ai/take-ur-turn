@@ -78,7 +78,8 @@ const env = (panes: unknown[], extra: Record<string, string> = {}, dryRun = fals
   TUT_READY_TIMEOUT_MS: "300",
   TUT_TEXT_LAND_TIMEOUT_MS: "200",
   TUT_SUBMIT_TIMEOUT_MS: "100",
-  TUT_SUBMIT_READY_TIMEOUT_MS: "120",
+  TUT_SUBMIT_RETRY_MS: "60",
+  TUT_SUBMIT_RETRY_TIMEOUT_MS: "400",
   ...extra,
 });
 
@@ -184,7 +185,7 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
       // Closed-loop preview: land-confirm + verified-submit lines with
       // their knobs, both for the born branch.
       expect(stdout).toContain("DRY-RUN: text-land check <label:t2.reviewer> (timeout 5000ms; on timeout submit anyway)");
-      expect(stdout).toContain("DRY-RUN: submit verify <label:t2.reviewer> (timeout 3000ms; wait for readiness up to 15000ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)");
+      expect(stdout).toContain("DRY-RUN: submit verify <label:t2.reviewer> (verify 3000ms by input-box-cleared; then bounded Enter resend loop — interval 1500ms within 30000ms; exhaustion → manual-fallback note, still exit 0)");
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }
@@ -301,7 +302,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
     expect(r.stdout).toContain("DRY-RUN: herdr pane send-text w11:p6");
     expect(r.stdout).toContain("DRY-RUN: text-land check w11:p6 (timeout 200ms; on timeout submit anyway)");
     expect(r.stdout).toContain("DRY-RUN: herdr pane send-keys w11:p6 Enter");
-    expect(r.stdout).toContain("DRY-RUN: submit verify w11:p6 (timeout 100ms; wait for readiness up to 120ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)");
+    expect(r.stdout).toContain("DRY-RUN: submit verify w11:p6 (verify 100ms by input-box-cleared; then bounded Enter resend loop — interval 60ms within 400ms; exhaustion → manual-fallback note, still exit 0)");
     expect(r.stderr).toContain("same-role continuation");
     expect(r.lines.every((l) => l === "pane list")).toBe(true); // read-only discovery, nothing else
   });

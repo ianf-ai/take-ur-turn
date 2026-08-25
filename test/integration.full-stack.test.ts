@@ -156,6 +156,7 @@ interface StateView {
     updated_at: string;
     needs_attention: boolean;
     waiting_for: string;
+    cast?: Record<string, unknown>;
   }>;
   notify?: unknown;
 }
@@ -711,7 +712,7 @@ describe("--url real chain (context commands against an ephemeral-port hub)", ()
 // --- per-task cast routing (real hub, real CLI handlers, launcher dry-run) ------------
 
 describe("cast routing end-to-end", () => {
-  it("create --cast routes start-next to the cast agent; no-cast task stays on the default lineup", async () => {
+  it("create --cast routes through Hub/read/state to the fixture launcher; no-cast stays on the default lineup", async () => {
     const baseUrl = await startHubOnly();
     const io = captureIo();
     const lastJson = (): any => JSON.parse(io.out().trim().split("\n").pop()!); // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -720,9 +721,10 @@ describe("cast routing end-to-end", () => {
       // assertion can tell the cast apart from the default).
       await main([
         "create", "--title", "Cast Routing Task", "--description", "d", "--creator", "t", "--role", "architect",
-        "--cast", "executor=codex", "--url", baseUrl,
+        "--cast", "executor=codex --model gpt-5.6 --sandbox workspace-write --search", "--url", baseUrl,
       ]);
       const castId = lastJson().task_id as string;
+      const route = { agent: "codex", args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] };
       await main([
         "publish", castId, "--role", "architect", "--content-type", "design",
         "--summary", "s", "--body", "b", "--url", baseUrl,
@@ -730,11 +732,14 @@ describe("cast routing end-to-end", () => {
       lastJson(); // drain
       await main(["read", castId, "--json", "--url", baseUrl]);
       const read = lastJson() as { cast?: unknown; flow?: string };
-      expect(read.cast).toEqual({ executor: "codex" }); // round-trips through the real hub
+      expect(read.cast).toEqual({ executor: route }); // round-trips through the real MCP Hub
       expect(read.flow).toBe("full"); // deferred registration item on the real read path
+      expect((await stateEntry(baseUrl, castId)).cast).toEqual({ executor: route }); // HTTP /state seam
 
       const prev = process.env.TUT_DRY_RUN;
       process.env.TUT_DRY_RUN = "1";
+      setEnv("PATH", `${path.resolve(import.meta.dirname, "bin")}:${process.env.PATH ?? ""}`);
+      setEnv("TUT_HERDR_PANES", "[]"); // fixture Herdr makes the dry-run boundary hermetic
       // Hermetic chain for the no-cast task's resolution: clean L1 (temp
       // cwd) + pinned empty L2 → DEFAULT_ROLES (executor=pi), never the
       // repo's live .context-hub config or the machine's user-level one.
@@ -746,6 +751,7 @@ describe("cast routing end-to-end", () => {
       try {
         await main(["start-next", castId, "--url", baseUrl]);
         expect(io.out()).toContain("(agent 'codex', label"); // cast routed the round to codex
+        expect(io.out()).toContain("pane run <root> codex --model gpt-5.6 --sandbox workspace-write --search");
 
         // Regression (zero migration): a no-cast task routes through the
         // default chain (executor → pi via DEFAULT_ROLES).

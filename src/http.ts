@@ -33,7 +33,7 @@ import {
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { autoSectionOf, readConfig, writeFlowMode } from "./config.js";
 import { createMcpServer } from "./mcp.js";
-import { PROJECT_TASK_ID } from "./types.js";
+import { PROJECT_TASK_ID, type AgentRoute } from "./types.js";
 import { Store } from "./store.js";
 
 export interface RequestHandlerDeps {
@@ -92,7 +92,7 @@ interface StateTaskEntry {
   waiting_for: string;
   version: number;
   flow: string;
-  cast?: Record<string, string>;
+  cast?: Record<string, AgentRoute>;
 }
 
 export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {

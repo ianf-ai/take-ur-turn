@@ -14,7 +14,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +32,8 @@ import {
   type ReadOutcome,
 } from "./config.js";
 import { launchBlocked, latestRecordVersion, markLaunched, readLaunchLog, resolveLaunchTarget } from "./launch.js";
-import { KNOWN_ROLES, defaultUserConfigDir, resolveAgent } from "./workspace.js";
+import { KNOWN_ROLES, defaultUserConfigDir, resolveAgentRoute } from "./workspace.js";
+import { AgentCommandError, formatAgentRoute, parseAgentInvocation, parseAgentRoute } from "./agent-command.js";
 import {
   hubCreate,
   hubDecide,
@@ -44,12 +45,12 @@ import {
   type HubListResult,
   type HubReadResult,
 } from "./hub-client.js";
-import type { Cast, Flow } from "./types.js";
+import type { AgentRoute, Cast, Flow } from "./types.js";
 
 /** Human rendering of a cast: "executor=pi, reviewer=codex" (insertion order). */
 function formatCast(cast: Cast): string {
   return Object.entries(cast)
-    .map(([role, agent]) => `${role}=${agent}`)
+    .map(([role, route]) => `${role}=${formatAgentRoute(route)}`)
     .join(", ");
 }
 
@@ -95,13 +96,15 @@ Usage:
       task waiting for an agent (same default selection as start-next).
       Default interval 5s; transient fetch failures are retried with a
       throttled warning.
-  tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
+  tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=command>]... [--url <u>]
       Create a task; prints task_id, status, version. flow picks the workflow
       (immutable after creation, default full): full = design → implement →
       review → approval; direct = design already exists, starts implementing;
       solo = small change, review skipped (code_changes → approval directly).
-      cast routes individual roles of THIS task to other agents
-      (e.g. --cast executor=pi,reviewer=codex); routing only, immutable like flow.
+      cast routes individual roles of THIS task to other agents (e.g.
+      --cast executor=pi --cast 'reviewer=codex --model gpt-5.6'); routing
+      only, immutable like flow. The legacy comma form remains supported;
+      command values are shell-neutral argv words.
       create is the initiating-side action (host/human): the task exists before
       any delivery, and the first round is an ordinary round — manual mode
       starts it with tut start-next <task_id>; auto mode lets the Notifier
@@ -119,8 +122,8 @@ Usage:
   tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
       Record a human decision. decide close also reaps the task's panes
       (best-effort; the decision itself never depends on the terminal).
-  tut assign <role> <agent>
-      Change which agent occupies a role seat, writing the PROJECT-level
+  tut assign <role> <command...>
+      Change which agent command occupies a role seat, writing the PROJECT-level
       .context-hub/workspace.json (cwd). Missing file → initialized from the
       currently effective lineup (all three roles) first; a corrupt file is
       never clobbered. User-level ~/.config/tut/workspace.json is maintained
@@ -139,6 +142,17 @@ Usage:
       every task — needs_attention first, then newest updates first.
       One-shot snapshot (continuous watching is tut notify's job); --json
       prints the same filtered/sorted snapshot for scripts.
+  tut skill <host|architect|executor|reviewer>
+      Print a role skill's full text. The skills directory is resolved
+      module-relative (../skills — npm install, git clone, and npm link
+      shapes all work), read locally, zero network: runs inside
+      default-sandboxed agent sessions.
+  tut init
+      Maintain the TUT block in this project's AGENTS.md (creates the file
+      when absent; idempotent — an existing marked block is refreshed in
+      place, never duplicated). The block tells agents receiving "act as
+      TUT Host / drive this task" instructions to run 'tut skill host';
+      worker-role skills are supplied automatically by the launcher.
 `;
 
 // --- parsed shapes (frozen — handlers consume these) -------------------------
@@ -180,8 +194,10 @@ export type ParsedArgs =
   | { command: "status"; json: boolean; url?: string }
   | { command: "decide"; task_id: string; decision: "approve" | "reject" | "close"; by: string; reason?: string; url?: string }
   | { command: "ack"; task_id: string; note?: string; url?: string }
-  | { command: "assign"; role: "architect" | "executor" | "reviewer"; agent: string }
+  | { command: "assign"; role: "architect" | "executor" | "reviewer"; agent: AgentRoute }
   | { command: "up"; dryRun: boolean; url?: string }
+  | { command: "skill"; role: SkillRole }
+  | { command: "init" }
   | { command: "usage"; error?: string };
 
 // --- shared tokenizer ---------------------------------------------------------
@@ -189,6 +205,8 @@ export type ParsedArgs =
 interface Tokens {
   positionals: string[];
   flags: Map<string, string>;
+  /** All values for explicitly repeatable value flags, in input order. */
+  repeated: Map<string, string[]>;
   bools: Set<string>;
 }
 
@@ -197,11 +215,14 @@ interface FlagSpec {
   values: ReadonlySet<string>;
   /** boolean flags legal for this command */
   bools?: ReadonlySet<string>;
+  /** value flags which may occur more than once (currently create --cast). */
+  repeatable?: ReadonlySet<string>;
 }
 
 function tokenize(args: readonly string[], spec: FlagSpec): Tokens | { error: string } {
   const positionals: string[] = [];
   const flags = new Map<string, string>();
+  const repeated = new Map<string, string[]>();
   const bools = new Set<string>();
   const boolSpec = spec.bools ?? new Set<string>();
   for (let i = 0; i < args.length; i++) {
@@ -214,7 +235,19 @@ function tokenize(args: readonly string[], spec: FlagSpec): Tokens | { error: st
       if (!spec.values.has(name) && !boolSpec.has(name)) {
         return { error: `unknown argument: --${name}` };
       }
-      if (flags.has(name) || bools.has(name)) return { error: `duplicate flag: --${name}` };
+      if (flags.has(name) || bools.has(name)) {
+        if (!spec.repeatable?.has(name) || bools.has(name)) return { error: `duplicate flag: --${name}` };
+        const next = args[i + 1];
+        if (eq === -1 && (next === undefined || next.startsWith("--"))) {
+          return { error: `--${name} requires a value` };
+        }
+        const value = eq === -1 ? next! : arg.slice(eq + 1);
+        const values = repeated.get(name) ?? [flags.get(name)!];
+        values.push(value);
+        repeated.set(name, values);
+        if (eq === -1) i++;
+        continue;
+      }
       if (boolSpec.has(name)) {
         if (eq !== -1) return { error: `--${name} does not take a value` };
         bools.add(name);
@@ -232,7 +265,7 @@ function tokenize(args: readonly string[], spec: FlagSpec): Tokens | { error: st
       positionals.push(arg);
     }
   }
-  return { positionals, flags, bools };
+  return { positionals, flags, repeated, bools };
 }
 
 type FlagResult<T> = { value: T } | { error: string };
@@ -257,6 +290,10 @@ function intFlag(tokens: Tokens, name: string): FlagResult<number> | { value?: u
 
 function strFlag(tokens: Tokens, name: string): string | undefined {
   return tokens.flags.get(name);
+}
+
+function strFlags(tokens: Tokens, name: string): string[] {
+  return tokens.repeated.get(name) ?? (tokens.flags.has(name) ? [tokens.flags.get(name)!] : []);
 }
 
 function requireStr(tokens: Tokens, name: string): FlagResult<string> {
@@ -387,24 +424,41 @@ function parseWatch(args: readonly string[]): ParsedArgs {
   };
 }
 
+const CAST_ROLES = ["architect", "executor", "reviewer"] as const;
+
+/** Split legacy comma shorthand only at a known role= boundary. */
+function splitCastEntries(raw: string): string[] {
+  const boundary = /,(?=\s*(?:architect|executor|reviewer)=)/u;
+  return raw.split(boundary).map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+}
+
 function parseCastPairs(raw: string): Cast | { error: string } {
   const out: Cast = {};
-  for (const pair of raw.split(",")) {
+  for (const pair of splitCastEntries(raw)) {
     const eq = pair.indexOf("=");
     if (eq <= 0) return { error: `--cast entries must be role=agent pairs, got: '${pair}'` };
     const role = pair.slice(0, eq).trim();
-    const agent = pair.slice(eq + 1).trim();
-    if (role !== "architect" && role !== "executor" && role !== "reviewer") {
+    const command = pair.slice(eq + 1).trim();
+    if (!(CAST_ROLES as readonly string[]).includes(role)) {
       return { error: `--cast role must be architect|executor|reviewer, got: '${role}'` };
     }
-    if (agent.length === 0) return { error: `--cast agent for '${role}' must be non-empty` };
-    out[role] = agent;
+    if (command.length === 0) return { error: `--cast agent for '${role}' must be non-empty` };
+    try {
+      out[role as keyof Cast] = parseAgentRoute(command, `--cast agent for '${role}'`);
+    } catch (e) {
+      const message = e instanceof AgentCommandError ? e.message : "invalid command";
+      return { error: `--cast agent for '${role}' is invalid: ${message}` };
+    }
   }
+  if (Object.keys(out).length === 0) return { error: `--cast entries must be role=agent pairs, got: '${raw}'` };
   return out;
 }
 
 function parseCreate(args: readonly string[]): ParsedArgs {
-  const t = tokenize(args, { values: new Set(["title", "description", "creator", "role", "flow", "cast", "url"]) });
+  const t = tokenize(args, {
+    values: new Set(["title", "description", "creator", "role", "flow", "cast", "url"]),
+    repeatable: new Set(["cast"]),
+  });
   if ("error" in t) return { command: "usage", error: t.error };
   const title = requireStr(t, "title");
   if ("error" in title) return { command: "usage", error: title.error };
@@ -419,9 +473,13 @@ function parseCreate(args: readonly string[]): ParsedArgs {
   if (flow !== undefined && flow !== "full" && flow !== "direct" && flow !== "solo") {
     return { command: "usage", error: `--flow must be full|direct|solo, got: ${flow}` };
   }
-  const castRaw = strFlag(t, "cast");
-  const cast = castRaw !== undefined ? parseCastPairs(castRaw) : undefined;
-  if (cast !== undefined && "error" in cast) return { command: "usage", error: cast.error };
+  const castValues = strFlags(t, "cast");
+  let cast: Cast | undefined;
+  for (const castRaw of castValues) {
+    const parsed = parseCastPairs(castRaw);
+    if ("error" in parsed) return { command: "usage", error: parsed.error };
+    cast = { ...(cast ?? {}), ...parsed };
+  }
   const url = strFlag(t, "url");
   return {
     command: "create",
@@ -430,7 +488,7 @@ function parseCreate(args: readonly string[]): ParsedArgs {
     creator: creator.value,
     role: role.value,
     ...(flow !== undefined ? { flow } : {}),
-    ...((cast !== undefined && !("error" in cast)) ? { cast } : {}),
+    ...(cast !== undefined ? { cast } : {}),
     ...(url !== undefined ? { url } : {}),
   };
 }
@@ -578,19 +636,24 @@ function parseAck(args: readonly string[]): ParsedArgs {
 }
 
 function parseAssign(args: readonly string[]): ParsedArgs {
-  const t = tokenize(args, { values: new Set() });
-  if ("error" in t) return { command: "usage", error: t.error };
-  const extra = extraPositionalError(t, 2);
-  if (extra !== undefined) return { command: "usage", error: extra };
-  const role = t.positionals[0];
-  if (role !== "architect" && role !== "executor" && role !== "reviewer") {
+  // Everything after the role belongs to the command value. This is
+  // intentionally not passed through the TUT flag tokenizer: an unquoted
+  // `--model` must be an agent argument, while the documented quoted form
+  // remains equivalent.
+  const role = args[0];
+  if (!(CAST_ROLES as readonly string[]).includes(role ?? "")) {
     return { command: "usage", error: `role must be architect|executor|reviewer, got: ${role ?? "(missing)"}` };
   }
-  const agent = t.positionals[1];
-  if (agent === undefined || agent.length === 0) {
+  const command = args.slice(1);
+  if (command.length === 0) {
     return { command: "usage", error: "assign requires an agent name" };
   }
-  return { command: "assign", role, agent };
+  try {
+    return { command: "assign", role: role as "architect" | "executor" | "reviewer", agent: parseAgentInvocation(command, "assign command") };
+  } catch (e) {
+    const message = e instanceof AgentCommandError ? e.message : "invalid command";
+    return { command: "usage", error: `assign command is invalid: ${message}` };
+  }
 }
 
 function parseUp(args: readonly string[]): ParsedArgs {
@@ -600,6 +663,31 @@ function parseUp(args: readonly string[]): ParsedArgs {
   if (extra !== undefined) return { command: "usage", error: extra };
   const url = strFlag(t, "url");
   return { command: "up", dryRun: t.bools.has("dry-run"), ...(url !== undefined ? { url } : {}) };
+}
+
+/** The roles that ship a skill file (skills/<role>.md in the package). */
+export const SKILL_ROLES = ["host", "architect", "executor", "reviewer"] as const;
+export type SkillRole = (typeof SKILL_ROLES)[number];
+
+function parseSkill(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(), bools: new Set() });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 1);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  const role = t.positionals[0];
+  if (role === undefined) return { command: "usage", error: `skill requires a role: ${SKILL_ROLES.join(" | ")}` };
+  if (!(SKILL_ROLES as readonly string[]).includes(role)) {
+    return { command: "usage", error: `skill role must be ${SKILL_ROLES.join(" | ")}, got: ${role}` };
+  }
+  return { command: "skill", role: role as SkillRole };
+}
+
+function parseInit(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(), bools: new Set() });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 0);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  return { command: "init" };
 }
 
 /** Pure: argv (without node/script) → parsed command, or a usage result. */
@@ -624,12 +712,14 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     case "ack": return parseAck(rest);
     case "assign": return parseAssign(rest);
     case "up": return parseUp(rest);
+    case "skill": return parseSkill(rest);
+    case "init": return parseInit(rest);
     default: return { command: "usage", error: `unknown command: ${first}` };
   }
 }
 
 // --- handlers -----------------------------------------------------------------
-// All fifteen subcommands are wired (notify; mode/config/start-next/watch;
+// All seventeen subcommands are wired (notify; mode/config/start-next/watch;
 // ack reuses the context publish path as a fixed human ack note; status is a
 // human overview over the context list path). Task creation is the
 // initiating side's action (tut create); the first round is an ordinary
@@ -926,8 +1016,11 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
   // retry works, no --force): resolve the launch target through the cast →
   // workspace → routes chain, then require the routed agent on PATH.
   let agent: string;
+  let agentArgs: string[] = [];
   try {
-    agent = (await resolveLaunchTarget(parsed.url, taskId, role)).agent;
+    const target = await resolveLaunchTarget(parsed.url, taskId, role);
+    agent = target.agent;
+    agentArgs = target.args ?? [];
   } catch (e) {
     process.stderr.write(`tut: cannot resolve launch target for ${role} on ${taskId}: ${(e as Error).message}\n`);
     return 1;
@@ -951,7 +1044,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
   // --fresh (pane policy) is orthogonal to --force (dedup bypass): it is
   // passed straight through to the launcher as a leading flag; without it
   // the argv is byte-identical to before (the Notifier path never sets it).
-  const run = await runScript(LAUNCH_SCRIPT, [...(parsed.fresh ? ["--fresh"] : []), taskId, role, agent]);
+  const run = await runScript(LAUNCH_SCRIPT, [...(parsed.fresh ? ["--fresh"] : []), taskId, role, agent, ...agentArgs]);
   if (run.error !== undefined) {
     process.stderr.write(`tut: cannot run launcher ${LAUNCH_SCRIPT}: ${run.error.message}\n`);
     process.stderr.write("tut: relaunch with --force once the pane is fixed\n");
@@ -1379,7 +1472,9 @@ async function runAssign(parsed: Extract<ParsedArgs, { command: "assign" }>): Pr
     // file captures the full roster, not just the edited seat.
     const seeded: Record<string, unknown> = {};
     for (const role of KNOWN_ROLES) {
-      seeded[role] = { agent: await resolveAgent(role) };
+      const route = await resolveAgentRoute(role);
+      if (typeof route === "string") seeded[role] = { agent: route };
+      else seeded[role] = { agent: route.agent, args: [...route.args] };
     }
     raw = { roles: seeded };
   }
@@ -1393,10 +1488,17 @@ async function runAssign(parsed: Extract<ParsedArgs, { command: "assign" }>): Pr
     process.stderr.write(`tut: assign: ${file}: roles.${parsed.role} is not an object; nothing written\n`);
     return 1;
   }
+  const routeFields = typeof parsed.agent === "string"
+    ? { agent: parsed.agent }
+    : { agent: parsed.agent.agent, args: [...parsed.agent.args] };
   const next =
     entry === undefined || entry === null
-      ? { agent: parsed.agent }
-      : { ...(entry as Record<string, unknown>), agent: parsed.agent };
+      ? routeFields
+      : (() => {
+          const existing = entry as Record<string, unknown>;
+          const { args: _staleArgs, ...withoutArgs } = existing;
+          return { ...withoutArgs, ...routeFields };
+        })();
   (roles as Record<string, unknown>)[parsed.role] = next;
 
   const temp = `${file}.${process.pid}.tmp`;
@@ -1409,7 +1511,80 @@ async function runAssign(parsed: Extract<ParsedArgs, { command: "assign" }>): Pr
     process.stderr.write(`tut: assign: cannot write ${file}: ${(e as Error).message}\n`);
     return 1;
   }
-  process.stdout.write(`assign: ${parsed.role} → ${parsed.agent} (${file})\n`);
+  process.stdout.write(`assign: ${parsed.role} → ${formatAgentRoute(parsed.agent)} (${file})\n`);
+  return 0;
+}
+
+// --- tut skill / tut init -----------------------------------------------------
+
+/**
+ * The skills directory shipped in the package, resolved module-relative
+ * (../skills — one directory up from src/cli.ts and dist/cli.js alike;
+ * identical for npm install, git clone, and npm link layouts).
+ */
+const SKILLS_DIR = fileURLToPath(new URL("../skills/", import.meta.url));
+
+/** The marked block `tut init` maintains in a project's AGENTS.md. */
+function agentsBlock(): string {
+  return [
+    "<!-- TUT:BEGIN -->",
+    "<!-- Managed block: `tut init` refreshes between the markers; keep edits outside -->",
+    "",
+    "## TUT (Take Ur Turn)",
+    "",
+    "本仓库使用 TUT（Take Ur Turn）多 Agent 协作：本地 Context Hub——append-only 记录、",
+    "派生任务状态、人工审批门。收到「担任 TUT Host／全程驱动」类指令的 Agent：运行",
+    "`tut skill host` 读取并遵守 Host 角色规则（工具面 MCP-first，`tut` CLI 为等价通道）。",
+    "工人角色（architect / executor / reviewer）的 skill 由启动器在投递时自动供给，",
+    "无需人工配置。",
+    "",
+    "<!-- TUT:END -->",
+  ].join("\n");
+}
+
+/** `/<!-- TUT:BEGIN -->[\s\S]*?<!-- TUT:END -->/` as a source literal. */
+const TUT_BLOCK_RE = /<!-- TUT:BEGIN -->[\s\S]*?<!-- TUT:END -->/;
+
+async function runSkill(parsed: Extract<ParsedArgs, { command: "skill" }>): Promise<number> {
+  const file = path.join(SKILLS_DIR, `${parsed.role}.md`);
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    process.stderr.write(
+      `tut: cannot read the ${parsed.role} skill (${file}) — the skills/ directory must sit next to the installed CLI (npm package content)\n`,
+    );
+    return 1;
+  }
+  process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+  return 0;
+}
+
+async function runInit(): Promise<number> {
+  const target = path.join(process.cwd(), "AGENTS.md");
+  const block = agentsBlock();
+  let existing: string | null = null;
+  try {
+    existing = readFileSync(target, "utf8");
+  } catch {
+    existing = null; // absent (any other read failure resurfaces at the write below)
+  }
+  try {
+    if (existing === null) {
+      writeFileSync(target, `${block}\n`, "utf8");
+      process.stdout.write(`init: created ${target} with the TUT block\n`);
+    } else if (TUT_BLOCK_RE.test(existing)) {
+      writeFileSync(target, existing.replace(TUT_BLOCK_RE, block), "utf8");
+      process.stdout.write(`init: refreshed the TUT block in ${target} (idempotent — no duplicate)\n`);
+    } else {
+      writeFileSync(target, `${existing.replace(/\s*$/, "\n\n")}${block}\n`, "utf8");
+      process.stdout.write(`init: appended the TUT block to ${target}\n`);
+    }
+  } catch (e: unknown) {
+    process.stderr.write(`tut: cannot write ${target}: ${(e as Error).message}\n`);
+    return 1;
+  }
+  process.stdout.write("init: the activation phrase needs no instructions — paste「担任 TUT Host，全程驱动这个任务：<你的需求>」into any agent session\n");
   return 0;
 }
 
@@ -1687,6 +1862,18 @@ function upUrlError(url: string): string {
   return `tut: up: --url must be an http loopback URL with an explicit port (e.g. http://127.0.0.1:3002), got: ${url}\n`;
 }
 
+/**
+ * The tail activation hint (final wording, human ruling 2026-08-25): pure
+ * intent — no paths, no how-to-read-rules instructions. The mechanism
+ * lives in the AGENTS.md block `tut init` maintains; printed on every up
+ * exit path, --dry-run included.
+ */
+function printActivationHint(): void {
+  process.stdout.write("up: activate a Host — tell any coding-agent session in this repo:\n");
+  process.stdout.write("up:   「担任 TUT Host，全程驱动这个任务：<你的需求>」\n");
+  process.stdout.write('up:   ("Act as TUT Host and drive this task end to end: <request>" — works via the AGENTS.md block from `tut init`)\n');
+}
+
 async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<number> {
   const dryRun = parsed.dryRun;
   const cwd = process.cwd();
@@ -1911,12 +2098,14 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
     process.stdout.write(`up: herdr unusable (${herdrError}) — panes cannot be managed; start manually:\n`);
     for (const cmd of manual) process.stdout.write(`up:   ${cmd}\n`);
     process.stdout.write("up: agent panes are on-demand — launchers raise them at hand-off\n");
+    printActivationHint();
     return 0;
   }
   // No role-pane provisioning here — panes are agent-keyed and
   // raised on demand by the launcher at hand-off time. up is the power
   // switch (hub + notify).
   process.stdout.write("up: agent panes are on-demand — launchers raise them at hand-off\n");
+  printActivationHint();
   return 0;
 }
 
@@ -1951,6 +2140,8 @@ export const HANDLERS = {
   ack: runAck,
   assign: runAssign,
   up: runUp,
+  skill: runSkill as Handler<Extract<ParsedArgs, { command: "skill" }>>,
+  init: runInit as Handler<Extract<ParsedArgs, { command: "init" }>>,
 };
 
 /** Runs a parsed invocation; returns the process exit code. */
@@ -1977,6 +2168,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     case "ack": return HANDLERS.ack(parsed);
     case "assign": return HANDLERS.assign(parsed);
     case "up": return HANDLERS.up(parsed);
+    case "skill": return HANDLERS.skill(parsed);
+    case "init": return HANDLERS.init(parsed);
   }
 }
 

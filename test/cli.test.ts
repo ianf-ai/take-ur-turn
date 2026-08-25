@@ -333,8 +333,8 @@ describe("cli arg parsing (pure parseArgs)", () => {
     });
   });
 
-  it("USAGE documents all eleven subcommands", () => {
-    for (const cmd of ["serve", "notify", "mode", "start-next", "create", "publish", "read", "list", "status", "decide", "ack"]) {
+  it("USAGE documents all seventeen subcommands", () => {
+    for (const cmd of ["serve", "notify", "mode", "config", "start-next", "watch", "create", "publish", "read", "list", "status", "decide", "ack", "assign", "up", "skill", "init"]) {
       expect(USAGE).toContain(`tut ${cmd}`);
     }
   });

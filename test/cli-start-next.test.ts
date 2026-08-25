@@ -24,6 +24,7 @@ vi.mock("../src/hub-client.js", async (importOriginal) => ({
 
 import { main, parseArgs } from "../src/cli.js";
 import { hubDecide, hubPublish, hubRead } from "../src/hub-client.js";
+import type { AgentRoute } from "../src/types.js";
 
 // --- parse -----------------------------------------------------------------------
 
@@ -98,7 +99,7 @@ interface StateTask {
   waiting_for: string;
   needs_attention?: boolean;
   /** Per-task cast overrides (absent on older hubs/fixtures). */
-  cast?: Record<string, string>;
+  cast?: Record<string, AgentRoute>;
 }
 
 /** Stub global fetch to serve this /state body for every call. */
@@ -607,5 +608,37 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
     expect(io.err()).toContain("agent 'no-such-cli-x' (routed for executor on t-pre) is not on PATH");
     expect(vi.mocked(hubPublish)).not.toHaveBeenCalled(); // 无痕: no launch marker
     expect(io.out()).not.toContain("DRY-RUN");
+  });
+
+  it("parameterized cast reaches the real launcher with the complete ordered argv", async () => {
+    const route = {
+      agent: "codex",
+      args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search", "-c", "check_for_update_on_startup=true"],
+    };
+    stubState([{ task_id: "t-args", status: "implementing", waiting_for: "agent:executor", cast: { executor: route } }]);
+    vi.mocked(hubRead).mockResolvedValue({ task_id: "t-args", title: "Args", status: "implementing", versions: [] });
+    vi.mocked(hubPublish).mockResolvedValue({ task_id: "t-args", version: 1, status: "implementing", needs_attention: false });
+
+    const code = await withFixtureHerdr(() => withDryRun(() => main(["start-next", "t-args", "--url", "http://hub.test"])));
+
+    expect(code).toBe(0);
+    expect(io.out()).toContain(
+      "pane run <root> codex --model gpt-5.6 --sandbox workspace-write --search -c check_for_update_on_startup=true -c check_for_update_on_startup=false",
+    );
+    expect(vi.mocked(hubPublish)).toHaveBeenCalledTimes(1);
+  });
+
+  it("invalid parameterized cast fails before marker, pane birth, or run", async () => {
+    stubState([{ task_id: "t-invalid", status: "implementing", waiting_for: "agent:executor", cast: { executor: { agent: "codex", args: [""] } } }]);
+    vi.mocked(hubRead).mockResolvedValue({ task_id: "t-invalid", title: "Invalid", status: "implementing", versions: [] });
+
+    const code = await withFixtureHerdr(() => withDryRun(() => main(["start-next", "t-invalid", "--url", "http://hub.test"])));
+
+    expect(code).toBe(1);
+    expect(io.err()).toContain("cannot resolve launch target");
+    expect(io.err()).toContain("cast role 'executor'.args[0]");
+    expect(vi.mocked(hubPublish)).not.toHaveBeenCalled();
+    expect(io.out()).not.toContain("DRY-RUN");
+    expect(io.out()).not.toContain("pane run");
   });
 });

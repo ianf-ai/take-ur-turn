@@ -21,8 +21,8 @@ TUT 的答案：把过程记忆放进 Hub（写入永不因流程被拒），把
 - **Append-only 记录**：Agent 经 5 个 MCP 工具（create / publish / read / list / decide）往任务日志追加记录——design、code_changes、review、revision、note、decision。记录永不删除，任何零参与者凭日志可复原全部决策与理由
 - **派生状态**：任务状态（走到哪、该谁动）不存储、不执法，是记录序列经纯函数算出的视图。表外组合（如 solo 流程里发 review）照样落盘，但会置 `needs_attention` 提醒人处置
 - **审批门**：review pass 后派生为 `pending_approval`，需要**人**发一条 decision 记录（approve / reject）才继续。close 在任意状态有效——人有权随时终止任务
-- **流程变体**：建任务时选 `--flow full|direct|solo`——full 走完整循环；direct 跳过设计阶段（repo 已有设计）；solo 小改动免审不免批（跳过 review，直达审批）
-- **manual / auto 流转**：manual（默认）该谁动时通知人，人按键启动下一个；auto 模式 Notifier 经启动器直接拉起下一个 Agent（按 role 白名单分级信任），人只做 decide；无论哪档，都可由 coding-agent Host 会话代你跑全程（见下文会话代驾）
+- **流程变体**：建任务时选 `--flow full|direct|solo`——full 走完整循环；solo 小改动免审不免批（跳过 review，直达审批）；direct 面向「简单但触风险面（核心路径/门禁/公开面，错了贵）」的改动——给 solo 加一轮 review
+- **manual / auto 流转**：manual（默认）该谁动时通知人，人按键启动下一个；auto 模式 Notifier 经启动器直接拉起下一个 Agent（按 role 白名单分级信任），人只做 decide；无论哪档，都可由 coding-agent Host 会话代你跑全程（见下文会话驱动）
 
 ## 架构
 
@@ -84,6 +84,12 @@ npm run build
 tut up
 ```
 
+**一次性接线**——把 TUT 标记块注入项目 `AGENTS.md`（幂等：无文件则创建，已有标记块只刷新不重复追加）：
+
+```bash
+tut init
+```
+
 **发起一个任务**（发起侧两步——任务先于投递存在，首轮即普通轮）：
 
 ```bash
@@ -94,23 +100,33 @@ tut create --title "mode 子命令补 --url flag" \
 tut start-next <task_id>   # manual：投首轮（auto 模式：Notifier 按白名单自动投递）
 ```
 
-`create` 的流程（`--flow full|direct|solo`）与任务级阵容（`--cast executor=pi,reviewer=codex`）是真旗子；需求与验收口径写在 `title` + `description` 里，Agent 经 `context.read` 自取。
+`create` 的流程（`--flow full|direct|solo`）与任务级阵容是真旗子。cast 既支持旧的裸名（`--cast executor=pi`），也支持带有序参数的命令（`--cast 'executor=codex --model gpt-5.6 --sandbox workspace-write --search'`）；多个带参 role 可重复 `--cast`。旧逗号简写（`--cast executor=pi,reviewer=codex`）继续兼容。需求与验收口径写在 `title` + `description` 里，Agent 经 `context.read` 自取。
 
 之后 Agent 在各自 pane 里经 MCP 工具读写 Hub 推进任务；`tut status` 看总览，该人审批时 Notifier 会通知你，`tut decide <task_id> --decision approve --by <你的名字>` 拍板。
 
 Notifier 的辅通道（blocked 即时告警、done 交叉验证）依赖 Herdr 把 pane 内 Agent 的状态变化投给 `scripts/on-agent-event.sh`——这是一次性的环境配置（Herdr 插件），见 [design/system-design.md](design/system-design.md) 7.2 节的接线说明。
 
-## 会话代驾（Host 模式）
+## 会话驱动（Host 模式）
 
-上面的快速上手是手动路径——其实除了 `tut up`，你不必再碰终端：在项目里开一个交互式 coding-agent 会话（任何能读仓库、能跑 shell 命令的 CLI agent），让它加载 [skills/host.md](skills/host.md)——它就担任 **Host** 角色，你的主会话驱动者。你负责说话，Host 负责环境检查、把你的诉求磨成任务（`tut create`，需求+验收）、轮次交接代按 `tut start-next`、盯状态，到审批门带着三件套回来找你：改了什么、验证结果、它自己的抽查意见。
+上面的快速上手是手动路径——其实除了 `tut up` 和 `tut init`，你不必再碰终端：在项目里开一个交互式 coding-agent 会话（任何能读仓库、能跑 shell 命令的 CLI agent），让它担任 TUT Host——它会运行 `tut skill host` 加载 [host skill](skills/host.md) 并按其行事，成为你的 **Host** 驱动者。你负责说话，Host 负责环境检查、把你的诉求磨成任务（`tut create`，需求+验收）、轮次交接代按 `tut start-next`、盯状态，到审批门带着三件套回来找你：改了什么、验证结果、它自己的抽查意见。
+
+**一句话激活 Host**——把下面这句直接贴进 Agent 会话（换成你的需求即可）：
+
+```text
+担任 TUT Host，全程驱动这个任务：<你的需求>
+```
+
+激活语是纯意图——不含路径、不含操作指引；机制经项目 `AGENTS.md` 注入（`tut init` 维护的标记块，幂等）：收到指令的 Agent 会运行 `tut skill host` 自取规则，激活语无需教它怎么做。
 
 对话大致长这样：
 
-> 你：「盯完这个任务：给 mode 子命令补个 --url flag。」
+> 你：「全程驱动这个任务：给 mode 子命令补个 --url flag。」
 > ……Host 建任务、推轮次、盯状态……
 > Host：「review pass。改动 2 个文件 +12/−3，测试全绿；我抽查了 diff，无异议。批吗？」
 
-发起时一句委托（「盯完这个任务」）即授权整个推进循环；审批永远归你——Host 只呈现、不代批，每次 `tut decide` 都凭你的明确同意才执行。auto 模式下轮次交接由 Notifier 接手，Host 的重心移到审批门与异常处置。
+发起时一句委托（「全程驱动这个任务」）即授权整个推进循环；审批永远归你——Host 只呈现、不代批，每次 `tut decide` 都凭你的明确同意才执行。auto 模式下轮次交接由 Notifier 接手，Host 的重心移到审批门与异常处置。
+
+环境提示：个别 Agent CLI 的命令沙箱默认禁网——CLI 通道（`tut list` 等）在此类会话里可能被拦，而 MCP 工具经 Agent 宿主进程连接、不受影响。host skill 因此写成 **MCP-first**：零网络配置的沙箱会话也能跑通 Host 全流程（skill 的工具面表逐条列了降级用法）。
 
 守住分工的边界是**驱动不代工**——Host 不写 design / code_changes / review / revision 记录，这些只出自 architect / executor / reviewer 各自 pane 里的会话。（Host 角色与架构表里的「Agent Host」无关——后者指 Herdr，承载 Agent 的终端环境。）
 
@@ -145,7 +161,7 @@ tut config get <key> [--root <dir>]
 tut config set <key> <value> [--root <dir>]
 tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
 tut watch [<task_id>] [--url <u>] [--interval <s>]
-tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
+tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=command>]... [--url <u>]
 tut publish <task_id> --role <r> --content-type <t> --summary <s>
              (--body <text> | --payload-file <md>)
              [--verdict <pass|fail_code|fail_design>] [--commits <a,b>]
@@ -153,8 +169,10 @@ tut publish <task_id> --role <r> --content-type <t> --summary <s>
 tut read <task_id> [--since-version <n>] [--json] [--url <u>]
 tut list [--status <s>] [--json] [--url <u>]
 tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
-tut assign <role> <agent>
+tut assign <role> <command...>
 tut up [--url <u>] [--dry-run]
+tut skill <host|architect|executor|reviewer>
+tut init
 tut ack <task_id> [--note <text>] [--url <u>]
 tut status [--json] [--url <u>]
 ```
@@ -178,8 +196,8 @@ Reviewer 读上下文 → Review（每条问题带关闭条件）→ 发布 revi
 
 上图是默认流程 **full**。建任务时可选变体（create 时确定、落库后不可变）：
 
-- **direct**：repo 已有现成设计，跳过设计阶段——建任务即 implementing；review 与人审批照常
 - **solo**：小改动免审——跳过 review，code_changes 直接派生 pending_approval 由人 approve / reject。免审不免批：approve 仍是人的门
+- **direct**：简单改动触及风险面（核心路径/门禁/公开面，错了贵）时，给 solo 加一轮 review——建任务即 implementing（repo 已有现成设计可供施工），review 与人审批照常
 
 ## 配置
 
@@ -215,6 +233,10 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
   "naming": { "tab_label": "TUT {role}" }
 }
 ```
+
+带参 workspace 条目使用有序 `args` 数组，例如：
+`"executor": { "agent": "codex", "args": ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] }`。
+旧的裸字符串 cast 形状保持不变；TUT 不解释命令值中的 shell 引号、变量、运算符、重定向或 glob。只有命令首词进入 `command -v` 检查，完整 argv 才交给 launcher。Codex 在用户参数之后追加 `-c check_for_update_on_startup=false`，pi 在命令前加 `env PI_SKIP_VERSION_CHECK=1`；`TUT_SUPPRESS_AGENT_UPDATE=0` 可关闭这些附加项。
 
 `naming.tab_label` 渲染**tab** 标签（人读侧）：占位符 `{role}` / `{task}` / `{agent}`，未知占位符原样保留，默认 `TUT {role}`。**pane** 标签是机器寻址键、不可模板化：轮次 pane 恒为 `<task_id>.<role>`（事件反查直接命中）。双字段各司其职。
 

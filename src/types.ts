@@ -35,15 +35,25 @@ export type Verdict = "pass" | "fail_code" | "fail_design";
  */
 export type Flow = "full" | "direct" | "solo";
 
+/** A command route with explicit argv semantics (agent-command.ts). */
+export interface AgentCommand {
+  agent: string;
+  args: string[];
+}
+
+/** Legacy bare agent name or a parameterized command. */
+export type AgentRoute = string | AgentCommand;
+
 /**
- * Per-task cast (system-design 4.1): role → agent name, a ROUTING
- * parameter only — it tells the launcher which agent to raise for each role.
- * Not a participation roster (write freedom unchanged) and NOT consumed by
+ * Per-task cast (system-design 4.1): role → agent route, a ROUTING parameter
+ * only — it tells the launcher which agent to raise for each role. Not a
+ * participation roster (write freedom unchanged) and NOT consumed by
  * derivation (state-machine input signature untouched). Partial maps are
  * legal: missing roles fall back to the default lineup. Immutable in meta
- * after create, same as flow.
+ * after create, same as flow. Bare strings remain the on-disk compatibility
+ * shape; parameterized commands use {agent,args}.
  */
-export type Cast = Partial<Record<"architect" | "executor" | "reviewer", string>>;
+export type Cast = Partial<Record<"architect" | "executor" | "reviewer", AgentRoute>>;
 
 export type WaitingFor = "human" | "none" | `agent:${string}`;
 

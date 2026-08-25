@@ -21,7 +21,7 @@ TUT's answer: put the process memory into the Hub (writes are never rejected on 
 - **Append-only records**: agents append records to the task log via 5 MCP tools (create / publish / read / list / decide) — design, code_changes, review, revision, note, decision. Records are never deleted; anyone starting from zero can reconstruct every decision and its rationale from the log alone
 - **Derived state**: task state (where things stand, whose move it is) is not stored and not enforced — it is a view computed from the record sequence by a pure function. Combinations outside the state table (e.g. publishing a review in a solo task) still land on disk, but set `needs_attention` so a human can deal with it
 - **Approval gate**: once a review passes, the derived state becomes `pending_approval`, and a **human** must publish a decision record (approve / reject) before anything continues. close is valid in any state — humans retain the authority to end a task at any time
-- **Flow variants**: pick `--flow full|direct|solo` when creating a task — full runs the complete loop; direct skips the design stage (the repo already has a design); solo skips review for small changes — review-free but not approval-free (straight to the approval gate)
+- **Flow variants**: pick `--flow full|direct|solo` when creating a task — full runs the complete loop; solo skips review for small changes (review-free but not approval-free — straight to the approval gate); direct adds one review round to solo for simple changes that touch a risk surface (core paths / gates / public surface — expensive when wrong)
 - **manual / auto progression**: in manual (the default), the human is notified when it is someone's turn and starts the next step; in auto, the Notifier launches the next agent directly through the launcher (with graded trust via the role whitelist), and humans only make decide calls; in either mode, a coding-agent Host session can run the whole loop on your behalf ([Host Mode](#host-mode-drive-it-from-a-conversation))
 
 ## Architecture
@@ -84,6 +84,12 @@ The from-source build output is `dist/cli.js`. Use `npm link` to put the `tut` c
 tut up
 ```
 
+**One-time project hookup** — inject the TUT block into the project's `AGENTS.md` (idempotent; the file is created when absent, an existing marked block is refreshed, never duplicated):
+
+```bash
+tut init
+```
+
 **Kick off a task** (two steps on the initiating side — the task exists before any delivery, and the first round is an ordinary round):
 
 ```bash
@@ -94,7 +100,7 @@ Acceptance: the flag reaches the Hub call; both flag forms tested." \
 tut start-next <task_id>   # manual: start the first round (auto mode: the Notifier starts it per its whitelist)
 ```
 
-`create` takes the workflow (`--flow full|direct|solo`) and the per-task lineup (`--cast executor=pi,reviewer=codex`) as real flags; the requirement and its acceptance criteria live in `title` + `description`, where agents pick them up via `context.read`.
+`create` takes the workflow (`--flow full|direct|solo`) and the per-task lineup as real flags. Cast values may be legacy bare names (`--cast executor=pi`) or parameterized, ordered commands (`--cast 'executor=codex --model gpt-5.6 --sandbox workspace-write --search'`); repeat `--cast` for multiple parameterized roles. The legacy comma form (`--cast executor=pi,reviewer=codex`) remains compatible. The requirement and its acceptance criteria live in `title` + `description`, where agents pick them up via `context.read`.
 
 From there, agents push the task forward by reading and writing the Hub through MCP tools from their own panes; `tut status` shows the overview, the Notifier notifies you when an approval is due, and you make the call with `tut decide <task_id> --decision approve --by <your-name>`.
 
@@ -102,15 +108,26 @@ The Notifier's side channels (instant blocked alerts, done cross-checks) rely on
 
 ## Host Mode: Drive It from a Conversation
 
-The quick start above was the by-hand path — beyond `tut up`, you never have to touch the terminal again: open an interactive coding-agent session (any CLI agent that can read the repo and run shell commands) in the project and have it load [skills/host.md](skills/host.md) — it takes the **Host** role, your driver. You talk; the Host checks the environment, shapes your request into a task (`tut create`, requirement + acceptance), presses `tut start-next` at round handoffs, watches state, and reports at approval gates with the three essentials: what changed, how it was verified, and its own spot-check opinion.
+The quick start above was the by-hand path — beyond `tut up` and `tut init`, you never have to touch the terminal again: open an interactive coding-agent session (any CLI agent that can read the repo and run shell commands) in the project and tell it to act as TUT Host — it runs `tut skill host`, picks up the [host skill](skills/host.md), and takes the **Host** role, your driver. You talk; the Host checks the environment, shapes your request into a task (`tut create`, requirement + acceptance), presses `tut start-next` at round handoffs, watches state, and reports at approval gates with the three essentials: what changed, how it was verified, and its own spot-check opinion.
 
-The conversation looks roughly like this:
+**Activate the Host with one sentence** — paste this into the agent session (swap in your request):
 
-> You: "See this task through: add a --url flag to the mode subcommand."
+```text
+担任 TUT Host，全程驱动这个任务：<你的需求>
+（Act as TUT Host and drive this task end to end: <request>）
+```
+
+The phrase is pure intent — no paths, no instructions on how to read the rules. The mechanism is injected into the project's `AGENTS.md` (the marked block `tut init` maintains): an agent receiving such an instruction runs `tut skill host` and picks up the role rules itself, so the activation phrase never has to teach them.
+
+The conversation then looks roughly like this:
+
+> You: "Drive this task end to end: add a --url flag to the mode subcommand."
 > … the Host creates the task, advances the rounds, watches state …
 > Host: "Review passed. 2 files changed (+12/−3), tests green; I spot-checked the diff — no objections. Approve?"
 
-One delegated sentence at kickoff ("see this task through") authorizes the whole progression loop; approvals stay strictly yours — the Host presents, you decide, and each `tut decide` runs only after your explicit consent. In auto mode the Notifier takes over round handoffs and the Host focuses on approval gates and exceptions.
+One delegated sentence at kickoff ("drive this task end to end") authorizes the whole progression loop; approvals stay strictly yours — the Host presents, you decide, and each `tut decide` runs only after your explicit consent. In auto mode the Notifier takes over round handoffs and the Host focuses on approval gates and exceptions.
+
+One environment note: some agent CLIs sandbox shell commands with no network by default — the CLI channel (`tut list` etc.) can be silently blocked in such sessions, while the MCP tools go through the agent host process and stay available. The Host skill is therefore written **MCP-first**: a zero-network sandboxed session can still run the whole Host flow (the skill's tool-surface table lists per-command fallbacks).
 
 The boundary that keeps the division of labor honest: **drive, don't do the work** — the Host never writes design / code_changes / review / revision records; those come only from the architect / executor / reviewer sessions in their own panes. (The Host role is unrelated to "Agent Host" in the architecture table — that one is Herdr, the terminal environment agents live in.)
 
@@ -145,7 +162,7 @@ tut config get <key> [--root <dir>]
 tut config set <key> <value> [--root <dir>]
 tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
 tut watch [<task_id>] [--url <u>] [--interval <s>]
-tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=agent,...>] [--url <u>]
+tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=command>]... [--url <u>]
 tut publish <task_id> --role <r> --content-type <t> --summary <s>
              (--body <text> | --payload-file <md>)
              [--verdict <pass|fail_code|fail_design>] [--commits <a,b>]
@@ -153,8 +170,10 @@ tut publish <task_id> --role <r> --content-type <t> --summary <s>
 tut read <task_id> [--since-version <n>] [--json] [--url <u>]
 tut list [--status <s>] [--json] [--url <u>]
 tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
-tut assign <role> <agent>
+tut assign <role> <command...>
 tut up [--url <u>] [--dry-run]
+tut skill <host|architect|executor|reviewer>
+tut init
 tut ack <task_id> [--note <text>] [--url <u>]
 tut status [--json] [--url <u>]
 ```
@@ -178,8 +197,8 @@ Reviewer reads context → reviews (each finding carries a closing condition) �
 
 The diagram above is the default flow, **full**. Variants are chosen when the task is created (fixed at create time, immutable once persisted):
 
-- **direct**: the repo already has a design, so the design stage is skipped — the task starts in implementing; review and human approval proceed as usual
 - **solo**: small changes skip review — code_changes derives pending_approval directly for a human approve / reject. Review-free, but not approval-free: approve is still the human's gate
+- **direct**: for simple changes that touch a risk surface (core paths / gates / public surface — expensive when wrong), solo gets one review round added — the task starts in implementing (the repo already carries the design it works from) and proceeds through review and human approval as usual
 
 ## Configuration
 
@@ -215,6 +234,13 @@ File shape (only what you want to change needs to be present; entries may carry 
   "naming": { "tab_label": "TUT {role}" }
 }
 ```
+
+Parameterized workspace entries use an ordered `args` array, for example
+`"executor": { "agent": "codex", "args": ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] }`.
+TUT preserves the legacy bare-string cast shape and does not interpret shell
+quotes, variables, operators, redirects, or globs inside command values. Only
+the command head is checked with `command -v`; the complete argv reaches the
+launcher. Codex receives TUT's update suppression after user args (`-c check_for_update_on_startup=false`), pi receives `env PI_SKIP_VERSION_CHECK=1`, and `TUT_SUPPRESS_AGENT_UPDATE=0` disables these additions.
 
 `naming.tab_label` renders the human-facing **tab** label: placeholders `{role}` / `{task}` / `{agent}`, unknown placeholders preserved verbatim, default `TUT {role}`. The **pane** label is the machine addressing key and is never templated: round panes stay `<task_id>.<role>` (event reverse-lookup hits directly). Two fields, two jobs.
 
