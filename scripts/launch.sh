@@ -1,6 +1,6 @@
 #!/bin/sh
 # Launcher contract (system-design 7.2, same-role-continuity edition). Usage:
-#   launch.sh [--fresh] <task_id> <role> [<agent>]
+#   launch.sh [--fresh] <task_id> <role> [<agent> [<arg>...]]
 #                        # round hand-off (start-next / auto; the first round
 #                        # after tut create is an ordinary round hand-off too)
 #   launch.sh --cleanup <task_id>
@@ -90,10 +90,11 @@
 #
 # Delivery tail (7.2.1, closed-loop edition): the
 # BORN branch gates on the receiver painting its UI, then the submit step is
-# a CLOSED LOOP: land-confirm the text, Enter, VERIFY the screen reacted,
-# bounded Enter resends. The CONTINUATION branch skips only the birth gate
-# (the seat's UI has long since painted) and runs the SAME land-confirm +
-# verified-submit loop — one delivery code path, no drift:
+# a CLOSED LOOP: land-confirm the text, Enter, VERIFY the receiver's input
+# box let go of it, then a LONG BOUNDED loop of Enter resends. The
+# CONTINUATION branch skips only the birth gate (the seat's UI has long
+# since painted) and runs the SAME land-confirm + verified-submit loop —
+# one delivery code path, no drift:
 #   ready-probe: poll `herdr pane read <pane> --source visible --lines 40`
 #     until the output differs from the post-echo baseline AND is stable for
 #     two consecutive polls AND the floor wait has elapsed (TUT_READY_FLOOR_MS
@@ -106,24 +107,41 @@
 #     TUT_TEXT_LAND_TIMEOUT_MS default 5000; timeout → stderr note, submit
 #     anyway). Produces the with-text snapshot the submit step verifies
 #     against (and incidentally outlasts the codex first-frame init window).
-#   verified submit: `herdr pane send-keys <pane> Enter`, then poll for ANY
-#     screen change vs the with-text snapshot (composer cleared / transcript
-#     grows / spinner) within TUT_SUBMIT_TIMEOUT_MS default 3000. No change
-#     does NOT start a fixed retry loop: wait for a post-submit readiness
-#     signal (Herdr agent_status idle/working when available) for
-#     TUT_SUBMIT_READY_TIMEOUT_MS (defaulting to TUT_READY_TIMEOUT_MS, 15000).
-#     A screen reaction during that wait counts as a late successful submit;
-#     otherwise, once the readiness signal arrives, send exactly one more
-#     Enter and verify it. If that post-ready attempt stays silent, or the
-#     signal never arrives, emit the manual fallback and STILL EXIT 0. The
-#     prompt is already in the input box, so a failure exit would trigger
-#     duplicate birth/delivery semantics.
+#   verified submit: `herdr pane send-keys <pane> Enter`, then verify within
+#     TUT_SUBMIT_TIMEOUT_MS default 3000 by the INPUT-BOX-CLEARED criterion:
+#     submitted ⟺ a non-empty screen whose BOTTOM REGION (the last 3
+#     non-empty lines — the composer and its chrome; live-calibrated: codex's
+#     "› …" composer line reverts to its placeholder, pi's bottom status
+#     rows start ticking when the round begins) no longer matches the
+#     with-text snapshot's bottom region. A repaint ABOVE the region no
+#     longer counts — the tightened criterion (the live sentinel: the
+#     swallow window can OUTLIVE the idle readiness signal, so "any change"
+#     could call a swallowed Enter a success and strand the prompt
+#     silently). Box still holds the text → a bounded resend loop: one
+#     Enter per TUT_SUBMIT_RETRY_MS default 1500 (the TEXT is never re-sent)
+#     for up to TUT_SUBMIT_RETRY_TIMEOUT_MS default 30000, verifying every
+#     poll; window exhaustion → manual-fallback note + STILL EXIT 0 (the
+#     prompt sits in the input box, a failure exit would re-trigger
+#     duplicate delivery). TUT_SUBMIT_RETRIES and TUT_SUBMIT_READY_TIMEOUT_MS
+#     are inert legacy knobs (kept so old launch environments carrying them
+#     do not fail); the agent_status readiness boundary is retired from the
+#     submit decision — the sentinel disproved its predictive power.
+#   diagnostics (decoupled observer): every delivery step emits one
+#     `tut-delivery t=<epoch-ms> …` stderr line — gate polls/release/
+#     timeout, send-text, land polls/observed/timeout, every Enter (with
+#     attempt number), every loop read, submit-confirmed, give-up. Pure
+#     observation, never a gate: TUT_DELIVERY_DIAG=0 silences the lines and
+#     NOTHING else changes. The timestamps exist to reconstruct the timeline
+#     of the NEXT swallowed-Enter incident (timing lottery; trigger
+#     still unidentified) by aligning them with the notify-pane log (the
+#     Notifier tees this script's stderr there).
 # Why the loop (7.2.1 root cause): the gate signal is "UI painted", which on
 # pi coincides with submit-readiness but on codex SPLITS from it — the first
 # frame is the shell (the composer renders send-text's text) while the async
 # init (session/model/credentials) finishes later and swallows Enters
 # arriving inside the window. Correctness therefore must not depend on
-# guessing that timing: observe the reaction, resend when silent.
+# guessing that timing: observe the box, resend on the clock until it lets
+# go, report honestly when the bounded window runs out.
 #
 # Birth/provisioning failures exit 1 AFTER the caller's launch marker —
 # recover with start-next --force. TUT_DRY_RUN=1 prints the sequence
@@ -133,6 +151,9 @@
 # on the tut side); the script itself never depends on cwd.
 
 set -u
+# Route tokens are validated before this expansion is used. Disable pathname
+# expansion as a second guard before the final herdr argv boundary.
+set -f
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TUT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -153,15 +174,20 @@ CHAIN_ROOT=""   # L1 root for the workspace chain: anchor cwd (set at entry)
 # restores the raw agent command (escape knob, same spirit as
 # TUT_CONTINUITY_ROLES). The agent-presence check (command -v) always
 # probes the BARE agent name.
-suppress_agent_update() {
+# `AGENT_ARGS` is a space-separated list produced only by tut-resolve.mjs's
+# shell-neutral parser. It is expanded at the final herdr argv boundary after
+# pathname expansion has been disabled above.
+build_run_cmd() {
+  BRC_CMD="$AGENT"
+  if [ -n "${AGENT_ARGS:-}" ]; then BRC_CMD="$BRC_CMD $AGENT_ARGS"; fi
   if [ "${TUT_SUPPRESS_AGENT_UPDATE:-1}" = "0" ]; then
-    printf '%s' "$1"
+    printf '%s' "$BRC_CMD"
     return 0
   fi
-  case "$1" in
-    codex) printf '%s' "codex -c check_for_update_on_startup=false" ;;
-    pi) printf '%s' "env PI_SKIP_VERSION_CHECK=1 pi" ;;
-    *) printf '%s' "$1" ;;
+  case "$AGENT" in
+    codex) printf '%s' "$BRC_CMD -c check_for_update_on_startup=false" ;;
+    pi) printf '%s' "env PI_SKIP_VERSION_CHECK=1 $BRC_CMD" ;;
+    *) printf '%s' "$BRC_CMD" ;;
   esac
 }
 
@@ -230,7 +256,7 @@ tab_label_for() {
 }
 
 # Resolve the full agent chain for ($1 task_id, $2 role): cast via /state,
-# then files. Prints the agent; on hub failure falls back to files with a
+# then files. Prints a route display; on hub failure falls back to files with a
 # stderr note (cast tasks may route to the default lineup until the hub is
 # back — accepted degradation, system-design 7.2).
 resolve_agent() {
@@ -242,8 +268,11 @@ process.stdin.on("end", () => {
   try {
     const state = JSON.parse(raw);
     const entry = (state?.tasks ?? []).find((t) => t.task_id === process.argv[1]);
-    const agent = entry?.cast?.[process.argv[2]];
-    if (typeof agent === "string" && agent.length > 0) process.stdout.write(agent);
+    const route = entry?.cast?.[process.argv[2]];
+    if (typeof route === "string" && route.length > 0) process.stdout.write(route);
+    else if (route && typeof route === "object" && typeof route.agent === "string" && Array.isArray(route.args)) {
+      process.stdout.write([route.agent, ...route.args].join(" "));
+    }
   } catch {}
 });
 ' "$TASK" "$ROLE" 2>/dev/null || true)
@@ -255,6 +284,26 @@ process.stdin.on("end", () => {
     echo "launch: hub unreachable at $HUB_URL — cast not readable, using the default lineup" >&2
   fi
   agent_from_files "$ROLE"
+}
+
+# Parse a route at the launcher boundary. A single value is the legacy raw
+# command string; multiple values are already argv tokens from start-next or
+# Notifier. The node helper validates both forms and prints one token per line.
+set_route_from_invocation() {
+  ROUTE_WORDS=$(node "$TUT_RESOLVE" parse-invocation "$@" 2>"${TMPDIR:-/tmp}/tut-route-error.$$") || {
+    ROUTE_ERROR=$(cat "${TMPDIR:-/tmp}/tut-route-error.$$" 2>/dev/null || true)
+    rm -f "${TMPDIR:-/tmp}/tut-route-error.$$"
+    echo "launch: invalid agent command${ROUTE_ERROR:+: $ROUTE_ERROR}" >&2
+    return 1
+  }
+  rm -f "${TMPDIR:-/tmp}/tut-route-error.$$"
+  AGENT=$(printf '%s\n' "$ROUTE_WORDS" | sed -n '1p')
+  AGENT_ARGS=$(printf '%s\n' "$ROUTE_WORDS" | sed -n '2,$p' | awk 'NR == 1 { printf "%s", $0; next } { printf " %s", $0 }')
+  [ -n "$AGENT" ] || {
+    echo "launch: invalid agent command: missing executable" >&2
+    return 1
+  }
+  return 0
 }
 
 # --- anchor resolution (system-design 7.2) -----------------------------------------
@@ -379,7 +428,7 @@ process.stdin.on("end", () => {
 # Birth a fresh pane with DUAL labels: $1 tab label (human-facing — the
 # naming.tab_label template rendered by the caller), $2 pane label (the
 # machine addressing key, caller-fixed: <task_id>.<role> — NEVER templated),
-# $3 agent command (must be on PATH).
+# $3 agent executable (must be on PATH); `AGENT_ARGS` carries the ordered tail.
 # Prints the new pane_id (empty in dry-run). Exit 1 when the agent is
 # missing, the anchor cannot be resolved, or herdr fails at every step.
 #
@@ -410,11 +459,11 @@ birth_pane() {
     echo "DRY-RUN: birth: herdr tab create --workspace $ANCHOR_WS --cwd $ANCHOR_CWD --label $BP_TAB_LABEL --no-focus"
     echo "DRY-RUN: birth: adopt the tab's root pane (response root_pane, else pane list by tab_id)"
     echo "DRY-RUN: birth: herdr pane rename <root> $BP_LABEL"
-    echo "DRY-RUN: birth: herdr pane run <root> $(suppress_agent_update "$BP_AGENT")"
+    echo "DRY-RUN: birth: herdr pane run <root> $(build_run_cmd)"
     return 0
   fi
 
-  BP_RUN_CMD=$(suppress_agent_update "$BP_AGENT")
+  BP_RUN_CMD=$(build_run_cmd)
 
   # Primary: adopt the root pane the tab create ships.
   BP_RAW=$(herdr tab create --workspace "$ANCHOR_WS" --cwd "$ANCHOR_CWD" --label "$BP_TAB_LABEL" --no-focus 2>/dev/null)
@@ -576,34 +625,71 @@ process.stdin.on("end", () => {
 
 # --- readiness-gated delivery ----------------------------------------------------
 
+# --- delivery diagnostics (7.2.1, decoupled observer) ------------------------------
+
+# One `tut-delivery t=<epoch-ms> …` stderr line per delivery step. Pure
+# observation — never a gate, never a branch: TUT_DELIVERY_DIAG=0 silences
+# the lines and nothing else changes (decoupling pinned by test). node is
+# already a hard dependency of this script (all JSON parsing runs through
+# it); ~25ms per call sits well inside the 250ms poll grid, and every
+# timeout below is counted in polls, so the observation cannot change the
+# loop's decisions. `date +%s`000 is the no-node fallback (second
+# resolution is still a reconstructable timeline). Purpose: the
+# swallowed-Enter lottery is unreproducible under control — the next
+# organic hit gets its timeline from these lines, aligned against the
+# notify-pane log (the Notifier tees this script's stderr there).
+diag_clock() {
+  node -e 'process.stdout.write(String(Date.now()))' 2>/dev/null || true
+}
+
+# $@ = the event's fields (e.g. "read pane=X step=gate idx=3 …").
+diag() {
+  [ "${TUT_DELIVERY_DIAG:-1}" = "1" ] || return 0
+  DIAG_NOW=$(diag_clock)
+  [ -n "${DIAG_NOW:-}" ] || DIAG_NOW="$(date +%s)000"
+  echo "tut-delivery t=${DIAG_NOW} $*" >&2
+}
+
+# Last non-empty line of screen $1, trailing whitespace trimmed, capped at
+# 40 chars, single quotes stripped — rides inside the quoted tail='…'
+# field of a read diag line (bounded, safe to log).
+diag_tail() {
+  printf '%s' "$1" | awk 'NF { l = $0 } END { if (l != "") { sub(/[ \t\r]+$/, "", l); print substr(l, 1, 40) } }' | tr -d "'"
+}
+
+# Bottom region of screen $1: its last $2 (default 3) non-empty lines,
+# trailing whitespace trimmed, newline-joined — where the receiver's
+# composer and its chrome live. Live-calibrated on both TUIs: codex's
+# "› …" composer line + status row sit in the last non-empty lines (the
+# placeholder reverts when the box empties); pi's separator/cwd/token-stat
+# rows do (they start ticking the moment the round begins). This is the
+# submit criterion's whole field of view.
+screen_bottom() {
+  printf '%s' "$1" | awk -v n="${2:-3}" '
+    NF { sub(/[ \t\r]+$/, ""); ring[c % n] = $0; c++ }
+    END {
+      start = (c > n) ? c - n : 0;
+      for (j = start; j < c; j++) printf "%s%s", (j > start ? "\n" : ""), ring[j % n];
+    }'
+}
+
+# Submit-confirmed predicate (the tightened criterion): the receiver's
+# input box let go of the text ⟺ a NON-EMPTY screen whose bottom region no
+# longer matches the with-text snapshot's region ($2, precomputed via
+# screen_bottom). Repaints above the region do not count; an empty read is
+# a glitch and never confirms. Degraded note: when land-confirm timed out
+# with an unpainted screen, the region baseline is empty and any non-empty
+# screen confirms — the old open-loop looseness, kept only on that path.
+box_cleared() {
+  [ -n "$1" ] || return 1
+  [ "$(screen_bottom "$1" 3)" != "$2" ]
+}
+
 # Terminal text of pane $1 (probe input). --source visible: the rendered
 # screen — available on every pane from birth (herdr 0.8's "recent"
 # snapshots proved UNRELIABLE on freshly born panes, see 7.2.1).
 pane_output() {
   herdr pane read "$1" --source visible --lines 40 2>/dev/null || true
-}
-
-# Herdr's lifecycle state is the strongest readiness signal available at the
-# launcher boundary: idle means the agent is ready for input, while working
-# means its input loop is alive and can queue a prompt. The helper is queried
-# only after an initial Enter has gone silent, so the normal first-submit path
-# keeps the old read-only verification shape. Missing/unknown status is a
-# conservative "not ready" and falls back to the bounded visible-screen
-# observation below.
-pane_agent_ready() {
-  PAR_PANE="$1"
-  pane_list_json | node -e '
-let raw = "";
-process.stdin.on("data", (d) => (raw += d));
-process.stdin.on("end", () => {
-  try {
-    const list = JSON.parse(raw);
-    const panes = list?.result?.panes ?? list?.panes ?? [];
-    const hit = panes.find((p) => p.pane_id === process.argv[1]);
-    if (["idle", "working"].includes(hit?.agent_status ?? "")) process.stdout.write("ready");
-  } catch {}
-});
-' "$PAR_PANE" 2>/dev/null || true
 }
 
 # Wait until the freshly born pane $1 shows its receiver: the output must
@@ -618,6 +704,7 @@ wait_born_ready() {
   WBR_FLOOR_POLLS=$(( ${TUT_READY_FLOOR_MS:-1500} / WBR_POLL_MS ))
   WBR_MAX_POLLS=$(( ${TUT_READY_TIMEOUT_MS:-15000} / WBR_POLL_MS ))
   WBR_SLEEP=$(awk "BEGIN{printf \"%.3f\", $WBR_POLL_MS/1000}")
+  diag "gate-start pane=$WBR_PANE floor_ms=${TUT_READY_FLOOR_MS:-1500} timeout_ms=${TUT_READY_TIMEOUT_MS:-15000}"
   WBR_BASE=$(pane_output "$WBR_PANE")
   WBR_PREV="$WBR_BASE"
   WBR_I=0
@@ -625,13 +712,16 @@ wait_born_ready() {
     sleep "$WBR_SLEEP"
     WBR_OUT=$(pane_output "$WBR_PANE")
     if [ -n "$WBR_OUT" ] && [ "$WBR_OUT" != "$WBR_BASE" ] && [ "$WBR_OUT" = "$WBR_PREV" ] && [ "$WBR_I" -ge "$WBR_FLOOR_POLLS" ]; then
+      diag "gate-release pane=$WBR_PANE idx=$WBR_I len=${#WBR_OUT} tail='$(diag_tail "$WBR_OUT")'"
       printf '%s' "$WBR_OUT"
       return 0
     fi
+    diag "read pane=$WBR_PANE step=gate idx=$WBR_I len=${#WBR_OUT} tail='$(diag_tail "$WBR_OUT")'"
     WBR_PREV="$WBR_OUT"
     WBR_I=$(( WBR_I + 1 ))
   done
   echo "launch: born pane $WBR_PANE not observed ready within $(( WBR_MAX_POLLS * WBR_POLL_MS ))ms — delivering anyway (if the text idles in the input box, press Enter there)" >&2
+  diag "gate-timeout pane=$WBR_PANE idx=$WBR_I len=${#WBR_OUT}"
   printf '%s' "$WBR_OUT"
   return 0
 }
@@ -647,100 +737,96 @@ confirm_text_landed() {
   TL_POLL_MS="${TUT_READY_POLL_MS:-250}"
   TL_MAX_POLLS=$(( ${TUT_TEXT_LAND_TIMEOUT_MS:-5000} / TL_POLL_MS ))
   TL_SLEEP=$(awk "BEGIN{printf \"%.3f\", $TL_POLL_MS/1000}")
+  diag "land-start pane=$TL_PANE timeout_ms=${TUT_TEXT_LAND_TIMEOUT_MS:-5000}"
   TL_I=0
   TL_OUT="$TL_BASE"
   while [ "$TL_I" -lt "$TL_MAX_POLLS" ]; do
     sleep "$TL_SLEEP"
     TL_OUT=$(pane_output "$TL_PANE")
     if [ -n "$TL_OUT" ] && [ "$TL_OUT" != "$TL_BASE" ]; then
+      diag "land-observed pane=$TL_PANE idx=$TL_I len=${#TL_OUT} tail='$(diag_tail "$TL_OUT")'"
       printf '%s' "$TL_OUT"
       return 0
     fi
+    diag "read pane=$TL_PANE step=land idx=$TL_I len=${#TL_OUT} tail='$(diag_tail "$TL_OUT")'"
     TL_I=$(( TL_I + 1 ))
   done
   echo "launch: text landing not observed on $TL_PANE within ${TUT_TEXT_LAND_TIMEOUT_MS:-5000}ms — submitting anyway (if it idles in the input box, press Enter there)" >&2
+  diag "land-timeout pane=$TL_PANE idx=$TL_I len=${#TL_OUT}"
   printf '%s' "$TL_OUT"
   return 0
 }
 
-# Wait after an initial silent Enter for the readiness boundary. Return 0
-# when Herdr reports the input loop ready, 2 when the visible screen reacts
-# late (that is already a successful submit), and 1 on a bounded timeout.
-wait_submit_ready() {
-  WSR_PANE="$1"; WSR_BASE="$2"
-  WSR_POLL_MS="${TUT_READY_POLL_MS:-250}"
-  WSR_TIMEOUT_MS="${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}"
-  WSR_MAX_POLLS=$(( WSR_TIMEOUT_MS / WSR_POLL_MS ))
-  [ "$WSR_MAX_POLLS" -gt 0 ] || WSR_MAX_POLLS=1
-  WSR_SLEEP=$(awk "BEGIN{printf \"%.3f\", $WSR_POLL_MS/1000}")
-  WSR_I=0
-  while [ "$WSR_I" -lt "$WSR_MAX_POLLS" ]; do
-    sleep "$WSR_SLEEP"
-    WSR_OUT=$(pane_output "$WSR_PANE")
-    # If the screen moved without a ready status, the original Enter's
-    # reaction finally rendered; do not add a second Enter to an empty
-    # composer. This is the safe late-render path.
-    if [ -n "$WSR_OUT" ] && [ "$WSR_OUT" != "$WSR_BASE" ]; then
-      return 2
-    fi
-    if [ "$(pane_agent_ready "$WSR_PANE")" = "ready" ]; then
-      return 0
-    fi
-    WSR_I=$(( WSR_I + 1 ))
-  done
-  return 1
-}
-
-# Verified submit (7.2.1 readiness-bound closed loop): Enter once, verify
-# promptly, then wait without burning retries until the readiness boundary.
-# Once ready, one final Enter is enough to establish "delivered or report";
-# there is no fixed-count × fixed-interval retry lottery anymore. $1 is the
-# pane and $2 is the with-text snapshot.
+# Verified submit (7.2.1 input-box-cleared + bounded-resend-loop edition):
+# $1 is the pane, $2 the with-text snapshot. Phase 1: ONE Enter, then verify
+# for TUT_SUBMIT_TIMEOUT_MS (default 3000) by the cleared-box criterion —
+# the healthy path stays exactly one Enter. Phase 2 (the box still holds
+# the text): resend Enter at most once per TUT_SUBMIT_RETRY_MS (default
+# 1500) within TUT_SUBMIT_RETRY_TIMEOUT_MS (default 30000), verifying every
+# poll — the live sentinel proved the swallow window can outlive the
+# idle readiness signal, so the loop resends on the clock, not on readiness,
+# and only the box letting go of the text (not "any change") confirms.
+# Exhaustion → manual-fallback note + STILL EXIT 0 (the prompt sits in the
+# input box; a failure exit would re-trigger duplicate delivery). The text
+# is never re-sent.
 verified_submit() {
   VS_PANE="$1"; VS_BASE="$2"
   VS_POLL_MS="${TUT_READY_POLL_MS:-250}"
+  VS_SLEEP=$(awk "BEGIN{printf \"%.3f\", $VS_POLL_MS/1000}")
+  VS_SIG=$(screen_bottom "$VS_BASE" 3)
   VS_MAX_POLLS=$(( ${TUT_SUBMIT_TIMEOUT_MS:-3000} / VS_POLL_MS ))
   [ "$VS_MAX_POLLS" -gt 0 ] || VS_MAX_POLLS=1
-  VS_SLEEP=$(awk "BEGIN{printf \"%.3f\", $VS_POLL_MS/1000}")
+  VS_RETRY_POLLS=$(( ${TUT_SUBMIT_RETRY_MS:-1500} / VS_POLL_MS ))
+  [ "$VS_RETRY_POLLS" -gt 0 ] || VS_RETRY_POLLS=1
+  VS_WINDOW_POLLS=$(( ${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000} / VS_POLL_MS ))
+  [ "$VS_WINDOW_POLLS" -gt 0 ] || VS_WINDOW_POLLS=1
+  VS_ATTEMPT=1
+  VS_SINCE_ENTER=0
+  diag "submit pane=$VS_PANE phase=initial attempt=1 verify_ms=${TUT_SUBMIT_TIMEOUT_MS:-3000} retry_ms=${TUT_SUBMIT_RETRY_MS:-1500} window_ms=${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}"
   herdr pane send-keys "$VS_PANE" Enter >/dev/null 2>&1 || {
     echo "launch: herdr pane send-keys $VS_PANE Enter failed (initial attempt)" >&2
   }
+  diag "enter pane=$VS_PANE attempt=1 phase=initial"
   VS_I=0
   while [ "$VS_I" -lt "$VS_MAX_POLLS" ]; do
     sleep "$VS_SLEEP"
+    VS_SINCE_ENTER=$(( VS_SINCE_ENTER + 1 ))
     VS_OUT=$(pane_output "$VS_PANE")
-    if [ -n "$VS_OUT" ] && [ "$VS_OUT" != "$VS_BASE" ]; then
+    if [ -n "$VS_OUT" ] && box_cleared "$VS_OUT" "$VS_SIG"; then
+      diag "submit-confirmed pane=$VS_PANE attempt=$VS_ATTEMPT phase=verify idx=$VS_I"
       return 0
     fi
+    diag "read pane=$VS_PANE step=verify idx=$VS_I len=${#VS_OUT} box=held tail='$(diag_tail "$VS_OUT")'"
     VS_I=$(( VS_I + 1 ))
   done
 
-  wait_submit_ready "$VS_PANE" "$VS_BASE"
-  VS_READY_RC=$?
-  VS_READY_TIMEOUT="${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}"
-  if [ "$VS_READY_RC" -eq 2 ]; then
-    echo "launch: screen reaction arrived late on $VS_PANE — initial Enter eventually submitted" >&2
-    return 0
-  fi
-  if [ "$VS_READY_RC" -eq 0 ]; then
-    echo "launch: input readiness observed on $VS_PANE — resending Enter once (no retry before readiness)" >&2
-    herdr pane send-keys "$VS_PANE" Enter >/dev/null 2>&1 || {
-      echo "launch: herdr pane send-keys $VS_PANE Enter failed (post-ready attempt)" >&2
-    }
-    VS_I=0
-    while [ "$VS_I" -lt "$VS_MAX_POLLS" ]; do
-      sleep "$VS_SLEEP"
-      VS_OUT=$(pane_output "$VS_PANE")
-      if [ -n "$VS_OUT" ] && [ "$VS_OUT" != "$VS_BASE" ]; then
-        return 0
-      fi
-      VS_I=$(( VS_I + 1 ))
-    done
-    echo "launch: submit not verified on $VS_PANE after readiness — the prompt sits in the input box; press Enter there manually to start the round" >&2
-    return 0
-  fi
+  echo "launch: input box still holds the text on $VS_PANE after ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms — bounded Enter resend loop (interval ${TUT_SUBMIT_RETRY_MS:-1500}ms, window ${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}ms)" >&2
+  diag "loop-start pane=$VS_PANE attempts=$VS_ATTEMPT interval_ms=${TUT_SUBMIT_RETRY_MS:-1500} window_ms=${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}"
+  VS_N=0
+  while [ "$VS_N" -lt "$VS_WINDOW_POLLS" ]; do
+    sleep "$VS_SLEEP"
+    VS_SINCE_ENTER=$(( VS_SINCE_ENTER + 1 ))
+    VS_N=$(( VS_N + 1 ))
+    VS_OUT=$(pane_output "$VS_PANE")
+    if [ -n "$VS_OUT" ] && box_cleared "$VS_OUT" "$VS_SIG"; then
+      echo "launch: input box cleared on $VS_PANE — submit confirmed (attempt $VS_ATTEMPT)" >&2
+      diag "submit-confirmed pane=$VS_PANE attempt=$VS_ATTEMPT phase=loop idx=$VS_N"
+      return 0
+    fi
+    diag "read pane=$VS_PANE step=loop idx=$VS_N len=${#VS_OUT} box=held tail='$(diag_tail "$VS_OUT")'"
+    if [ "$VS_SINCE_ENTER" -ge "$VS_RETRY_POLLS" ]; then
+      VS_ATTEMPT=$(( VS_ATTEMPT + 1 ))
+      VS_SINCE_ENTER=0
+      herdr pane send-keys "$VS_PANE" Enter >/dev/null 2>&1 || {
+        echo "launch: herdr pane send-keys $VS_PANE Enter failed (attempt $VS_ATTEMPT)" >&2
+      }
+      echo "launch: resending Enter (attempt $VS_ATTEMPT) on $VS_PANE — box still holds the text" >&2
+      diag "enter pane=$VS_PANE attempt=$VS_ATTEMPT phase=loop resend"
+    fi
+  done
 
-  echo "launch: submit readiness not observed on $VS_PANE within ${VS_READY_TIMEOUT}ms — no retry before readiness; the prompt sits in the input box; press Enter there manually to start the round" >&2
+  echo "launch: submit not confirmed on $VS_PANE within ${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}ms after $VS_ATTEMPT Enters — the prompt sits in the input box; press Enter there manually to start the round" >&2
+  diag "give-up pane=$VS_PANE attempts=$VS_ATTEMPT window_ms=${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}"
   return 0
 }
 
@@ -756,6 +842,7 @@ deliver_prompt() {
     echo "launch: herdr pane send-text $DL_PANE failed" >&2
     return 1
   }
+  diag "send-text pane=$DL_PANE branch=born len=${#DL_TEXT}"
   DL_SNAP=$(confirm_text_landed "$DL_PANE" "$DL_BASE")
   verified_submit "$DL_PANE" "$DL_SNAP"
 }
@@ -770,10 +857,12 @@ deliver_prompt() {
 deliver_continuation() {
   DC_PANE="$1"; DC_TEXT="$2"
   DC_BASE=$(pane_output "$DC_PANE")
+  diag "read pane=$DC_PANE step=snapshot idx=0 len=${#DC_BASE} tail='$(diag_tail "$DC_BASE")'"
   herdr pane send-text "$DC_PANE" "$DC_TEXT" >/dev/null || {
     echo "launch: herdr pane send-text $DC_PANE failed" >&2
     return 1
   }
+  diag "send-text pane=$DC_PANE branch=continuation len=${#DC_TEXT}"
   DC_SNAP=$(confirm_text_landed "$DC_PANE" "$DC_BASE")
   verified_submit "$DC_PANE" "$DC_SNAP"
 }
@@ -797,17 +886,20 @@ if [ "${1:-}" = "--fresh" ]; then
   FRESH=1
   shift
 fi
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "usage: $0 [--fresh] <task_id> <role> [<agent>]   |   $0 --cleanup <task_id>" >&2
+if [ "$#" -lt 2 ]; then
+  echo "usage: $0 [--fresh] <task_id> <role> [<agent> [<arg>...]]   |   $0 --cleanup <task_id>" >&2
   exit 1
 fi
 
 TASK_ID="$1"
 ROLE="$2"
-AGENT="${3:-}"
+shift 2
 resolve_chain_root
-if [ -z "$AGENT" ]; then
-  AGENT=$(resolve_agent "$TASK_ID" "$ROLE")
+if [ "$#" -gt 0 ]; then
+  set_route_from_invocation "$@" || exit 1
+else
+  ROUTE_DISPLAY=$(resolve_agent "$TASK_ID" "$ROLE") || exit 1
+  set_route_from_invocation "$ROUTE_DISPLAY" || exit 1
 fi
 
 # Dual labels (4.4): tab label = template (human-facing; the pane label is
@@ -839,7 +931,7 @@ if [ "$FRESH" -ne 1 ] && is_continuity_role "$ROLE"; then
       echo "DRY-RUN: herdr pane send-text $CONT_PANE \"${PROMPT}\""
       echo "DRY-RUN: text-land check $CONT_PANE (timeout ${TUT_TEXT_LAND_TIMEOUT_MS:-5000}ms; on timeout submit anyway)"
       echo "DRY-RUN: herdr pane send-keys $CONT_PANE Enter"
-      echo "DRY-RUN: submit verify $CONT_PANE (timeout ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms; wait for readiness up to ${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)"
+      echo "DRY-RUN: submit verify $CONT_PANE (verify ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms by input-box-cleared; then bounded Enter resend loop — interval ${TUT_SUBMIT_RETRY_MS:-1500}ms within ${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}ms; exhaustion → manual-fallback note, still exit 0)"
       exit 0
     fi
     deliver_continuation "$CONT_PANE" "$PROMPT" || exit 1
@@ -877,7 +969,7 @@ if [ "${TUT_DRY_RUN:-0}" = "1" ]; then
   echo "DRY-RUN: herdr pane send-text ${TARGET} (agent '${AGENT}', label '${BIRTH_LABEL}') \"${PROMPT}\""
   echo "DRY-RUN: text-land check ${TARGET} (timeout ${TUT_TEXT_LAND_TIMEOUT_MS:-5000}ms; on timeout submit anyway)"
   echo "DRY-RUN: herdr pane send-keys ${TARGET} Enter"
-  echo "DRY-RUN: submit verify ${TARGET} (timeout ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms; wait for readiness up to ${TUT_SUBMIT_READY_TIMEOUT_MS:-${TUT_READY_TIMEOUT_MS:-15000}}ms before one bounded Enter resend; no signal → manual-fallback note, still exit 0)"
+  echo "DRY-RUN: submit verify ${TARGET} (verify ${TUT_SUBMIT_TIMEOUT_MS:-3000}ms by input-box-cleared; then bounded Enter resend loop — interval ${TUT_SUBMIT_RETRY_MS:-1500}ms within ${TUT_SUBMIT_RETRY_TIMEOUT_MS:-30000}ms; exhaustion → manual-fallback note, still exit 0)"
   exit 0
 fi
 
