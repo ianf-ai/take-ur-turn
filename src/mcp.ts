@@ -63,9 +63,13 @@ const STATUS_ENUM = z.enum([
  */
 const FLOW_ENUM = z.enum(["full", "direct", "solo"]);
 
-/** Per-task cast (system-design 4.1): role → agent routing overrides. */
+/** Per-task cast (system-design 4.1): legacy string or parameterized route. */
 const CAST_ROLES_ENUM = z.enum(["architect", "executor", "reviewer"]);
-const castSchema = z.record(CAST_ROLES_ENUM, z.string()).optional();
+const agentRouteSchema = z.union([
+  z.string(),
+  z.object({ agent: z.string(), args: z.array(z.string()) }),
+]);
+const castSchema = z.record(CAST_ROLES_ENUM, agentRouteSchema).optional();
 
 /** Payload envelope as a raw zod schema: extend-only passthrough (context-design 2.3/5). */
 const payloadSchema = z
@@ -95,9 +99,11 @@ export function createMcpServer(store: Store): McpServer {
         "implementing (later design records are reference notes, no transition); solo = small change exempt from " +
         "review — code_changes goes straight to pending_approval (a review record in solo is a visible out-of-table " +
         "anomaly). role is the creator's role label (convention: \"architect\" | \"executor\" | \"reviewer\" | " +
-        "\"human\"). cast optionally overrides the agent each role routes to for THIS task (role → agent name, " +
+        "\"human\"). cast optionally overrides the agent command each role routes to for THIS task (role → route, " +
         "e.g. {executor: \"pi\"}); it is a routing parameter only — it never restricts who may publish — and is " +
-        "immutable after creation, like flow.",
+        "immutable after creation, like flow. A route may be a legacy bare string or " +
+        "{agent, args} with ordered shell-neutral argv words; parameterized values are " +
+        "preserved without interpretation.",
       inputSchema: {
         title: z.string(),
         description: z.string(),

@@ -13,6 +13,7 @@ import {
   type WaitingFor,
   type Warning,
 } from "./types.js";
+import { AgentCommandError, validateAgentRoute } from "./agent-command.js";
 import { derive } from "./state-machine.js";
 
 /**
@@ -43,7 +44,7 @@ export interface CreateTaskInput {
   role: string;
   /** Workflow variant (system-design 3.1): absent = "full". */
   flow?: Flow;
-  /** Per-task cast: role → agent routing overrides, absent roles use the default lineup. */
+  /** Per-task cast: role → agent route overrides, absent roles use the default lineup. */
   cast?: Cast;
 }
 
@@ -114,7 +115,7 @@ interface TaskMeta {
    */
   flow?: Flow;
   /**
-   * Per-task cast: role → agent routing. Written once at create, never
+   * Per-task cast: role → agent route. Written once at create, never
    * touched again — same immutability-by-construction as flow (no write path
    * exists). Absent on default creates and on project scope.
    */
@@ -147,21 +148,23 @@ function requireValidFlow(value: unknown): Flow {
 
 const CAST_ROLES = ["architect", "executor", "reviewer"] as const;
 
-/** Create-time cast validation: role keys limited to the three convention roles, agents non-empty strings. */
+/** Create-time cast validation: role keys limited to the three convention roles. */
 function requireValidCast(value: unknown): Cast | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new StoreError(ErrorCode.VALIDATION_ERROR, "cast must be an object of role=agent pairs");
+    throw new StoreError(ErrorCode.VALIDATION_ERROR, "cast must be an object of role=agent command pairs");
   }
   const out: Cast = {};
-  for (const [role, agent] of Object.entries(value as Record<string, unknown>)) {
+  for (const [role, route] of Object.entries(value as Record<string, unknown>)) {
     if (!(CAST_ROLES as readonly string[]).includes(role)) {
       throw new StoreError(ErrorCode.VALIDATION_ERROR, `cast role must be one of ${CAST_ROLES.join("|")}, got: ${role}`);
     }
-    if (typeof agent !== "string" || agent.trim().length === 0) {
-      throw new StoreError(ErrorCode.VALIDATION_ERROR, `cast agent for '${role}' must be a non-empty string`);
+    try {
+      out[role as keyof Cast] = validateAgentRoute(route, `cast agent for '${role}'`);
+    } catch (e) {
+      const message = e instanceof AgentCommandError ? e.message : "invalid command route";
+      throw new StoreError(ErrorCode.VALIDATION_ERROR, message);
     }
-    out[role as keyof Cast] = agent;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }

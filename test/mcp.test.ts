@@ -83,6 +83,27 @@ describe("context.create", () => {
     expect(out.json?.version).toBe(0);
   });
 
+  it("round-trips a parameterized cast through create, read, and list", async () => {
+    const cast = { executor: { agent: "codex", args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] } };
+    const created = await call("context.create", {
+      title: "Parameterized route",
+      description: "preserve ordered launch argv",
+      creator: "tester",
+      role: "architect",
+      cast,
+    });
+    expect(created.isError).toBe(false);
+    const taskId = created.json?.task_id as string;
+
+    const read = await call("context.read", { task_id: taskId });
+    expect(read.isError).toBe(false);
+    expect(read.json?.cast).toEqual(cast);
+
+    const listed = await call("context.list", {});
+    const entry = (listed.json?.tasks as Array<Record<string, unknown>>).find((task) => task.task_id === taskId);
+    expect(entry?.cast).toEqual(cast);
+  });
+
   it("rejects a missing required field as an input-validation tool error", async () => {
     const out = await call("context.create", {
       title: "x",
