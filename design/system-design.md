@@ -135,14 +135,16 @@ review pass 派生出 `pending_approval` 后，需要一条**人**发布的 deci
 
 ```
 输入：{ title, description, creator, role, flow?, cast? }   flow ∈ "full" | "direct" | "solo"，缺省 full；
-                                                             cast ∈ { architect? / executor? / reviewer? → agent 名 }，
+                                                             cast ∈ { architect? / executor? / reviewer? → AgentRoute }，
                                                              部分指定合法（缺的 role 回落默认阵容）
 输出：{ task_id, status, version: 0 }                status 按 flow 派生：full/solo → "designing"，direct → "implementing"
 ```
 
 flow 与 cast 落 meta 后均不可变（无写入路径，构造性不可变），变更 = 新任务。
 
-task_id 由 Server 生成（slug 化 title + 必要时加短后缀）。role 是创建者自述标签，任务不维护参与角色名册。**cast 是路由参数不是参与名册**：只影响启动器为各 role 拉谁（消费侧解析链见 6.2），不约束谁能写记录（写入自由不变）——CLI 通道为 `tut create --cast executor=pi,reviewer=codex`。
+task_id 由 Server 生成（slug 化 title + 必要时加短后缀）。role 是创建者自述标签，任务不维护参与角色名册。**cast 是路由参数不是参与名册**：只影响启动器为各 role 拉谁（消费侧解析链见 6.2），不约束谁能写记录（写入自由不变）——CLI 通道为 `tut create --cast executor=pi --cast 'reviewer=codex --model gpt-5.6'`。
+
+`AgentRoute = string | AgentCommand`，其中 `AgentCommand = { agent: string, args: string[] }`。裸 agent 名继续按旧字符串落库；带参命令规范化为对象，args 顺序和值逐项保留。人类命令值只支持一个非空可执行词和若干非空参数词，TUT 只按空白分词并拒绝引号、反斜杠、变量、管道、重定向、glob、命令替换等 shell 语法；TUT 不解释命令内的 shell。`assign` 的 role 后剩余 argv 也按同一规则作为命令值。
 
 **context.publish**
 
@@ -213,7 +215,7 @@ GET /state
     notify?: { channels: [...], webhook_url: "..." },   // 可选，见下注
     tasks: [ { task_id, title, status, updated_at, needs_attention: bool,
                waiting_for: "human" | "agent:<role>" | "none",
-               version: number, flow: "full"|"direct"|"solo", cast?: {...} } ] }   // 见下注（加法修订）
+               version: number, flow: "full"|"direct"|"solo", cast?: { role → AgentRoute } } ] }   // 见下注（加法修订）
 ```
 
 status / waiting_for / needs_attention 为派生结果（见第 3 节；project scope 不出现在 /state——它没有可派生的状态）。任务条目原六字段形状冻结，`version`、`flow`（总现、规范化 `"full"`）、`cast?`（有才现）均为**加法修订**，同时外泄到 context.read / context.list 的 MCP 输出面（条目同名字段，schema 只增不改）；Hub 只暴露原始 cast，不替消费方解析路由（解析链在消费侧，见 6.2）。顶层 `notify` 键同为**加法修订**：回显 config.json 的 `notify` 字段（Channel 配置，见 8.3），config 缺省或损坏时键不出现、接口不报错——Notifier 每轮轮询随取随用，配置变更下个周期生效，不为读配置增加文件依赖。Notifier 常驻轮询这个接口（默认间隔 5s，可配置，见 6.1），对比上一次快照，发现 `waiting_for` 变化或 `needs_attention` 置位即发通知。一个只读 HTTP 接口就够了，Notifier 不需要 MCP 客户端能力。
@@ -316,9 +318,11 @@ Notifier 主循环（默认 5s，可配置）
 
 auto 模式启动前的检查是流程执法的唯一所在（三项）：**① review pass 但没有 decision 记录、② needs_attention 置位、③ 目标 role 不在启动白名单**（config.json 的 `auto.launch_roles`，经 /state 的 `auto` 键暴露，缺省空 = 全部回落）——任一命中则 Notifier 不自动启动，转通知人。检查顺序：判门 → 白名单 → 查重（launch note）→ 前置检查 → 落痕 → 启动；**白名单未过不落 launch 痕**（不阻碍人的 `tut start-next`），**前置检查失败也无痕**（解析不出目标 agent / agent 不在 PATH → 报错退出，重试自然、无需 --force；herdr 层失败仍发生在落痕后 → 恢复用 `--force`）。manual 模式下人本身就是门。
 
-manual 模式下 Notifier 同样持有启动能力但不使用——auto/manual 切换只改 Notifier 的一个分支，不改 Hub；流程真相仍在派生状态，模式只决定「谁来按下启动键」。**role → agent 的路由解析链**（单一链、两个启动门共用）：**task cast（/state 条目）→ 三级 workspace 链逐 role 回退——L1 项目级 `<项目根>/.context-hub/workspace.json` → L2 用户级 `~/.config/tut/workspace.json`（`TUT_USER_CONFIG_DIR` 可覆盖目录）→ 内置 DEFAULT_ROLES（architect=codex / executor=pi / reviewer=codex，值冻结）**。读侧 never-throw（缺失/损坏文件 = 该级缺席），per-field 逐键回退（L1 只写 executor 时 architect 取 L2/L3）；旧形 `{label, agent}` 条目读侧容忍（只读 `.agent`）；label 字段与 routes.json 已**概念退役**（物理删除，统一收敛于此）。仓库内 `scripts/workspace.json` 退役为种子（运行时零读取），`tut assign` 改写**项目级**文件（不存在时从当前有效阵容初始化三 role 全量落盘）；「一 Agent 多帽」是一等表达。双实现格局的统一口径：TS 侧 workspace.ts `resolveAgent`（tut start-next 与 Notifier auto 门共用，launch.ts `resolveLaunchTarget` 汇聚）+ launch.sh 侧零构建 node 模块 `scripts/tut-resolve.mjs`——**同链、同 fixture 向量、同输出**，一致性由 parity 测试钉死（bash/TS 双语言下「单一代码文件」不可行，链的统一以测试保证）。
+manual 模式下 Notifier 同样持有启动能力但不使用——auto/manual 切换只改 Notifier 的一个分支，不改 Hub；流程真相仍在派生状态，模式只决定「谁来按下启动键」。**role → agent 的路由解析链**（单一链、两个启动门共用）：**task cast（/state 条目）→ 三级 workspace 链逐 role 回退——L1 项目级 `<项目根>/.context-hub/workspace.json` → L2 用户级 `~/.config/tut/workspace.json`（`TUT_USER_CONFIG_DIR` 可覆盖目录）→ 内置 DEFAULT_ROLES（architect=codex / executor=pi / reviewer=codex，值冻结）**。中间层传递 `AgentRoute`，不得 split 后只取首词或改变 args 顺序；TS 侧 `resolveAgent` 保留旧的显示字符串包装，`resolveAgentRoute` 给启动消费者返回 `{agent,args}`。读侧 never-throw（缺失/损坏文件 = 该级缺席），per-field 逐键回退（L1 只写 executor 时 architect 取 L2/L3）；旧形 `{label, agent}` 条目读侧容忍（只读 `.agent`），新形 `{agent,args}` 逐项读取；label 字段与 routes.json 已**概念退役**（物理删除，统一收敛于此）。仓库内 `scripts/workspace.json` 退役为种子（运行时零读取），`tut assign` 改写**项目级**文件（不存在时从当前有效阵容初始化三 role 全量落盘）；「一 Agent 多帽」是一等表达。双实现格局的统一口径：TS 侧 workspace.ts `resolveAgentRoute`（tut start-next 与 Notifier auto 门共用，launch.ts `resolveLaunchTarget` 汇聚）+ launch.sh 侧零构建 node 模块 `scripts/tut-resolve.mjs`——**同链、同 fixture 向量、同输出**，一致性由 parity 测试钉死（bash/TS 双语言下「单一代码文件」不可行，链的统一以测试保证）。
 
-`tut start-next [<task_id>] [--fresh]` 子命令是人工确认入口：读当前 waiting_for → 前置检查（解析目标 agent + PATH）→ 经启动器（`launch.sh [--fresh] <task_id> <role> <agent>`，见 7.2）投递轮次 prompt——三分支：同角色延续 / 角色变更新生 / `--fresh` 显式新生（见 4.4）；`--fresh` 与 `--force` 正交（前者 pane 策略、后者去重旁路）。它和 auto 模式走同一条启动通路与解析链，只是按键者是人。**`tut up` 已退化为电源开关**：只供给 hub + notify pane（兼作 birth 锚点，见 7.2），不再预供 role pane——agent pane 由启动器在轮次交接时诞生、随生命周期钩子回收（见 4.4/7.2），「多开 agent = 闲置零成本」由此成立。
+命令值的 CLI 语法是 `--cast <role=command>` 可重复；旧的 `--cast executor=pi,reviewer=codex` 逗号简写继续可读，只有逗号后紧跟已知 `role=` 才是下一项边界，参数 token 内的普通逗号不截断。`tut assign <role> <command...>` 将 role 后的剩余 argv 作为同一命令值。命令首词才进入 `command -v`；参数化示例：`--cast 'executor=codex --model gpt-5.6 --sandbox workspace-write --search'`。
+
+`tut start-next [<task_id>] [--fresh]` 子命令是人工确认入口：读当前 waiting_for → 前置检查（解析目标 command 首词 + PATH）→ 经启动器（`launch.sh [--fresh] <task_id> <role> <agent> [<arg>...]`，见 7.2）投递轮次 prompt——三分支：同角色延续 / 角色变更新生 / `--fresh` 显式新生（见 4.4）；`--fresh` 与 `--force` 正交（前者 pane 策略、后者去重旁路）。它和 auto 模式走同一条启动通路与解析链，只是按键者是人。**`tut up` 已退化为电源开关**：只供给 hub + notify pane（兼作 birth 锚点，见 7.2），不再预供 role pane——agent pane 由启动器在轮次交接时诞生、随生命周期钩子回收（见 4.4/7.2），「多开 agent = 闲置零成本」由此成立。
 
 ## 7. Agent Host：信号源与启动器
 
@@ -337,7 +341,9 @@ Agent Host 是承载本机 Agent 进程的宿主环境。架构对它的依赖�
 | 角色 | 契约 | 当前绑定 |
 |------|------|---------|
 | 信号源（in） | 事件投给统一入口：`scripts/on-agent-event.sh <event> <agent> <pane>`，event ∈ working / blocked / done | Herdr 插件投递 |
-| 启动器（out） | 经统一封装启动（**跨角色必 fresh、同角色连续轮延续**）：`scripts/launch.sh [--fresh] <task_id> <role> [<agent>]`（轮次交接，auto 模式 / start-next 用，建任务后的首轮同此；第三参为解析后的目标 agent——调用方（cli / notifier）经 6.2 解析链得出后显式传入，缺省时脚本自行解析：`GET $TUT_HUB_URL/state` 拿 cast → `scripts/tut-resolve.mjs` 三级链（L1 根 = `$TUT_PROJECT_ROOT` ?? 锚点 cwd ?? 跳过该级），hub 不可达回落默认阵容并 stderr 提示）；`scripts/launch.sh --cleanup <task_id>`（任务关闭钩子，`tut decide close` 触发，best-effort）。**锚点解析提前到入口**：每个入口先解析一次锚点并派生链根，全程复用；锚点不可达且无 `TUT_PROJECT_ROOT` → 链落 L2/L3 + stderr 降级声明（birth 路径仍 loud fail）。**三分支轮次交接**（详见 4.4）：①同任务同角色连续轮 + 现存活 pane（label 精确等于 `<task_id>.<role>`，活 = `agent_status ∈ {idle, working, blocked}`；`done`/缺失 = 死）→ **只投递不收割不新生**（`send-text` + `Enter` 无门控直投，stderr 延续注记——复用/新生都是可见选择）；②新生分支（角色变更/首轮/死 pane）——收割收窄：close ⟺ `<T>.*` ∧ 非 working ∧ ¬(延续角色 ∧ 活)，延续集合脚本内默认 `executor reviewer`（env `TUT_CONTINUITY_ROLES` 空格分隔可覆盖，空串 = 全收割的逃生/测试旋钮），working 跳过+警告语义保留；收割后仍存在活的 `<T>.<role>` pane → loud abort 不诞生（寻址键唯一性守卫，防 start-next --force 撞 working pane 静默诞生同标签第二个 pane）；③`--fresh`——显式外部视角：force-close 该任务全部 `<T>.<role>` pane（含 working——显式选择授权杀活会话）后走新生分支；`tut start-next --fresh` 解析透传（与 `--force` 正交），notifier 永不传。运维口径：cast 中途换 agent 后启动同角色轮，配 `--fresh`（现存 pane 里还是旧 agent 的会话；角色提示词 agent 无关，仍可经 Hub 干活，属降级不致命）。**birth 锚定**（关闭两类历史锚定漏洞：pane list 全局、tab create 缺省进聚焦 workspace）：锚点 = pane list 中 `tut-hub` pane 的 `(workspace_id, cwd)`（hub 进程所在即事实锚），回落 `tut-notify` → `$TUT_SPLIT_BASE` 指定 pane → loud fail——绝不取「pane list 首个」，不按 workspace label 匹配（label 可重名）。**birth 序列（adopt-root，双标签）**：`command -v <agent>` 前置 → `herdr tab create --workspace W --cwd C --label <tab_label> --no-focus`（tab 标签 = naming 模板渲染；自带空根 pane，收养为工位，噪音窗零产生）→ 根 pane 双通道发现（响应 `root_pane` → pane list 按 tab_id）→ `pane rename <pane_label>`（pane 标签 = 固定寻址键 `<task_id>.<role>`，见 4.4）→ `pane run <agent>`；**拉起禁自更新**（供给强化，自更新竞争事故的根治）：run 命令按 agent 附带自更新抑制——codex → `-c check_for_update_on_startup=false`（config 覆盖旗标，掐掉启动期更新检查即 npm 自更新触发器）；pi → `env PI_SKIP_VERSION_CHECK=1`（文档化 env）；未知 agent 原样透传，`command -v` 存在性检查始终探裸名；`TUT_SUPPRESS_AGENT_UPDATE=0` 逃生旋钮。机制约束：herdr `pane run` 把 argv 敲进 pane 的 shell，包装形式必须是纯词（无引号）；**tab create 退出码 0 但输出不可解析**→ 经 `herdr tab list --workspace W` 按 label 匹配回收 tab_id（绝不盲建第二个同 label tab），二次 `tab create` 仅在首次可证失败（非零退出）时执行；rename/run 失败时回退锚定版 split 序列（close 失败根 → split 锚点 pane 带 `--cwd` → move 入 tab → **有界重试收扫该 tab 残留根**（pane list 可滞后于刚建 tab——≤`TUT_ROOT_SWEEP_RETRIES` 次 × `TUT_ROOT_SWEEP_RETRY_MS` 间隔重列）→ rename → run → **run 成功后幂等 sweep**（重列该 tab，close 除新 pane 外一切 pane，重试 + sweep 双保险））。**投递机制**（见 7.2.1）：prompt 不用 `pane run` 投——两分支同走「`send-text` + 落框确认 + readiness-bound 验证式提交（首个 Enter 沉默时等待就绪信号，再至多重发一次）闭环；born 分支前置就绪门控，延续分支免门控（存量 pane UI 已绘制）。内部调容器命令（herdr 0.8 语法） | `herdr tab create` / `tab list` / `pane split` / `pane send-text` / `pane send-keys` 等 |
+| 启动器（out） | 经统一封装启动（**跨角色必 fresh、同角色连续轮延续**）：`scripts/launch.sh [--fresh] <task_id> <role> [<agent> [<arg>...]]`（轮次交接，auto 模式 / start-next 用，建任务后的首轮同此；第三参为解析后的目标 agent——调用方（cli / notifier）经 6.2 解析链得出后显式传入，缺省时脚本自行解析：`GET $TUT_HUB_URL/state` 拿 cast → `scripts/tut-resolve.mjs` 三级链（L1 根 = `$TUT_PROJECT_ROOT` ?? 锚点 cwd ?? 跳过该级），hub 不可达回落默认阵容并 stderr 提示）；`scripts/launch.sh --cleanup <task_id>`（任务关闭钩子，`tut decide close` 触发，best-effort）。**锚点解析提前到入口**：每个入口先解析一次锚点并派生链根，全程复用；锚点不可达且无 `TUT_PROJECT_ROOT` → 链落 L2/L3 + stderr 降级声明（birth 路径仍 loud fail）。**三分支轮次交接**（详见 4.4）：①同任务同角色连续轮 + 现存活 pane（label 精确等于 `<task_id>.<role>`，活 = `agent_status ∈ {idle, working, blocked}`；`done`/缺失 = 死）→ **只投递不收割不新生**（`send-text` + `Enter` 无门控直投，stderr 延续注记——复用/新生都是可见选择）；②新生分支（角色变更/首轮/死 pane）——收割收窄：close ⟺ `<T>.*` ∧ 非 working ∧ ¬(延续角色 ∧ 活)，延续集合脚本内默认 `executor reviewer`（env `TUT_CONTINUITY_ROLES` 空格分隔可覆盖，空串 = 全收割的逃生/测试旋钮），working 跳过+警告语义保留；收割后仍存在活的 `<T>.<role>` pane → loud abort 不诞生（寻址键唯一性守卫，防 start-next --force 撞 working pane 静默诞生同标签第二个 pane）；③`--fresh`——显式外部视角：force-close 该任务全部 `<T>.<role>` pane（含 working——显式选择授权杀活会话）后走新生分支；`tut start-next --fresh` 解析透传（与 `--force` 正交），notifier 永不传。运维口径：cast 中途换 agent 后启动同角色轮，配 `--fresh`（现存 pane 里还是旧 agent 的会话；角色提示词 agent 无关，仍可经 Hub 干活，属降级不致命）。**birth 锚定**（关闭两类历史锚定漏洞：pane list 全局、tab create 缺省进聚焦 workspace）：锚点 = pane list 中 `tut-hub` pane 的 `(workspace_id, cwd)`（hub 进程所在即事实锚），回落 `tut-notify` → `$TUT_SPLIT_BASE` 指定 pane → loud fail——绝不取「pane list 首个」，不按 workspace label 匹配（label 可重名）。**birth 序列（adopt-root，双标签）**：`command -v <agent>` 前置 → `herdr tab create --workspace W --cwd C --label <tab_label> --no-focus`（tab 标签 = naming 模板渲染；自带空根 pane，收养为工位，噪音窗零产生）→ 根 pane 双通道发现（响应 `root_pane` → pane list 按 tab_id）→ `pane rename <pane_label>`（pane 标签 = 固定寻址键 `<task_id>.<role>`，见 4.4）→ `pane run <agent> [<arg>...]`；**拉起禁自更新**（供给强化，自更新竞争事故的根治）：run 命令按 agent 附带自更新抑制——codex → `-c check_for_update_on_startup=false`（config 覆盖旗标，掐掉启动期更新检查即 npm 自更新触发器）；pi → `env PI_SKIP_VERSION_CHECK=1`（文档化 env）；未知 agent 原样透传，`command -v` 存在性检查始终探裸名；`TUT_SUPPRESS_AGENT_UPDATE=0` 逃生旋钮。机制约束：herdr `pane run` 把 argv 敲进 pane 的 shell，包装形式必须是纯词（无引号）；**tab create 退出码 0 但输出不可解析**→ 经 `herdr tab list --workspace W` 按 label 匹配回收 tab_id（绝不盲建第二个同 label tab），二次 `tab create` 仅在首次可证失败（非零退出）时执行；rename/run 失败时回退锚定版 split 序列（close 失败根 → split 锚点 pane 带 `--cwd` → move 入 tab → **有界重试收扫该 tab 残留根**（pane list 可滞后于刚建 tab——≤`TUT_ROOT_SWEEP_RETRIES` 次 × `TUT_ROOT_SWEEP_RETRY_MS` 间隔重列）→ rename → run → **run 成功后幂等 sweep**（重列该 tab，close 除新 pane 外一切 pane，重试 + sweep 双保险））。**投递机制**（见 7.2.1）：prompt 不用 `pane run` 投——两分支同走「`send-text` + 落框确认 + 验证式提交（输入框清空判据 + 长有界 Enter 循环重发）+ 分步时间戳诊断」闭环；born 分支前置就绪门控，延续分支免门控（存量 pane UI 已绘制）。内部调容器命令（herdr 0.8 语法） | `herdr tab create` / `tab list` / `pane split` / `pane send-text` / `pane send-keys` 等 |
+
+本任务对启动器契约作加法扩展：`scripts/launch.sh [--fresh] <task_id> <role> [<agent> [<arg>...]]`。调用方把命令首词与有序 args 逐项传入；旧的第三参裸 agent 继续可用，第三参为 legacy 命令字符串时仅在入口解析一次。`command -v` 只探首词，Herdr 收到逐项 shell-neutral argv；codex 在用户 args 后追加 `-c check_for_update_on_startup=false`，pi 在原命令前加 `env PI_SKIP_VERSION_CHECK=1`，未知命令逐项原样传递，`TUT_SUPPRESS_AGENT_UPDATE=0` 关闭 suppression。其余生命周期、锚定、收割、投递与回退语义不变。
 
 任何实现只要履行契约即可接入：更换终端容器、或将来的 Agent 直报，都只改这两个粘合脚本——Hub、派生、通知逻辑不动。
 
@@ -368,23 +374,25 @@ Notifier 的辅通道（blocked 即时告警、done 交叉验证、working 刷�
 
 auto 启动的可见性分两段：启动器成功返回后立即通知「launch succeeded」，并开始短引信（默认 300s，可由 `tut notify --working-timeout <s>` 配置）；匹配同一任务/轮次的 `working` 事件到达后再通知「agent working」并熄灭引信。引信到期仍没有 working 信号时，经同一 Channel 告警并提示人工介入。working 事件若早于下一次 /state 快照到达，Notifier 先触发一次对比，快照补齐后重做前缀反查，避免 fresh pane 的时序竞态被误判为未知事件。
 
-#### 7.2.1 投递机制：就绪门控 + 落框确认 + 验证式提交
+#### 7.2.1 投递机制：就绪门控 + 落框确认 + 验证式提交（输入框清空判据 + 长有界循环重发 + 分步时间戳诊断）
 
-prompt 不用 `pane run` 一体投递：其「打字 + 回车」走终端括号粘贴（bracketed paste）启发式，与正在启动的 TUI（模式切换中）存在时序竞争，回车可能丢失。改为显式投递，且提交步是**闭环**（真机回归实证后修复）：
+prompt 不用 `pane run` 一体投递：其「打字 + 回车」走终端括号粘贴（bracketed paste）启发式，与正在启动的 TUI（模式切换中）存在时序竞争，回车可能丢失。改为显式投递，且提交步是**闭环**（真机回归实证后修复，后又按 live 哨兵反例两度演进）：
 
 1. **就绪探测**（born 分支专属——同角色延续分支无门控，见下）：轮询 `herdr pane read <pane> --source visible --lines 40`，要求输出相对基准（`pane run <agent>` 返回瞬间的 shell 回显）发生变化且连续两次采样稳定，且不早于下限等待——即接收方 UI 已绘制。参数：`TUT_READY_FLOOR_MS`（默认 1500）、`TUT_READY_TIMEOUT_MS`（默认 15000，到点照投并 stderr 提示）、`TUT_READY_POLL_MS`（默认 250，亦为下列各步的轮询节奏）。
 2. **投递**：`herdr pane send-text <pane> "<prompt>"`——字面文本，不产生粘贴标记。
 3. **落框确认**：以投前快照为基准轮询读屏，窗口 `TUT_TEXT_LAND_TIMEOUT_MS`（默认 5000）内出现变化 → 文本已渲染在接收方输入框；超时 → stderr 提示后照常提交（永不比开环差）。此步产出「带文本快照」作为提交验证基准。
-4. **验证式提交**：先 `herdr pane send-keys <pane> Enter`，在 `TUT_SUBMIT_TIMEOUT_MS`（默认 3000）内轮询读屏；相对带文本快照出现任何变化（composer 清空/会话流增长/spinner）即视为提交生效。无变化时**不进入固定次数 × 固定间隔的重发循环**：等待一个以就绪信号为界的窗口 `TUT_SUBMIT_READY_TIMEOUT_MS`（默认沿用 `TUT_READY_TIMEOUT_MS`，即 15000），期间不再发送 Enter。Herdr `agent_status ∈ {idle, working}` 是当前可用的就绪信号；若等待期间屏幕先发生变化，视为首个 Enter 的迟到反应。就绪信号到达后只重发一次 Enter 并再次验证——成功即结束，仍无变化则 stderr 人工补救指引 + **exit 0**；窗口内没有信号同样只报人工补救 + exit 0。`TUT_SUBMIT_RETRIES` 不再决定重发次数（保留为无效旧环境变量，避免旧启动环境因未知变量失败）。文本永不重发，避免重复 prompt。
+4. **验证式提交（输入框清空判据）**：先 `herdr pane send-keys <pane> Enter`，在 `TUT_SUBMIT_TIMEOUT_MS`（默认 3000）内轮询读屏；判据收紧为**接收方输入框清空/提交特征**：当前屏幕非空且其**底部区域**（末 3 个非空行——composer 及其 chrome 所在处；真机校准：codex 的「› …」composer 行提交后回退为占位、pi 的底部状态行随回合启动走字）与带文本快照的底部区域不一致。composer 之外的 repaint 不再计为提交——收紧动机：live 哨兵反例证明吞没窗口可长于 idle 就绪信号，「任意变化」会在 Enter 实际被吞时误判成功、静默抡浅 prompt。
+5. **长有界循环重发**：首窗无清空则进入重发循环：窗口 `TUT_SUBMIT_RETRY_TIMEOUT_MS`（默认 30000）内每 `TUT_SUBMIT_RETRY_MS`（默认 1500）重发一次 Enter 并逐轮询验证，直到判据满足；窗口耗尽 → stderr 人工补救指引 + **exit 0**（prompt 已在输入框，失败退出会触发重复投递语义）。文本永不重发。`TUT_SUBMIT_RETRIES`、`TUT_SUBMIT_READY_TIMEOUT_MS` 为无效旧环境变量（保留避免旧启动环境失败）；就绪信号（`agent_status`）退出提交决策——哨兵反例证伪其预测力，重发只看时钟与输入框。
+6. **分步时间戳诊断（与重发解耦的纯观察）**：投递链每步向 stderr 落一条 `tut-delivery t=<epoch-ms> …`——门控每轮读屏与放行/超时、send-text、落框每轮与命中/超时、每次 Enter（含 attempt 序号）、循环内每次读屏与重发、判据满足（submit-confirmed）、放弃（give-up）。时间戳可与 notify pane 日志对齐重建时间线（受控复现失败、触发条件未收敛——下次有机中招靠它抓现行）。`TUT_DELIVERY_DIAG=0` 关闭；开关两侧投递行为完全相同（诊断从不作为门控或分支条件）。Notifier 对 launch.sh 的 stderr 实时转发到 notify pane（8.2：stdio 即日志）——诊断在成功投递后也存活。
 
-**同角色延续分支走同一提交闭环**：send-text 前先取快照 → 落框确认 → 验证式提交（无就绪门控不变——存量 pane UI 早已绘制）。单一投递代码路径，避免两套逻辑漂移。已知局限：对 working 中 pane 屏幕本就在变，提交验证恒真——语义与开环时代相同（排队投递本就不验证消费），如实记录。
+**同角色延续分支走同一提交闭环**：send-text 前先取快照 → 落框确认 → 验证式提交（无就绪门控不变——存量 pane UI 早已绘制）。单一投递代码路径，避免两套逻辑漂移。已知局限：对 working 中 pane 底部区域随流转持续变化，清空判据快速为真——语义与开环时代相同（排队投递本就不验证消费），如实记录。
 
-**为什么需要闭环（双 TUI 时序差异根因）**：门控信号是「接收方 UI 已绘制且稳定」，它与「提交就绪」的关系在两个 TUI 上不同——pi 首帧绘制 ≈ 输入循环整体就绪（含提交处理），「已绘制」与「提交就绪」在时序上重合；codex 首帧画的是 UI 外壳（composer 随首帧即活，send-text 的文本能渲染出来），但提交通路依赖的异步初始化（会话/模型/凭据）在首帧之后才完成，窗口期内到达的 Enter 被吞掉而不产生提交，初始化完成后到达的 Enter 正常提交。即门控测的是「已绘制」不是「提交就绪」——pi 上两者恰好同时，codex 上分离（codex 内部哪个子系统吞 Enter 从外部不可观测，设计上刻意不依赖该归因）。新的提交窗口把「是否重发」从次数改成 readiness 边界：未 ready 时只观察不烧 Enter；ready 后一次重试仍无反应就明确报告，避免时序彩票。
+**为什么需要闭环（双 TUI 时序差异根因）**：门控信号是「接收方 UI 已绘制且稳定」，它与「提交就绪」的关系在两个 TUI 上不同——pi 首帧绘制 ≈ 输入循环整体就绪（含提交处理），「已绘制」与「提交就绪」在时序上重合；codex 首帧画的是 UI 外壳（composer 随首帧即活，send-text 的文本能渲染出来），但提交通路依赖的异步初始化（会话/模型/凭据）在首帧之后才完成，窗口期内到达的 Enter 被吞掉而不产生提交，初始化完成后到达的 Enter 正常提交。即门控测的是「已绘制」不是「提交就绪」——pi 上两者恰好同时，codex 上分离（codex 内部哪个子系统吞 Enter 从外部不可观测，设计上刻意不依赖该归因）。重发边界已三度演进：固定次数（时序彩票）→ readiness 边界（哨兵反例证伪：idle 在场 Enter 仍被吞、就绪后一次重发未救回——吞没窗口长于 idle 信号出现点）→ 本版时钟边界 + 清空判据：循环重发只看输入框是否放行文本，窗口有界、耗尽如实报告，避免时序彩票。
 
 **herdr 0.8 集成注记**（集成约束，上述设计由此而来）：
 
 - `pane read` 的 `recent` / `recent-unwrapped` 源在刚诞生的 pane 上不可靠（可能恒返空）；`visible` 源从诞生起可靠——探测与各确认步一律用 `visible`。变更检测与门控同源（同一读屏原语）：两次 codex birth 的门控均正常放行，证明 visible 读屏无光标闪烁类噪声；若未来版本退化（读屏恒空），各确认步全部走超时降级 + 提示，行为等同开环时代，不会更糟。
-- `pane list` 的 `agent_status`（idle = ready for input；working = input loop alive）是提交重发的 readiness 边界；只在首个 Enter 的验证窗口无反应后读取它，避免正常路径增加额外调用。Herdr 版本或接入层不提供该状态时，退化为同一 visible 屏幕的有界观察：迟到的屏幕变化算首个提交成功，完全无信号则人工补 Enter。
+- `pane list` 的 `agent_status`（idle = ready for input；working = input loop alive）曾是提交重发的 readiness 边界；哨兵反例（idle 在场 Enter 仍被吞、就绪后一次重发未救回）证明它不预测 Enter 可达性后退出提交决策。提交判据只依赖 visible 读屏。
 - 门控信号是「屏幕内容相对回显基准发生变化并稳定」，不依赖接收方类型；投递与提交是普通 pty 写入，对 canonical 读取器（普通 CLI）与 raw-mode TUI（交互式 Agent CLI）同样成立。
 - 供给序列关键命令的回包形状：`pane split` → `{"result":{"pane":{"pane_id",…}}}`、`pane move --tab` → `{"result":{"move_result":{…}}}`、`pane rename` → `{"result":{"pane":{"pane_id","label"}}}`——launch.sh 的容错解析与此一致（move / rename 仅以退出码判成败，不解析响应体）。
 
@@ -444,7 +452,8 @@ take-ur-turn/
 │   ├── launch.ts          # 启动目标解析（cast → workspace → 默认阵容）+ 启动标记
 │   ├── workspace.ts       # role → agent 三级解析链（项目 .context-hub → 用户级 → 默认）+ naming 模板解析；tut-resolve.mjs 为 launch.sh 侧镜像实现（parity 测试钉死一致）
 │   ├── http.ts            # GET /state + POST /mode
-│   └── types.ts           # 跨模块冻结契约（seam 类型）
+│   ├── types.ts           # 跨模块冻结契约（seam 类型）
+│   └── agent-command.ts   # AgentRoute/argv 解析与 shell-neutral 校验
 └── test/                  # vitest：派生规则全序列 + store 并发
 ```
 

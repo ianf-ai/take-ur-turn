@@ -53,6 +53,6 @@ take-ur-turn/
 | Architect | 需求分析、技术方案、架构决策 | Codex CLI (GPT) |
 | Executor | 编码实现、按 review 反馈修改 | Pi (GLM) |
 | Reviewer | 代码与方案 Review | Codex CLI (GPT) |
-| Host（驱动者） | 主会话代驾：环境检查、任务发起、轮次推进、审批点汇报、异常处置——驱动不代工 | 任一主会话 Agent（ZCode / codex 等）；担任时加载 `skills/host.md` |
+| Host（驱动者） | 主会话驱动：环境检查、任务发起、轮次推进、审批点汇报、异常处置——驱动不代工 | 任一主会话 Agent（ZCode / codex 等）；担任时加载 `skills/host.md` |
 
 各 Agent 通过 Context Hub 的 MCP 工具发布/读取上下文，不依赖手工维护的中转文件（传统 design.md / review.md 转交模式）。

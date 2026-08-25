@@ -101,7 +101,7 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 
 信封字段**只增不改**；Server 不做入口校验（与主设计 4.1 一致）。
 
-**cast 不进信封**：任务级点将（role → agent）是 TaskMeta 字段，随 create 落库、随 read/list/state 暴露——它是路由参数不是记录内容，信封 schema 零改动（见主设计 4.1/6.2）。
+**cast 不进信封**：任务级点将（role → agent route）是 TaskMeta 字段，随 create 落库、随 read/list/state 暴露——它是路由参数不是记录内容，信封 schema 零改动（见主设计 4.1/6.2）。裸 agent 仍是字符串；带参命令使用 `{agent,args}`，args 按顺序保留。
 
 ### 2.4 body 模板（由 skill 教给 Agent，不进 schema）
 
