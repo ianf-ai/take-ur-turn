@@ -17,6 +17,14 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Cast, ContextRecord, Flow, Warning } from "./types.js";
 
+/**
+ * CLI Hub calls are short-lived.  Do not leave an undici keep-alive socket
+ * behind while the process is handing its exit code back to Node.
+ */
+const CLOSE_CONNECTION_REQUEST_INIT: RequestInit = {
+  headers: { Connection: "close" },
+};
+
 export class HubError extends Error {
   readonly code: string;
   constructor(code: string, message: string) {
@@ -166,7 +174,9 @@ function mcpEndpoint(url: string): URL {
  * never manage client lifecycle or leak sessions.
  */
 async function callHubTool(url: string, name: string, args: Record<string, unknown>): Promise<unknown> {
-  const transport = new StreamableHTTPClientTransport(mcpEndpoint(url));
+  const transport = new StreamableHTTPClientTransport(mcpEndpoint(url), {
+    requestInit: CLOSE_CONNECTION_REQUEST_INIT,
+  });
   const client = new Client({ name: "tut-cli", version: "0.1.0" });
   try {
     // Same exactOptionalPropertyTypes gap as the server side (src/http.ts):
