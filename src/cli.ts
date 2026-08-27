@@ -824,7 +824,7 @@ async function runMode(parsed: Extract<ParsedArgs, { command: "mode" }>): Promis
   try {
     res = await fetch(new URL("/mode", parsed.url), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", Connection: "close" },
       body: JSON.stringify({ flow_mode: parsed.mode }),
     });
   } catch (e) {
@@ -925,7 +925,7 @@ interface StateSnapshot {
 
 /** GET <hub>/state and status-check; throws on fetch/HTTP failure (callers own the message). */
 async function fetchStateSnapshot(url: string): Promise<StateSnapshot> {
-  const res = await fetch(new URL("/state", url));
+  const res = await fetch(new URL("/state", url), { headers: { Connection: "close" } });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as StateSnapshot;
 }
@@ -1820,7 +1820,7 @@ async function pollUntil(check: () => Promise<boolean>, timeoutMs: number, inter
  */
 async function hubHealthy(baseUrl: string): Promise<boolean> {
   try {
-    const res = await fetch(new URL("/state", baseUrl));
+    const res = await fetch(new URL("/state", baseUrl), { headers: { Connection: "close" } });
     if (!res.ok) return false;
     const body: unknown = await res.json();
     if (body === null || typeof body !== "object") return false;
@@ -2369,10 +2369,12 @@ function invokedAsScript(): boolean {
 }
 if (invokedAsScript()) {
   void main().then(
-    (code) => process.exit(code),
+    (code) => {
+      process.exitCode = code;
+    },
     (e: unknown) => {
       process.stderr.write(`tut: ${(e as Error).message}\n`);
-      process.exit(1);
+      process.exitCode = 1;
     },
   );
 }
