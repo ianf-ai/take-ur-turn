@@ -213,6 +213,10 @@ describe("config set (validated, key-preserving writes)", () => {
     expect(await main(["config", "set", "auto.launch_roles", "executor,codex", "--root", root])).toBe(1);
     expect(io.err()).toContain('invalid role in auto.launch_roles: "codex"');
     expect(io.err()).toContain("architect|executor|reviewer");
+    // The error teaches the way out: format + example (agents are the
+    // classic wrong value here).
+    expect(io.err()).toContain("comma-separated bare role names");
+    expect(io.err()).toContain("e.g. architect,executor,reviewer");
     expect(existsSync(configFile())).toBe(false);
   });
 

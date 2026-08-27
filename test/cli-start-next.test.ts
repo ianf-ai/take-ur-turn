@@ -98,6 +98,7 @@ interface StateTask {
   status: string;
   waiting_for: string;
   needs_attention?: boolean;
+  version?: number;
   /** Per-task cast overrides (absent on older hubs/fixtures). */
   cast?: Record<string, AgentRoute>;
 }
@@ -186,7 +187,7 @@ describe("start-next no-arg default (handler, /state stubbed)", () => {
     process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
     let code: number;
     try {
-      code = await withDryRun(() => main(["start-next", "--url", "http://hub.test"]));
+      code = await withFixtureHerdr(() => withDryRun(() => main(["start-next", "--url", "http://hub.test"])));
     } finally {
       process.chdir(prevCwd);
       if (prevUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
@@ -206,20 +207,24 @@ describe("start-next no-arg default (handler, /state stubbed)", () => {
       task_id: "t-unique",
       role: "human",
       content_type: "note",
-      payload: expect.objectContaining({ launch: { role: "executor", base_version: 0, via: "start-next" } }),
+      payload: expect.objectContaining({
+        launch: expect.objectContaining({ role: "executor", base_version: 0, via: "start-next", protocol_version: 2 }),
+      }),
       expected_version: 0,
     });
   });
 
-  it("marks the launched line [!!] when the selected task needs attention", async () => {
+  it("withholds launch when the selected task needs attention", async () => {
     stubState([{ task_id: "t-att", status: "implementing", waiting_for: "agent:executor", needs_attention: true }]);
     vi.mocked(hubRead).mockResolvedValue({ task_id: "t-att", title: "Att", status: "implementing", versions: [] });
     vi.mocked(hubPublish).mockResolvedValue({ task_id: "t-att", version: 1, status: "implementing", needs_attention: true });
 
     const code = await withDryRun(() => main(["start-next"]));
 
-    expect(code).toBe(0);
-    expect(io.out()).toContain("launched executor for t-att via launch.sh [!!]");
+    expect(code).toBe(1);
+    expect(io.err()).toContain("needs_attention set; launch is withheld");
+    expect(vi.mocked(hubPublish)).not.toHaveBeenCalled();
+    expect(io.out()).not.toContain("DRY-RUN");
   });
 
   it("no-arg selection still honors the duplicate-launch guard (no spawn, no marker append)", async () => {
@@ -392,12 +397,14 @@ describe("first round after tut create (doorbell, real launch.sh under TUT_DRY_R
       task_id: "kick-one",
       role: "human",
       content_type: "note",
-      payload: expect.objectContaining({ launch: { role: "architect", base_version: 0, via: "start-next" } }),
+      payload: expect.objectContaining({
+        launch: expect.objectContaining({ role: "architect", base_version: 0, via: "start-next", protocol_version: 2 }),
+      }),
       expected_version: 0,
     });
   });
 
-  it("launcher failure forwards child stderr, exits 1, and points at --force (the marker was already appended)", async () => {
+  it("missing anchor fails before any marker or launcher mutation", async () => {
     stubState([
       { task_id: "kick-fail", status: "designing", waiting_for: "agent:architect", cast: { architect: "pi" } },
     ]);
@@ -405,7 +412,7 @@ describe("first round after tut create (doorbell, real launch.sh under TUT_DRY_R
     vi.mocked(hubPublish).mockResolvedValue({ task_id: "kick-fail", version: 1, status: "designing", needs_attention: false });
 
     // Live launcher against the fixture herdr whose pane list fails — the
-    // anchor cannot resolve and the launcher fails loudly AFTER the marker.
+    // anchor cannot resolve and the launch door fails BEFORE the marker.
     const code = await withFixtureHerdr(() => {
       const prev = process.env.TUT_DRY_RUN;
       delete process.env.TUT_DRY_RUN;
@@ -418,11 +425,11 @@ describe("first round after tut create (doorbell, real launch.sh under TUT_DRY_R
 
     expect(code).toBe(1);
     const err = io.err();
-    expect(err).toContain("no anchor pane found"); // launch.sh's stderr forwarded
-    expect(err).toContain("tut: launcher exited with code 1");
-    expect(err).toContain("relaunch with --force");
-    // The marker went in BEFORE the launcher — exactly one publish happened.
-    expect(vi.mocked(hubPublish)).toHaveBeenCalledTimes(1);
+    expect(err).toContain("no anchor pane found");
+    expect(err).not.toContain("tut: launcher exited with code 1");
+    expect(err).not.toContain("relaunch with --force");
+    // No anchor means no Herdr mutation and no optimistic marker.
+    expect(vi.mocked(hubPublish)).not.toHaveBeenCalled();
   });
 });
 
@@ -505,7 +512,9 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
       task_id: "t-fresh",
       role: "human",
       content_type: "note",
-      payload: expect.objectContaining({ launch: { role: "executor", base_version: 0, via: "start-next" } }),
+      payload: expect.objectContaining({
+        launch: expect.objectContaining({ role: "executor", base_version: 0, via: "start-next", protocol_version: 2 }),
+      }),
       expected_version: 0,
     });
   });
@@ -570,10 +579,12 @@ describe("tut decide (close spawns launch.sh --cleanup; approve does not)", () =
     });
 
     expect(code).toBe(0); // the decision succeeded regardless
-    // The hook ran (reaping note); the failing pane list (stderr swallowed by
-    // the launcher's tolerant pane_list_json) yielded no closable panes and
-    // no error surfaced — --cleanup is best-effort end to end.
+    // The hook ran (reaping note); the failing pane list yielded no closable
+    // panes but did surface an actionable warning — --cleanup remains
+    // best-effort end to end.
     expect(io.err()).toContain("reaping panes of task 't-gone2'");
+    expect(io.err()).toContain("pane list failed");
+    expect(io.err()).toContain("retry cleanup");
     expect(io.err()).not.toContain("pane cleanup exited with code");
     expect(io.out()).toContain('"status":"closed"');
   });
@@ -610,6 +621,86 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
     expect(io.out()).not.toContain("DRY-RUN");
   });
 
+  it("state/log version mismatch fails closed before marker or child", async () => {
+    stubState([
+      { task_id: "t-race", status: "implementing", waiting_for: "agent:executor", version: 1, cast: { executor: "pi" } },
+    ]);
+    vi.mocked(hubRead).mockResolvedValue({
+      task_id: "t-race",
+      title: "Race",
+      status: "reviewing",
+      versions: [
+        {
+          version: 1,
+          task_id: "t-race",
+          role: "architect",
+          content_type: "design",
+          timestamp: "2026-08-17T00:00:00.000Z",
+          payload: { summary: "design", body: "design" },
+        },
+        {
+          version: 2,
+          task_id: "t-race",
+          role: "executor",
+          content_type: "code_changes",
+          timestamp: "2026-08-17T00:01:00.000Z",
+          payload: { summary: "newer state", body: "newer state" },
+        },
+      ],
+    });
+
+    const code = await main(["start-next", "t-race", "--url", "http://hub.test"]);
+
+    expect(code).toBe(1);
+    expect(io.err()).toContain("state/log version mismatch: state v1, log v2");
+    expect(vi.mocked(hubPublish)).not.toHaveBeenCalled();
+    expect(io.out()).not.toContain("DRY-RUN");
+  });
+
+  it("uses the same state/log snapshot for role, marker base, and child launch", async () => {
+    stubState([
+      { task_id: "t-snapshot", status: "implementing", waiting_for: "agent:executor", version: 2, cast: { executor: "pi" } },
+    ]);
+    vi.mocked(hubRead).mockResolvedValue({
+      task_id: "t-snapshot",
+      title: "Snapshot",
+      status: "implementing",
+      versions: [
+        {
+          version: 1,
+          task_id: "t-snapshot",
+          role: "architect",
+          content_type: "design",
+          timestamp: "2026-08-17T00:00:00.000Z",
+          payload: { summary: "design", body: "design" },
+        },
+        {
+          version: 2,
+          task_id: "t-snapshot",
+          role: "executor",
+          content_type: "code_changes",
+          timestamp: "2026-08-17T00:01:00.000Z",
+          payload: { summary: "handoff", body: "handoff" },
+        },
+      ],
+    });
+    vi.mocked(hubPublish).mockResolvedValue({ task_id: "t-snapshot", version: 3, status: "implementing", needs_attention: false });
+
+    const code = await withFixtureHerdr(() => withDryRun(() => main(["start-next", "t-snapshot", "--url", "http://hub.test"])));
+
+    expect(code).toBe(0);
+    expect(io.out()).toContain("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
+    expect(vi.mocked(hubPublish)).toHaveBeenCalledWith("http://hub.test", {
+      task_id: "t-snapshot",
+      role: "human",
+      content_type: "note",
+      payload: expect.objectContaining({
+        launch: expect.objectContaining({ role: "executor", base_version: 2, via: "start-next" }),
+      }),
+      expected_version: 2,
+    });
+  });
+
   it("parameterized cast reaches the real launcher with the complete ordered argv", async () => {
     const route = {
       agent: "codex",
@@ -623,7 +714,7 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
 
     expect(code).toBe(0);
     expect(io.out()).toContain(
-      "pane run <root> codex --model gpt-5.6 --sandbox workspace-write --search -c check_for_update_on_startup=true -c check_for_update_on_startup=false",
+      "pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'",
     );
     expect(vi.mocked(hubPublish)).toHaveBeenCalledTimes(1);
   });

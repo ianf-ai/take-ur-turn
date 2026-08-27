@@ -35,6 +35,10 @@ const SAVED_PATH = process.env.PATH ?? "";
 const SAVED_LOG = process.env.TUT_HERDR_LOG;
 const SAVED_PANES = process.env.TUT_HERDR_PANES;
 const SAVED_FAIL = process.env.TUT_HERDR_FAIL;
+const SAVED_REQUIRE_PANE_ID = process.env.TUT_HERDR_REQUIRE_PANE_ID;
+const SAVED_HERDR_PANE_ID = process.env.HERDR_PANE_ID;
+const SAVED_LAG_POLLS = process.env.TUT_HERDR_LIST_LAG_POLLS;
+const SAVED_LAG_SET = process.env.TUT_HERDR_PANES_LAG;
 const SAVED_WAIT = process.env.TUT_UP_HUB_WAIT_MS;
 const SAVED_SELF = process.env.TUT_UP_CLI_SELF;
 const TRASH: string[] = [];
@@ -156,6 +160,14 @@ afterEach(() => {
   else process.env.TUT_HERDR_PANES = SAVED_PANES;
   if (SAVED_FAIL === undefined) delete process.env.TUT_HERDR_FAIL;
   else process.env.TUT_HERDR_FAIL = SAVED_FAIL;
+  if (SAVED_REQUIRE_PANE_ID === undefined) delete process.env.TUT_HERDR_REQUIRE_PANE_ID;
+  else process.env.TUT_HERDR_REQUIRE_PANE_ID = SAVED_REQUIRE_PANE_ID;
+  if (SAVED_HERDR_PANE_ID === undefined) delete process.env.HERDR_PANE_ID;
+  else process.env.HERDR_PANE_ID = SAVED_HERDR_PANE_ID;
+  if (SAVED_LAG_POLLS === undefined) delete process.env.TUT_HERDR_LIST_LAG_POLLS;
+  else process.env.TUT_HERDR_LIST_LAG_POLLS = SAVED_LAG_POLLS;
+  if (SAVED_LAG_SET === undefined) delete process.env.TUT_HERDR_PANES_LAG;
+  else process.env.TUT_HERDR_PANES_LAG = SAVED_LAG_SET;
   if (SAVED_WAIT === undefined) delete process.env.TUT_UP_HUB_WAIT_MS;
   else process.env.TUT_UP_HUB_WAIT_MS = SAVED_WAIT;
   if (SAVED_SELF === undefined) delete process.env.TUT_UP_CLI_SELF;
@@ -191,7 +203,12 @@ describe("tut up (behavior)", () => {
       const code = await main(["up"]);
 
       expect(code).toBe(1);
-      expect(io.err()).toContain("run tut up from the project root");
+      // The remediation is concrete (tut init onboards — the missing piece
+      // is the layout marker, not the directory), never the old misleading
+      // "run from project root" alone.
+      expect(io.err()).toContain("no package.json or .context-hub/");
+      expect(io.err()).toContain("tut init");
+      expect(io.err()).not.toContain("run tut up from the project root");
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       io.restore();
@@ -212,7 +229,13 @@ describe("tut up (behavior)", () => {
       expect(code).toBe(0);
       expect(io.out()).toContain("up: no workspace lineup config found");
       expect(io.out()).toContain("using built-in defaults (architect=codex, executor=pi, reviewer=codex)");
-      expect(io.out()).toContain(`cp ${path.join(REPO, "scripts", "workspace.json")} ${path.join(project, ".context-hub", "workspace.json")}`);
+      // Light path first: tut assign is the primary customization hint,
+      // the full cp comes after it (the advanced route).
+      const out = io.out();
+      const assignIdx = out.indexOf("to customize: tut assign <role> <agent>");
+      const cpIdx = out.indexOf(`cp ${path.join(REPO, "scripts", "workspace.json")} ${path.join(project, ".context-hub", "workspace.json")}`);
+      expect(assignIdx).toBeGreaterThanOrEqual(0);
+      expect(cpIdx).toBeGreaterThan(assignIdx);
       expect(existsSync(path.join(project, ".context-hub", "workspace.json"))).toBe(false); // a hint, never a write
     } finally {
       io.restore();
@@ -286,18 +309,48 @@ describe("tut up (behavior)", () => {
         "pane close FIX:root1", // tab create ships an empty root — cleaned up
         "pane rename FIX:p1 tut-hub",
         `pane run FIX:p1 cd ${project} && node ${self} serve`,
+        "pane list", // report-time id resolution (fresh by-label lookup)
         splitLine,
         // second sys pane splits the hub pane explicitly — even halves, no
         // reliance on move's default target semantics
         "pane move FIX:p2 --tab FIX:t1 --split down --ratio 0.5 --no-focus --target-pane FIX:p1",
         "pane rename FIX:p2 tut-notify",
         `pane run FIX:p2 cd ${project} && node ${self} notify`,
+        "pane list", // report-time id resolution
       ]);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001 (pane FIX:p1, tab tut-sys");
       expect(io.out()).toContain("up: notify running (pane FIX:p2, tab tut-sys)");
       // Role panes are never provisioned here — even with a preset 'exec'
       // pane and all agents on PATH, the loop is gone; the on-demand note fires.
       expect(io.out()).toContain("up: agent panes are on-demand — launchers raise them at hand-off");
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("pane id in the success report comes from a fresh by-label lookup (split-time ids go stale on a move)", async () => {
+    // Pane ids are window-scoped: moving the split pane into the sys tab's
+    // window re-addresses it. Scripted with list lag — the entry snapshot
+    // (list #1) shows no sys panes so provisioning runs fresh, while later
+    // lists serve the pane under its POST-MOVE id with the label applied.
+    // The success report must carry the CURRENT id, not the split-time one.
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath, [{ pane_id: "w1H:p2", label: "tut-hub", tab_id: "w1H" }]);
+    process.env.TUT_HERDR_LIST_LAG_POLLS = "1";
+    process.env.TUT_HERDR_PANES_LAG = "[]";
+    process.chdir(project);
+    stubFetch(logAwareProbes(logPath));
+    const io = captureIo();
+    try {
+      const code = await main(["up"]);
+
+      expect(code).toBe(0);
+      expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001 (pane w1H:p2, tab tut-sys");
+      expect(io.out()).not.toContain("pane FIX:p1, tab tut-sys"); // the stale split-time id is gone
+      // The fresh lookup was real: a second pane list call sits after the
+      // provisioning sequence.
+      const lines = logLines(logPath);
+      expect(lines.filter((l) => l === "pane list").length).toBeGreaterThanOrEqual(2);
     } finally {
       io.restore();
     }
@@ -343,7 +396,11 @@ describe("tut up (behavior)", () => {
       const code = await main(["up"]);
 
       expect(code).toBe(0);
-      expect(logLines(logPath)).toEqual(["pane list", `pane run w5:p1 cd ${project} && node ${self} serve`]);
+      expect(logLines(logPath)).toEqual([
+        "pane list",
+        `pane run w5:p1 cd ${project} && node ${self} serve`,
+        "pane list", // report-time id resolution (by label)
+      ]);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001 (pane w5:p1, tab tut-sys, reused");
       expect(io.out()).toContain("up: notify already listening");
     } finally {
@@ -365,7 +422,11 @@ describe("tut up (behavior)", () => {
       const code = await main(["up"]);
 
       expect(code).toBe(0);
-      expect(logLines(logPath)).toEqual(["pane list", `pane run w6:p1 cd ${project} && node ${self} notify`]);
+      expect(logLines(logPath)).toEqual([
+        "pane list",
+        `pane run w6:p1 cd ${project} && node ${self} notify`,
+        "pane list", // report-time id resolution (by label)
+      ]);
       expect(io.out()).toContain("up: hub already running");
       expect(io.out()).toContain("up: notify running (pane w6:p1, tab tut-sys, reused)");
     } finally {
@@ -394,6 +455,7 @@ describe("tut up (behavior)", () => {
         "pane move FIX:p1 --tab w5:t2 --split down --ratio 0.5 --no-focus --target-pane w5:p1",
         "pane rename FIX:p1 tut-notify",
         `pane run FIX:p1 cd ${project} && node ${self} notify`,
+        "pane list", // report-time id resolution (by label)
       ]);
       expect(log.filter((l) => l.startsWith("tab create") || l.startsWith("pane close")).length).toBe(0);
       expect(io.out()).toContain("up: hub already running");
@@ -421,6 +483,32 @@ describe("tut up (behavior)", () => {
         `pane split --current --direction right --no-focus --cwd ${project}`,
         `tab create --label tut-sys --no-focus --cwd ${project}`,
         "pane move FIX:p1 --tab FIX:t1 --split down --ratio 0.5 --no-focus",
+      ]);
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("missing HERDR_PANE_ID explains the interactive-pane remedy after split failure", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath);
+    delete process.env.HERDR_PANE_ID;
+    process.env.TUT_HERDR_REQUIRE_PANE_ID = "1";
+    process.chdir(project);
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await main(["up"]);
+
+      expect(code).toBe(1);
+      expect(io.err()).toContain("--current requires HERDR_PANE_ID");
+      expect(io.err()).toContain("interactive Herdr pane");
+      expect(io.err()).toContain("HERDR_PANE_ID");
+      expect(io.err()).toContain("valid pane id");
+      expect(io.err()).toContain("unset/empty");
+      expect(logLines(logPath)).toEqual([
+        "pane list",
+        `pane split --current --direction right --no-focus --cwd ${project}`,
       ]);
     } finally {
       io.restore();
@@ -869,6 +957,118 @@ describe("tut up --url (non-default local hub)", () => {
       expect(logLines(logPath)).toEqual(["pane list"]); // all three role labels preset → skips only
     } finally {
       io.restore();
+    }
+  });
+});
+
+
+// --- shell dialect renderer integration (unit 6) --------------------------------------
+// The service commands are PaneCommands now: POSIX keeps the legacy bytes
+// (pinned above, unchanged), PowerShell dialects never see &&, cmd picks the
+// safe direct form or the encoded pane-runner, and a bad TUT_PANE_SHELL
+// fails the whole up run before any probe.
+
+describe("up service commands through the pane dialect renderer", () => {
+  const SAVED_PANE_SHELL = process.env.TUT_PANE_SHELL;
+
+  afterEach(() => {
+    if (SAVED_PANE_SHELL === undefined) delete process.env.TUT_PANE_SHELL;
+    else process.env.TUT_PANE_SHELL = SAVED_PANE_SHELL;
+    vi.unstubAllGlobals();
+  });
+
+  it("TUT_PANE_SHELL=powershell5: pane run carries the script-block form — no && anywhere", async () => {
+    const { project, logPath, self } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath);
+    process.env.TUT_PANE_SHELL = "powershell5";
+    stubFetch((url) => (url.includes("/state") || url.includes("/agent-event") ? refused() : refused()));
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run"]);
+      expect(code).toBe(0);
+      const run = logLines(logPath).find((l) => l.startsWith("pane run"));
+      expect(run).toBeUndefined(); // dry-run logs no pane run; assert on the preview text
+      const out = io.out();
+      const serveLine = out.split("\n").find((l) => l.includes("pane run") && l.includes("serve"));
+      expect(serveLine).toBeDefined();
+      expect(serveLine).toContain("Set-Location -LiteralPath");
+      expect(serveLine).not.toContain("&&");
+      expect(serveLine).toContain(`& 'node' '${self}' 'serve'`);
+    } finally {
+      io.restore();
+      process.chdir(SAVED_CWD);
+    }
+  });
+
+  it("TUT_PANE_SHELL=cmd: safe project cwd takes the cd /d direct form", async () => {
+    const { project, logPath, self } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath);
+    process.env.TUT_PANE_SHELL = "cmd";
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run"]);
+      expect(code).toBe(0);
+      const serveLine = io.out().split("\n").find((l) => l.includes("pane run") && l.includes("serve"));
+      expect(serveLine).toContain(`cd /d "${project}"`);
+      expect(serveLine).toContain(`&& "node" "${self}" "serve"`);
+    } finally {
+      io.restore();
+      process.chdir(SAVED_CWD);
+    }
+  });
+
+  it("TUT_PANE_SHELL=cmd with an unsafe cwd (% in path) switches to the encoded runner", async () => {
+    // A project dir containing % : cmd must never see it unencoded.
+    const base = mkdtempSync(path.join(os.tmpdir(), "tut-up-100%25-"));
+    const project = realpathSync(base);
+    TRASH.push(base);
+    writeFileSync(path.join(base, "package.json"), '{"name":"up-cmd-enc"}\n', "utf8");
+    const self = path.join(project, "dist", "cli.js");
+    process.env.TUT_UP_CLI_SELF = self;
+    process.chdir(project);
+    const logPath = path.join(project, "herdr.log");
+    useFixtureHerdr(logPath);
+    process.env.TUT_PANE_SHELL = "cmd";
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run"]);
+      expect(code).toBe(0);
+      // "serve" lives only inside the payload token now — take the first
+      // pane-run preview line (serve) by position, not by content.
+      const serveLine = io.out().split("\n").find((l) => l.includes("pane run"));
+      expect(serveLine).toBeDefined();
+      expect(serveLine).not.toContain("cd /d");
+      expect(serveLine).toMatch(/--payload "[A-Za-z0-9_-]+"/u);
+      const token = /--payload "([A-Za-z0-9_-]+)"/u.exec(serveLine ?? "")?.[1] ?? "";
+      const payload = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as Record<string, unknown>;
+      expect(payload.cwd).toBe(project); // the % lives only inside the payload
+      expect(payload.purpose).toBe("service");
+      expect(payload.args).toEqual([self, "serve"]);
+    } finally {
+      io.restore();
+      process.chdir(SAVED_CWD);
+    }
+  });
+
+  it("an unknown TUT_PANE_SHELL fails the run before any herdr probe", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath);
+    process.env.TUT_PANE_SHELL = "csh";
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run"]);
+      expect(code).toBe(1);
+      expect(io.err()).toContain("TUT_PANE_SHELL 'csh'");
+      expect(logLines(logPath)).toEqual([]); // not even pane list ran
+    } finally {
+      io.restore();
+      process.chdir(SAVED_CWD);
     }
   });
 });

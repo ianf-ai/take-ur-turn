@@ -36,15 +36,23 @@ import http from "node:http";
 async function withCleanChain<T>(fn: () => Promise<T>): Promise<T> {
   const prevCwd = process.cwd();
   const prevUserDir = process.env.TUT_USER_CONFIG_DIR;
+  const prevHerdr = process.env.TUT_HERDR_EXECUTABLE;
+  const prevPanes = process.env.TUT_HERDR_PANES;
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-cli-chain-"));
   process.chdir(tmp);
   process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
+  process.env.TUT_HERDR_EXECUTABLE = path.resolve(import.meta.dirname, "bin/herdr");
+  process.env.TUT_HERDR_PANES = "[]";
   try {
     return await fn();
   } finally {
     process.chdir(prevCwd);
     if (prevUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
     else process.env.TUT_USER_CONFIG_DIR = prevUserDir;
+    if (prevHerdr === undefined) delete process.env.TUT_HERDR_EXECUTABLE;
+    else process.env.TUT_HERDR_EXECUTABLE = prevHerdr;
+    if (prevPanes === undefined) delete process.env.TUT_HERDR_PANES;
+    else process.env.TUT_HERDR_PANES = prevPanes;
     rmSync(tmp, { recursive: true, force: true });
   }
 }
@@ -785,7 +793,21 @@ describe("mode / start-next handlers (real hub)", () => {
     const created = await store.createTask({ title: "Start Next Task", description: "d", creator: "t", role: "architect" });
     await store.append(created.task_id, { role: "architect", content_type: "design", payload: { summary: "s", body: "b" } });
     // now implementing → waiting_for agent:executor
-    vi.mocked(hubRead).mockResolvedValue({ task_id: created.task_id, title: "Start Next Task", status: "implementing", versions: [] });
+    vi.mocked(hubRead).mockResolvedValue({
+      task_id: created.task_id,
+      title: "Start Next Task",
+      status: "implementing",
+      versions: [
+        {
+          version: 1,
+          task_id: created.task_id,
+          role: "architect",
+          content_type: "design",
+          timestamp: "2026-08-17T00:00:00.000Z",
+          payload: { summary: "design", body: "design" },
+        },
+      ],
+    });
     vi.mocked(hubPublish).mockResolvedValue({ task_id: created.task_id, version: 1, status: "implementing", needs_attention: false });
 
     const prev = process.env.TUT_DRY_RUN;
@@ -837,6 +859,7 @@ describe("mode / start-next handlers (real hub)", () => {
     const store = new Store(root);
     const created = await store.createTask({ title: "Duplicate Task", description: "d", creator: "t", role: "architect" });
     await store.append(created.task_id, { role: "architect", content_type: "design", payload: { summary: "s", body: "b" } });
+    await store.append(created.task_id, { role: "human", content_type: "note", payload: { summary: "operator note", body: "operator note" } });
 
     const code = await main(["start-next", created.task_id, "--url", baseUrl]);
 
@@ -875,6 +898,7 @@ describe("mode / start-next handlers (real hub)", () => {
     const store = new Store(root);
     const created = await store.createTask({ title: "Force Task", description: "d", creator: "t", role: "architect" });
     await store.append(created.task_id, { role: "architect", content_type: "design", payload: { summary: "s", body: "b" } });
+    await store.append(created.task_id, { role: "human", content_type: "note", payload: { summary: "operator note", body: "operator note" } });
 
     const prev = process.env.TUT_DRY_RUN;
     process.env.TUT_DRY_RUN = "1";
@@ -890,7 +914,9 @@ describe("mode / start-next handlers (real hub)", () => {
       task_id: created.task_id,
       role: "human",
       content_type: "note",
-      payload: expect.objectContaining({ launch: { role: "executor", base_version: 2, via: "start-next" } }),
+      payload: expect.objectContaining({
+        launch: expect.objectContaining({ role: "executor", base_version: 2, via: "start-next", protocol_version: 2 }),
+      }),
       expected_version: 2,
     });
     expect(io.out()).toContain("DRY-RUN");
@@ -901,9 +927,18 @@ describe("mode / start-next handlers (real hub)", () => {
       task_id: "race-task",
       title: "Race task",
       status: "implementing",
-      versions: [],
+      versions: [
+        {
+          version: 1,
+          task_id: "race-task",
+          role: "architect",
+          content_type: "design",
+          timestamp: "2026-08-17T00:00:00.000Z",
+          payload: { summary: "design", body: "design" },
+        },
+      ],
     });
-    vi.mocked(hubPublish).mockRejectedValue(new HubError("VERSION_CONFLICT", "expected_version 0 does not match current version 1"));
+    vi.mocked(hubPublish).mockRejectedValue(new HubError("VERSION_CONFLICT", "expected_version 1 does not match current version 2"));
     const store = new Store(root);
     const created = await store.createTask({ title: "Race Task", description: "d", creator: "t", role: "architect" });
     await store.append(created.task_id, { role: "architect", content_type: "design", payload: { summary: "s", body: "b" } });
@@ -927,7 +962,7 @@ describe("mode / start-next handlers (real hub)", () => {
     }
 
     expect(code).toBe(1);
-    expect(io.err().split("\n")[0]).toBe("VERSION_CONFLICT: expected_version 0 does not match current version 1");
+    expect(io.err().split("\n")[0]).toBe("VERSION_CONFLICT: expected_version 1 does not match current version 2");
     expect(io.out()).not.toContain("DRY-RUN");
   });
 

@@ -55,14 +55,24 @@
 //                 screen repeating (wins over everything for post-text
 //                 reads; pre-text reads use the knobs above)
 //   TUT_HERDR_TABS           — tabs served by `tab list` (tab-id recovery)
+//   TUT_HERDR_PANE_LABEL      — label served by `pane get` (default "<id>:label");
+//                 TUT_HERDR_PANE_LABEL_RAW instead prints arbitrary raw text
+//                 for `pane get` (invalid-JSON injection)
 //   TUT_HERDR_TAB_CREATE_RAW — when set, `tab create` prints this RAW text
 //                 (non-JSON) and exits 0 — the unparseable-success injection
+//   TUT_HERDR_TAB_CREATE_SIGNAL — when set, `tab create` is terminated by
+//                 this signal after logging, modelling a remote mutation whose
+//                 response was lost
+//   TUT_HERDR_PANES_RAW       — when set, `pane list` prints this RAW text
+//                 instead of JSON — the unusable-inventory injection
 //   TUT_HERDR_LIST_LAG_POLLS / TUT_HERDR_PANES_LAG — first N `pane list` calls
 //                 serve the LAG set instead of TUT_HERDR_PANES (list lag
 //                 behind a freshly created tab)
 //   TUT_HERDR_AGENT_PANE — virtual readiness target pane id (default FIX:root1)
 //   TUT_HERDR_AGENT_STATUS — static virtual agent_status after pane run
 //   TUT_HERDR_AGENT_STATUS_SCRIPT — JSON status timeline after pane run
+//   TUT_HERDR_REQUIRE_PANE_ID — when 1, pane split --current models Herdr's
+//                 headless error if HERDR_PANE_ID is unset or empty
 // Split hands out fresh ids FIX:p1, FIX:p2, ... (count = split lines logged);
 // tab create hands out FIX:t<n> / root FIX:root<n> the same way.
 // Plain JS on purpose: this file is executed directly by node, not vitest.
@@ -163,18 +173,35 @@ if (argv[0] === "pane" && sub === "list") {
       visiblePanes = [...visiblePanes, { pane_id: target, label: "", agent_status: status }];
     }
   }
-  emit({ id: "cli:pane:list", result: { panes: visiblePanes, type: "pane_list" } });
+  if (process.env.TUT_HERDR_PANES_RAW !== undefined) {
+    process.stdout.write(process.env.TUT_HERDR_PANES_RAW);
+  } else {
+    emit({ id: "cli:pane:list", result: { panes: visiblePanes, type: "pane_list" } });
+  }
 } else if (argv[0] === "tab" && sub === "list") {
   const tabs = process.env.TUT_HERDR_TABS ? JSON.parse(process.env.TUT_HERDR_TABS) : [];
   emit({ id: "cli:tab:list", result: { tabs, type: "tab_list" } });
 } else if (argv[0] === "pane" && sub === "split") {
+  if (
+    process.env.TUT_HERDR_REQUIRE_PANE_ID === "1" &&
+    argv.includes("--current") &&
+    (process.env.HERDR_PANE_ID ?? "").trim().length === 0
+  ) {
+    process.stderr.write("herdr: pane split --current requires HERDR_PANE_ID\n");
+    process.exit(1);
+  }
   emit({ id: "cli:pane:split", result: { pane: { pane_id: `FIX:p${loggedCount("pane split")}` }, type: "pane_info" } });
 } else if (argv[0] === "tab" && sub === "create") {
   const n = loggedCount("tab create");
   const labelIdx = argv.indexOf("--label");
   const label = labelIdx >= 0 ? argv[labelIdx + 1] : "";
   const tabId = `FIX:t${n}`;
-  if (process.env.TUT_HERDR_TAB_CREATE_RAW !== undefined) {
+  if (process.env.TUT_HERDR_TAB_CREATE_SIGNAL !== undefined) {
+    // The command is logged before the signal, so the parent can observe that
+    // this attempt happened while the fixture's tab/pane env models the
+    // already-created remote objects.
+    process.kill(process.pid, process.env.TUT_HERDR_TAB_CREATE_SIGNAL);
+  } else if (process.env.TUT_HERDR_TAB_CREATE_RAW !== undefined) {
     // unparseable-but-successful create (raw text, exit 0)
     process.stdout.write(process.env.TUT_HERDR_TAB_CREATE_RAW);
   } else {
@@ -199,6 +226,18 @@ if (argv[0] === "pane" && sub === "list") {
   emit({ id: "cli:pane:send-text", result: { type: "ok" } });
 } else if (argv[0] === "pane" && sub === "send-keys") {
   emit({ id: "cli:pane:send-keys", result: { type: "ok" } });
+} else if (argv[0] === "pane" && sub === "get") {
+  // `pane get <pane_id>` — the event hook's pane_id → label channel. Label comes
+  // from TUT_HERDR_PANE_LABEL (spaces/Unicode welcome) or defaults to a stable
+  // derived value; label-failure paths go through the generic TUT_HERDR_FAIL
+  // injection above (e.g. TUT_HERDR_FAIL=pane:get), same JSON shape as live
+  // herdr: {"result":{"pane":{"pane_id","label"}}}.
+  const label = process.env.TUT_HERDR_PANE_LABEL ?? `${argv[2]}:label`;
+  if (process.env.TUT_HERDR_PANE_LABEL_RAW !== undefined) {
+    process.stdout.write(process.env.TUT_HERDR_PANE_LABEL_RAW);
+  } else {
+    emit({ id: "cli:pane:get", result: { pane: { pane_id: argv[2], label }, type: "pane_info" } });
+  }
 } else if (argv[0] === "pane" && sub === "read") {
   // Raw text, no JSON envelope (real herdr pane read prints terminal text).
   // Precedence for the pane being read ($3): ENTER script (post-text reads

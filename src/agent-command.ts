@@ -5,7 +5,7 @@
  * storage compatibility) or an explicit argv-shaped command.  TUT accepts a
  * deliberately small grammar: whitespace separates words, while shell
  * syntax is rejected instead of interpreted.  The launcher can therefore
- * expand a validated route into argv without eval/sh -c or a second parser.
+ * expand a validated route into argv without shell evaluation or a second parser.
  */
 
 import type { AgentCommand, AgentRoute } from "./types.js";
