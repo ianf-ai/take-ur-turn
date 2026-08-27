@@ -59,7 +59,7 @@ designing → implementing → reviewing ─┬─ pass       → pending_approv
 
 ## Quick Start
 
-Prerequisites: Node.js ≥ 20, Herdr (the Agent Host, providing the terminal panes agents live in; install with `brew install herdr`, project homepage https://github.com/herdrdev/herdr), and at least one coding agent CLI. **Platforms: macOS / Linux only** (the launcher is a POSIX shell; Herdr's Windows support is still in beta).
+Prerequisites: Node.js ≥ 20, Herdr (the Agent Host, providing the terminal panes agents live in; install with `brew install herdr` on macOS/Linux, native binary from the [Herdr releases](https://github.com/herdrdev/herdr/releases) page on Windows), and at least one coding agent CLI. **Platforms: macOS, Linux and Windows** (Windows is newly supported in 0.5.0 — see [Windows notes](#windows-notes) for setup boundaries).
 
 **Install** — the npm package ships everything TUT needs at runtime (built CLI, role skills, launcher scripts):
 
@@ -285,6 +285,16 @@ Behavioral instructions for the agent roles live in [skills/](skills/) (architec
 Design docs and skills are currently Chinese-language; code, CLI output, and commit conventions are English.
 
 ## Troubleshooting and Known Limitations
+
+### Windows notes
+
+Native Windows works end to end (hub, MCP, CLI, flow driving were verified against Herdr's Windows build and PowerShell 5.1). Setup boundaries worth knowing:
+
+- **Agent CLIs installed via npm ship as `.cmd` shims**, which TUT deliberately does not execute (spawn-injection hardening). Point the role at a direct Node entry route instead, e.g. `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`, or install an agent that ships a native executable
+- If PowerShell's execution policy blocks script blocks (`tut up` provisions panes by typing commands into panes), run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once
+- `tut up` must run where a current pane context exists (an interactive Herdr pane, or `HERDR_PANE_ID` pointing at a valid pane id); headless runs fail with that named in the error
+- Desktop notifications degrade to a terminal bell on Windows (toast channel not implemented yet)
+- Herdr's Windows zip needs the VC++ runtime (`vc_redist.x64`) — without it the binary exits silently
 
 **Troubleshooting**:
 

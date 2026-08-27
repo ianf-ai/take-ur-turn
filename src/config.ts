@@ -213,7 +213,7 @@ export type ConfigKeyAssignment = { key: "flow_mode"; value: FlowMode } | { key:
 export function configKeyDomain(key: ConfigKey): string {
   return key === "flow_mode"
     ? '"manual" | "auto"'
-    : `comma-separated roles (${KNOWN_ROLES.join("|")}); "" clears the whitelist`;
+    : `comma-separated bare role names (${KNOWN_ROLES.join("|")}), e.g. ${KNOWN_ROLES.join(",")}; "" clears the whitelist`;
 }
 
 /** Available-keys hint line shared by every `tut config` rejection path. */
@@ -241,7 +241,15 @@ export function parseConfigValue(
     const role = piece.trim();
     if (role.length === 0) continue;
     if (!(KNOWN_ROLES as readonly string[]).includes(role)) {
-      return { ok: false, error: `invalid role in auto.launch_roles: "${role}" (roles: ${KNOWN_ROLES.join("|")})` };
+      // The error is the documentation: the format AND a copy-pasteable
+      // example ride along (roles are bare names — agents like "codex" are
+      // the classic wrong value this must teach its way out of).
+      return {
+        ok: false,
+        error:
+          `invalid role in auto.launch_roles: "${role}" — not a known role; ` +
+          `expected ${configKeyDomain("auto.launch_roles")}`,
+      };
     }
     if (!roles.includes(role)) roles.push(role);
   }

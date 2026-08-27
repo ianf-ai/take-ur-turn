@@ -187,12 +187,12 @@ describe("launcher argv boundary", () => {
 
   it("passes ordered args and appends codex suppression after user -c", async () => {
     const result = await run(LAUNCHER, ["route-launch", "executor", "codex", "--model", "gpt-5.6", "--sandbox", "workspace-write", "--search", "-c", "check_for_update_on_startup=true"], { env: env() });
-    expect(result.stdout).toContain("pane run <root> codex --model gpt-5.6 --sandbox workspace-write --search -c check_for_update_on_startup=true -c check_for_update_on_startup=false");
+    expect(result.stdout).toContain("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'");
   });
 
   it("supports a legacy raw command string and pi suppression", async () => {
     const result = await run(LAUNCHER, ["route-launch", "executor", "pi --model fast --search"], { env: env() });
-    expect(result.stdout).toContain("pane run <root> env PI_SKIP_VERSION_CHECK=1 pi --model fast --search");
+    expect(result.stdout).toContain("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi' '--model' 'fast' '--search'");
   });
 
   it("rejects injection tokens before pane birth", async () => {

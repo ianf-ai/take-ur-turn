@@ -9,8 +9,9 @@
 
 import { hubPublish, hubRead, type HubPublishResult } from "./hub-client.js";
 import { commandHead, commandArgs } from "./agent-command.js";
-import { resolveAgentRoute } from "./workspace.js";
-import type { AgentRoute, Cast, ContextRecord } from "./types.js";
+import { resolveAgentRouteWithSource } from "./workspace.js";
+import type { ResolveOptions } from "./workspace.js";
+import type { AgentRoute, Cast, ContextRecord, LaunchMarkerProjection, LaunchRouteSource } from "./types.js";
 
 export type LaunchVia = "start-next" | "auto";
 
@@ -24,6 +25,11 @@ export interface LaunchMarker {
   role: string;
   base_version: number;
   via: LaunchVia;
+  protocol_version?: 2;
+  route?: AgentRoute;
+  route_source?: LaunchRouteSource;
+  target_kind?: string;
+  target_digest?: string;
 }
 
 /** Return the greatest record version in a log, or zero for a newly-created task. */
@@ -86,6 +92,8 @@ export interface LaunchTarget {
   args?: string[];
   /** The task's cast, when /state exposes one (for callers that want the whole picture). */
   cast?: Cast;
+  /** Provenance of the normalized route for the canonical invocation planner. */
+  route_source?: LaunchRouteSource;
 }
 
 /**
@@ -96,19 +104,33 @@ export interface LaunchTarget {
  * safe to call as a pre-check before the launch marker.
  */
 export async function resolveLaunchTarget(url: string, taskId: string, role: string): Promise<LaunchTarget> {
+  const target = await resolveLaunchTargetWithSource(url, taskId, role);
+  const { route_source: _routeSource, ...compatibilityTarget } = target;
+  return compatibilityTarget;
+}
+
+/** Resolve a target and retain the route provenance for canonical planning. */
+export async function resolveLaunchTargetWithSource(
+  url: string,
+  taskId: string,
+  role: string,
+  resolveOptions: ResolveOptions = {},
+): Promise<LaunchTarget> {
   const res = await fetch(new URL("/state", url));
   if (!res.ok) throw new Error(`GET ${url}/state → HTTP ${res.status}`);
   const state = (await res.json()) as { tasks?: Array<{ task_id: string; cast?: Cast }> };
   const entry = state.tasks?.find((t) => t.task_id === taskId);
   if (entry === undefined) throw new Error(`task ${taskId} not in /state`);
   const cast = entry.cast;
-  const route: AgentRoute = await resolveAgentRoute(role, cast);
+  const resolved = await resolveAgentRouteWithSource(role, cast, resolveOptions);
+  const route: AgentRoute = resolved.route;
   const normalizedAgent = commandHead(route);
   const args = commandArgs(route);
   return {
     agent: normalizedAgent,
     ...(args.length > 0 ? { args } : {}),
     ...(cast !== undefined ? { cast } : {}),
+    route_source: resolved.source,
   };
 }
 
@@ -124,7 +146,23 @@ export async function markLaunched(
   role: string,
   baseVersion: number,
   via: LaunchVia,
+  projection?: LaunchMarkerProjection,
 ): Promise<HubPublishResult> {
+  if (projection !== undefined && (projection.role !== role || projection.base_version !== baseVersion || projection.via !== via)) {
+    throw new Error("launch marker projection does not match the launch request");
+  }
+  const launch = projection === undefined
+    ? { role, base_version: baseVersion, via }
+    : {
+        protocol_version: 2 as const,
+        role: projection.role,
+        base_version: projection.base_version,
+        via: projection.via,
+        route: { agent: projection.route.agent, args: [...projection.route.args] },
+        route_source: projection.route_source,
+        target_kind: projection.target_kind,
+        target_digest: projection.target_digest,
+      };
   return await hubPublish(url, {
     task_id: taskId,
     role: "human",
@@ -132,7 +170,7 @@ export async function markLaunched(
     payload: {
       summary: launchSummary(role, baseVersion),
       body: launchBody(role, baseVersion, via),
-      launch: { role, base_version: baseVersion, via },
+      launch,
     },
     expected_version: baseVersion,
   });

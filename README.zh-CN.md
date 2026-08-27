@@ -59,7 +59,7 @@ designing → implementing → reviewing ─┬─ pass       → pending_approv
 
 ## 快速上手
 
-前置：Node.js ≥ 20、Herdr（Agent Host，承载各 Agent 的终端 pane；`brew install herdr` 安装，项目主页 https://github.com/herdrdev/herdr ）、至少一个 coding agent CLI。**平台：仅 macOS / Linux**（启动器为 POSIX shell；Herdr 的 Windows 支持尚在 beta）。
+前置：Node.js ≥ 20、Herdr（Agent Host，承载各 Agent 的终端 pane；macOS/Linux 用 `brew install herdr`，Windows 从 [Herdr releases](https://github.com/herdrdev/herdr/releases) 取原生二进制）、至少一个 coding agent CLI。**平台：macOS、Linux、Windows**（Windows 为 0.5.0 新增支持——安装边界见 [Windows 说明](#windows-说明)）。
 
 **安装**——npm 包自带运行所需的一切（构建好的 CLI、角色 skill、启动器脚本）：
 
@@ -279,6 +279,16 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 - [design/context-design.md](design/context-design.md) — **上下文设计**：放什么（scope / 记录类型 / payload 信封与 body 模板）、怎么管理
 
 ## 故障排查与已知限制
+
+### Windows 说明
+
+原生 Windows 端到端可用（hub、MCP、CLI、流转驱动均已对照 Herdr Windows 版与 PowerShell 5.1 验证）。安装边界须知：
+
+- **npm 安装的 agent CLI 以 `.cmd` shim 形态存在**，TUT 出于加固考虑不执行 shim。请将角色指向 direct Node entry 路由，例如 `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`，或使用带原生可执行文件的 agent
+- 若 PowerShell 执行策略拦截 script block（`tut up` 通过向 pane 键入命令来供给），先执行一次 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+- `tut up` 需要存在当前 pane 上下文（交互式 Herdr pane 内运行，或 `HERDR_PANE_ID` 指向有效 pane id）；无头运行会失败，报错中会点名原因
+- 桌面通知在 Windows 上降级为终端响铃（toast 通道尚未实现）
+- Herdr 的 Windows zip 依赖 VC++ 运行库（`vc_redist.x64`）——缺失时二进制静默退出
 
 **排障**：
 

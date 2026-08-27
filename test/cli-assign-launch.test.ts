@@ -365,7 +365,7 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
     expect(stdout).not.toContain("send-text w2:p1"); // the existing pane receives NOTHING
     expect(stdout).toContain("DRY-RUN: birth: herdr tab create --workspace w11 --cwd /repo --label TUT executor --no-focus");
     expect(stdout).toContain("DRY-RUN: birth: herdr pane rename <root> t1.executor");
-    expect(stdout).toContain("DRY-RUN: birth: herdr pane run <root> env PI_SKIP_VERSION_CHECK=1 pi");
+    expect(stdout).toContain("DRY-RUN: birth: herdr pane run <root> cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
     expect(stdout).toContain("DRY-RUN: ready-probe <label:t1.executor> (born pane");
     expect(stdout).toContain("(agent 'pi', label 't1.executor')");
   });
@@ -471,7 +471,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
         // shipped root pane (rename + run) — no split, no move.
         const createIdx = lines.findIndex((l) => l === "tab create --workspace w9 --cwd /x --label TUT architect --no-focus");
         expect(createIdx).toBeGreaterThanOrEqual(0);
-        const runIdx = lines.findIndex((l) => l === "pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+        const runIdx = lines.findIndex((l) => l === "pane run FIX:root1 cd -- '/x' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
         expect(runIdx).toBeGreaterThan(createIdx);
         expect(lines).toContain("pane rename FIX:root1 t1.architect"); // round pane label from round one
         // FULL closed-loop order (design 斨1). Gate: exactly 4 reads (base +
@@ -513,7 +513,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
       const createIdx = lines.findIndex((l) => l === "tab create --workspace w9 --cwd /x --label TUT executor --no-focus");
       expect(createIdx).toBeGreaterThan(lastList);
       expect(lines).toContain("pane rename FIX:root1 t1.executor");
-      const runIdx = lines.findIndex((l) => l === "pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+      const runIdx = lines.findIndex((l) => l === "pane run FIX:root1 cd -- '/x' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
       expect(runIdx).toBeGreaterThan(createIdx);
       const sendTextIdx = lines.findIndex((l) => l.startsWith("pane send-text FIX:root1"));
       expect(lines[sendTextIdx]).toBe(`pane send-text FIX:root1 轮到你了（role: executor）：请用 Context Hub 读取任务 t1 的完整上下文（context.read），按你的 role skill（${path.resolve(SCRIPTS_DIR, "../skills/executor.md")}）开始本轮工作，完成后发布相应记录（context.publish）。`);
@@ -575,7 +575,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
     "multi-swallow recovery: FOUR swallowed Enters, the fifth commits — the loop resends until the box clears",
     async () => {
       // The acceptance scenario for the loop resend: the swallow window
-      // outlives several Enter attempts (the live-sentinel shape — it
+      // outlives several Enter attempts (the observed race shape — it
       // outlived even the idle readiness signal). Every Enter-indexed
       // screen holds the composer text until screens[5] lets go; the loop
       // must keep resending Enter on the clock, never re-send the text,
@@ -617,7 +617,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
     async () => {
       // Nothing ever lets go of the text (dead screen): the loop resends
       // Enter on the clock within the bounded window (not readiness-gated
-      // — the sentinel disproved that), then points the human at the input
+      // — disproved by a controlled experiment), then points the human at the input
       // box and still exits 0 — a failure exit would re-enter (duplicate
       // birth), the worse outcome the design rejects.
       const boot = JSON.stringify(["", "", "ui", "ui"]);
@@ -840,5 +840,72 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
       expect(off.confirmed).toBe(true); // off still succeeds the same way
     },
     20_000,
+  );
+
+  it(
+    "diagnostics persist to <root>/.context-hub/delivery.log with task/role context; stderr keeps its original shape",
+    async () => {
+      // Pane scrollback is finite and can flush mid-incident — the durable
+      // copy lives under the project root (TUT_PROJECT_ROOT here; live the
+      // anchor-cwd chain root serves the same role). One file for all
+      // tasks: every persisted line carries task=/role= so concurrent
+      // tasks stay distinguishable. The stderr line stays byte-shaped as
+      // before (the notify pane tees it; the timeline tests parse it).
+      const proj = mkdtempSync(path.join(os.tmpdir(), "tut-diag-persist-"));
+      const log = path.join(os.tmpdir(), `tut-diag-persist-${process.pid}.log`);
+      rmSync(log, { force: true });
+      const boot = JSON.stringify(["", "", "ui", "ui", "ui ▎prompt", "working — round started"]);
+      try {
+        const { stderr } = await runLaunch(LAUNCH_SH, ["t-pr", "architect", "pi"], {
+          env: liveEnv({
+            TUT_PROJECT_ROOT: proj,
+            TUT_HERDR_LOG: log,
+            TUT_HERDR_READ_SCRIPT: boot,
+          }),
+        });
+        const fileLines = readFileSync(path.join(proj, ".context-hub", "delivery.log"), "utf8")
+          .split("\n")
+          .filter((l) => l.length > 0);
+        expect(fileLines.length).toBeGreaterThan(0);
+        expect(fileLines.every((l) => /^tut-delivery t=\d+ task=t-pr role=architect /.test(l))).toBe(true);
+        // Same event stream on both sinks, same order — the file is the
+        // durable copy of the stderr line, event fields included.
+        const errDiag = stderr.split("\n").filter((l) => l.startsWith("tut-delivery "));
+        expect(errDiag.length).toBe(fileLines.length);
+        expect(
+          errDiag.every((l, i) => {
+            const fileTail = fileLines[i]?.replace(/^tut-delivery t=\d+ task=t-pr role=architect /, "");
+            return l.startsWith("tut-delivery t=") && !l.includes("task=") && l.replace(/^tut-delivery t=\d+ /, "") === fileTail;
+          }),
+        ).toBe(true);
+      } finally {
+        rmSync(proj, { recursive: true, force: true });
+        rmSync(log, { force: true });
+      }
+    },
+    15_000,
+  );
+
+  it(
+    "TUT_DELIVERY_DIAG=0 writes nothing to disk either — one switch silences both sinks",
+    async () => {
+      const proj = mkdtempSync(path.join(os.tmpdir(), "tut-diag-disk-off-"));
+      try {
+        await runLaunch(LAUNCH_SH, ["t-po", "architect", "pi"], {
+          env: liveEnv({
+            TUT_PROJECT_ROOT: proj,
+            TUT_DELIVERY_DIAG: "0",
+            TUT_READY_TIMEOUT_MS: "100",
+            TUT_TEXT_LAND_TIMEOUT_MS: "80",
+            TUT_SUBMIT_RETRY_TIMEOUT_MS: "200",
+          }),
+        });
+        expect(existsSync(path.join(proj, ".context-hub", "delivery.log"))).toBe(false);
+        expect(existsSync(path.join(proj, ".context-hub"))).toBe(false); // not even the dir — lazy setup
+      } finally {
+        rmSync(proj, { recursive: true, force: true });
+      }
+    },
+    15_000,
   );
 });

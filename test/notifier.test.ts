@@ -42,6 +42,12 @@ const U3 = "2026-08-15T10:10:00.000Z";
 /** Tests that exercise the auto branch POSITIVELY whitelist
  *  every standard role; withholding cases pin the exact narrower list (or none). */
 const ALL_ROLES = { launch_roles: ["architect", "executor", "reviewer"] };
+const TEST_ANCHOR = {
+  pane_id: "fixture:anchor",
+  label: "tut-hub",
+  workspace_id: "fixture-workspace",
+  cwd: "/fixture/workspace",
+};
 
 function task(overrides: Partial<StateTask> & { task_id: string }): StateTask {
   return {
@@ -185,6 +191,15 @@ function makeHarness(opts: HarnessOpts = {}) {
         opts.order?.push("sweep-list-end");
         return opts.panes ?? [];
       },
+      // Anchor discovery is intentionally a separate seam from the minimal
+      // done-sweep inventory.  The synthetic system row is the legal anchor
+      // used by auto-launch tests; sweep fixtures remain label-only.
+      listAnchorPanes: async () => [{
+        pane_id: "fixture:anchor",
+        label: "tut-hub",
+        workspace_id: "fixture-workspace",
+        cwd: "/fixture/workspace",
+      }],
       readPane: async (paneId: string) => {
         if (opts.readPaneFails?.includes(paneId)) throw new Error(`fixture read failure for ${paneId}`);
         sweptReads.push(paneId);
@@ -337,6 +352,85 @@ describe("compare loop (poll /state)", () => {
   });
 });
 
+// --- pending approval edge ----------------------------------------------------------
+
+describe("pending_approval notifications", () => {
+  it("detects the status edge even when waiting_for is already human, truncates the title, and logs once", async () => {
+    const longTitle = `${"Approval title ".repeat(8)}tail`;
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", title: longTitle, status: "reviewing", waiting_for: "human" })]));
+    await hz.notifier.requestCompare(); // baseline: human-waiting, not pending_approval
+
+    hz.set(state([task({
+      task_id: "t1",
+      title: longTitle,
+      status: "pending_approval",
+      waiting_for: "human",
+      updated_at: U2,
+    })]));
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare(); // same pending state: no repeated alert
+
+    expect(titlesMatching("waiting for human")).toHaveLength(1);
+    expect(h.sent).toHaveLength(2); // desktop + webhook
+    const msg = h.sent[0]!.msg;
+    expect(msg.task_id).toBe("t1");
+    expect(msg.body).toContain(`${longTitle.slice(0, 72)}…`);
+    expect(msg.body).not.toContain(longTitle);
+    expect(msg.body).toContain("status: pending_approval");
+    expect(msg.body).toContain("waiting for approval");
+    expect(msg.body).toContain("tut decide t1 --decision approve --by <your-name>");
+    expect(msg.body).toContain("replace `<your-name>` with your identity");
+    expect(msg.body).toContain("--decision reject");
+    expect(parseArgs(["decide", "t1", "--decision", "approve", "--by", "alice"])).toMatchObject({
+      command: "decide",
+      task_id: "t1",
+      decision: "approve",
+      by: "alice",
+    });
+    expect(hz.logs.filter((line) => line.includes("TUT t1: waiting for human"))).toHaveLength(1);
+  });
+
+  it("does not notify for a pending baseline or replay it after a flow-mode change", async () => {
+    const hz = makeHarness({ flowMode: "manual" });
+    const pending = task({ task_id: "t1", status: "pending_approval", waiting_for: "human" });
+    hz.set(state([pending], { flow_mode: "manual" }));
+    await hz.notifier.requestCompare(); // existing pending task: silent baseline
+    hz.set(state([pending], { flow_mode: "auto" }));
+    await hz.notifier.requestCompare(); // mode change is not a status edge
+    expect(h.sent).toEqual([]);
+  });
+
+  it("resets the edge after leaving pending_approval so a later entry notifies again", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer" })]));
+    await hz.notifier.requestCompare();
+
+    hz.set(state([task({ task_id: "t1", status: "pending_approval", waiting_for: "human", updated_at: U2 })]));
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "approved", waiting_for: "human", updated_at: U3 })]));
+    await hz.notifier.requestCompare(); // leaves pending_approval; no flow edge
+    hz.set(state([task({ task_id: "t1", status: "pending_approval", waiting_for: "human", updated_at: "2026-08-15T10:15:00.000Z" })]));
+    await hz.notifier.requestCompare();
+
+    expect(titlesMatching("waiting for human")).toHaveLength(2);
+    expect(h.sent).toHaveLength(4); // two approval edges × two channels
+  });
+
+  it("uses the existing auto-mode human gate channels for the approval edge", async () => {
+    const hz = makeHarness({ flowMode: "auto" });
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "human" })], { flow_mode: "auto" }));
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "pending_approval", waiting_for: "human", updated_at: U2 })], { flow_mode: "auto" }));
+    await hz.notifier.requestCompare();
+
+    expect(hz.launches).toEqual([]);
+    expect(titlesMatching("human decision needed")).toHaveLength(1);
+    expect(h.sent[0]!.msg.body).toContain("waiting for approval");
+    expect(h.sent[0]!.msg.body).toContain("auto launch withheld");
+  });
+});
+
 // --- version-jump merge log (log-only, no behavior change) -------------------------
 
 describe("version jump merge log", () => {
@@ -438,6 +532,39 @@ describe("needs_attention handling", () => {
 // --- auto-mode gate (/state-only reading) -----------------------------------
 
 describe("auto-mode gate", () => {
+  it("fails closed when the state task version and launch log version diverge", async () => {
+    const order: string[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      order,
+      readLog: async (taskId): Promise<ContextRecord[]> => [
+        {
+          version: 2,
+          task_id: taskId,
+          role: "executor",
+          content_type: "code_changes",
+          timestamp: U2,
+          payload: { summary: "newer state", body: "newer state" },
+        },
+      ],
+    });
+    await hz.notifier.requestCompare();
+    hz.set(
+      state(
+        [task({ task_id: "t-race", status: "implementing", waiting_for: "agent:executor", version: 1, updated_at: U2 })],
+        { flow_mode: "auto", auto: ALL_ROLES },
+      ),
+    );
+    await hz.notifier.requestCompare();
+
+    expect(hz.launches).toEqual([]);
+    expect(order).not.toContain("marker");
+    expect(order).not.toContain("launch");
+    expect(hz.logs.some((line) => line.includes("state/log version mismatch: state v1, log v2"))).toBe(true);
+    expect(titlesMatching("auto launch failed")).toHaveLength(1);
+  });
+
   it("launches via launch.sh for an agent:* hand-off and notifies 'auto-launched'", async () => {
     const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"] });
     await hz.notifier.requestCompare();
@@ -520,7 +647,7 @@ describe("auto-mode gate", () => {
       readLog: async () => records,
     });
     await hz.notifier.requestCompare();
-    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare();
 
     records = [
@@ -562,7 +689,7 @@ describe("auto-mode gate", () => {
       readLog: async () => records,
     });
     await hz.notifier.requestCompare();
-    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare();
 
     records = [
@@ -646,7 +773,7 @@ describe("auto-mode gate", () => {
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2, version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare(); // executor watch
 
-    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3, version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3, version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare(); // executor watch retired, reviewer watch armed
 
     hz.at(50);
@@ -674,7 +801,7 @@ describe("auto-mode gate", () => {
       readLog: async () => records,
     });
     await hz.notifier.requestCompare();
-    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2, version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare(); // round 1 executor watch
 
     records = [
@@ -691,7 +818,7 @@ describe("auto-mode gate", () => {
         },
       },
     ];
-    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3, version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3, version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare(); // retire round 1
     records = [
       ...records,
@@ -724,7 +851,7 @@ describe("auto-mode gate", () => {
         payload: { summary: "round handoff", body: "next executor round" },
       },
     ];
-    hz.set(state([task({ task_id: "t1", status: "revising", waiting_for: "agent:executor", updated_at: U3, version: 5 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.set(state([task({ task_id: "t1", status: "revising", waiting_for: "agent:executor", updated_at: U3, version: 4 })], { flow_mode: "auto", auto: ALL_ROLES }));
     await hz.notifier.requestCompare(); // round 2 executor watch
 
     hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor.old" });
@@ -768,6 +895,7 @@ describe("auto-mode gate", () => {
         resolveTarget: async () => "pi",
         now: () => 0,
         log: (line) => h.sent.push({ name: "log", msg: { title: line, body: "" } }),
+        listAnchorPanes: async () => [TEST_ANCHOR],
       },
     );
     openNotifiers.push(notifier);
@@ -798,6 +926,7 @@ describe("auto-mode gate", () => {
         resolveTarget: async () => "pi",
         now: () => 0,
         log: () => undefined,
+        listAnchorPanes: async () => [TEST_ANCHOR],
       },
     );
     openNotifiers.push(notifier);
@@ -838,6 +967,7 @@ describe("auto-mode gate", () => {
         resolveTarget: async () => "pi",
         now: () => 0,
         log: () => undefined,
+        listAnchorPanes: async () => [TEST_ANCHOR],
       },
     );
     openNotifiers.push(notifier);
@@ -876,6 +1006,50 @@ describe("auto-mode gate", () => {
     expect(titlesMatching("human decision needed")).toHaveLength(0);
   });
 
+  it("target pre-check failure fails the auto launch BEFORE the marker or spawn", async () => {
+    // The pre-check seam throws exactly what the production default resolver
+    // wrapper produces for a Windows target refusal (AgentTargetError message
+    // carried by "fails its target pre-check"); the canonical auto path must
+    // route it to autoLaunchFailed — no marker append, no launcher spawn.
+    const logs: string[] = [];
+    const calls: string[] = [];
+    let cur = state([task({ task_id: "t1", status: "designing", waiting_for: "agent:architect" })], { flow_mode: "auto", auto: ALL_ROLES });
+    const notifier = new Notifier(
+      { url: "http://x:1", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
+      {
+        fetchState: async () => cur,
+        readLog: async () => [],
+        markLaunched: async () => {
+          calls.push("marker");
+          return { version: 1 };
+        },
+        launch: async () => {
+          calls.push("launch");
+          return "launched";
+        },
+        resolveTargetWithSource: async () => {
+          calls.push("precheck");
+          throw new Error(
+            "routed agent 'pi' fails its target pre-check: agent 'pi' resolves to a Windows shim (C:\\npm\\pi.cmd) — TUT does not execute .cmd shims",
+          );
+        },
+        now: () => 0,
+        log: (l: string) => {
+          logs.push(l);
+        },
+        listAnchorPanes: async () => [TEST_ANCHOR],
+      },
+    );
+    openNotifiers.push(notifier);
+    await notifier.requestCompare(); // baseline
+    cur = state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES });
+    await notifier.requestCompare(); // gate passes → pre-check throws internally
+
+    expect(calls).toEqual(["precheck"]); // neither the marker nor the launcher ran
+    expect(titlesMatching("auto launch failed")).toHaveLength(1);
+    expect(logs.some((l) => l.includes("precheck failed") && l.includes("Windows shim"))).toBe(true);
+  });
+
   it("launch failure is logged and notified, never thrown", async () => {
     const logs: string[] = [];
     let cur = state([task({ task_id: "t1", status: "designing", waiting_for: "agent:architect" })], { flow_mode: "auto", auto: ALL_ROLES });
@@ -893,6 +1067,7 @@ describe("auto-mode gate", () => {
         log: (l: string) => {
           logs.push(l);
         },
+        listAnchorPanes: async () => [TEST_ANCHOR],
       },
     );
     openNotifiers.push(notifier);
@@ -1391,6 +1566,7 @@ describe("done-event pane sweep: final screens archived into the notify log", ()
 
     await vi.advanceTimersByTimeAsync(50); // the delayed inventory lands; sweep completes
     await hz.flush();
+    await vi.waitFor(() => expect(order).toContain("launch"));
 
     // THE closing order: sweep read archived BEFORE this task's marker and launch.
     expect(order.indexOf("sweep-read:w11:p6")).toBeGreaterThanOrEqual(0);
@@ -1980,7 +2156,7 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
         expect(text).toContain("submit-confirmed pane=FIX:root1 attempt=1");
         // The birth really ran against the fixture (not a dry-run).
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines).toContain("pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+        expect(lines).toContain("pane run FIX:root1 cd -- '/x' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
       } finally {
         spy.mockRestore();
         rmSync(log, { force: true });

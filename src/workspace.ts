@@ -25,7 +25,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { AgentCommandError, formatAgentRoute, parseAgentRoute, validateAgentRoute } from "./agent-command.js";
-import type { AgentRoute, Cast } from "./types.js";
+import type { AgentCommand, AgentRoute, Cast } from "./types.js";
 
 /** Built-in default lineup (L3). Role → agent; values frozen. */
 export const DEFAULT_ROLES: Record<string, string> = {
@@ -47,13 +47,34 @@ export interface ResolveOptions {
   projectRoot?: string;
   /** L2 config dir (default: $TUT_USER_CONFIG_DIR, else ~/.config/tut). */
   userConfigDir?: string;
+  /** A planner-bound config snapshot; when present no workspace files are read. */
+  workspaceSnapshot?: WorkspaceConfigSnapshot;
+}
+
+/** Route plus the level that supplied it, for launch audit projections. */
+export interface ResolvedAgentRoute {
+  route: AgentRoute;
+  source: "task-cast" | "workspace-project" | "workspace-user" | "builtin-default";
 }
 
 /** Default L2 dir: env override, else ~/.config/tut. */
-export function defaultUserConfigDir(): string {
-  const env = process.env.TUT_USER_CONFIG_DIR;
+export function defaultUserConfigDir(environment: NodeJS.ProcessEnv = process.env): string {
+  const env = environment.TUT_USER_CONFIG_DIR;
   if (env !== undefined && env.length > 0) return env;
   return path.join(homedir(), ".config", "tut");
+}
+
+/**
+ * The immutable workspace declaration consumed by one launch planner.  It is
+ * deliberately separate from ExecutionContext: the latter is serialized into
+ * the child invocation, while these parsed declarations stay parent-local and
+ * never enter the Context Hub marker.
+ */
+export interface WorkspaceConfigSnapshot {
+  readonly projectRoot: string;
+  readonly userConfigDir: string;
+  readonly roles: readonly [Readonly<Record<string, AgentRoute>>, Readonly<Record<string, AgentRoute>>];
+  readonly tabLabel: readonly [string | undefined, string | undefined];
 }
 
 /** Parsed workspace config file: roles per-key + naming.tab_label. */
@@ -109,14 +130,50 @@ function parseTabLabel(raw: Record<string, unknown> | null): string | undefined 
   return typeof label === "string" && label.length > 0 ? label : undefined;
 }
 
-async function readLevels(opts: ResolveOptions): Promise<WorkspaceLevels> {
-  const l1 = await readJson(path.join(opts.projectRoot ?? process.cwd(), ".context-hub", "workspace.json"));
-  const l2 = await readJson(path.join(opts.userConfigDir ?? defaultUserConfigDir(), "workspace.json"));
+async function readLevels(projectRoot: string, userConfigDir: string): Promise<WorkspaceLevels> {
+  const l1 = await readJson(path.join(projectRoot, ".context-hub", "workspace.json"));
+  const l2 = await readJson(path.join(userConfigDir, "workspace.json"));
   return {
     roles: [parseRoles(l1), parseRoles(l2)],
     tabLabel: [parseTabLabel(l1), parseTabLabel(l2)],
   };
 }
+
+function freezeRoute(route: AgentRoute): AgentRoute {
+  if (typeof route === "string") return route;
+  const frozen: AgentCommand = {
+    agent: route.agent,
+    args: Object.freeze([...route.args]) as unknown as string[],
+  };
+  return Object.freeze(frozen) as AgentRoute;
+}
+
+function freezeRoleMap(routes: Record<string, AgentRoute>): Readonly<Record<string, AgentRoute>> {
+  const frozen: Record<string, AgentRoute> = {};
+  for (const [role, route] of Object.entries(routes)) frozen[role] = freezeRoute(route);
+  return Object.freeze(frozen);
+}
+
+/** Read and freeze both workspace levels once for a planner boundary. */
+export async function readWorkspaceConfigSnapshot(
+  opts: Omit<ResolveOptions, "workspaceSnapshot"> = {},
+): Promise<WorkspaceConfigSnapshot> {
+  const projectRoot = path.resolve(opts.projectRoot ?? process.cwd());
+  const userConfigDir = path.resolve(opts.userConfigDir ?? defaultUserConfigDir());
+  const levels = await readLevels(projectRoot, userConfigDir);
+  return Object.freeze({
+    projectRoot,
+    userConfigDir,
+    roles: Object.freeze([freezeRoleMap(levels.roles[0]), freezeRoleMap(levels.roles[1])]) as readonly [
+      Readonly<Record<string, AgentRoute>>,
+      Readonly<Record<string, AgentRoute>>,
+    ],
+    tabLabel: Object.freeze([...levels.tabLabel]) as readonly [string | undefined, string | undefined],
+  });
+}
+
+/** Short alias used by planner code that calls the value a workspace snapshot. */
+export const readWorkspaceSnapshot = readWorkspaceConfigSnapshot;
 
 /**
  * Resolve a role to its agent. Order (frozen): task cast → L1 project file
@@ -127,15 +184,41 @@ function parseRouteForResolution(route: AgentRoute, field: string): AgentRoute {
 }
 
 export async function resolveAgentRoute(role: string, cast?: Cast, opts: ResolveOptions = {}): Promise<AgentRoute> {
+  return (await resolveAgentRouteWithSource(role, cast, opts)).route;
+}
+
+/**
+ * Resolve a route without losing its provenance.  This is the planner-facing
+ * sibling of resolveAgentRoute; the old function remains the compatibility
+ * API used by callers that only need an AgentRoute.
+ */
+export async function resolveAgentRouteWithSource(
+  role: string,
+  cast?: Cast,
+  opts: ResolveOptions = {},
+): Promise<ResolvedAgentRoute> {
   const fromCast = cast?.[role as keyof Cast];
   if (fromCast !== undefined) {
     // A task cast is an explicit routing decision. Invalid input must stop at
     // the launch pre-check; silently falling through to a workspace/default
     // agent could launch the wrong executable and leave a misleading marker.
-    return parseRouteForResolution(fromCast, `cast role '${role}'`);
+    return { route: parseRouteForResolution(fromCast, `cast role '${role}'`), source: "task-cast" };
   }
-  const levels = await readLevels(opts);
-  return levels.roles[0][role] ?? levels.roles[1][role] ?? DEFAULT_ROLES[role] ?? UNKNOWN_ROLE_AGENT;
+  const snapshot = opts.workspaceSnapshot ?? await readWorkspaceConfigSnapshot(opts);
+  const project = snapshot.roles[0][role];
+  if (project !== undefined) return { route: project, source: "workspace-project" };
+  const user = snapshot.roles[1][role];
+  if (user !== undefined) return { route: user, source: "workspace-user" };
+  return { route: DEFAULT_ROLES[role] ?? UNKNOWN_ROLE_AGENT, source: "builtin-default" };
+}
+
+/** Resolve an already-snapshotted route without touching the filesystem. */
+export async function resolveAgentRouteFromSnapshot(
+  role: string,
+  cast: Cast | undefined,
+  snapshot: WorkspaceConfigSnapshot,
+): Promise<ResolvedAgentRoute> {
+  return await resolveAgentRouteWithSource(role, cast, { workspaceSnapshot: snapshot });
 }
 
 /**
@@ -154,6 +237,11 @@ export async function resolveAgent(role: string, cast?: Cast, opts: ResolveOptio
  * (`tab-label` subcommand) — the TS side has no tab-label consumer.
  */
 export async function resolveTabLabelTemplate(opts: ResolveOptions = {}): Promise<string> {
-  const levels = await readLevels(opts);
-  return levels.tabLabel[0] ?? levels.tabLabel[1] ?? DEFAULT_TAB_LABEL;
+  const snapshot = opts.workspaceSnapshot ?? await readWorkspaceConfigSnapshot(opts);
+  return snapshot.tabLabel[0] ?? snapshot.tabLabel[1] ?? DEFAULT_TAB_LABEL;
+}
+
+/** Resolve naming from the same immutable config read as the route. */
+export function resolveTabLabelTemplateFromSnapshot(snapshot: WorkspaceConfigSnapshot): string {
+  return snapshot.tabLabel[0] ?? snapshot.tabLabel[1] ?? DEFAULT_TAB_LABEL;
 }

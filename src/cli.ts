@@ -13,12 +13,17 @@
  * DEFAULT_HUB_URL applied in the handler). No deps.
  */
 
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startServer } from "./server.js";
+import {
+  renderPaneCommand,
+  resolvePaneShellDialect,
+  type PaneCommand,
+  type ShellDialect,
+} from "./launcher/shell-renderer.js";
 import { runNotify } from "./notifier.js";
 import {
   autoSectionOf,
@@ -31,8 +36,25 @@ import {
   type Config,
   type ReadOutcome,
 } from "./config.js";
-import { launchBlocked, latestRecordVersion, markLaunched, readLaunchLog, resolveLaunchTarget } from "./launch.js";
-import { KNOWN_ROLES, defaultUserConfigDir, resolveAgentRoute } from "./workspace.js";
+import { launchBlocked, latestRecordVersion, markLaunched, readLaunchLog } from "./launch.js";
+import { assertLaunchStateGate, bindLaunchBaseVersion, buildLaunchInvocation } from "./launcher/invocation.js";
+import {
+  AgentTargetError,
+  UnsupportedWindowsShimError,
+  resolvePlatformExecutionPlan,
+} from "./launcher/target-resolver.js";
+import { cliEntryPath, runInternalLaunch, runInternalLaunchInvocation, spawnDirect } from "./launcher/process.js";
+import { parseLaunchEntry, runLaunchEntry } from "./launcher/entry.js";
+import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
+import { HerdrClient, type HerdrPane as HerdrClientPane } from "./launcher/herdr-client.js";
+import {
+  KNOWN_ROLES,
+  defaultUserConfigDir,
+  readWorkspaceConfigSnapshot,
+  resolveAgentRoute,
+  resolveAgentRouteWithSource,
+  resolveTabLabelTemplateFromSnapshot,
+} from "./workspace.js";
 import { AgentCommandError, formatAgentRoute, parseAgentInvocation, parseAgentRoute } from "./agent-command.js";
 import {
   hubCreate,
@@ -45,7 +67,7 @@ import {
   type HubListResult,
   type HubReadResult,
 } from "./hub-client.js";
-import type { AgentRoute, Cast, Flow } from "./types.js";
+import type { AgentRoute, Cast, Flow, LaunchRequest } from "./types.js";
 
 /** Human rendering of a cast: "executor=pi, reviewer=codex" (insertion order). */
 function formatCast(cast: Cast): string {
@@ -71,8 +93,9 @@ Usage:
       file serve re-reads every request, so writes take effect on the next
       poll cycle, no restart; works with the Hub down, same discipline as
       tut assign). Keys: flow_mode ("manual"|"auto" — the offline equivalent
-      of tut mode), auto.launch_roles (comma-separated role whitelist,
-      "" clears). get also reads notify (read-only: an object config,
+      of tut mode), auto.launch_roles (comma-separated bare role names —
+      e.g. architect,executor,reviewer; "" clears the whitelist). get also
+      reads notify (read-only: an object config,
       edit config.json by hand). Unknown keys and illegal values are
       rejected with the available keys and their value domains. Default
       --root: .context-hub (relative to cwd — run from the project root,
@@ -85,6 +108,9 @@ Usage:
       --force): force-close the task's same-role pane and birth a brand-new
       one — the explicit outside-perspective choice (system-design 4.4);
       the Notifier never passes it.
+  tut launch [--fresh] <task_id> <role> [<agent> [<arg>...]]
+  tut launch --cleanup <task_id>
+      Internal launch entry used by start-next, Notifier, and the POSIX shim.
   tut watch [<task_id>] [--url <u>] [--interval <s>]
       Watch a task until its derived state changes, then exit with a code
       for the situation: 0 = round boundary (a new record advanced the
@@ -148,11 +174,15 @@ Usage:
       shapes all work), read locally, zero network: runs inside
       default-sandboxed agent sessions.
   tut init
-      Maintain the TUT block in this project's AGENTS.md (creates the file
-      when absent; idempotent — an existing marked block is refreshed in
-      place, never duplicated). The block tells agents receiving "act as
-      TUT Host / drive this task" instructions to run 'tut skill host';
-      worker-role skills are supplied automatically by the launcher.
+      Full onboarding for this repo, one command, idempotent (a non-JS
+      repo becomes a TUT project without any hand editing): creates
+      .context-hub/, appends it to .gitignore (no duplicate entry when the
+      ignore rule is already there), and maintains the TUT block in this
+      project's AGENTS.md (creates the file when absent; an existing marked
+      block is refreshed in place, never duplicated). The block tells
+      agents receiving "act as TUT Host / drive this task" instructions to
+      run 'tut skill host'; worker-role skills are supplied automatically
+      by the launcher.
 `;
 
 // --- parsed shapes (frozen — handlers consume these) -------------------------
@@ -171,6 +201,7 @@ export type ParsedArgs =
   | { command: "mode"; mode: "manual" | "auto"; url: string }
   | { command: "config"; action: "get" | "set"; key: string; value?: string; root: string }
   | { command: "start-next"; task_id?: string; url: string; force: boolean; fresh: boolean }
+  | { command: "launch"; args: string[] }
   | { command: "watch"; task_id?: string; url: string; interval: number }
   | { command: "create"; title: string; description: string; creator: string; role: string; flow?: Flow; cast?: Cast; url?: string }
   | {
@@ -690,6 +721,16 @@ function parseInit(args: readonly string[]): ParsedArgs {
   return { command: "init" };
 }
 
+/**
+ * Internal launcher arguments deliberately bypass the public flag tokenizer:
+ * after task_id and role, every remaining token belongs to the agent route
+ * and must reach the launcher unchanged.  The launcher entry performs the
+ * one allowed legacy-route parse.
+ */
+function parseLaunch(args: readonly string[]): ParsedArgs {
+  return { command: "launch", args: [...args] };
+}
+
 /** Pure: argv (without node/script) → parsed command, or a usage result. */
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const args = [...argv];
@@ -702,6 +743,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     case "mode": return parseMode(rest);
     case "config": return parseConfig(rest);
     case "start-next": return parseStartNext(rest);
+    case "launch": return parseLaunch(rest);
     case "watch": return parseWatch(rest);
     case "create": return parseCreate(rest);
     case "publish": return parsePublish(rest);
@@ -757,12 +799,6 @@ async function runServe(parsed: Extract<ParsedArgs, { command: "serve" }>): Prom
 
 /** Hub BASE url for the context subcommands (--url override; default when the flag is absent). */
 const DEFAULT_HUB_URL = "http://127.0.0.1:3001";
-
-/**
- * scripts/launch.sh resolved module-relative (../scripts/launch.sh — one
- * directory up from src/cli.ts and dist/cli.js alike, always inside the repo).
- */
-const LAUNCH_SCRIPT = fileURLToPath(new URL("../scripts/launch.sh", import.meta.url));
 
 /**
  * Uniform failure exit: HubError prints "CODE: message" so the first stderr
@@ -877,7 +913,14 @@ async function runConfig(parsed: Extract<ParsedArgs, { command: "config" }>): Pr
 
 /** Shape of GET /state consumed by start-next/watch (six-field entries plus the additive version, see http.ts). */
 interface StateSnapshot {
-  tasks?: Array<{ task_id: string; status?: string; waiting_for?: string; needs_attention?: boolean; version?: number }>;
+  tasks?: Array<{
+    task_id: string;
+    status?: string;
+    waiting_for?: string;
+    needs_attention?: boolean;
+    version?: number;
+    cast?: Cast;
+  }>;
 }
 
 /** GET <hub>/state and status-check; throws on fetch/HTTP failure (callers own the message). */
@@ -889,36 +932,12 @@ async function fetchStateSnapshot(url: string): Promise<StateSnapshot> {
 
 /**
  * No-arg default: from one /state snapshot, the tasks waiting for an agent
- * (waiting_for "agent:<role>"). Note the real state machine forces
- * waiting_for "human" whenever needs_attention is set (state-machine), so the
- * `!!` marks below surface only defensive display-side information — the
- * consumer should still see them if that coupling ever changes.
+ * (waiting_for "agent:<role>"). An anomalous needs_attention combination is
+ * still listed for truthful selection diagnostics, then withheld by the
+ * canonical launch gate.
  */
 function agentWaitingTasks(state: StateSnapshot): Array<NonNullable<StateSnapshot["tasks"]>[number]> {
   return (state.tasks ?? []).filter((t) => (t.waiting_for ?? "").startsWith("agent:"));
-}
-
-/** Spawn a script and capture its output; never rejects (spawn errors resolve with .error). */
-function runScript(
-  script: string,
-  args: string[],
-): Promise<{ code: number | null; stdout: string; stderrText: string; error?: Error }> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderrText = "";
-    const child = spawn(script, args, {
-      env: { ...process.env }, // TUT_DRY_RUN passes through — launch.sh's dry-run switch
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderrText += chunk.toString("utf8");
-    });
-    child.once("error", (error) => resolve({ code: null, stdout, stderrText, error }));
-    child.once("close", (code) => resolve({ code, stdout, stderrText }));
-  });
 }
 
 /**
@@ -973,6 +992,22 @@ function selectTargetTask(
   return { entry };
 }
 
+/** Internal launch command.  It is intentionally not part of the public
+ * workflow parser: route tokens after task_id/role belong to the launcher. */
+async function runLaunch(parsed: Extract<ParsedArgs, { command: "launch" }>): Promise<number> {
+  const entry = parseLaunchEntry(parsed.args);
+  if ("error" in entry) {
+    process.stderr.write(`tut: launch: ${entry.error}\n`);
+    return 1;
+  }
+  try {
+    return await runLaunchEntry(entry);
+  } catch (e) {
+    process.stderr.write(`tut: launch: ${(e as Error).message}\n`);
+    return 1;
+  }
+}
+
 async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" }>): Promise<number> {
   let state: StateSnapshot;
   try {
@@ -997,13 +1032,33 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
     return 1;
   }
 
+  const request: LaunchRequest = {
+    kind: "round",
+    task_id: taskId,
+    role,
+    fresh: parsed.fresh,
+    via: "start-next",
+  };
+  try {
+    assertLaunchStateGate(request, entry);
+  } catch (e) {
+    process.stderr.write(`tut: cannot launch ${role} for ${taskId}: ${(e as Error).message}\n`);
+    return 1;
+  }
+
   let records;
   try {
     records = await readLaunchLog(parsed.url, taskId);
   } catch (e) {
     return failWith(e);
   }
-  const baseVersion = latestRecordVersion(records);
+  let baseVersion: number;
+  try {
+    baseVersion = bindLaunchBaseVersion(entry.version, latestRecordVersion(records));
+  } catch (e) {
+    process.stderr.write(`tut: cannot launch ${role} for ${taskId}: ${(e as Error).message}\n`);
+    return 1;
+  }
   const blocked = launchBlocked(records, role);
   if (blocked.blocked && !parsed.force) {
     process.stderr.write(
@@ -1012,55 +1067,115 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
     return 1;
   }
 
-  // Pre-checks, BEFORE the marker (failure leaves no trace — a plain
-  // retry works, no --force): resolve the launch target through the cast →
-  // workspace → routes chain, then require the routed agent on PATH.
-  let agent: string;
-  let agentArgs: string[] = [];
+  // Pre-checks, BEFORE the marker (failure leaves no trace — a plain retry
+  // works, no --force): resolve one normalized route, build one immutable
+  // invocation, then require its executable on PATH.  The child receives the
+  // invocation as one JSON argv item; it is never asked to resolve the route
+  // a second time.
+  const launchEnvironment = { ...process.env };
+  let invocation: ReturnType<typeof buildLaunchInvocation>;
   try {
-    const target = await resolveLaunchTarget(parsed.url, taskId, role);
-    agent = target.agent;
-    agentArgs = target.args ?? [];
+    // Freeze the Herdr anchor and routing root before the marker.  The
+    // internal child receives this snapshot and must not rediscover a
+    // focused/different workspace during lifecycle execution.
+    const executionContext = await resolveExecutionContext({
+      caller_cwd: process.cwd(),
+      env: launchEnvironment,
+      dry_run: launchEnvironment.TUT_DRY_RUN === "1",
+    });
+    const projectRoot = executionContext.routingRoot.startsWith("<")
+      ? executionContext.caller_cwd ?? process.cwd()
+      : executionContext.routingRoot;
+    const workspaceSnapshot = await readWorkspaceConfigSnapshot({
+      projectRoot,
+      userConfigDir: defaultUserConfigDir(launchEnvironment),
+    });
+    const resolved = await resolveAgentRouteWithSource(
+      role,
+      entry.cast,
+      { workspaceSnapshot },
+    );
+    const route = typeof resolved.route === "string"
+      ? { agent: resolved.route, args: [] }
+      : { agent: resolved.route.agent, args: [...resolved.route.args] };
+    // Target resolution happens after route selection and before the marker:
+    // POSIX proves PATH presence (which + executable regular file), Windows
+    // resolves its structured target and refuses shims.  Any failure leaves
+    // no trace — a plain retry works, no --force needed.
+    let plan: Awaited<ReturnType<typeof resolvePlatformExecutionPlan>>;
+    try {
+      plan = await resolvePlatformExecutionPlan(route, { environment: launchEnvironment });
+    } catch (e) {
+      if (e instanceof UnsupportedWindowsShimError || e instanceof AgentTargetError) {
+        throw new Error(
+          e instanceof UnsupportedWindowsShimError
+            ? (e as Error).message
+            : `agent '${route.agent}' (routed for ${role} on ${taskId}) is not on PATH — ${(e as Error).message}`,
+        );
+      }
+      throw e;
+    }
+    const template = resolveTabLabelTemplateFromSnapshot(workspaceSnapshot);
+    const tabLabel = template
+      .replaceAll("{role}", role)
+      .replaceAll("{task}", taskId)
+      .replaceAll("{agent}", route.agent);
+    if (tabLabel.length === 0 || /[\u0000\r\n]/u.test(tabLabel)) {
+      throw new Error("naming.tab_label renders to an invalid label");
+    }
+    const skillPath = fileURLToPath(new URL(`../skills/${role}.md`, import.meta.url));
+    invocation = buildLaunchInvocation({
+      request,
+      base_version: baseVersion,
+      hub_url: parsed.url,
+      route,
+      route_source: resolved.source,
+      context: executionContext,
+      naming: { tab_label: tabLabel, pane_label: `${taskId}.${role}` },
+      prompt: `轮到你了（role: ${role}）：请用 Context Hub 读取任务 ${taskId} 的完整上下文（context.read），按你的 role skill（${skillPath}）开始本轮工作，完成后发布相应记录（context.publish）。`,
+      ...(plan.platform === "posix"
+        ? { posix_direct: plan.posix_direct }
+        : { resolved_target: plan.resolved_target, effective_agent: plan.effective_agent }),
+    });
   } catch (e) {
     process.stderr.write(`tut: cannot resolve launch target for ${role} on ${taskId}: ${(e as Error).message}\n`);
     return 1;
   }
-  if (!(await commandOnPath(agent))) {
-    process.stderr.write(
-      `tut: agent '${agent}' (routed for ${role} on ${taskId}) is not on PATH — install it, or fix the task cast / workspace lineup\n`,
-    );
-    return 1;
+
+  if (launchEnvironment.TUT_DRY_RUN !== "1") {
+    try {
+      requireBirthAnchor(invocation.context);
+    } catch (e) {
+      process.stderr.write(`tut: cannot launch ${role} for ${taskId}: ${(e as Error).message}\n`);
+      return 1;
+    }
   }
 
   // Fail closed: the marker must win the optimistic-concurrency race before
   // the launcher is called. A VERSION_CONFLICT therefore cannot cause a
   // second pane prompt.
   try {
-    await markLaunched(parsed.url, taskId, role, baseVersion, "start-next");
+    await markLaunched(parsed.url, taskId, role, baseVersion, "start-next", invocation.marker_projection);
   } catch (e) {
     return failWith(e);
   }
 
-  // --fresh (pane policy) is orthogonal to --force (dedup bypass): it is
-  // passed straight through to the launcher as a leading flag; without it
-  // the argv is byte-identical to before (the Notifier path never sets it).
-  const run = await runScript(LAUNCH_SCRIPT, [...(parsed.fresh ? ["--fresh"] : []), taskId, role, agent, ...agentArgs]);
+  // --fresh is already frozen in the invocation.  The child receives no raw
+  // route values, so there is no second parse or route-source drift.
+  const run = await runInternalLaunchInvocation(invocation);
   if (run.error !== undefined) {
-    process.stderr.write(`tut: cannot run launcher ${LAUNCH_SCRIPT}: ${run.error.message}\n`);
+    process.stderr.write(`tut: cannot run internal launcher ${cliEntryPath()}: ${run.error.message}\n`);
     process.stderr.write("tut: relaunch with --force once the pane is fixed\n");
     return 1;
   }
   if (run.stdout.length > 0) process.stdout.write(run.stdout.endsWith("\n") ? run.stdout : `${run.stdout}\n`);
-  if (run.stderrText.length > 0) process.stderr.write(run.stderrText.endsWith("\n") ? run.stderrText : `${run.stderrText}\n`);
+  if (run.stderr.length > 0) process.stderr.write(run.stderr.endsWith("\n") ? run.stderr : `${run.stderr}\n`);
   if (run.code !== 0) {
     process.stderr.write(`tut: launcher exited with code ${run.code}\n`);
     process.stderr.write("tut: relaunch with --force once the pane is fixed\n");
     return 1;
   }
-  // Flag an anomalous launch in the confirmation itself — the human
-  // pressing the key should see they launched a needs_attention task.
-  const attentionMark = entry.needs_attention === true ? ` [${ATTENTION_MARKER}]` : "";
-  process.stdout.write(`start-next: launched ${role} for ${taskId} via launch.sh${attentionMark}\n`);
+  process.stdout.write(`start-next: launched ${role} for ${taskId} via launch.sh\n`);
   return 0;
 }
 
@@ -1397,14 +1512,14 @@ async function runDecide(parsed: Extract<ParsedArgs, { command: "decide" }>): Pr
   // by design: cleanup warnings surface on stderr but never fail the decide
   // itself — approval must not be blocked by the terminal container.
   if (parsed.decision === "close") {
-    const run = await runScript(LAUNCH_SCRIPT, ["--cleanup", parsed.task_id]);
+    const run = await runInternalLaunch(["--cleanup", parsed.task_id]);
     if (run.error !== undefined) {
-      process.stderr.write(`tut: cannot run launcher ${LAUNCH_SCRIPT}: ${run.error.message} (pane cleanup skipped)\n`);
+      process.stderr.write(`tut: cannot run internal launcher ${cliEntryPath()}: ${run.error.message} (pane cleanup skipped)\n`);
     } else if (run.code !== 0) {
       process.stderr.write(`tut: pane cleanup exited with code ${run.code} (task is closed regardless)\n`);
     }
     if (run.stdout.length > 0) process.stdout.write(run.stdout.endsWith("\n") ? run.stdout : `${run.stdout}\n`);
-    if (run.stderrText.length > 0) process.stderr.write(run.stderrText.endsWith("\n") ? run.stderrText : `${run.stderrText}\n`);
+    if (run.stderr.length > 0) process.stderr.write(run.stderr.endsWith("\n") ? run.stderr : `${run.stderr}\n`);
   }
   return 0;
 }
@@ -1561,7 +1676,54 @@ async function runSkill(parsed: Extract<ParsedArgs, { command: "skill" }>): Prom
 }
 
 async function runInit(): Promise<number> {
-  const target = path.join(process.cwd(), "AGENTS.md");
+  const root = process.cwd();
+
+  // Step 1 — .context-hub/: the runtime-data root (serve's default --root,
+  // and the layout marker tut up accepts for non-JS repos). mkdir recursive
+  // is a no-op when it already exists — reruns stay idempotent.
+  const hubDir = path.join(root, ".context-hub");
+  try {
+    await mkdir(hubDir, { recursive: true });
+    process.stdout.write(`init: ensured ${hubDir}/\n`);
+  } catch (e) {
+    process.stderr.write(`tut: cannot create ${hubDir}: ${(e as Error).message}\n`);
+    return 1;
+  }
+
+  // Step 2 — .gitignore: runtime data is machine-local, never committed.
+  // Idempotent: any existing ignore line for it (with or without the
+  // trailing slash) means no write at all.
+  const gitignore = path.join(root, ".gitignore");
+  const GITIGNORE_ENTRY = ".context-hub/";
+  try {
+    let giExisting: string | null = null;
+    try {
+      giExisting = readFileSync(gitignore, "utf8");
+    } catch {
+      giExisting = null; // absent (any other read failure resurfaces at the write below)
+    }
+    if (giExisting === null) {
+      writeFileSync(gitignore, `${GITIGNORE_ENTRY}\n`, "utf8");
+      process.stdout.write(`init: created ${gitignore} ignoring ${GITIGNORE_ENTRY}\n`);
+    } else if (
+      giExisting.split("\n").some((line) => {
+        const trimmed = line.trim();
+        return trimmed === ".context-hub" || trimmed === GITIGNORE_ENTRY;
+      })
+    ) {
+      process.stdout.write(`init: .gitignore already ignores ${GITIGNORE_ENTRY} (idempotent — no change)\n`);
+    } else {
+      const base = giExisting.replace(/\s+$/, "");
+      writeFileSync(gitignore, base.length === 0 ? `${GITIGNORE_ENTRY}\n` : `${base}\n${GITIGNORE_ENTRY}\n`, "utf8");
+      process.stdout.write(`init: appended ${GITIGNORE_ENTRY} to ${gitignore}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`tut: cannot write ${gitignore}: ${(e as Error).message}\n`);
+    return 1;
+  }
+
+  // Step 3 — the AGENTS.md TUT block (the original init behavior).
+  const target = path.join(root, "AGENTS.md");
   const block = agentsBlock();
   let existing: string | null = null;
   try {
@@ -1723,24 +1885,9 @@ function printInvariantsHint(url: string): void {
   );
 }
 
-function parseJson<T>(text: string): T | null {
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    return null;
-  }
-}
+const herdrClient = new HerdrClient();
 
-/** First stderr line of a failed herdr call, for degradation messages. */
-function firstLine(text: string): string {
-  return text.split("\n")[0] ?? "";
-}
-
-interface HerdrPane {
-  pane_id: string;
-  label?: string;
-  tab_id?: string; // C-layout: sys-pane discovery (which tab a pane lives in)
-}
+type HerdrPane = HerdrClientPane;
 
 /**
  * `herdr pane list` → pane snapshot. A missing binary or failing call returns
@@ -1748,44 +1895,20 @@ interface HerdrPane {
  * prints manual commands instead of ever spawning hidden background processes.
  */
 export async function herdrPaneList(): Promise<{ panes: HerdrPane[] } | { error: string }> {
-  const run = await runScript("herdr", ["pane", "list"]);
-  if (run.error !== undefined) return { error: "herdr not found on PATH" };
-  if (run.code !== 0) {
-    const line = firstLine(run.stderrText);
-    return { error: `herdr pane list exited ${run.code}${line.length > 0 ? `: ${line}` : ""}` };
+  try {
+    return await herdrClient.paneList();
+  } catch (error) {
+    return { error: (error as Error).message };
   }
-  const list = parseJson<{ result?: { panes?: unknown }; panes?: unknown }>(run.stdout);
-  const raw = list?.result?.panes ?? list?.panes; // envelope shape, same as launch.sh
-  if (!Array.isArray(raw)) return { error: "herdr pane list returned unparseable output" };
-  const panes: HerdrPane[] = [];
-  for (const entry of raw) {
-    if (entry === null || typeof entry !== "object") continue;
-    const { pane_id, label, tab_id } = entry as Record<string, unknown>;
-    if (typeof pane_id === "string" && pane_id.length > 0) {
-      panes.push({
-        pane_id,
-        ...(typeof label === "string" ? { label } : {}),
-        ...(typeof tab_id === "string" ? { tab_id } : {}),
-      });
-    }
-  }
-  return { panes };
 }
 
 /** `herdr pane split` off the current pane (no-focus, same window) → new pane id. */
 async function herdrSplit(cwd: string): Promise<string | { error: string }> {
-  const run = await runScript("herdr", [
-    "pane", "split", "--current", "--direction", "right", "--no-focus", "--cwd", cwd,
-  ]);
-  if (run.error !== undefined) return { error: `herdr pane split failed to spawn: ${run.error.message}` };
-  if (run.code !== 0) {
-    const line = firstLine(run.stderrText);
-    return { error: `herdr pane split exited ${run.code}${line.length > 0 ? `: ${line}` : ""}` };
+  try {
+    return (await herdrClient.paneSplit({ current: true, direction: "right", noFocus: true, cwd })).paneId;
+  } catch (error) {
+    return { error: (error as Error).message };
   }
-  const parsed = parseJson<{ result?: { pane?: { pane_id?: unknown } } }>(run.stdout);
-  const id = parsed?.result?.pane?.pane_id;
-  if (typeof id !== "string" || id.length === 0) return { error: "herdr pane split returned no pane_id" };
-  return id;
 }
 
 /**
@@ -1795,41 +1918,59 @@ async function herdrSplit(cwd: string): Promise<string | { error: string }> {
  * the cosmetic cleanup close, not the provisioning itself.
  */
 async function herdrTabCreate(cwd: string): Promise<{ tabId: string; rootPaneId?: string } | { error: string }> {
-  const run = await runScript("herdr", ["tab", "create", "--label", SYS_TAB_LABEL, "--no-focus", "--cwd", cwd]);
-  if (run.error !== undefined) return { error: `herdr tab create failed to spawn: ${run.error.message}` };
-  if (run.code !== 0) {
-    const line = firstLine(run.stderrText);
-    return { error: `herdr tab create exited ${run.code}${line.length > 0 ? `: ${line}` : ""}` };
+  try {
+    return await herdrClient.tabCreate({ label: SYS_TAB_LABEL, noFocus: true, cwd });
+  } catch (error) {
+    return { error: (error as Error).message };
   }
-  const parsed = parseJson<{
-    result?: { tab?: { tab_id?: unknown; id?: unknown }; root_pane?: { pane_id?: unknown } };
-  }>(run.stdout);
-  const tabId = parsed?.result?.tab?.tab_id ?? parsed?.result?.tab?.id;
-  if (typeof tabId !== "string" || tabId.length === 0) return { error: "herdr tab create returned no tab id" };
-  const rootPaneId = parsed?.result?.root_pane?.pane_id;
-  return {
-    tabId,
-    ...(typeof rootPaneId === "string" && rootPaneId.length > 0 ? { rootPaneId } : {}),
-  };
 }
 
 /** Rename/run panes ops: exit-code check, herdr's stderr forwarded on failure. */
 async function herdrOk(args: string[]): Promise<boolean> {
-  const run = await runScript("herdr", args);
+  const run = await herdrClient.command(args);
   if (run.error !== undefined) {
     process.stderr.write(`tut: up: herdr ${args[1] ?? ""} failed to spawn: ${run.error.message}\n`);
     return false;
   }
-  if (run.code !== 0 && run.stderrText.length > 0) {
-    process.stderr.write(run.stderrText.endsWith("\n") ? run.stderrText : `${run.stderrText}\n`);
+  if (run.code !== 0 && run.stderr.length > 0) {
+    process.stderr.write(run.stderr.endsWith("\n") ? run.stderr : `${run.stderr}\n`);
   }
   return run.code === 0;
 }
 
-/** Plain-name CLI presence check via `which` — never runs the agent itself. */
-async function commandOnPath(name: string): Promise<boolean> {
-  const run = await runScript("which", [name]);
-  return run.error === undefined && run.code === 0;
+/**
+ * Explain the common headless-up failure: Herdr's `--current` split needs
+ * either an interactive pane context or an explicit, valid pane id.
+ * Include the configured value when present so an invalid id is actionable.
+ */
+function printHerdrAnchorHint(): void {
+  const configured = process.env.HERDR_PANE_ID?.trim();
+  const state = configured === undefined || configured.length === 0
+    ? "unset/empty"
+    : `'${configured}' (verify that it is valid)`;
+  process.stderr.write(
+    `tut: up: Herdr anchor unavailable — run up inside an interactive Herdr pane, or set HERDR_PANE_ID to a valid pane id (currently ${state})\n`,
+  );
+}
+
+/**
+ * The pane id to REPORT for a system pane, resolved fresh by label at
+ * report time. Pane ids are window-scoped — a pane moved into the sys
+ * tab's window is re-addressed (w1G:p2 → w1H:p2), so both the entry
+ * snapshot and the split-time id can be stale by the moment we print
+ * them. The label (set moments earlier by pane rename, or discovered by
+ * the snapshot in the reuse path) is the stable addressing key; a fresh
+ * pane list resolves it to the CURRENT id. Falls back to the
+ * provisioning-time id when the fresh list is unusable or misses — the
+ * report must never fail the provisioning.
+ */
+async function reportedPaneId(label: string, fallback: string): Promise<string> {
+  const listing = await herdrPaneList();
+  if ("panes" in listing) {
+    const hit = listing.panes.find((p) => p.label === label);
+    if (hit !== undefined) return hit.pane_id;
+  }
+  return fallback;
 }
 
 /**
@@ -1909,7 +2050,7 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
 
   if (!existsSync(path.join(cwd, "package.json")) && !existsSync(path.join(cwd, ".context-hub"))) {
     process.stderr.write(
-      `tut: up: no package.json or .context-hub/ in ${cwd} — run tut up from the project root\n`,
+      `tut: up: no package.json or .context-hub/ in ${cwd} — not a TUT project yet: run 'tut init' here to onboard (creates .context-hub/ and the AGENTS.md block), or cd to the project root and run tut up there\n`,
     );
     return 1;
   }
@@ -1927,15 +2068,50 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
       "up: no workspace lineup config found — using built-in defaults (architect=codex, executor=pi, reviewer=codex)\n",
     );
     process.stdout.write(
-      `up:   to customize: cp ${seed} ${path.join(cwd, ".context-hub", "workspace.json")}   (project-level; or ${path.join(defaultUserConfigDir(), "workspace.json")} for all projects)\n`,
+      "up:   to customize: tut assign <role> <agent>   (the light path — e.g. tut assign executor pi; rewrites one seat)\n",
+    );
+    process.stdout.write(
+      `up:   full control: cp ${seed} ${path.join(cwd, ".context-hub", "workspace.json")}   (project-level; or ${path.join(defaultUserConfigDir(), "workspace.json")} for all projects)\n`,
     );
   }
 
   // A non-default --url must reach the provisioned panes too — serve binds
   // the parsed port, notify polls it (byte-identical commands when the default
   // is used, so existing provisioning output is unchanged).
-  const serveCmd = `cd ${cwd} && node ${self} serve${hubPort === 3001 ? "" : ` --port ${hubPort}`}`;
-  const notifyCmd = `cd ${cwd} && node ${self} notify${hubPort === 3001 ? "" : ` --url ${hubUrl}`}`;
+  //
+  // The service commands are PaneCommands now, rendered by the same dialect
+  // renderer the agent panes use: POSIX output keeps the legacy `cd … &&
+  // node …` bytes exactly; PowerShell dialects never see `&&`; cmd picks the
+  // safe direct form or the encoded pane-runner.  The dialect resolves
+  // BEFORE any probe so a bad TUT_PANE_SHELL fails the whole up run.
+  let dialect: ShellDialect;
+  try {
+    dialect = resolvePaneShellDialect(process.env);
+  } catch (error) {
+    process.stderr.write(`tut: up: ${(error as Error).message}\n`);
+    return 1;
+  }
+  // Windows carries the absolute node.exe the cmd/PowerShell forms quote;
+  // POSIX keeps the bare PATH-resolved `node` word of the legacy bytes.
+  const nodeWord = process.platform === "win32" ? process.execPath : "node";
+  const renderServiceCommand = (args: readonly string[]): string =>
+    renderPaneCommand({
+      cwd,
+      executable: nodeWord,
+      args: [...args],
+      env: {},
+      dialect,
+      purpose: "service",
+    } as PaneCommand).command_text;
+  let serveCmd: string;
+  let notifyCmd: string;
+  try {
+    serveCmd = renderServiceCommand([self, "serve", ...(hubPort === 3001 ? [] : ["--port", String(hubPort)])]);
+    notifyCmd = renderServiceCommand([self, "notify", ...(hubPort === 3001 ? [] : ["--url", hubUrl])]);
+  } catch (error) {
+    process.stderr.write(`tut: up: cannot render the service pane command: ${(error as Error).message}\n`);
+    return 1;
+  }
   const manual: string[] = [];
 
   // Herdr usability + the role-step pane snapshot in one read.
@@ -2010,6 +2186,7 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
     const pane = await herdrSplit(cwd);
     if (typeof pane !== "string") {
       process.stderr.write(`tut: up: ${pane.error}\n`);
+      printHerdrAnchorHint();
       return null;
     }
     if (sysTab === null) {
@@ -2026,6 +2203,7 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
       process.stderr.write(
         `tut: up: could not move pane ${pane} into tab ${SYS_TAB_LABEL} — orphan pane left in the current tab; clean up manually: herdr pane close ${pane}\n`,
       );
+      printHerdrAnchorHint();
       return null;
     }
     sysTab.anchorPane = pane; // the next sys pane splits THIS pane (--ratio 0.5 → even halves)
@@ -2067,7 +2245,7 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
       }
       hubUp = true;
       process.stdout.write(
-        `up: hub serving on ${hubUrl} (pane ${provisioned.paneId}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""}, waited ${Date.now() - startedAt}ms)\n`,
+        `up: hub serving on ${hubUrl} (pane ${await reportedPaneId(SYS_HUB_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""}, waited ${Date.now() - startedAt}ms)\n`,
       );
     }
   }
@@ -2087,7 +2265,7 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
     if (provisioned === null) return 1;
     if (!dryRun) {
       process.stdout.write(
-        `up: notify running (pane ${provisioned.paneId}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""})\n`,
+        `up: notify running (pane ${await reportedPaneId(SYS_NOTIFY_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""})\n`,
       );
     }
   }
@@ -2130,6 +2308,7 @@ export const HANDLERS = {
   mode: runMode,
   config: runConfig,
   startNext: runStartNext,
+  launch: runLaunch,
   watch: runWatch,
   create: runCreate,
   publish: runPublish,
@@ -2158,6 +2337,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     case "mode": return HANDLERS.mode(parsed);
     case "config": return HANDLERS.config(parsed);
     case "start-next": return HANDLERS.startNext(parsed);
+    case "launch": return HANDLERS.launch(parsed);
     case "watch": return HANDLERS.watch(parsed);
     case "create": return HANDLERS.create(parsed);
     case "publish": return HANDLERS.publish(parsed);

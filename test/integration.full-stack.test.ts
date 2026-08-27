@@ -191,6 +191,7 @@ async function startStack(): Promise<Stack> {
   cleanups.push(() => io.restore());
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-intstack-"));
   cleanups.push(() => rmSync(tmp, { recursive: true, force: true }));
+  setEnv("TUT_PROJECT_ROOT", tmp);
   const root = path.join(tmp, ".context-hub");
   mkdirSync(root, { recursive: true });
   const sink = await startWebhookSink();
@@ -234,6 +235,7 @@ async function attachNotifier(stack: Stack): Promise<void> {
 async function startHubOnly(): Promise<string> {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-intstack-"));
   cleanups.push(() => rmSync(tmp, { recursive: true, force: true }));
+  setEnv("TUT_PROJECT_ROOT", tmp);
   const running = await startServer({ root: path.join(tmp, ".context-hub"), port: 0 });
   cleanups.push(() => running.close());
   return running.url;
@@ -633,7 +635,12 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
     expect(out).toContain(id); // the prompt tells the agent which task to read
     expect(out).toContain(`launched executor for ${id}`);
     const log = await hubRead(baseUrl, id);
-    expect(log.versions.at(-1)?.payload.launch).toEqual({ role: "executor", base_version: 1, via: "start-next" });
+    expect(log.versions.at(-1)?.payload.launch).toEqual(expect.objectContaining({
+      protocol_version: 2,
+      role: "executor",
+      base_version: 1,
+      via: "start-next",
+    }));
   });
 
   // --- 7. on-agent-event.sh ------------------------------------------------------------------
@@ -751,7 +758,7 @@ describe("cast routing end-to-end", () => {
       try {
         await main(["start-next", castId, "--url", baseUrl]);
         expect(io.out()).toContain("(agent 'codex', label"); // cast routed the round to codex
-        expect(io.out()).toContain("pane run <root> codex --model gpt-5.6 --sandbox workspace-write --search");
+        expect(io.out()).toContain("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search'");
 
         // Regression (zero migration): a no-cast task routes through the
         // default chain (executor → pi via DEFAULT_ROLES).

@@ -30,7 +30,6 @@
  * human instead. Absent/empty list withholds everything (conservative default).
  */
 
-import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createChannels, type Channel, type Notification } from "./channels.js";
@@ -39,12 +38,30 @@ import {
   latestRecordVersion,
   markLaunched as appendLaunchMarker,
   readLaunchLog,
-  resolveLaunchTarget,
+  resolveLaunchTargetWithSource,
   type LaunchVia,
 } from "./launch.js";
 import { commandHead, commandArgs } from "./agent-command.js";
-import type { AgentRoute, Cast, ContextRecord } from "./types.js";
-import { KNOWN_ROLES, resolveAgentRoute } from "./workspace.js";
+import { assertLaunchStateGate, bindLaunchBaseVersion, buildLaunchInvocation } from "./launcher/invocation.js";
+import {
+  AgentTargetError,
+  UnsupportedWindowsShimError,
+  planForPlatform,
+  resolvePosixTargetPresence,
+  type PlatformExecutionPlan,
+} from "./launcher/target-resolver.js";
+import { runInternalLaunch, runInternalLaunchInvocation, spawnDirect } from "./launcher/process.js";
+import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
+import { HerdrClient } from "./launcher/herdr-client.js";
+import type { AgentCommand, AgentRoute, Cast, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "./types.js";
+import {
+  KNOWN_ROLES,
+  defaultUserConfigDir,
+  readWorkspaceConfigSnapshot,
+  resolveAgentRoute,
+  resolveTabLabelTemplateFromSnapshot,
+  type WorkspaceConfigSnapshot,
+} from "./workspace.js";
 
 export interface NotifyOptions {
   /** Hub BASE url (default http://127.0.0.1:3001); /state is appended. */
@@ -106,6 +123,11 @@ export interface AgentEvent {
 export interface PaneSnapshot {
   pane_id: string;
   label: string;
+  /** Optional Herdr metadata retained for one-shot launch anchoring. */
+  tab_id?: string;
+  workspace_id?: string;
+  cwd?: string;
+  agent_status?: string;
 }
 
 interface WorkingWatch {
@@ -126,12 +148,14 @@ interface InFlightLaunch {
 
 export interface NotifierDeps {
   fetchState(url: string): Promise<StateResponse>;
-  /** Launch with the same executable + ordered argv tail used by start-next. */
+  /** Backward-compatible injected launch seam for existing callers/tests. */
   launch(taskId: string, role: string, agent: string, args?: string[]): Promise<string>;
+  /** Canonical launch seam: receives the same frozen invocation as the marker. */
+  launchInvocation?(invocation: LaunchInvocation): Promise<string>;
   /** Full task log used by auto launch de-duplication; injectable for tests. */
   readLog(taskId: string): Promise<ContextRecord[]>;
-  /** Append the optimistic launch marker before calling launch.sh. */
-  markLaunched(taskId: string, role: string, baseVersion: number, via: LaunchVia): Promise<unknown>;
+  /** Append the optimistic launch marker before calling the launcher. */
+  markLaunched(taskId: string, role: string, baseVersion: number, via: LaunchVia, projection?: LaunchMarkerProjection): Promise<unknown>;
   channelsFor(notifyCfg: unknown): Channel[];
   now(): number;
   log(line: string): void;
@@ -141,6 +165,14 @@ export interface NotifierDeps {
    * launch marker — a failure must leave no trace. Injectable for tests.
    */
   resolveTarget?(taskId: string, role: string): Promise<AgentRoute>;
+  /** Canonical target seam retaining route provenance (and, on Windows, the
+   * once-resolved platform plan) for the marker and the invocation. */
+  resolveTargetWithSource?(
+    taskId: string,
+    role: string,
+    projectRoot?: string,
+    workspaceSnapshot?: WorkspaceConfigSnapshot,
+  ): Promise<{ route: AgentRoute; source: LaunchRouteSource; plan?: PlatformExecutionPlan }>;
   /**
    * Routing maps for the event→task mapping (agent-keyed). Refreshed
    * every poll so workspace.json edits apply without a notifier restart.
@@ -152,6 +184,13 @@ export interface NotifierDeps {
    * for tests; the default spawns the real CLI.
    */
   listPanes?(): Promise<PaneSnapshot[]>;
+  /**
+   * Independent Herdr inventory for canonical launch anchoring.  Unlike the
+   * done sweep, rows must carry workspace_id and cwd on the selected system
+   * pane.  It is separate so a minimal sweep fixture can never become an
+   * accidental birth anchor.
+   */
+  listAnchorPanes?(): Promise<PaneSnapshot[]>;
   /**
    * Visible-screen read of one pane for the done-event sweep (herdr pane
    * read --source visible). Injectable for tests.
@@ -171,44 +210,124 @@ async function defaultFetchState(url: string): Promise<StateResponse> {
   return (await res.json()) as StateResponse;
 }
 
-/** Plain-name CLI presence check via `which` — never runs the agent itself. */
-function commandOnPath(name: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const child = spawn("which", [name], { stdio: "ignore" });
-    child.on("error", () => resolve(false));
-    child.on("exit", (code) => resolve(code === 0));
-  });
+/** Auto-door pre-check: resolve the routed agent, retain provenance, prove the target. */
+async function defaultResolveTargetWithSource(
+  url: string,
+  taskId: string,
+  role: string,
+  projectRoot?: string,
+  workspaceSnapshot?: WorkspaceConfigSnapshot,
+): Promise<{ route: AgentRoute; source: LaunchRouteSource; plan?: PlatformExecutionPlan }> {
+  const configuredRoot = projectRoot ?? process.env.TUT_PROJECT_ROOT;
+  const target = await resolveLaunchTargetWithSource(
+    url,
+    taskId,
+    role,
+    workspaceSnapshot !== undefined
+      ? { workspaceSnapshot }
+      : configuredRoot !== undefined && configuredRoot.length > 0
+        ? { projectRoot: configuredRoot }
+        : {},
+  );
+  const route: AgentRoute = target.args !== undefined
+    ? { agent: target.agent, args: [...target.args] }
+    : target.agent;
+  const agent = typeof route === "string" ? route : route.agent;
+  // Target proof mirrors the human door: POSIX proves PATH presence before
+  // the marker; Windows resolves its structured target once and carries the
+  // whole plan forward (no second where.exe pass).
+  let plan: PlatformExecutionPlan | undefined;
+  try {
+    if (process.platform === "win32") {
+      plan = await planForPlatform(
+        typeof route === "string" ? { agent: route, args: [] } : { agent: route.agent, args: [...route.args] },
+        process.env,
+      );
+    } else {
+      await resolvePosixTargetPresence(agent);
+    }
+  } catch (e) {
+    if (e instanceof UnsupportedWindowsShimError || e instanceof AgentTargetError) {
+      throw new Error(`routed agent '${agent}' fails its target pre-check: ${(e as Error).message}`);
+    }
+    throw e;
+  }
+  return {
+    route,
+    source: target.route_source ?? (target.cast?.[role as keyof Cast] === undefined ? "builtin-default" : "task-cast"),
+    ...(plan !== undefined ? { plan } : {}),
+  };
 }
 
-/** Auto-door pre-check: resolve the routed agent, require it on PATH. */
-async function defaultResolveTarget(url: string, taskId: string, role: string): Promise<AgentRoute> {
-  const target = await resolveLaunchTarget(url, taskId, role);
-  if (!(await commandOnPath(target.agent))) {
-    throw new Error(`routed agent '${target.agent}' is not on PATH`);
+function routeSourceForTask(task: StateTask, role: string): LaunchRouteSource {
+  return task.cast?.[role as keyof Cast] === undefined ? "builtin-default" : "task-cast";
+}
+
+function renderTabLabel(template: string, role: string, taskId: string, agent: string): string {
+  const rendered = template
+    .replaceAll("{role}", role)
+    .replaceAll("{task}", taskId)
+    .replaceAll("{agent}", agent);
+  if (rendered.length === 0 || /[\u0000\r\n]/u.test(rendered)) {
+    throw new Error("naming.tab_label renders to an invalid label");
   }
-  return target.args !== undefined ? { agent: target.agent, args: [...target.args] } : target.agent;
+  return rendered;
 }
 
 /**
- * Runs scripts/launch.sh <task_id> <role>. The environment is passed through
- * unchanged so TUT_DRY_RUN=1 makes launch.sh print the command instead of
- * calling Herdr (the script tests use exactly this).
- * Resolves with captured stdout (the DRY-RUN line / launcher output).
- *
- * Path note: one directory up from this module (../scripts/launch.sh —
- * module-relative, resolving inside the repo from both src/ and dist/).
+ * Freeze the auto-launch request after the state/dedup/preflight gates.  The
+ * caller supplies the one-shot context snapshot; this planner only renders
+ * the route and naming values from that snapshot into the invocation.
+ * `preResolvedPlan` (from the default target resolver on Windows) keeps the
+ * structured target single-resolved; injected test resolvers fall back to
+ * the pure POSIX plan build.
  */
-const LAUNCH_SCRIPT_URL = new URL("../scripts/launch.sh", import.meta.url);
+async function buildAutoInvocation(
+  task: StateTask,
+  role: string,
+  route: AgentRoute,
+  routeSource: LaunchRouteSource,
+  baseVersion: number,
+  hubUrl: string,
+  context: ExecutionContext,
+  workspaceSnapshot: WorkspaceConfigSnapshot,
+  environment: NodeJS.ProcessEnv,
+  preResolvedPlan?: PlatformExecutionPlan,
+): Promise<LaunchInvocation> {
+  const normalized: AgentCommand = { agent: commandHead(route), args: commandArgs(route) };
+  const plan = preResolvedPlan ?? await planForPlatform(normalized, environment);
+  const template = resolveTabLabelTemplateFromSnapshot(workspaceSnapshot);
+  const skillPath = fileURLToPath(new URL(`../skills/${role}.md`, import.meta.url));
+  const request: LaunchRequest = {
+    kind: "round",
+    task_id: task.task_id,
+    role,
+    fresh: false,
+    via: "auto",
+  };
+  return buildLaunchInvocation({
+    request,
+    base_version: baseVersion,
+    hub_url: hubUrl,
+    route: normalized,
+    route_source: routeSource,
+    context,
+    naming: {
+      tab_label: renderTabLabel(template, role, task.task_id, normalized.agent),
+      pane_label: `${task.task_id}.${role}`,
+    },
+    prompt: `轮到你了（role: ${role}）：请用 Context Hub 读取任务 ${task.task_id} 的完整上下文（context.read），按你的 role skill（${skillPath}）开始本轮工作，完成后发布相应记录（context.publish）。`,
+    ...(plan.platform === "posix"
+      ? { posix_direct: plan.posix_direct }
+      : { resolved_target: plan.resolved_target, effective_agent: plan.effective_agent }),
+  });
+}
 
-/** Runs scripts/launch.sh <task_id> <role> <agent...>. The environment
- *  defaults to this process's (passed through unchanged so TUT_DRY_RUN=1
- *  makes launch.sh print the command instead of running it); injectable for
- *  tests. The child's stderr is TEED live to this process's stderr (the
- *  notify pane — 8.2: stdout/stderr is the log): launch.sh's delivery
- *  diagnostics (`tut-delivery t=<ms> …`) must survive a SUCCESSFUL launch
- *  too, or the next swallowed-Enter incident leaves no timeline. On
- *  failure the reject message still carries the tail (duplicated in the
- *  pane on that rare path — loud is fine). */
+/**
+ * Compatibility export for callers that still provide a positional route.
+ * Production Notifier auto mode uses spawnLaunchInvocation below, so the
+ * route is not re-resolved or re-encoded at the child boundary.
+ */
 export async function spawnLaunch(
   taskId: string,
   role: string,
@@ -216,32 +335,33 @@ export async function spawnLaunch(
   args: string[] = [],
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
-  const script = fileURLToPath(LAUNCH_SCRIPT_URL);
-  return await new Promise<string>((resolve, reject) => {
-    const child = spawn(script, [taskId, role, agent, ...args], {
-      env: { ...env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      stderr += text;
-      process.stderr.write(text);
-    });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
-      if (code === 0) {
-        resolve(stdout.trim());
-      } else {
-        const tail = stderr.trim();
-        reject(new Error(`launch.sh ${taskId} ${role} exited ${code ?? `signal ${signal}`}${tail ? `: ${tail}` : ""}`));
-      }
-    });
-  });
+  const result = await runInternalLaunch(
+    [taskId, role, agent, ...args],
+    { env, teeStderr: (chunk) => process.stderr.write(chunk) },
+  );
+  if (result.error !== undefined) throw result.error;
+  if (result.code !== 0) {
+    const tail = result.stderr.trim();
+    throw new Error(`launch.sh ${taskId} ${role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
+  }
+  return result.stdout.trim();
+}
+
+/** Canonical Notifier child boundary: process.execPath + absolute dist/cli.js. */
+export async function spawnLaunchInvocation(
+  invocation: LaunchInvocation,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const result = await runInternalLaunchInvocation(
+    invocation,
+    { env, teeStderr: (chunk) => process.stderr.write(chunk) },
+  );
+  if (result.error !== undefined) throw result.error;
+  if (result.code !== 0) {
+    const tail = result.stderr.trim();
+    throw new Error(`launch.sh ${invocation.task_id} ${invocation.role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
+  }
+  return result.stdout.trim();
 }
 
 function defaultLog(line: string): void {
@@ -252,6 +372,15 @@ function versionOf(value: unknown): number | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const version = (value as { version?: unknown }).version;
   return typeof version === "number" && Number.isSafeInteger(version) && version >= 0 ? version : undefined;
+}
+
+/** Keep approval alerts useful in desktop surfaces with a bounded title body. */
+const PENDING_APPROVAL_TITLE_LIMIT = 72;
+
+function truncatePendingApprovalTitle(title: string): string {
+  return title.length <= PENDING_APPROVAL_TITLE_LIMIT
+    ? title
+    : `${title.slice(0, PENDING_APPROVAL_TITLE_LIMIT)}…`;
 }
 
 /**
@@ -291,45 +420,21 @@ export async function defaultLoadRouting(): Promise<RoutingMaps> {
 // the only source reliable from birth).
 
 const SWEEP_READ_LINES = 40;
-
-function runCapture(cmd: string, args: string[]): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`${cmd} ${args.join(" ")} exited ${code ?? `signal ${signal}`}${stderr.trim() ? `: ${stderr.trim()}` : ""}`));
-    });
-  });
-}
-
-function parsePaneSnapshots(raw: string): PaneSnapshot[] {
-  try {
-    const out = JSON.parse(raw) as { result?: { panes?: unknown }; panes?: unknown };
-    const panes = (out?.result?.panes ?? out?.panes) as Array<{ pane_id?: unknown; label?: unknown }> | undefined;
-    if (!Array.isArray(panes)) return [];
-    return panes
-      .filter((p) => typeof p?.pane_id === "string")
-      .map((p) => ({ pane_id: p.pane_id as string, label: typeof p.label === "string" ? p.label : "" }));
-  } catch {
-    return [];
-  }
-}
+const herdrClient = new HerdrClient();
 
 async function defaultListPanes(): Promise<PaneSnapshot[]> {
-  return parsePaneSnapshots(await runCapture("herdr", ["pane", "list"]));
+  return (await herdrClient.paneList()).panes.map((pane) => ({
+    pane_id: pane.pane_id,
+    label: pane.label ?? "",
+    ...(pane.tab_id !== undefined ? { tab_id: pane.tab_id } : {}),
+    ...(pane.workspace_id !== undefined ? { workspace_id: pane.workspace_id } : {}),
+    ...(pane.cwd !== undefined ? { cwd: pane.cwd } : {}),
+    ...(pane.agent_status !== undefined ? { agent_status: pane.agent_status } : {}),
+  }));
 }
 
 async function defaultReadPane(paneId: string): Promise<string> {
-  return await runCapture("herdr", ["pane", "read", paneId, "--source", "visible", "--lines", String(SWEEP_READ_LINES)]);
+  return await herdrClient.paneRead(paneId, { source: "visible", lines: SWEEP_READ_LINES });
 }
 
 // --- loopback Host guard (mirrors src/http.ts) -------------------------------------
@@ -403,6 +508,8 @@ export class Notifier {
   private readonly deps: NotifierDeps;
 
   private snapshot: Map<string, StateTask> | null = null;
+  /** Tasks whose pending_approval entry edge has already been notified. */
+  private pendingApprovalTasks = new Set<string>();
   private channels: Channel[] = createChannels(undefined);
   private consecutiveFailures = 0;
   /** Routing maps for the event reverse lookup; null until first load. */
@@ -443,7 +550,14 @@ export class Notifier {
   /** Resolved (non-optional) loaders built from deps. */
   private readonly routingLoader: () => Promise<RoutingMaps>;
   private readonly targetResolver: (taskId: string, role: string) => Promise<AgentRoute>;
+  private readonly targetSourceResolver: (
+    taskId: string,
+    role: string,
+    projectRoot?: string,
+    workspaceSnapshot?: WorkspaceConfigSnapshot,
+  ) => Promise<{ route: AgentRoute; source: LaunchRouteSource; plan?: PlatformExecutionPlan }>;
   private readonly paneLister: () => Promise<PaneSnapshot[]>;
+  private readonly anchorPaneLister: () => Promise<PaneSnapshot[]>;
   private readonly paneReader: (paneId: string) => Promise<string>;
 
   constructor(options: NotifyOptions, deps: Partial<NotifierDeps> = {}) {
@@ -454,14 +568,26 @@ export class Notifier {
     this.workingTimeoutMs = Math.max(0, Number.isFinite(workingTimeoutSec) ? workingTimeoutSec : 300) * 1000;
     this.eventPort = options.eventPort;
     this.routingLoader = deps.loadRouting ?? defaultLoadRouting;
-    this.targetResolver = deps.resolveTarget ?? ((taskId, role) => defaultResolveTarget(options.url, taskId, role));
+    this.targetResolver = deps.resolveTarget ?? (async (taskId, role) => (await defaultResolveTargetWithSource(options.url, taskId, role)).route);
+    this.targetSourceResolver = deps.resolveTargetWithSource !== undefined
+      ? (taskId, role, projectRoot, workspaceSnapshot) => deps.resolveTargetWithSource!(taskId, role, projectRoot, workspaceSnapshot)
+      : deps.resolveTarget === undefined
+        ? (taskId, role, projectRoot, workspaceSnapshot) => defaultResolveTargetWithSource(options.url, taskId, role, projectRoot, workspaceSnapshot)
+        : async (taskId, role) => ({
+            route: await this.targetResolver(taskId, role),
+            source: "builtin-default" as const,
+          });
     this.paneLister = deps.listPanes ?? defaultListPanes;
+    this.anchorPaneLister = deps.listAnchorPanes ?? defaultListPanes;
     this.paneReader = deps.readPane ?? defaultReadPane;
+    const canonicalLaunch = deps.launchInvocation
+      ?? (deps.launch === undefined ? (invocation: LaunchInvocation) => spawnLaunchInvocation(invocation) : undefined);
     this.deps = {
       fetchState: deps.fetchState ?? defaultFetchState,
       launch: deps.launch ?? spawnLaunch,
+      ...(canonicalLaunch !== undefined ? { launchInvocation: canonicalLaunch } : {}),
       readLog: deps.readLog ?? ((taskId) => readLaunchLog(options.url, taskId)),
-      markLaunched: deps.markLaunched ?? ((taskId, role, baseVersion, via) => appendLaunchMarker(options.url, taskId, role, baseVersion, via)),
+      markLaunched: deps.markLaunched ?? ((taskId, role, baseVersion, via, projection) => appendLaunchMarker(options.url, taskId, role, baseVersion, via, projection)),
       channelsFor: deps.channelsFor ?? createChannels,
       now: deps.now ?? (() => Date.now()),
       log: deps.log ?? defaultLog,
@@ -521,6 +647,11 @@ export class Notifier {
     const prev = this.snapshot;
     const now = this.deps.now();
     this.snapshot = new Map(state.tasks.map((t) => [t.task_id, t]));
+    // A task omitted from /state has left the observable workflow. Forget its
+    // approval edge so a later reappearance can notify again.
+    for (const taskId of this.pendingApprovalTasks) {
+      if (!this.snapshot.has(taskId)) this.pendingApprovalTasks.delete(taskId);
+    }
     await this.retireObsoleteWorkingWatches(this.snapshot);
 
     if (prev === null) {
@@ -528,6 +659,7 @@ export class Notifier {
       for (const t of state.tasks) {
         this.lastUpdatedAt.set(t.task_id, t.updated_at);
         this.lastProgressAt.set(t.task_id, now);
+        if (t.status === "pending_approval") this.pendingApprovalTasks.add(t.task_id);
       }
       this.log(`baseline: ${state.tasks.length} task(s), flow_mode=${state.flow_mode}`);
       return;
@@ -550,6 +682,7 @@ export class Notifier {
     flowMode: string,
     auto: StateAuto | undefined,
   ): Promise<void> {
+    const pendingApprovalEntering = this.updatePendingApprovalEdge(after);
     // A task absent from the previous snapshot counts as waiting_for "none"
     // before, so brand-new tasks notify (absent → agent:* is a change) but a
     // snapshot-miss with waiting_for "none" stays silent.
@@ -583,6 +716,13 @@ export class Notifier {
         body: `${after.title} — status: ${after.status}: run \`tut read ${after.task_id}\` for warnings`,
         task_id: after.task_id,
       });
+      return;
+    }
+    if (pendingApprovalEntering) {
+      // Approval is a first-class state edge rather than a side effect of
+      // waiting_for. This also covers snapshots where the task was already
+      // waiting for a human before it entered pending_approval.
+      await this.notifyPendingApproval(after, flowMode);
       return;
     }
     if (!wfChanged) return;
@@ -634,6 +774,31 @@ export class Notifier {
     await this.autoLaunch(after, role);
   }
 
+  /** Track the pending_approval edge independently of waiting_for changes. */
+  private updatePendingApprovalEdge(task: StateTask): boolean {
+    if (task.status !== "pending_approval") {
+      this.pendingApprovalTasks.delete(task.task_id);
+      return false;
+    }
+    const entering = !this.pendingApprovalTasks.has(task.task_id);
+    this.pendingApprovalTasks.add(task.task_id);
+    return entering;
+  }
+
+  /** Notify through the existing channels and the notifier pane log. */
+  private async notifyPendingApproval(task: StateTask, flowMode: string): Promise<void> {
+    const title = flowMode === "auto"
+      ? `TUT ${task.task_id}: human decision needed`
+      : `TUT ${task.task_id}: waiting for human`;
+    const taskTitle = truncatePendingApprovalTitle(task.title);
+    const command = `tut decide ${task.task_id} --decision approve --by <your-name>`;
+    const approvalHint = `run \`${command}\` (replace \`<your-name>\` with your identity; use \`--decision reject\` to request revisions)`;
+    const body = flowMode === "auto"
+      ? `${taskTitle} — status: ${task.status}; waiting for: ${task.waiting_for}; waiting for approval; auto launch withheld (pending human decision); ${approvalHint}`
+      : `${taskTitle} — status: ${task.status}; waiting for: ${task.waiting_for}; waiting for approval; ${approvalHint}`;
+    await this.sendAll({ title, body, task_id: task.task_id });
+  }
+
   /**
    * The auto gate, as one rule: launch ONLY when
    *   (1) waiting_for starts with "agent:" (role = the suffix), and
@@ -655,6 +820,19 @@ export class Notifier {
   }
 
   private async autoLaunch(task: StateTask, role: string): Promise<void> {
+    const request: LaunchRequest = {
+      kind: "round",
+      task_id: task.task_id,
+      role,
+      fresh: false,
+      via: "auto",
+    };
+    try {
+      assertLaunchStateGate(request, task);
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, e);
+      return;
+    }
     // Done-sweep barrier (1/3, entry): this task's final-screen evidence must
     // be archived (or its failure recorded) before this round's launch
     // machinery starts — the launcher reaps the very panes the sweep reads.
@@ -667,10 +845,59 @@ export class Notifier {
       return;
     }
 
+    let baseVersion: number;
+    try {
+      baseVersion = bindLaunchBaseVersion(task.version, latestRecordVersion(records));
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, e);
+      return;
+    }
+
     const blocked = launchBlocked(records, role);
     if (blocked.blocked) {
       await this.autoLaunchSkipped(task, role, blocked.noteVersion);
       return;
+    }
+
+    // Resolve the Herdr snapshot and the workspace declaration snapshot before
+    // planning the route.  Both are frozen at this planner boundary, so
+    // naming, routing and birth cannot drift if focus, files, or environment
+    // changes after this point.
+    const environment = { ...process.env };
+    let executionContext: ExecutionContext;
+    try {
+      executionContext = await resolveExecutionContext({
+        client: { paneList: this.anchorPaneLister },
+        caller_cwd: process.cwd(),
+        env: environment,
+        dry_run: environment.TUT_DRY_RUN === "1",
+      });
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, new Error(`context planning failed: ${(e as Error).message}`));
+      return;
+    }
+    const projectRoot = executionContext.routingRoot.startsWith("<")
+      ? executionContext.caller_cwd ?? process.cwd()
+      : executionContext.routingRoot;
+    let workspaceSnapshot: WorkspaceConfigSnapshot;
+    try {
+      workspaceSnapshot = await readWorkspaceConfigSnapshot({
+        projectRoot,
+        userConfigDir: defaultUserConfigDir(environment),
+      });
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, new Error(`workspace planning failed: ${(e as Error).message}`));
+      return;
+    }
+    if (environment.TUT_DRY_RUN !== "1") {
+      try {
+        requireBirthAnchor(executionContext);
+      } catch (e) {
+        // No marker, no launch: a live auto door has the same mutation guard
+        // as the legacy child, while cleanup/sweep remain best-effort paths.
+        await this.autoLaunchFailed(task, role, e);
+        return;
+      }
     }
 
     // Pre-check BEFORE the marker (order: dedup → precheck → mark → launch,
@@ -678,8 +905,13 @@ export class Notifier {
     // routes) and require it on PATH. A failure leaves no trace — the human's
     // start-next (or the next auto round) is not blocked.
     let route: AgentRoute;
+    let routeSource: LaunchRouteSource;
+    let preResolvedPlan: PlatformExecutionPlan | undefined;
     try {
-      route = await this.targetResolver(task.task_id, role);
+      const resolved = await this.targetSourceResolver(task.task_id, role, projectRoot, workspaceSnapshot);
+      route = resolved.route;
+      routeSource = resolved.source === "builtin-default" ? routeSourceForTask(task, role) : resolved.source;
+      preResolvedPlan = resolved.plan;
     } catch (e) {
       await this.autoLaunchFailed(task, role, new Error(`precheck failed: ${(e as Error).message}`));
       return;
@@ -687,16 +919,34 @@ export class Notifier {
     const agent = commandHead(route);
     const args = commandArgs(route);
 
-    // Done-sweep barrier (2/3, post-precheck): a done event may have landed
-    // while readLog/precheck were in flight — re-check before the marker.
-    // From the resolution of this await to the markLaunched call the code is
-    // one synchronous continuation (no macrotask boundary), so a later done
-    // event can no longer slip between this check and the marker.
+    let invocation: LaunchInvocation;
+    try {
+      invocation = await buildAutoInvocation(
+        task,
+        role,
+        route,
+        routeSource,
+        baseVersion,
+        this.stateUrl.replace(/\/state$/u, ""),
+        executionContext,
+        workspaceSnapshot,
+        environment,
+        preResolvedPlan,
+      );
+    } catch (e) {
+      await this.autoLaunchFailed(task, role, new Error(`invocation planning failed: ${(e as Error).message}`));
+      return;
+    }
+    // Done-sweep barrier (2/3, post-planning): a done event may have landed
+    // while readLog/precheck/invocation planning were in flight — re-check
+    // immediately before the marker. From the resolution of this await to
+    // the markLaunched call the code is one synchronous continuation (no
+    // macrotask boundary), so a later done event cannot slip between this
+    // check and the marker.
     await this.awaitSweepBarrier(task.task_id);
-    const baseVersion = latestRecordVersion(records);
     let launchVersion: number | undefined;
     try {
-      const marker = await this.deps.markLaunched(task.task_id, role, baseVersion, "auto");
+      const marker = await this.deps.markLaunched(task.task_id, role, baseVersion, "auto", invocation.marker_projection);
       launchVersion = versionOf(marker) ?? task.version;
     } catch (e) {
       // A manual start-next or another notifier may have won the optimistic
@@ -723,9 +973,11 @@ export class Notifier {
     const launchKey = this.workingWatchKey(task.task_id, role);
     this.inFlightLaunches.set(launchKey, { task, role, agent, ...(launchVersion !== undefined ? { launchVersion } : {}) });
     try {
-      const out = args.length > 0
-        ? await this.deps.launch(task.task_id, role, agent, args)
-        : await this.deps.launch(task.task_id, role, agent);
+      const out = this.deps.launchInvocation !== undefined
+        ? await this.deps.launchInvocation(invocation)
+        : args.length > 0
+          ? await this.deps.launch(task.task_id, role, agent, args)
+          : await this.deps.launch(task.task_id, role, agent);
       this.inFlightLaunches.delete(launchKey);
       // Dry-run output is often multi-line (provisioning preview + delivery
       // preview); log EVERY line so the pane log shows the full launch preview.
@@ -1339,6 +1591,7 @@ export class Notifier {
     this.inFlightLaunches.clear();
     this.earlyWorkingSignals.clear();
     this.unresolvedWorkingEvents.clear();
+    this.pendingApprovalTasks.clear();
     this.sweepBarriers.clear();
     const server = this.server;
     this.server = null;

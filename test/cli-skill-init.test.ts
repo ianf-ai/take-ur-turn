@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -180,6 +180,79 @@ describe("init handler", () => {
       expect(text).toContain("担任 TUT Host／全程驱动");
       // Prose outside the markers is untouched.
       expect(text.startsWith("# Notes\n\n<!-- TUT:BEGIN -->")).toBe(true);
+    } finally {
+      io.restore();
+    }
+  });
+});
+
+// --- tut init: full onboarding (.context-hub/ + .gitignore) -----------------------
+
+describe("init onboarding (one command: runtime dir + ignore rule + AGENTS.md block)", () => {
+  it("a fresh (non-JS) repo gets .context-hub/, a .gitignore entry, and the AGENTS.md block in one run", async () => {
+    const dir = tempProject();
+    process.chdir(dir);
+    const io = captureIo();
+    try {
+      const code = await main(["init"]);
+      expect(code).toBe(0);
+      expect(existsSync(path.join(dir, ".context-hub"))).toBe(true);
+      expect(readFileSync(path.join(dir, ".gitignore"), "utf8")).toBe(".context-hub/\n");
+      expect(existsSync(path.join(dir, "AGENTS.md"))).toBe(true);
+      // tut up's layout guard now passes on this repo (the marker exists).
+    } finally {
+      io.restore();
+    }
+  });
+
+  it(".gitignore without the entry: exactly one line appended, existing entries preserved", async () => {
+    const dir = tempProject();
+    writeFileSync(path.join(dir, ".gitignore"), "node_modules/\ndist/", "utf8"); // no trailing newline
+    process.chdir(dir);
+    const io = captureIo();
+    try {
+      const code = await main(["init"]);
+      expect(code).toBe(0);
+      expect(io.out()).toContain("appended .context-hub/");
+      expect(readFileSync(path.join(dir, ".gitignore"), "utf8")).toBe("node_modules/\ndist/\n.context-hub/\n");
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("idempotent: an existing ignore line (bare or slashed) means no write, no duplicate", async () => {
+    const bare = "node_modules/\n.context-hub\n";
+    const slashed = "node_modules/\n.context-hub/\n";
+    for (const existing of [bare, slashed]) {
+      const dir = tempProject();
+      writeFileSync(path.join(dir, ".gitignore"), existing, "utf8");
+      process.chdir(dir);
+      const io = captureIo();
+      try {
+        const code = await main(["init"]);
+        expect(code).toBe(0);
+        expect(io.out()).toContain("already ignores");
+        expect(readFileSync(path.join(dir, ".gitignore"), "utf8")).toBe(existing); // byte-untouched
+      } finally {
+        io.restore();
+      }
+    }
+  });
+
+  it("re-running the whole onboarding is stable (dir exists, ignore present, block refreshed)", async () => {
+    const dir = tempProject();
+    process.chdir(dir);
+    const io = captureIo();
+    try {
+      await main(["init"]);
+      const afterFirst = [
+        readFileSync(path.join(dir, ".gitignore"), "utf8"),
+        readFileSync(path.join(dir, "AGENTS.md"), "utf8"),
+      ];
+      const code = await main(["init"]);
+      expect(code).toBe(0);
+      expect(readFileSync(path.join(dir, ".gitignore"), "utf8")).toBe(afterFirst[0]);
+      expect(readFileSync(path.join(dir, "AGENTS.md"), "utf8")).toBe(afterFirst[1]);
     } finally {
       io.restore();
     }

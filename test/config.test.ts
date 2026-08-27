@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   autoSectionOf,
+  configKeyDomain,
   ensureConfig,
   parseConfigValue,
   readConfig,
@@ -292,6 +293,19 @@ describe("parseConfigValue (tut config set validation)", () => {
     if (!result.ok) {
       expect(result.error).toContain('"codex"');
       expect(result.error).toContain("architect|executor|reviewer");
+    }
+  });
+
+  it("the invalid-role error is its own documentation: format and a copy-pasteable example", () => {
+    const result = parseConfigValue("auto.launch_roles", "codex");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("comma-separated bare role names");
+      expect(result.error).toContain("e.g. architect,executor,reviewer");
+      expect(result.error).toContain('"" clears the whitelist');
+      // The domain hint (shared by the available-keys hint) carries the
+      // same example — one source of truth.
+      expect(configKeyDomain("auto.launch_roles")).toContain("e.g. architect,executor,reviewer");
     }
   });
 });

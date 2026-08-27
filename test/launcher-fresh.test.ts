@@ -164,6 +164,16 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
     expect(dry.stdout).toContain("--workspace <workspace> --cwd <cwd> --label TUT executor");
   });
 
+  it("live no-anchor exits before reaping stale task panes or delivering continuation", async () => {
+    const stale = { pane_id: "wP:stale", label: "t1.architect", workspace_id: "wP", cwd: "/other/project", agent_status: "done" };
+    const continuation = { pane_id: "wP:continuation", label: "t1.executor", workspace_id: "wP", cwd: "/other/project", agent_status: "idle" };
+    const r = await runLogged(["t1", "executor", "pi"], [stale, continuation]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("no anchor pane found");
+    expect(r.lines).toEqual(["pane list"]);
+    expect(r.lines.some((line) => /pane close|send-text|send-keys|tab create|pane split|pane move|pane rename|pane run/u.test(line))).toBe(false);
+  });
+
   it("dry-run without any herdr on PATH still previews with placeholders", async () => {
     // Only a pi stub on PATH (no herdr at all): the preview must degrade to
     // placeholder anchors instead of failing.
@@ -428,6 +438,32 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
     expect(r.stderr).toContain("pane close w11:p5 (label 't9.reviewer') failed — continuing");
   });
 
+  it("a pane-list rejection warns with an action and still exits 0 without claiming full cleanup", async () => {
+    const r = await runLogged(["--cleanup", "t9"], [
+      HUB_PANE,
+      { pane_id: "w11:p5", label: "t9.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+    ], { TUT_HERDR_FAIL: "pane:list" });
+    expect(r.code).toBe(0);
+    expect(r.lines).toEqual(["pane list"]);
+    expect(r.lines).not.toContain("pane close w11:p5");
+    expect(r.stderr).toContain("pane list failed");
+    expect(r.stderr).toContain("no panes were closed");
+    expect(r.stderr).toContain("retry cleanup");
+    expect(r.stderr).not.toContain("cleanup complete");
+  });
+
+  it("an unusable non-JSON pane list warns with the parse reason and still exits 0", async () => {
+    const r = await runLogged(["--cleanup", "t9"], [
+      HUB_PANE,
+      { pane_id: "w11:p5", label: "t9.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+    ], { TUT_HERDR_PANES_RAW: "not json\n" });
+    expect(r.code).toBe(0);
+    expect(r.lines).toEqual(["pane list"]);
+    expect(r.stderr).toContain("returned invalid JSON");
+    expect(r.stderr).toContain("no panes were closed");
+    expect(r.stderr).toContain("retry cleanup");
+  });
+
   it("cleanup never touches panes outside the task's namespace (unlabeled/foreign tasks stay)", async () => {
     const panes = [
       HUB_PANE,
@@ -456,7 +492,7 @@ describe("self-update suppression: the agent run command disables startup update
       TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
     });
     expect(r.code).toBe(0);
-    expect(r.lines).toContain("pane run FIX:root1 codex -c check_for_update_on_startup=false");
+    expect(r.lines).toContain("pane run FIX:root1 cd -- '/repo' && 'codex' '-c' 'check_for_update_on_startup=false'");
     expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
     expectDelivered(r.lines, "FIX:root1");
   });
@@ -466,7 +502,7 @@ describe("self-update suppression: the agent run command disables startup update
       TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
     });
     expect(r.code).toBe(0);
-    expect(r.lines).toContain("pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+    expect(r.lines).toContain("pane run FIX:root1 cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
     expectDelivered(r.lines, "FIX:root1");
   });
 
@@ -477,7 +513,7 @@ describe("self-update suppression: the agent run command disables startup update
     });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("falling back to the anchored split sequence");
-    expect(r.lines).toContain("pane run FIX:p1 codex -c check_for_update_on_startup=false");
+    expect(r.lines).toContain("pane run FIX:p1 cd -- '/repo' && 'codex' '-c' 'check_for_update_on_startup=false'");
   });
 
   it("unknown agents pass through unchanged; the presence check probes the BARE agent name", async () => {
@@ -491,7 +527,7 @@ describe("self-update suppression: the agent run command disables startup update
         PATH: `${bin}:${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
       });
       expect(r.code).toBe(0);
-      expect(r.lines).toContain("pane run FIX:root1 stubagent");
+      expect(r.lines).toContain("pane run FIX:root1 cd -- '/repo' && 'stubagent'");
 
       // Presence check: an agent not on PATH fails the birth with the BARE
       // name in the message (the wrapped form is never what is probed).
@@ -509,13 +545,13 @@ describe("self-update suppression: the agent run command disables startup update
       TUT_SUPPRESS_AGENT_UPDATE: "0",
     });
     expect(r.code).toBe(0);
-    expect(r.lines).toContain("pane run FIX:root1 pi");
+    expect(r.lines).toContain("pane run FIX:root1 cd -- '/repo' && 'pi'");
   });
 
   it("dry-run preview shows the suppressed run command", async () => {
     const r = await runLogged(["t1", "executor", "codex"], [HUB_PANE], {}, true);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("DRY-RUN: birth: herdr pane run <root> codex -c check_for_update_on_startup=false");
+    expect(r.stdout).toContain("DRY-RUN: birth: herdr pane run <root> cd -- '/repo' && 'codex' '-c' 'check_for_update_on_startup=false'");
   });
 });
 
@@ -543,7 +579,7 @@ describe("adopt-root fallback: anchored split sequence when root adoption fails"
     expect(r.lines).toContain("pane move FIX:p1 --tab FIX:t1 --split down");
     // the fallback tab's stray panes are swept — FIX:root1 matches again (idempotent close, same target)
     expect(r.lines).toContain("pane rename FIX:p1 t1.executor");
-    expect(r.lines).toContain("pane run FIX:p1 env PI_SKIP_VERSION_CHECK=1 pi");
+    expect(r.lines).toContain("pane run FIX:p1 cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
     expectDelivered(r.lines, "FIX:p1");
   });
 
@@ -577,7 +613,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     // Root discovery fell to channel 2 (pane list by tab_id) and the birth
     // sequence completed on the recovered tab's root pane.
     expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
-    expect(r.lines).toContain("pane run FIX:root1 env PI_SKIP_VERSION_CHECK=1 pi");
+    expect(r.lines).toContain("pane run FIX:root1 cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
     expectDelivered(r.lines, "FIX:root1");
   });
 
@@ -591,6 +627,41 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     expect(r.stderr).toContain("refusing a second create");
     // Exactly one create (the unparseable success) — never a twin.
     expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+  });
+});
+
+// --- tab-create edge: signal termination may have created a remote tab --------
+
+describe("tab create signal termination: recover or refuse, never blindly duplicate", () => {
+  it("recovers a tab whose create response was interrupted and completes birth", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [
+      HUB_PANE,
+      { pane_id: "FIX:root1", label: "", workspace_id: "w11", cwd: "/repo", tab_id: "FIX:t1", agent_status: "idle" },
+    ], {
+      TUT_HERDR_TAB_CREATE_SIGNAL: "SIGTERM",
+      TUT_HERDR_TABS: JSON.stringify([{ label: "TUT executor", tab_id: "FIX:t1" }]),
+      TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+    });
+    expect(r.code).toBe(0);
+    expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+    expect(r.lines).toContain("tab list --workspace w11");
+    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines).toContain("pane run FIX:root1 cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
+    expectDelivered(r.lines, "FIX:root1");
+    expect(r.stderr).toContain("signal SIGTERM");
+    expect(r.stderr).toContain("tab id recovered via tab list");
+  });
+
+  it("refuses a second create when signal recovery cannot identify the tab", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [HUB_PANE], {
+      TUT_HERDR_TAB_CREATE_SIGNAL: "SIGTERM",
+      TUT_HERDR_TABS: "[]",
+    });
+    expect(r.code).toBe(1);
+    expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+    expect(r.lines.some((l) => l.startsWith("pane split"))).toBe(false);
+    expect(r.stderr).toContain("refusing a second create");
+    expect(r.stderr).toContain("inspect the tab manually");
   });
 });
 
