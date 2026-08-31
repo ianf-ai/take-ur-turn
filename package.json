@@ -1,6 +1,6 @@
 {
   "name": "take-ur-turn",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "TUT (Take Ur Turn): multi coding-agent collaboration via a local Context Hub — append-only shared memory, derived task state, human approval gates",
   "license": "Apache-2.0",
   "keywords": [

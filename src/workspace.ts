@@ -45,6 +45,8 @@ export const DEFAULT_TAB_LABEL = "TUT {role}";
 export interface ResolveOptions {
   /** L1 project root (default: process cwd — same assumption as tut up's guardrail). */
   projectRoot?: string;
+  /** Optional shared Hub root whose L1 declaration supplements the checkout L1. */
+  fallbackProjectRoot?: string;
   /** L2 config dir (default: $TUT_USER_CONFIG_DIR, else ~/.config/tut). */
   userConfigDir?: string;
   /** A planner-bound config snapshot; when present no workspace files are read. */
@@ -130,12 +132,26 @@ function parseTabLabel(raw: Record<string, unknown> | null): string | undefined 
   return typeof label === "string" && label.length > 0 ? label : undefined;
 }
 
-async function readLevels(projectRoot: string, userConfigDir: string): Promise<WorkspaceLevels> {
+async function readLevels(
+  projectRoot: string,
+  userConfigDir: string,
+  fallbackProjectRoot?: string,
+): Promise<WorkspaceLevels> {
   const l1 = await readJson(path.join(projectRoot, ".context-hub", "workspace.json"));
+  const fallback = fallbackProjectRoot !== undefined && path.resolve(fallbackProjectRoot) !== projectRoot
+    ? await readJson(path.join(fallbackProjectRoot, ".context-hub", "workspace.json"))
+    : null;
   const l2 = await readJson(path.join(userConfigDir, "workspace.json"));
+
+  // A worktree may intentionally omit its own `.context-hub/` checkout.  Use
+  // the shared Hub declaration as a supplemental L1: checkout-local values
+  // win, while missing/corrupt fields fall back per role/template exactly as
+  // the ordinary L1 → L2 chain does.
+  const projectRoles = { ...parseRoles(fallback), ...parseRoles(l1) };
+  const projectTabLabel = parseTabLabel(l1) ?? parseTabLabel(fallback);
   return {
-    roles: [parseRoles(l1), parseRoles(l2)],
-    tabLabel: [parseTabLabel(l1), parseTabLabel(l2)],
+    roles: [projectRoles, parseRoles(l2)],
+    tabLabel: [projectTabLabel, parseTabLabel(l2)],
   };
 }
 
@@ -159,8 +175,11 @@ export async function readWorkspaceConfigSnapshot(
   opts: Omit<ResolveOptions, "workspaceSnapshot"> = {},
 ): Promise<WorkspaceConfigSnapshot> {
   const projectRoot = path.resolve(opts.projectRoot ?? process.cwd());
+  const fallbackProjectRoot = opts.fallbackProjectRoot === undefined
+    ? undefined
+    : path.resolve(opts.fallbackProjectRoot);
   const userConfigDir = path.resolve(opts.userConfigDir ?? defaultUserConfigDir());
-  const levels = await readLevels(projectRoot, userConfigDir);
+  const levels = await readLevels(projectRoot, userConfigDir, fallbackProjectRoot);
   return Object.freeze({
     projectRoot,
     userConfigDir,

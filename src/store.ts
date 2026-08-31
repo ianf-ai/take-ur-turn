@@ -5,6 +5,7 @@ import {
   ErrorCode,
   PROJECT_TASK_ID,
   type Cast,
+  type CheckoutRoute,
   type ContextRecord,
   type ContentType,
   type Flow,
@@ -46,6 +47,8 @@ export interface CreateTaskInput {
   flow?: Flow;
   /** Per-task cast: role → agent route overrides, absent roles use the default lineup. */
   cast?: Cast;
+  /** Task-frozen checkout route; absent preserves the legacy current checkout. */
+  checkout?: CheckoutRoute;
 }
 
 export interface CreateTaskResult {
@@ -80,6 +83,8 @@ export interface ReadTaskResult {
   flow?: Flow;
   /** Per-task cast: present only when the task carries one. */
   cast?: Cast;
+  /** Task-frozen checkout route; absent preserves the legacy current checkout. */
+  checkout?: CheckoutRoute;
   status?: Status;
   versions: ContextRecord[];
 }
@@ -98,6 +103,8 @@ export interface TaskListEntry {
   flow?: Flow;
   /** Per-task cast: present only when the task carries one. */
   cast?: Cast;
+  /** Task-frozen checkout route; absent preserves the legacy current checkout. */
+  checkout?: CheckoutRoute;
 }
 
 /** meta.json on disk. Cached derived fields are absent for project scope. */
@@ -120,6 +127,8 @@ interface TaskMeta {
    * exists). Absent on default creates and on project scope.
    */
   cast?: Cast;
+  /** Task-frozen checkout route. Absent means the legacy current checkout. */
+  checkout?: CheckoutRoute;
   created_at: string;
   updated_at: string;
   /** Latest landed record version; 0 after create. */
@@ -167,6 +176,44 @@ function requireValidCast(value: unknown): Cast | undefined {
     }
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Create-time checkout validation. The route is immutable metadata; it never runs git. */
+function requireValidCheckout(value: unknown): CheckoutRoute | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new StoreError(ErrorCode.VALIDATION_ERROR, "checkout must be an object with kind current or worktree");
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.kind === "current") return { kind: "current" };
+  if (raw.kind !== "worktree") {
+    throw new StoreError(ErrorCode.VALIDATION_ERROR, "checkout.kind must be current or worktree");
+  }
+
+  const routeValue = (candidate: unknown, field: "path" | "ref"): string | undefined => {
+    if (candidate === undefined) return undefined;
+    if (typeof candidate !== "string" || candidate.trim().length === 0 || /[\u0000\r\n]/u.test(candidate)) {
+      throw new StoreError(ErrorCode.VALIDATION_ERROR, `checkout.${field} must be a non-empty string without NUL/CR/LF`);
+    }
+    return candidate;
+  };
+  const checkoutPath = routeValue(raw.path, "path");
+  const ref = routeValue(raw.ref, "ref");
+  if (checkoutPath === undefined) {
+    // A ref-only route can never launch: the launcher resolves explicit
+    // paths and never creates worktrees, so freezing one would create a
+    // permanently unlaunchable task (checkout is immutable).  Ref rides
+    // along as an annotation next to a path, never instead of one.
+    throw new StoreError(
+      ErrorCode.VALIDATION_ERROR,
+      "worktree checkout requires a path; ref alone is not accepted (ref may only annotate a path)",
+    );
+  }
+  return {
+    kind: "worktree",
+    path: checkoutPath,
+    ...(ref !== undefined ? { ref } : {}),
+  };
 }
 
 /**
@@ -298,6 +345,7 @@ export class Store {
     const role = requireNonEmptyString(input?.role, "role");
     const flow = requireValidFlow(input?.flow);
     const cast = requireValidCast(input?.cast);
+    const checkout = requireValidCheckout(input?.checkout);
 
     return this.enqueue(async () => {
       const taskId = await this.uniqueSlug(slugify(title));
@@ -312,6 +360,7 @@ export class Store {
         role,
         ...(flow !== undefined ? { flow } : {}), // absent = full; key stays out for default creates
         ...(cast !== undefined ? { cast } : {}), // absent = default lineup; key stays out for default creates
+        ...(checkout !== undefined ? { checkout } : {}), // absent = current; key stays out for old creates
         created_at: now,
         updated_at: now,
         version: 0,
@@ -436,6 +485,7 @@ export class Store {
     if (taskId !== PROJECT_TASK_ID) {
       result.flow = meta.flow ?? "full"; // deferred registration item: always present, normalized
       if (meta.cast !== undefined) result.cast = meta.cast;
+      if (meta.checkout !== undefined) result.checkout = meta.checkout;
       const derived = derive(taskId, records, meta.flow);
       if (derived) result.status = derived.status;
     }
@@ -500,6 +550,7 @@ export class Store {
         version: meta.version,
         flow: meta.flow ?? "full", // deferred registration item: always present, normalized
         ...(meta.cast !== undefined ? { cast: meta.cast } : {}),
+        ...(meta.checkout !== undefined ? { checkout: meta.checkout } : {}),
       });
     }
     out.sort((a, b) => a.task_id.localeCompare(b.task_id));

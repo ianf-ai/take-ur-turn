@@ -31,6 +31,7 @@ vi.mock("../src/channels.js", () => ({
 }));
 
 import { Notifier, runNotify, spawnLaunch, type StateResponse, type StateTask } from "../src/notifier.js";
+import { giveUpGuidance } from "../src/launcher/escalation.js";
 import { launchBlocked } from "../src/launch.js";
 import type { AgentRoute, ContextRecord } from "../src/types.js";
 import { HANDLERS, parseArgs } from "../src/cli.js";
@@ -955,7 +956,11 @@ describe("auto-mode gate", () => {
         fetchState: async () => current,
         readLog: async () => {
           reads += 1;
-          return reads === 1 ? [] : [winner];
+          // reads 1-2: per-poll auto-decision observability lines (baseline +
+          // this poll, both must see "fresh" so the launch path is entered);
+          // read 3: autoLaunch's own dedup read (still fresh → marker);
+          // read 4: the conflict re-read → the race winner's marker.
+          return reads <= 3 ? [] : [winner];
         },
         markLaunched: async () => {
           throw new Error("VERSION_CONFLICT: lost launch race");
@@ -975,7 +980,7 @@ describe("auto-mode gate", () => {
     current = state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES });
     await notifier.requestCompare();
 
-    expect(reads).toBe(2);
+    expect(reads).toBe(4);
     expect(launches).toEqual([]);
     expect(titlesMatching("auto launch skipped (already launched)")).toHaveLength(1);
     expect(titlesMatching("auto launch failed")).toHaveLength(0);
@@ -1263,6 +1268,297 @@ describe("auto-mode launch whitelist", () => {
   });
 });
 
+// --- auto-gate observability / unmatched flood rate-limit / mode visibility ---
+
+describe("auto-decision per-poll observability", () => {
+  it("an edge poll announces the launch (gate/whitelist/dedup pass) before it happens", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"] });
+    await hz.notifier.requestCompare(); // empty baseline
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toHaveLength(1);
+    const line = hz.logs.find((l) => l.includes("[t1] auto-decision:"));
+    expect(line).toBeDefined();
+    expect(line).toContain("waiting_for=agent:executor");
+    expect(line).toContain("gate=pass");
+    expect(line).toContain("needs_attention=false");
+    expect(line).toContain("whitelist=pass");
+    expect(line).toContain("dedup=fresh");
+    expect(line).toContain("action=launch (waiting_for edge none → agent:executor)");
+  });
+
+  it("the silent-door shape is visible: task already agent-waiting at baseline, unchanged next poll → no edge, no launch, decision line says why", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"] });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // baseline: task already waiting — acting is edge-triggered
+    hz.at(5_000);
+    await hz.notifier.requestCompare(); // waiting_for unchanged → still no edge
+    expect(hz.launches).toEqual([]); // pins current acting semantics: observability only, no root-cause fix
+    const lines = hz.logs.filter((l) => l.includes("auto-decision"));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("dedup=fresh");
+    expect(lines[0]).toContain("action=none (baseline poll; acting is edge-triggered)");
+    expect(lines[1]).toContain("action=none (no waiting_for edge since last poll)");
+  });
+
+  it("steady state after a launch: dedup=launched@vN with action=none, no second launch", async () => {
+    const records: ContextRecord[] = [
+      {
+        version: 2,
+        task_id: "t1",
+        role: "human",
+        content_type: "note",
+        timestamp: U1,
+        payload: { summary: "launch: executor (base v1)", body: "launch", launch: { role: "executor", base_version: 1, via: "auto" } },
+      },
+    ];
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], readLog: async () => records });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toEqual([]);
+    const lines = hz.logs.filter((l) => l.includes("auto-decision"));
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain("dedup=launched@v2");
+    expect(lines[1]).toContain("action=none (already launched; launched@v2)");
+  });
+
+  it("withheld candidates: gate/whitelist failures name their reason in the line and do NOT touch the hub log", async () => {
+    let reads = 0;
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["architect"],
+      readLog: async () => {
+        reads += 1;
+        return [];
+      },
+    });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "auto", auto: { launch_roles: ["architect"] } }));
+    await hz.notifier.requestCompare();
+    const line = hz.logs.find((l) => l.includes("[t1] auto-decision:"));
+    expect(line).toBeDefined();
+    expect(line).toContain("whitelist=fail ('executor' not in launch_roles)");
+    expect(line).toContain("dedup=n/a (not whitelisted)");
+    expect(line).toContain("action=withheld (role 'executor' not in launch whitelist)");
+    expect(reads).toBe(0); // withheld candidates are not read
+
+    const hz2 = makeHarness({ flowMode: "auto", autoRoles: ALL_ROLES.launch_roles });
+    await hz2.notifier.requestCompare(); // empty baseline
+    hz2.set(state([task({ task_id: "t2", status: "implementing", waiting_for: "agent:executor", needs_attention: true, updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz2.notifier.requestCompare();
+    const line2 = hz2.logs.find((l) => l.includes("[t2] auto-decision:"));
+    expect(line2).toBeDefined();
+    expect(line2).toContain("gate=blocked (needs_attention set)");
+    expect(line2).toContain("needs_attention=true");
+    expect(line2).toContain("action=withheld (gate: needs_attention set)");
+  });
+
+  it("manual mode logs no decision lines (mode visibility is the echo's job)", async () => {
+    const hz = makeHarness({ flowMode: "manual" });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "manual" }));
+    await hz.notifier.requestCompare();
+    hz.at(10 * 60_000);
+    await hz.notifier.requestCompare();
+    expect(hz.logs.some((l) => l.includes("auto-decision"))).toBe(false);
+  });
+
+  it("a candidate whose log read fails logs dedup=unreadable and survives", async () => {
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      readLog: async () => {
+        throw new Error("hub read boom");
+      },
+    });
+    await hz.notifier.requestCompare(); // empty baseline
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    const line = hz.logs.find((l) => l.includes("[t1] auto-decision:"));
+    expect(line).toBeDefined();
+    expect(line).toContain("dedup=unreadable (hub read boom)");
+    // acting proceeds as before: the launch path re-reads and fails loudly there
+    expect(titlesMatching("auto launch failed")).toHaveLength(1);
+  });
+});
+
+describe("flow_mode visibility", () => {
+  it("a mode switch logs one change line immediately", async () => {
+    const hz = makeHarness(); // manual
+    await hz.notifier.requestCompare();
+    hz.set(state([], { flow_mode: "auto" }));
+    await hz.notifier.requestCompare();
+    expect(hz.logs.some((l) => l.includes("flow_mode changed: manual → auto"))).toBe(true);
+    // and back
+    hz.set(state([], { flow_mode: "manual" }));
+    await hz.notifier.requestCompare();
+    expect(hz.logs.some((l) => l.includes("flow_mode changed: auto → manual"))).toBe(true);
+  });
+
+  it("an unchanged mode is echoed only after the echo interval, then re-armed", async () => {
+    const hz = makeHarness({ flowMode: "auto" });
+    await hz.notifier.requestCompare();
+    hz.at(4 * 60_000);
+    await hz.notifier.requestCompare();
+    expect(hz.logs.filter((l) => l.includes("flow_mode echo")).length).toBe(0); // below the interval: silent
+    hz.at(5 * 60_000); // exactly at the interval
+    await hz.notifier.requestCompare();
+    expect(hz.logs.some((l) => l.includes("flow_mode echo: auto"))).toBe(true);
+    hz.at(5 * 60_000 + 4 * 60_000); // still within the NEXT window
+    await hz.notifier.requestCompare();
+    expect(hz.logs.filter((l) => l.includes("flow_mode echo")).length).toBe(1);
+  });
+
+  it("the baseline line remains the session's first mode statement (no duplicate on first fetch)", async () => {
+    const hz = makeHarness({ flowMode: "auto" });
+    await hz.notifier.requestCompare();
+    const modeLines = hz.logs.filter((l) => l.includes("flow_mode"));
+    expect(modeLines).toHaveLength(1); // just the baseline line
+    expect(modeLines[0]).toContain("baseline: 0 task(s), flow_mode=auto");
+  });
+});
+
+describe("unmatched agent-event rate limit", () => {
+  it("same-source blocked flood: first event degrades as before, the window suppresses, next window re-emits with the aggregate", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+    await hz.flush();
+    expect(titlesMatching("agent stuck")).toHaveLength(1);
+    expect(hz.logs.filter((l) => l.includes("matches no task")).length).toBe(1);
+    for (let i = 0; i < 50; i++) {
+      hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+      await hz.flush(); // each flapping event gets its own compare + resolution
+    }
+    expect(titlesMatching("agent stuck")).toHaveLength(1); // suppressed — no per-event notify spam
+    expect(hz.logs.filter((l) => l.includes("matches no task")).length).toBe(1); // and no per-event log spam
+    hz.at(60_001); // window elapsed → the next event re-emits, carrying the aggregate
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+    await hz.flush();
+    expect(titlesMatching("agent stuck")).toHaveLength(2); // bounded: at most one full degrade per window
+    const agg = hz.logs.find((l) => l.includes("+50 suppressed in window: blocked×50"));
+    expect(agg).toBeDefined();
+  });
+
+  it("same-source working flood aggregates to one resolution line per window", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    for (let i = 0; i < 10; i++) {
+      hz.notifier.receiveEvent({ event: "working", agent: "codex", pane: "mystery" });
+      await hz.flush();
+    }
+    expect(hz.logs.filter((l) => l.includes("resolves to no task")).length).toBe(1);
+    expect(hz.fetchCount()).toBeGreaterThan(2); // the immediate compares still ran
+  });
+
+  it("a burst then silence: the pending suppression count flushes one window later, log-only", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+    await hz.flush();
+    for (let i = 0; i < 10; i++) {
+      hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+      await hz.flush();
+    }
+    expect(hz.logs.filter((l) => l.includes("matches no task")).length).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000); // flush timer fires without a new event
+    await hz.flush();
+    const flushed = hz.logs.find((l) => l.includes("10 further event(s) suppressed in the rate-limit window"));
+    expect(flushed).toBeDefined();
+    expect(flushed).toContain("(blocked×10)");
+    expect(titlesMatching("agent stuck")).toHaveLength(1); // the flush is log-only, no channel notify
+  });
+
+  it("mid-window burst then silence: the fallback flush lands at window expiry (60s after the emit), not a full window after the midpoint event", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" }); // t=0: emits, arms the window-expiry timer
+    await hz.flush();
+    hz.at(30_000);
+    await vi.advanceTimersByTimeAsync(30_000); // midpoint of the window (fake clock kept in lockstep with deps.now)
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+    hz.notifier.receiveEvent({ event: "working", agent: "codex", pane: "mystery" });
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+    await hz.flush();
+    expect(hz.logs.filter((l) => l.includes("matches no task")).length).toBe(1); // all three suppressed
+    await vi.advanceTimersByTimeAsync(29_999); // t=59_999 — one tick before expiry: nothing yet
+    expect(hz.logs.some((l) => l.includes("suppressed in the rate-limit window"))).toBe(false);
+    await vi.advanceTimersByTimeAsync(1); // t=60_000 — exactly lastEmit + window
+    const flushed = hz.logs.find((l) => l.includes("3 further event(s) suppressed in the rate-limit window"));
+    expect(flushed).toBeDefined();
+    expect(flushed).toContain("(blocked×2, working×1)"); // total AND per-event-type counts preserved
+    expect(titlesMatching("agent stuck")).toHaveLength(1); // log-only, no channel notify
+  });
+
+  it("repeated burst/silence rounds leave no expired flush timers behind and evict idle sources; each new round emits its first event afresh", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    // Test-only window into the bookkeeping under review: the timer set must
+    // not retain spent handles and the source map must not retain idle entries.
+    const internals = hz.notifier as unknown as {
+      timers: Set<ReturnType<typeof setTimeout>>;
+      unmatchedSources: Map<string, unknown>;
+    };
+    let clock = 0;
+    const tick = async (to: number): Promise<void> => {
+      hz.at(to);
+      await vi.advanceTimersByTimeAsync(to - clock); // wall clock ≈ fake clock
+      clock = to;
+    };
+    for (let round = 0; round < 5; round++) {
+      const base = round * 120_000;
+      await tick(base);
+      hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" }); // first event: emits
+      await hz.flush();
+      expect(titlesMatching("agent stuck")).toHaveLength(round + 1); // fresh round, fresh first degrade
+      expect(internals.timers.size).toBe(1); // exactly one pending flush timer per source
+      await tick(base + 30_000);
+      for (let i = 0; i < 3; i++) {
+        hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "mystery" });
+        await hz.flush();
+      }
+      await tick(base + 60_000); // window expiry → aggregate flush + eviction
+      expect(hz.logs.some((l) => l.includes("3 further event(s) suppressed in the rate-limit window"))).toBe(true);
+      expect(internals.timers.size).toBe(0); // the fired timer removed itself — no spent handles linger
+      expect(internals.unmatchedSources.size).toBe(0); // the idle source entry was evicted
+    }
+  });
+
+  it("a source that emits once and goes silent is evicted at window expiry (bounded bookkeeping without any suppression)", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    const internals = hz.notifier as unknown as {
+      timers: Set<ReturnType<typeof setTimeout>>;
+      unmatchedSources: Map<string, unknown>;
+    };
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "loner" });
+    await hz.flush();
+    expect(internals.unmatchedSources.size).toBe(1); // alive inside the window
+    expect(internals.timers.size).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000); // expiry: nothing pending → silent eviction
+    expect(internals.unmatchedSources.size).toBe(0);
+    expect(internals.timers.size).toBe(0);
+    expect(hz.logs.filter((l) => l.includes("suppressed in the rate-limit window")).length).toBe(0); // no spurious aggregate line
+  });
+
+  it("distinct sources rate-limit independently; matched events are untouched", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1" })]));
+    await hz.notifier.requestCompare();
+    for (const pane of ["mystery-a", "mystery-b"]) {
+      hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane });
+      await hz.flush();
+    }
+    expect(titlesMatching("agent stuck")).toHaveLength(2); // one per SOURCE
+    // a matched event interleaved with the flood keeps its exact behavior
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "t1" });
+    await hz.flush();
+    const stuck = h.sent.filter((s) => s.msg.title.includes("agent stuck"));
+    expect(stuck.some((s) => s.msg.task_id === "t1")).toBe(true);
+    expect(hz.fetchCount()).toBeGreaterThan(3);
+  });
+});
+
 // --- queue serialization ------------------------------------------------------------------
 
 describe("serial compare queue", () => {
@@ -1420,6 +1716,165 @@ describe("agent events", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await hz.flush();
     expect(h.sent).toEqual([]);
+  });
+});
+
+describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
+  it("matched round pane, legacy event WITHOUT evidence → conservative inspect-the-pane hint (never a blind Enter)", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    const baselineFetches = hz.fetchCount();
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    const gaveUp = h.sent.find((s) => s.msg.title === "TUT t1: prompt delivery gave up");
+    expect(gaveUp).toBeDefined();
+    expect(gaveUp?.msg.task_id).toBe("t1");
+    expect(gaveUp?.msg.body).toContain("title of t1"); // the task title
+    expect(gaveUp?.msg.body).toContain("t1.executor");
+    // Missing evidence fields → conservative hint only, composed from the
+    // shared single-source guidance (notifier prefix + giveUpGuidance).
+    expect(gaveUp?.msg.body).toContain(`box evidence unavailable — ${giveUpGuidance("unknown")}`);
+    expect(gaveUp?.msg.body).not.toContain("sits unconsumed in the input box");
+    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("held"));
+    expect(hz.fetchCount()).toBe(baselineFetches); // no compare enqueued
+    expect(hz.logs.some((l) => l.includes("delivery gave up for executor") && l.includes("box evidence unavailable"))).toBe(true);
+  });
+
+  it("half-valid core pair (box=held, transport missing) degrades to the conservative hint — atomic normalization", async () => {
+    // Review R2 P1: the core evidence pair box+transport is ATOMIC.  A
+    // programmatic half-pair must not buy the held copy (the wire path is
+    // covered by the HTTP endpoint tests below).
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held" });
+    await hz.flush();
+    const gaveUp = h.sent.find((s) => s.msg.title === "TUT t1: prompt delivery gave up");
+    expect(gaveUp?.msg.body).toContain(`box evidence unavailable — ${giveUpGuidance("unknown")}`);
+    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("held"));
+  });
+
+  it("box=held evidence → the alert may direct a manual Enter, word-for-word the shared held guidance", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held", transport: true, probe: "failed" });
+    await hz.flush();
+    const gaveUp = h.sent.find((s) => s.msg.title === "TUT t1: prompt delivery gave up");
+    expect(gaveUp?.msg.body).toContain(giveUpGuidance("held"));
+    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("cleared"));
+    expect(hz.logs.some((l) => l.includes("delivery gave up for executor") && l.includes(giveUpGuidance("held")))).toBe(true);
+  });
+
+  it("box=cleared evidence → confirm-round-first hint; the alert must NOT direct an Enter (double-prompt hazard)", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "cleared", transport: false, probe: "observed" });
+    await hz.flush();
+    const gaveUp = h.sent.find((s) => s.msg.title === "TUT t1: prompt delivery gave up");
+    expect(gaveUp?.msg.body).toContain(giveUpGuidance("cleared"));
+    // The core defect this closes: the alert channel must never send the
+    // human to the exact action the launcher evidence forbids.
+    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("held"));
+    expect(gaveUp?.msg.body).not.toContain("press Enter there manually");
+  });
+
+  it("give-up does NOT reset the stall watchdog — the 30-minute backstop keeps its clock", async () => {
+    const hz = makeHarness({ stallMin: 30 });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // baseline at t=0
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    hz.at(30 * 60_000);
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1); // markProgress was NOT called by the give-up
+  });
+
+  it("a matching live working short fuse is disarmed — the give-up alert replaces it", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], workingTimeoutSec: 5 });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // launch succeeds, fuse armed
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1);
+    expect(hz.logs.some((l) => l.includes("short working fuse disarmed"))).toBe(true);
+    await vi.advanceTimersByTimeAsync(5_000); // the fuse window would elapse
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0); // disarmed, not fired
+  });
+
+  it("in-flight give-up (real auto ordering): launch return does NOT re-arm the short fuse, stall clock intact", async () => {
+    // Review v4 P1 closure test: the launcher child emits the event BEFORE it
+    // exits, so the give-up always beats the launch return. The fuse must not
+    // be armed for this round afterwards, and the stall watchdog keeps its
+    // original clock (no markProgress on give-up).
+    let resolveLaunch!: (value: string) => void;
+    const launchPromise = new Promise<string>((resolve) => {
+      resolveLaunch = resolve;
+    });
+    const order: string[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      workingTimeoutSec: 5,
+      launch: async () => await launchPromise,
+      order,
+    });
+    await hz.notifier.requestCompare(); // baseline
+    hz.set(
+      state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], {
+        flow_mode: "auto",
+        auto: ALL_ROLES,
+      }),
+    );
+    const launching = hz.notifier.requestCompare(); // auto launch starts; promise still pending
+    // Wait until the launcher seam is actually being awaited (the marker is
+    // the last hub step before inFlightLaunches registration): the real
+    // autoLaunch path crosses real fs I/O, which pure microtask flushes do
+    // not advance.
+    for (let i = 0; i < 1000 && !order.includes("marker"); i++) {
+      await vi.advanceTimersByTimeAsync(1);
+      await hz.flush();
+    }
+    await vi.advanceTimersByTimeAsync(1);
+    await hz.flush();
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor" }); // child emits pre-exit
+    await hz.flush();
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1); // immediate escalation
+    expect(hz.logs.some((l) => l.includes("give-up arrived while the executor launch was still completing"))).toBe(true);
+    resolveLaunch("launched");
+    await launching;
+    await hz.flush();
+    expect(hz.logs.some((l) => l.includes("short working fuse not armed"))).toBe(true);
+    await vi.advanceTimersByTimeAsync(5_000); // the (never-armed) fuse window would elapse
+    await hz.flush();
+    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0); // no duplicate alarm
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1); // still exactly one give-up alert
+    hz.at(30 * 60_000); // stall watchdog on its original clock
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1); // give-up never marked progress
+  });
+
+  it("unmatched pane degrades rate-limited like the other events", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "mystery" });
+    await hz.flush();
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1);
+    const first = h.sent.find((s) => s.msg.title.includes("mystery"));
+    expect(first?.msg.task_id).toBeUndefined(); // no task → no task_id
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "mystery" });
+    await hz.flush();
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1); // suppressed in-window
+    hz.at(60_001);
+    hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "mystery" });
+    await hz.flush();
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(2); // window elapsed → re-emits
+    const agg = hz.logs.find((l) => l.includes("+1 suppressed in window: delivery_giveup×1"));
+    expect(agg).toBeDefined();
   });
 });
 
@@ -2056,6 +2511,52 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
     expect(hz.fetchCount()).toBe(0);
   });
 
+  it("delivery_giveup: core evidence pair box+transport normalized ATOMICALLY; complete payloads take their branches", async () => {
+    // Review R2 P1 closure matrix: a half-valid pair (one field well-typed,
+    // the other missing/ill-typed) must degrade to the conservative
+    // inspect-pane hint — never the held copy; complete payloads still
+    // drive their own branch.
+    const { hz, port } = await startListenerHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // baseline
+    const sentBaseline = h.sent.length; // h.sent is module-global across tests
+    const post = (body: unknown): Promise<{ status: number; body: string }> =>
+      rawRequest(port, "POST", "/agent-event", JSON.stringify(body));
+    const conservative = `box evidence unavailable — ${giveUpGuidance("unknown")}`;
+    // half pairs — every one must be conservative:
+    const heldNoTransport = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held" });
+    expect(heldNoTransport.status).toBe(200);
+    const heldBadTransport = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held", transport: "yes" });
+    expect(heldBadTransport.status).toBe(200);
+    const transportNoBox = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", transport: true });
+    expect(transportNoBox.status).toBe(200);
+    const transportBadBox = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", transport: true, box: 42 });
+    expect(transportBadBox.status).toBe(200);
+    // legacy three-field body (old launcher) and all-fields-garbage: same
+    // conservative degradation.
+    const legacy = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor" });
+    expect(legacy.status).toBe(200);
+    const garbage = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: 42, transport: "yes", probe: "maybe" });
+    expect(garbage.status).toBe(200);
+    // complete payloads still take their own branches:
+    const completeHeld = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held", transport: true, probe: "failed" });
+    expect(completeHeld.status).toBe(200);
+    const completeCleared = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "cleared", transport: false });
+    expect(completeCleared.status).toBe(200);
+    await hz.flush();
+    const bodies = h.sent
+      .slice(sentBaseline)
+      .filter((s) => s.name === "desktop" && s.msg.title === "TUT t1: prompt delivery gave up")
+      .map((s) => s.msg.body);
+    expect(bodies).toHaveLength(8);
+    const conservativeBodies = bodies.filter((b) => b.includes(conservative));
+    expect(conservativeBodies).toHaveLength(6); // 4 half pairs + legacy + garbage
+    // No conservative alert may direct the manual-Enter action.
+    expect(conservativeBodies.every((b) => !b.includes(giveUpGuidance("held")))).toBe(true);
+    expect(bodies.filter((b) => b.includes(giveUpGuidance("held")))).toHaveLength(1);
+    expect(bodies.filter((b) => b.includes(giveUpGuidance("cleared")))).toHaveLength(1);
+  });
+
   it("wrong path → 404; GET → 405", async () => {
     const { port } = await startListenerHarness();
     expect((await rawRequest(port, "POST", "/other", "{}")).status).toBe(404);
@@ -2135,6 +2636,7 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
           TUT_SPLIT_BASE: "w9:p0",
           TUT_HUB_URL: "http://127.0.0.1:1", // hub down: file chain + stderr note
           TUT_USER_CONFIG_DIR: path.join(os.tmpdir(), `tut-tee-l2-${process.pid}`),
+          TUT_DELIVERY_NONCE: "A1B2C3D4",
           TUT_READY_POLL_MS: "20",
           TUT_READY_FLOOR_MS: "0",
           TUT_READY_TIMEOUT_MS: "4000",
@@ -2145,7 +2647,12 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
             "",
             "pi TUI ready — status 0.0%",
             "pi TUI ready — status 0.0%",
-            "pi TUI ready ▎prompt",
+            "pi TUI ready — status 0.0%",
+            "pi TUI ready — status 0.0%",
+            // The landed view embeds every role's prompt head-fragment: the
+            // text-match landing criterion (7.2.1 step 3) only accepts a
+            // screen that actually shows the sent text.
+            "pi TUI ready ▎轮到你了（role: architect）：请用 轮到你了（role: executor）：请用 轮到你了（role: reviewer）：请用 开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）",
             "working — round started",
           ]),
         });
@@ -2156,7 +2663,7 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
         expect(text).toContain("submit-confirmed pane=FIX:root1 attempt=1");
         // The birth really ran against the fixture (not a dry-run).
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines).toContain("pane run FIX:root1 cd -- '/x' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
+        expect(lines.some((line) => line.startsWith("pane run FIX:root1 ") && line.includes("probe-runner.js"))).toBe(true);
       } finally {
         spy.mockRestore();
         rmSync(log, { force: true });

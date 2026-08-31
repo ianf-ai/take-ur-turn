@@ -184,6 +184,10 @@ const CHAIN_L2 = mkdtempSync(path.join(os.tmpdir(), "tut-assign-chain-"));
 const dryRunEnv = {
   ...process.env,
   TUT_DRY_RUN: "1",
+  // Deterministic: hub down → degrade current/default; a live hub on the
+  // default port must never leak its real /state (cast!) into these
+  // resolution-chain assertions with dummy task ids.
+  TUT_HUB_URL: "http://127.0.0.1:1",
   TUT_USER_CONFIG_DIR: CHAIN_L2,
 } as NodeJS.ProcessEnv;
 
@@ -403,11 +407,17 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
   });
 });
 
+/** Prompt head-fragments for every role, embedded in fixture screens: the
+ *  text-match landing criterion (7.2.1 step 3) only accepts a screen that
+ *  actually shows the sent text. */
+const PROMPT_MARK =
+  "轮到你了（role: architect）：请用 轮到你了（role: executor）：请用 轮到你了（role: reviewer）：请用 开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）";
+
 // --- closed-loop delivery (land-confirm + verified submit) ------------
 // The REAL script against the fixture herdr (non-dry-run): birth runs for
 // real (adopt-root), the ready-probe polls `pane read` until the receiver
 // UI is up, then the CLOSED-LOOP tail — send-text → land-confirm read →
-// Enter → submit-verify by the INPUT-BOX-CLEARED criterion, with a long
+// Enter → out-of-band relay/read → submit-verify by the INPUT-BOX-CLEARED criterion, with a long
 // bounded loop of clocked Enter resends when the box keeps holding the
 // text. Screen TIMELINES (TUT_HERDR_READ_SCRIPT) script the pre-text
 // receiver (boot empties → painted UI); TUT_HERDR_READ_ENTER_SCRIPT
@@ -416,19 +426,19 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
 // keep tests quick; defaults 250/1500/15000, 5000/3000 and
 // 1500/30000 (retry interval / resend window).
 
-describe("launch.sh delivery tail (birth → ready-probe → send-text → land-confirm → verified submit)", () => {
+describe("launch.sh delivery tail (birth → ready-probe → send-text → land-confirm → relay-verified submit)", () => {
   const FIXTURE_BIN = path.join(path.resolve(import.meta.dirname, ".."), "test", "bin");
   const NODE_DIR = path.dirname(process.execPath);
   const ANCHOR_PANE = { pane_id: "w9:p0", label: "hub", workspace_id: "w9", cwd: "/x", agent_status: "idle" };
 
-  /** Born-branch happy timeline: 2 boot empties → painted UI (stable pair
-   *  releases the gate) → prompt text landed → submit reaction. */
   const BORN_SCREENS = JSON.stringify([
     "",
     "",
     "pi TUI ready — status 0.0%",
     "pi TUI ready — status 0.0%",
-    "pi TUI ready ▎prompt",
+    "pi TUI ready — status 0.0%",
+    "pi TUI ready — status 0.0%",
+    `pi TUI ready ▎${PROMPT_MARK}`,
     "working — round started",
   ]);
 
@@ -440,13 +450,17 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
     TUT_SPLIT_BASE: "w9:p0", // escape-hatch anchor (no tut-hub pane in the fixture)
     TUT_HUB_URL: "http://127.0.0.1:1", // deterministic: no hub, file chain + stderr note
     TUT_USER_CONFIG_DIR: CHAIN_L2, // hermetic chain (L1 root /x does not exist)
+    TUT_DELIVERY_NONCE: "A1B2C3D4",
     TUT_READY_POLL_MS: "20",
     TUT_READY_FLOOR_MS: "0",
     TUT_READY_TIMEOUT_MS: "4000",
     TUT_TEXT_LAND_TIMEOUT_MS: "200",
     TUT_SUBMIT_TIMEOUT_MS: "100",
     TUT_SUBMIT_RETRY_MS: "40",
-    TUT_SUBMIT_RETRY_TIMEOUT_MS: "400",
+    // ONE shared submit budget (was a 400ms retry window on top of a 100ms
+    // initial one). Under full-suite load each fixture call costs real
+    // latency; the budget absorbs it without weakening any assertion.
+    TUT_SUBMIT_RETRY_TIMEOUT_MS: "800",
     ...extra,
   });
 
@@ -471,26 +485,30 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
         // shipped root pane (rename + run) — no split, no move.
         const createIdx = lines.findIndex((l) => l === "tab create --workspace w9 --cwd /x --label TUT architect --no-focus");
         expect(createIdx).toBeGreaterThanOrEqual(0);
-        const runIdx = lines.findIndex((l) => l === "pane run FIX:root1 cd -- '/x' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
+        const runIdx = lines.findIndex((l) => l.startsWith("pane run FIX:root1 ") && l.includes("probe-runner.js"));
         expect(runIdx).toBeGreaterThan(createIdx);
         expect(lines).toContain("pane rename FIX:root1 t1.architect"); // round pane label from round one
-        // FULL closed-loop order (design 斨1). Gate: exactly 4 reads (base +
-        // 2 boot empties + the stable pair that releases it).
+        // FULL closed-loop order (design 斨1). Gate: exactly 6 reads (base
+        // + 2 boot empties + the four-sample quiescence run).
         const isRead = (l: string) => l.startsWith("pane read FIX:root1");
         const firstRead = lines.findIndex(isRead);
         expect(firstRead).toBe(runIdx + 1);
         const sendTextIdx = lines.findIndex((l) => l.startsWith("pane send-text FIX:root1"));
-        expect(sendTextIdx).toBe(firstRead + 4); // base + poll + paint + stable
+        expect(sendTextIdx).toBe(firstRead + 6); // base + poll + paint + quiescence run
         const enterIdx = lines.findIndex((l) => l === "pane send-keys FIX:root1 Enter");
         // Land-confirm: exactly one read between the text and the Enter.
         expect(enterIdx).toBe(sendTextIdx + 2);
-        expect(lines[sendTextIdx]).toBe(`pane send-text FIX:root1 轮到你了（role: architect）：请用 Context Hub 读取任务 t1 的完整上下文（context.read），按你的 role skill（${path.resolve(SCRIPTS_DIR, "../skills/architect.md")}）开始本轮工作，完成后发布相应记录（context.publish）。`);
-        // Exactly ONE Enter (success on first try), then only verify reads —
-        // and the log ENDS on the verify read that saw the reaction.
+        expect(lines[sendTextIdx]).toBe(`pane send-text FIX:root1 轮到你了（role: architect）：请用 Context Hub 读取任务 t1 的完整上下文（context.read），按你的 role skill（${path.resolve(SCRIPTS_DIR, "../skills/architect.md")}）开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）`);
+        // Exactly ONE Enter (success on first try), followed by one relay
+        // read and the existing verify read. This fixture has no birth relay,
+        // so the compatibility path records unavailable and never injects
+        // probe text into the foreground TUI.
         expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(1);
-        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1"))).toHaveLength(1); // text never re-sent
-        expect(lines.slice(enterIdx + 1).every(isRead)).toBe(true);
-        expect(lines).toHaveLength(enterIdx + 2);
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1); // prompt never re-sent
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 printf 'TUT-DELIVERY-PROBE-"))).toHaveLength(0);
+        expect(lines[enterIdx + 1]).toMatch(/^pane read FIX:root1 /u); // relay read
+        expect(lines[enterIdx + 2]).toMatch(/^pane read FIX:root1 /u); // submit verify read
+        expect(lines).toHaveLength(enterIdx + 3);
       } finally {
         rmSync(log, { force: true });
       }
@@ -513,19 +531,20 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
       const createIdx = lines.findIndex((l) => l === "tab create --workspace w9 --cwd /x --label TUT executor --no-focus");
       expect(createIdx).toBeGreaterThan(lastList);
       expect(lines).toContain("pane rename FIX:root1 t1.executor");
-      const runIdx = lines.findIndex((l) => l === "pane run FIX:root1 cd -- '/x' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
+      const runIdx = lines.findIndex((l) => l.startsWith("pane run FIX:root1 ") && l.includes("probe-runner.js"));
       expect(runIdx).toBeGreaterThan(createIdx);
       const sendTextIdx = lines.findIndex((l) => l.startsWith("pane send-text FIX:root1"));
-      expect(lines[sendTextIdx]).toBe(`pane send-text FIX:root1 轮到你了（role: executor）：请用 Context Hub 读取任务 t1 的完整上下文（context.read），按你的 role skill（${path.resolve(SCRIPTS_DIR, "../skills/executor.md")}）开始本轮工作，完成后发布相应记录（context.publish）。`);
-      // The closed loop: gate reads precede the text, ONE Enter, verify
-      // reads only after it, log ends on the verifying read.
+      expect(lines[sendTextIdx]).toBe(`pane send-text FIX:root1 轮到你了（role: executor）：请用 Context Hub 读取任务 t1 的完整上下文（context.read），按你的 role skill（${path.resolve(SCRIPTS_DIR, "../skills/executor.md")}）开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）`);
+      // The closed loop: gate reads precede the text, ONE Enter, one relay
+      // read, then the verify read.
       expect(lines.slice(runIdx + 1, sendTextIdx).every((l) => l.startsWith("pane read FIX:root1"))).toBe(true);
-      expect(lines.slice(runIdx + 1, sendTextIdx).length).toBe(4);
+      expect(lines.slice(runIdx + 1, sendTextIdx).length).toBe(6);
       expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(1);
       const enterIdx = lines.indexOf("pane send-keys FIX:root1 Enter");
       expect(lines.slice(sendTextIdx + 1, enterIdx).length).toBe(1); // land-confirm read
-      expect(lines.slice(enterIdx + 1).every((l) => l.startsWith("pane read FIX:root1"))).toBe(true);
-      expect(lines).toHaveLength(enterIdx + 2);
+      expect(lines[enterIdx + 1]).toMatch(/^pane read FIX:root1 /u);
+      expect(lines[enterIdx + 2]).toMatch(/^pane read FIX:root1 /u);
+      expect(lines).toHaveLength(enterIdx + 3);
     } finally {
       rmSync(log, { force: true });
     }
@@ -540,10 +559,10 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
       // box holds), the SECOND commits (the bottom region changes — the
       // composer let go). The loop resends Enter ONLY — never the text —
       // and confirms on the box clearing, not on "any change".
-      const boot = JSON.stringify(["", "", "codex shell", "codex shell"]);
+      const boot = JSON.stringify(["", "", "codex shell", "codex shell", "codex shell", "codex shell"]);
       const enterScreens = JSON.stringify([
-        "codex shell ▎prompt",
-        "codex shell ▎prompt",
+        `codex shell ▎${PROMPT_MARK}`,
+        `codex shell ▎${PROMPT_MARK}`,
         "codex working — round started",
       ]);
       const log = path.join(os.tmpdir(), `tut-fail-recover-${process.pid}.log`);
@@ -557,7 +576,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
           }),
         });
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1"))).toHaveLength(1);
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1);
         expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(2);
         expect(stderr).toContain("resending Enter (attempt 2)");
         expect(stderr).toContain("input box cleared on FIX:root1 — submit confirmed (attempt 2)");
@@ -580,13 +599,13 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
       // screen holds the composer text until screens[5] lets go; the loop
       // must keep resending Enter on the clock, never re-send the text,
       // and confirm on the box clearing at attempt 5.
-      const boot = JSON.stringify(["", "", "codex shell", "codex shell"]);
+      const boot = JSON.stringify(["", "", "codex shell", "codex shell", "codex shell", "codex shell"]);
       const enterScreens = JSON.stringify([
-        "codex shell ▎prompt",
-        "codex shell ▎prompt",
-        "codex shell ▎prompt",
-        "codex shell ▎prompt",
-        "codex shell ▎prompt",
+        `codex shell ▎${PROMPT_MARK}`,
+        `codex shell ▎${PROMPT_MARK}`,
+        `codex shell ▎${PROMPT_MARK}`,
+        `codex shell ▎${PROMPT_MARK}`,
+        `codex shell ▎${PROMPT_MARK}`,
         "codex working — round started",
       ]);
       const log = path.join(os.tmpdir(), `tut-multi-swallow-${process.pid}.log`);
@@ -597,10 +616,12 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
             TUT_HERDR_LOG: log,
             TUT_HERDR_READ_SCRIPT: boot,
             TUT_HERDR_READ_ENTER_SCRIPT: enterScreens,
+            TUT_SUBMIT_TIMEOUT_MS: "40",
+            TUT_SUBMIT_RETRY_TIMEOUT_MS: "2000",
           }),
         });
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1"))).toHaveLength(1); // text never re-sent
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1); // text never re-sent
         expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(5);
         expect(stderr).toContain("resending Enter (attempt 5)");
         expect(stderr).toContain("input box cleared on FIX:root1 — submit confirmed (attempt 5)");
@@ -613,36 +634,27 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
   );
 
   it(
-    "resend window exhaustion: box never clears → clocked bounded resends, manual-fallback note, STILL EXIT 0",
+    "an unavailable birth relay keeps the compatibility box-cleared path safe",
     async () => {
-      // Nothing ever lets go of the text (dead screen): the loop resends
-      // Enter on the clock within the bounded window (not readiness-gated
-      // — disproved by a controlled experiment), then points the human at the input
-      // box and still exits 0 — a failure exit would re-enter (duplicate
-      // birth), the worse outcome the design rejects.
-      const boot = JSON.stringify(["", "", "ui", "ui"]);
-      const enterScreens = JSON.stringify(["ui ▎prompt"]); // last screen repeats: held forever
-      const log = path.join(os.tmpdir(), `tut-exhaust-${process.pid}.log`);
+      const boot = JSON.stringify(["", "", "codex shell", "codex shell", "codex shell", "codex shell"]);
+      const enterScreens = JSON.stringify([`codex shell ▎${PROMPT_MARK}`, "working"]);
+      const log = path.join(os.tmpdir(), `tut-probe-fail-${process.pid}.log`);
       rmSync(log, { force: true });
       try {
-        const { stderr } = await runLaunch(LAUNCH_SH, ["t-ex", "architect", "pi"], {
+        const { stderr } = await runLaunch(LAUNCH_SH, ["t-pf", "architect", "pi"], {
           env: liveEnv({
             TUT_HERDR_LOG: log,
             TUT_HERDR_READ_SCRIPT: boot,
             TUT_HERDR_READ_ENTER_SCRIPT: enterScreens,
-            TUT_SUBMIT_RETRY_TIMEOUT_MS: "200",
           }),
         });
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1"))).toHaveLength(1); // text still sent once
-        const enters = lines.filter((l) => l === "pane send-keys FIX:root1 Enter");
-        expect(enters.length).toBeGreaterThanOrEqual(3); // the initial Enter + clocked resends
-        expect(stderr).toContain("submit not confirmed on FIX:root1 within 200ms after");
-        expect(stderr).toContain("press Enter there manually to start the round");
-        // Deterministic tail: with poll 20 / retry 40 / window 200 the last
-        // iteration observes (no Enter fires past the window), so the log
-        // ends on a read.
-        expect(lines[lines.length - 1]).toMatch(/^pane read FIX:root1 /);
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1);
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 printf 'TUT-DELIVERY-PROBE-"))).toHaveLength(0);
+        expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(1);
+        expect(stderr).toMatch(/probe-result pane=FIX:root1 attempt=1 .*dispatch=unavailable found=false /u);
+        expect(stderr).toMatch(/submit-confirmed pane=FIX:root1 attempt=1 phase=verify /u);
+        expect(stderr).not.toContain("submit not confirmed");
       } finally {
         rmSync(log, { force: true });
       }
@@ -651,11 +663,70 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
   );
 
   it(
-    "land-confirm timeout degrades: note + submit anyway (never worse than the open loop)",
+    "resend window exhaustion: box never clears → clocked bounded resends, manual-fallback note, STILL EXIT 0",
     async () => {
-      // The text never visibly lands within TUT_TEXT_LAND_TIMEOUT_MS (4
-      // polls here): stderr note, then the submit loop runs as usual and
-      // verifies against the unchanged screen.
+      // Nothing ever lets go of the text (dead screen): the loop resends
+      // Enter on the clock inside the ONE shared budget (the 40ms initial
+      // window only consumes part of it — no window is re-armed), then
+      // points the human at the input box and still exits 0 — a failure
+      // exit would re-enter (duplicate birth), the worse outcome the
+      // design rejects.
+      const boot = JSON.stringify(["", "", "ui", "ui", "ui", "ui"]);
+      const enterScreens = JSON.stringify([`ui ▎${PROMPT_MARK}`]); // last screen repeats: held forever
+      const log = path.join(os.tmpdir(), `tut-exhaust-${process.pid}.log`);
+      rmSync(log, { force: true });
+      try {
+        const { stderr } = await runLaunch(LAUNCH_SH, ["t-ex", "architect", "pi"], {
+          env: liveEnv({
+            TUT_HERDR_LOG: log,
+            TUT_HERDR_READ_SCRIPT: boot,
+            TUT_HERDR_READ_ENTER_SCRIPT: enterScreens,
+            TUT_SUBMIT_TIMEOUT_MS: "40",
+            TUT_SUBMIT_RETRY_TIMEOUT_MS: "1000",
+          }),
+        });
+        const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1); // text still sent once
+        const enters = lines.filter((l) => l === "pane send-keys FIX:root1 Enter");
+        expect(enters.length).toBeGreaterThanOrEqual(3); // the initial Enter + clocked resends, all inside one budget
+        expect(stderr).toContain("submit not confirmed on FIX:root1 within 1000ms after");
+        // Evidence-honest guidance, timing-dependent which one: a tail read
+        // keeps the box "held" (manual-Enter note), but an in-flight last
+        // Enter (legal: started inside, returned past the deadline)
+        // honestly degrades the evidence to unknown (check-the-pane note).
+        // Both are correct; a blind Enter hint must never appear.
+        expect(
+          stderr.includes("press Enter there manually to start the round") ||
+            stderr.includes("inspect the pane and press Enter there manually only if the prompt is still visible"),
+        ).toBe(true);
+        // Tail shape is timing-legal BOTH ways: a normal exhaustion ends on
+        // an observation read, but an Enter that STARTED inside the budget
+        // may legitimately return after it (in-flight tail — no probe or
+        // read may follow it past the deadline). Assert the real invariants
+        // instead of freezing the tail: the run still exits 0 (execFile
+        // rejects any non-zero exit, so reaching these lines IS that check)
+        // and the resends are bounded.
+        const last = lines[lines.length - 1] ?? "";
+        expect(last.startsWith("pane read FIX:root1 ") || last === "pane send-keys FIX:root1 Enter").toBe(true);
+        // Hard bound: resends are ≥ TUT_SUBMIT_RETRY_MS (40ms) apart inside
+        // the 1000ms budget → at most 1 + ⌊1000/40⌋ Enters can ever fire.
+        expect(enters.length).toBeLessThanOrEqual(26);
+      } finally {
+        rmSync(log, { force: true });
+      }
+    },
+    15_000,
+  );
+
+  it(
+    "land-confirm timeout degrades to the honest never-landed path: observe-only wait, zero Enter, give-up + escalation",
+    async () => {
+      // The prompt text never appears within TUT_TEXT_LAND_TIMEOUT_MS (the
+      // screen repaints WITHOUT the text — the old any-change criterion
+      // took that as a landed prompt): honest stderr note, then the submit
+      // loop runs degraded (box evidence stays unknown until the text is
+      // seen), resends Enter on the clock, and gives up with
+      // land-never-observed — still exit 0.
       const screens = JSON.stringify([
         "",
         "",
@@ -673,11 +744,12 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
         const { stderr } = await runLaunch(LAUNCH_SH, ["t-lt", "architect", "pi"], {
           env: liveEnv({ TUT_HERDR_LOG: log, TUT_HERDR_READ_SCRIPT: screens, TUT_TEXT_LAND_TIMEOUT_MS: "80" }),
         });
-        expect(stderr).toContain("text landing not observed on FIX:root1 within 80ms — submitting anyway");
-        expect(stderr).not.toContain("resending"); // the submit itself verified on the first Enter
+        expect(stderr).toContain("prompt text not observed on FIX:root1 within 80ms — the receiver may not accept input yet; entering the no-blind-Enter wait (Enter only after the text is observed)");
+        expect(stderr).toContain("submit not confirmed on FIX:root1 within 800ms after 0 Enters");
+        expect(stderr).toContain("the prompt text was never observed on screen; no Enter was sent");
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(1);
-        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1"))).toHaveLength(1);
+        expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(0); // NO blind Enter onto a possibly-modal screen
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1); // text never re-sent
       } finally {
         rmSync(log, { force: true });
       }
@@ -696,18 +768,19 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
             TUT_HERDR_LOG: log,
             TUT_HERDR_PANE_READ: "", // never paints → every step times out
             TUT_READY_TIMEOUT_MS: "120",
-            TUT_SUBMIT_RETRY_TIMEOUT_MS: "100",
+            TUT_SUBMIT_TIMEOUT_MS: "20",
+            TUT_SUBMIT_RETRY_TIMEOUT_MS: "1200",
           }),
         });
         // All three degradation notes, in the pipeline's order.
         expect(stderr).toContain("not observed ready within 120ms — delivering anyway");
-        expect(stderr).toContain("text landing not observed on FIX:root1 within 200ms — submitting anyway");
-        expect(stderr).toContain("submit not confirmed on FIX:root1 within 100ms after");
+        expect(stderr).toContain("prompt text not observed on FIX:root1 within 200ms — the receiver may not accept input yet; entering the no-blind-Enter wait (Enter only after the text is observed)");
+        expect(stderr).toContain("submit not confirmed on FIX:root1 within 1200ms after 0 Enters");
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1"))).toHaveLength(1);
-        // The empty-screen path can never confirm (an empty read is a
-        // glitch, not a cleared box) — so the bounded loop DID resend.
-        expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter").length).toBeGreaterThanOrEqual(2);
+        expect(lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"))).toHaveLength(1);
+        // The text never appeared, so NO Enter ever fired (the blind-Enter
+        // lesson): the wait loop burns the budget on reads only.
+        expect(lines.filter((l) => l === "pane send-keys FIX:root1 Enter")).toHaveLength(0);
       } finally {
         rmSync(log, { force: true });
       }
@@ -730,13 +803,16 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
     TUT_SPLIT_BASE: "w9:p0",
     TUT_HUB_URL: "http://127.0.0.1:1",
     TUT_USER_CONFIG_DIR: mkdtempSync(path.join(os.tmpdir(), "tut-diag-l2-")),
+    TUT_DELIVERY_NONCE: "A1B2C3D4",
     TUT_READY_POLL_MS: "20",
     TUT_READY_FLOOR_MS: "0",
     TUT_READY_TIMEOUT_MS: "4000",
     TUT_TEXT_LAND_TIMEOUT_MS: "200",
     TUT_SUBMIT_TIMEOUT_MS: "100",
     TUT_SUBMIT_RETRY_MS: "40",
-    TUT_SUBMIT_RETRY_TIMEOUT_MS: "400",
+    // ONE shared submit budget; sized like the delivery-tail describe above
+    // to absorb fixture-call latency under full-suite load.
+    TUT_SUBMIT_RETRY_TIMEOUT_MS: "800",
     ...extra,
   });
 
@@ -755,8 +831,11 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
               "pi TUI ready — status 0.0%",
               "pi TUI ready — status 0.0%",
               "pi TUI ready — status 0.0%",
-              "pi TUI ready ▎prompt",
-              "pi TUI ready ▎prompt",
+              "pi TUI ready — status 0.0%",
+              // One non-matching repaint first: the land loop's read line is
+              // part of the covered event chain, then the fragment matches.
+              "pi TUI ready — repaint",
+              `pi TUI ready ▎${PROMPT_MARK}`,
               "working — round started",
             ]),
           }),
@@ -771,6 +850,8 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
         expect(events.some((e) => e.startsWith("read pane=FIX:root1 step=gate "))).toBe(true);
         expect(events.some((e) => e.startsWith("gate-release pane=FIX:root1"))).toBe(true);
         expect(events.some((e) => e.startsWith("send-text pane=FIX:root1 branch=born "))).toBe(true);
+        expect(events.some((e) => /^probe-send pane=FIX:root1 attempt=1 phase=initial marker=TUT-DELIVERY-PROBE-[0-9A-F]{8}$/u.test(e))).toBe(true);
+        expect(events.some((e) => /^probe-result pane=FIX:root1 attempt=1 phase=initial marker=TUT-DELIVERY-PROBE-[0-9A-F]{8} dispatch=unavailable found=false /u.test(e))).toBe(true);
         expect(events.some((e) => e.startsWith("read pane=FIX:root1 step=land "))).toBe(true);
         expect(events.some((e) => e.startsWith("land-observed pane=FIX:root1"))).toBe(true);
         expect(events.some((e) => e.startsWith("enter pane=FIX:root1 attempt=1 "))).toBe(true);
@@ -800,10 +881,10 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
       // The same swallowed-once-then-commit scenario with the diagnostics
       // off: same Enter count, same success — observation never gates
       // behavior (the loop ignores the diag lines entirely).
-      const boot = JSON.stringify(["", "", "codex shell", "codex shell"]);
+      const boot = JSON.stringify(["", "", "codex shell", "codex shell", "codex shell", "codex shell"]);
       const enterScreens = JSON.stringify([
-        "codex shell ▎prompt",
-        "codex shell ▎prompt",
+        `codex shell ▎${PROMPT_MARK}`,
+        `codex shell ▎${PROMPT_MARK}`,
         "codex working — round started",
       ]);
       const runOnce = async (knob: string) => {
@@ -832,10 +913,11 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
       expect(on.diag).toBeGreaterThan(0);
       expect(off.diag).toBe(0);
       const shape = (lines: string[]) => ({
-        texts: lines.filter((l) => l.startsWith("pane send-text")).length,
+        promptTexts: lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了")).length,
+        probeTexts: lines.filter((l) => l.startsWith("pane send-text FIX:root1 printf 'TUT-DELIVERY-PROBE-")).length,
         enters: lines.filter((l) => l === "pane send-keys FIX:root1 Enter").length,
       });
-      expect(shape(on.lines)).toEqual({ texts: 1, enters: 2 });
+      expect(shape(on.lines)).toEqual({ promptTexts: 1, probeTexts: 0, enters: 2 });
       expect(shape(off.lines)).toEqual(shape(on.lines)); // identical delivery
       expect(off.confirmed).toBe(true); // off still succeeds the same way
     },
@@ -854,7 +936,16 @@ describe("launch.sh delivery diagnostics (tut-delivery timeline)", () => {
       const proj = mkdtempSync(path.join(os.tmpdir(), "tut-diag-persist-"));
       const log = path.join(os.tmpdir(), `tut-diag-persist-${process.pid}.log`);
       rmSync(log, { force: true });
-      const boot = JSON.stringify(["", "", "ui", "ui", "ui ▎prompt", "working — round started"]);
+      const boot = JSON.stringify([
+        "",
+        "",
+        "ui",
+        "ui",
+        "ui",
+        "ui",
+        `ui ▎${PROMPT_MARK}`,
+        "working — round started",
+      ]);
       try {
         const { stderr } = await runLaunch(LAUNCH_SH, ["t-pr", "architect", "pi"], {
           env: liveEnv({

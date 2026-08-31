@@ -28,6 +28,15 @@
  * check / marker append — not whitelisted ⇒ no launch, NO launch marker (a
  * withheld round must never block the human's `tut start-next`), notify the
  * human instead. Absent/empty list withholds everything (conservative default).
+ *
+ * Observability: acting stays edge-triggered, but every auto-mode poll
+ * also logs ONE decision line per agent:*-waiting task (who it waits for,
+ * each gate check, the dedup result, the action this poll takes and why) so
+ * a silently-withheld round is greppable and the timeline rebuildable;
+ * flow_mode is logged on change and echoed periodically; reverse-lookup-miss
+ * agent events are rate-limited per source (first of a window degrades as
+ * before, the rest aggregate) so an unlabeled pane's status flapping cannot
+ * flood the notify log.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -42,6 +51,8 @@ import {
   type LaunchVia,
 } from "./launch.js";
 import { commandHead, commandArgs } from "./agent-command.js";
+import type { GiveUpBoxEvidence, GiveUpProbeEvidence } from "./launcher/escalation.js";
+import { giveUpGuidance } from "./launcher/escalation.js";
 import { assertLaunchStateGate, bindLaunchBaseVersion, buildLaunchInvocation } from "./launcher/invocation.js";
 import {
   AgentTargetError,
@@ -53,7 +64,7 @@ import {
 import { runInternalLaunch, runInternalLaunchInvocation, spawnDirect } from "./launcher/process.js";
 import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
 import { HerdrClient } from "./launcher/herdr-client.js";
-import type { AgentCommand, AgentRoute, Cast, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "./types.js";
+import type { AgentCommand, AgentRoute, Cast, CheckoutRoute, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "./types.js";
 import {
   KNOWN_ROLES,
   defaultUserConfigDir,
@@ -95,6 +106,8 @@ export interface StateTask {
   version?: number;
   /** Task's per-role cast overrides (absent on older hubs/fixtures). */
   cast?: Cast;
+  /** Task-frozen checkout route (absent on older hubs/fixtures = current). */
+  checkout?: CheckoutRoute;
 }
 
 /** The optional /state `auto` section: the launch whitelist.
@@ -114,9 +127,43 @@ export interface StateResponse {
 }
 
 export interface AgentEvent {
-  event: "working" | "blocked" | "done";
+  /**
+   * working / blocked / done are the agent-status events (Herdr signal
+   * source).  delivery_giveup is emitted by the LAUNCHER (7.2.1): its
+   * bounded submit-retry window exhausted.  What happened to the prompt
+   * is in the optional evidence fields below — the alert copy follows
+   * them, never a fixed "press Enter" claim.
+   */
+  event: "working" | "blocked" | "done" | "delivery_giveup";
   agent: string;
   pane: string;
+  /** Give-up evidence (7.2.1 additive fields, launcher-emitted only):
+   *  the last input-box observation and the last Enter transport result;
+   *  `probe` is the relay's diagnostic visibility.  Legacy give-up
+   *  events without them degrade to the conservative inspect-the-pane
+   *  hint. */
+  box?: GiveUpBoxEvidence;
+  transport?: boolean;
+  probe?: GiveUpProbeEvidence;
+}
+
+/**
+ * Give-up alert copy follows the launcher's three-state evidence
+ * discipline word for word (7.2.1 step 5) by consuming the SAME
+ * single-source guidance as the launcher's stderr (giveUpGuidance).
+ * The required core evidence pair `box + transport` is ATOMIC: only a
+ * complete, well-typed pair may drive the copy — a half-valid payload
+ * (one field present, the other missing or ill-typed) or box=unknown
+ * itself degrades to the conservative inspect-the-pane hint, never a
+ * blind "press Enter".  `probe` stays optional and never gates the
+ * copy.
+ */
+function deliveryGiveUpHint(evt: Pick<AgentEvent, "box" | "transport">): string {
+  const box = evt.box;
+  if ((box !== "held" && box !== "cleared" && box !== "unknown") || typeof evt.transport !== "boolean" || box === "unknown") {
+    return `box evidence unavailable — ${giveUpGuidance("unknown")}`;
+  }
+  return giveUpGuidance(box);
 }
 
 /** A pane-list row consumed by the done-event sweep (system-design 4.4). */
@@ -144,6 +191,19 @@ interface InFlightLaunch {
   role: string;
   agent: string;
   launchVersion?: number;
+}
+
+/** Rate-limit bookkeeping for one unmatched-event source (unmatched-event rate limit). */
+interface UnmatchedSource {
+  /** When the last degradation line was emitted for this source. */
+  lastEmitAt: number;
+  /** Events suppressed since the last emit (aggregate payload). */
+  suppressed: number;
+  byEvent: Map<string, number>;
+  /** Fires at window expiry — `lastEmitAt + WINDOW` — flushing any pending
+   *  aggregate (a silent flapping source still gets its line) and evicting
+   *  the now-idle source entry. One timer per source at most. */
+  flushTimer?: ReturnType<typeof setTimeout> | undefined;
 }
 
 export interface NotifierDeps {
@@ -377,6 +437,15 @@ function versionOf(value: unknown): number | undefined {
 /** Keep approval alerts useful in desktop surfaces with a bounded title body. */
 const PENDING_APPROVAL_TITLE_LIMIT = 72;
 
+/** Unmatched (reverse-lookup-miss) events from one source (pane+
+ *  agent) emit their degradation line/notify once per window; the rest of
+ *  the window only counts toward the next aggregate line. */
+const UNMATCHED_EVENT_WINDOW_MS = 60_000;
+
+/** An unchanged flow_mode is re-echoed at most this often, so the
+ *  tail of the notify log always answers "what mode are we in". */
+const FLOW_MODE_ECHO_INTERVAL_MS = 5 * 60_000;
+
 function truncatePendingApprovalTitle(title: string): string {
   return title.length <= PENDING_APPROVAL_TITLE_LIMIT
     ? title
@@ -514,6 +583,12 @@ export class Notifier {
   private consecutiveFailures = 0;
   /** Routing maps for the event reverse lookup; null until first load. */
   private routing: RoutingMaps | null = null;
+  /** Last observed flow_mode; null before the first successful fetch. */
+  private lastFlowMode: string | null = null;
+  /** When the last flow_mode line (change or echo) was logged. */
+  private lastModeEchoAt = 0;
+  /** Rate-limit state per unmatched-event source (key: pane + agent). */
+  private unmatchedSources = new Map<string, UnmatchedSource>();
 
   // Serial-compare queue: `pending` coalesces, `drain` is the in-flight cycle.
   private pending = false;
@@ -531,6 +606,16 @@ export class Notifier {
   private inFlightLaunches = new Map<string, InFlightLaunch>();
   /** Working signals observed while the launcher was still completing. */
   private earlyWorkingSignals = new Map<string, AgentEvent>();
+  /**
+   * Delivery give-ups observed while the launcher was still completing
+   * (the launcher emits the event before its child exits, so in the real
+   * auto sequence the give-up ALWAYS beats the launch return).  Consumed
+   * when the launch returns: the short working fuse is NOT armed — the
+   * give-up alert already reported this round's fate, and a generic
+   * "no working signal" alarm five minutes later would be a false
+   * duplicate.  Entry is dropped if the launch fails (nothing to suppress).
+   */
+  private earlyGiveUps = new Map<string, AgentEvent>();
   /** Working events that arrived before the next poll exposed their task. */
   private unresolvedWorkingEvents = new Set<string>();
   /**
@@ -653,6 +738,10 @@ export class Notifier {
       if (!this.snapshot.has(taskId)) this.pendingApprovalTasks.delete(taskId);
     }
     await this.retireObsoleteWorkingWatches(this.snapshot);
+    // Mode visibility — a switch logs immediately, an unchanged mode
+    // is re-echoed periodically (below the baseline branch so the baseline
+    // line itself stays the first mode statement of a session).
+    this.observeFlowMode(state.flow_mode, now);
 
     if (prev === null) {
       // First successful fetch: baseline, no notifications.
@@ -662,9 +751,16 @@ export class Notifier {
         if (t.status === "pending_approval") this.pendingApprovalTasks.add(t.task_id);
       }
       this.log(`baseline: ${state.tasks.length} task(s), flow_mode=${state.flow_mode}`);
+      // Decision lines on the baseline poll too — a task that is
+      // ALREADY agent-waiting when the notifier (re)starts is exactly the
+      // silent-door shape; its "no action, and why" must be visible.
+      if (state.flow_mode === "auto") await this.logAutoDecisions(null, state);
       return;
     }
 
+    // Per-poll decision lines precede this poll's acting — the line
+    // announces the launch (or the reason there will be none) first.
+    if (state.flow_mode === "auto") await this.logAutoDecisions(prev, state);
     try {
       for (const after of state.tasks) {
         await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto);
@@ -819,6 +915,89 @@ export class Notifier {
     return null;
   }
 
+  /**
+   * Per-poll auto-gate observability: in auto mode every poll logs ONE
+   * decision line per agent:*-waiting task — who it waits for, each gate
+   * check (decision gate / needs_attention / whitelist), the launch dedup
+   * result, and the action this poll will (not) take with its reason.
+   * Acting itself stays edge-triggered and unchanged; the line exists so a
+   * "should have launched but zero marker zero action" round is diagnosable
+   * from the log alone (e.g. the task was already agent-waiting at baseline,
+   * or the waiting_for edge never fired across a manual→auto switch).
+   * Dedup observation re-reads the task log once per candidate per poll
+   * (local HTTP — the price of a truthful per-round 查重 result); withheld
+   * candidates (gate or whitelist) are not read at all.
+   */
+  private async logAutoDecisions(prev: ReadonlyMap<string, StateTask> | null, state: StateResponse): Promise<void> {
+    for (const task of state.tasks) {
+      if (!task.waiting_for.startsWith("agent:")) continue;
+      const role = task.waiting_for.slice("agent:".length);
+      const gate = this.autoGateReason(task);
+      const whitelisted = autoWhitelisted(state.auto, role);
+      let dedup = gate !== null ? "n/a (gate withheld)" : "n/a (not whitelisted)";
+      if (gate === null && whitelisted) {
+        try {
+          const records = await this.deps.readLog(task.task_id);
+          const blocked = launchBlocked(records, role);
+          dedup = blocked.blocked ? `launched@v${blocked.noteVersion}` : "fresh";
+        } catch (e) {
+          dedup = `unreadable (${(e as Error).message})`;
+        }
+      }
+      let action: string;
+      if (gate !== null) {
+        action = `withheld (gate: ${gate})`;
+      } else if (!whitelisted) {
+        action = `withheld (role '${role}' not in launch whitelist)`;
+      } else if (dedup === "fresh") {
+        if (prev === null) {
+          action = "none (baseline poll; acting is edge-triggered)";
+        } else {
+          const beforeWf = prev.get(task.task_id)?.waiting_for ?? "none";
+          action = beforeWf !== task.waiting_for
+            ? `launch (waiting_for edge ${beforeWf} → ${task.waiting_for})`
+            : "none (no waiting_for edge since last poll)";
+        }
+      } else if (dedup.startsWith("launched@")) {
+        action = `none (already launched; ${dedup})`;
+      } else {
+        action = `none this poll; an edge would re-read the log (dedup ${dedup})`;
+      }
+      this.log(
+        `[${task.task_id}] auto-decision: waiting_for=${task.waiting_for}` +
+          ` | gate=${gate === null ? "pass" : `blocked (${gate})`}` +
+          ` | needs_attention=${task.needs_attention}` +
+          ` | whitelist=${whitelisted ? "pass" : `fail ('${role}' not in launch_roles)`}` +
+          ` | dedup=${dedup} | action=${action}`,
+      );
+    }
+  }
+
+  /**
+   * flow_mode visibility: a mode switch logs one line immediately; an
+   * unchanged mode is re-echoed periodically (default 5 min) so the tail of
+   * the notify log always answers "what mode are we in". The first
+   * successful fetch stays silent here — the baseline line already carries
+   * flow_mode.
+   */
+  private observeFlowMode(mode: string, now: number): void {
+    if (this.lastFlowMode === null) {
+      this.lastFlowMode = mode;
+      this.lastModeEchoAt = now;
+      return;
+    }
+    if (mode !== this.lastFlowMode) {
+      this.log(`flow_mode changed: ${this.lastFlowMode} → ${mode}`);
+      this.lastFlowMode = mode;
+      this.lastModeEchoAt = now;
+      return;
+    }
+    if (now - this.lastModeEchoAt >= FLOW_MODE_ECHO_INTERVAL_MS) {
+      this.log(`flow_mode echo: ${mode}`);
+      this.lastModeEchoAt = now;
+    }
+  }
+
   private async autoLaunch(task: StateTask, role: string): Promise<void> {
     const request: LaunchRequest = {
       kind: "round",
@@ -871,6 +1050,7 @@ export class Notifier {
         caller_cwd: process.cwd(),
         env: environment,
         dry_run: environment.TUT_DRY_RUN === "1",
+        ...(task.checkout !== undefined ? { checkout: task.checkout } : {}),
       });
     } catch (e) {
       await this.autoLaunchFailed(task, role, new Error(`context planning failed: ${(e as Error).message}`));
@@ -884,6 +1064,9 @@ export class Notifier {
       workspaceSnapshot = await readWorkspaceConfigSnapshot({
         projectRoot,
         userConfigDir: defaultUserConfigDir(environment),
+        ...(executionContext.checkout.kind === "worktree" && !executionContext.hubRoot.startsWith("<")
+          ? { fallbackProjectRoot: executionContext.hubRoot }
+          : {}),
       });
     } catch (e) {
       await this.autoLaunchFailed(task, role, new Error(`workspace planning failed: ${(e as Error).message}`));
@@ -984,7 +1167,17 @@ export class Notifier {
       for (const line of out.trim().split("\n")) {
         this.log(`launch.sh (${task.task_id}, ${role})${line ? ` → ${line}` : ""}`);
       }
-      this.armWorkingWatch(task, role, agent, launchVersion);
+      // A delivery give-up that landed while this launch was in flight has
+      // already escalated this round's fate through the channels; arming the
+      // short fuse now would re-alarm the same round five minutes later as a
+      // generic "no working signal". Consume the record either way.
+      const earlyGiveUp = this.earlyGiveUps.get(launchKey);
+      this.earlyGiveUps.delete(launchKey);
+      if (earlyGiveUp !== undefined) {
+        this.log(`[${task.task_id}] short working fuse not armed: delivery gave up while the launch was completing (give-up alert already sent)`);
+      } else {
+        this.armWorkingWatch(task, role, agent, launchVersion);
+      }
       this.log(
         `[${task.task_id}] launch succeeded for ${role}; waiting for working signal within ${Math.ceil(this.workingTimeoutMs / 1000)}s`,
       );
@@ -1005,6 +1198,7 @@ export class Notifier {
     } catch (e) {
       this.inFlightLaunches.delete(launchKey);
       this.earlyWorkingSignals.delete(launchKey);
+      this.earlyGiveUps.delete(launchKey);
       await this.autoLaunchFailed(task, role, e);
     }
   }
@@ -1201,6 +1395,65 @@ export class Notifier {
     });
   }
 
+  /**
+   * Delivery give-up escalation (7.2.1): the launcher exhausted its bounded
+   * submit-retry window and the submit stayed unconfirmed — whether the
+   * prompt still sits in the pane's input box is exactly what the event's
+   * evidence fields (box/transport/probe) report.  Escalate through the
+   * configured channels IMMEDIATELY (the gap this closes: without it,
+   * nobody outside the machine learns until the 30-minute stall watchdog
+   * fires); the alert copy branches on that evidence per
+   * deliveryGiveUpHint — never a blind "press Enter".
+   *
+   * Deliberately does NOT mark progress: a give-up is the opposite of
+   * progress, so the stall watchdog keeps its clock as the backstop
+   * reminder.  A matching live working watch IS disarmed — the give-up
+   * alert is the "no working signal" report with better precision than the
+   * generic short fuse; if the human presses Enter afterwards, the late
+   * working signal still marks progress like any unwatched round.
+   */
+  private async handleDeliveryGiveUp(evt: AgentEvent, taskId: string | null): Promise<void> {
+    if (taskId === null) {
+      // Same rate-limited degradation as the other unmatched events.
+      const agg = this.rateLimitUnmatched(evt);
+      if (agg !== null) {
+        this.log(`delivery give-up event pane '${evt.pane}' matches no task (4.4 convention broken)${agg}`);
+        void this.sendAll({
+          title: `TUT ${evt.pane}: prompt delivery gave up`,
+          body: `Prompt delivery to pane ${evt.pane} gave up — ${deliveryGiveUpHint(evt)}`,
+        });
+      }
+      return;
+    }
+    const hit = await this.workingWatchForEvent(evt, taskId);
+    if (hit !== undefined) {
+      this.clearWorkingWatch(hit.key);
+      this.log(`[${taskId}] delivery give-up received for ${hit.watch.role}; short working fuse disarmed (this alert replaces it)`);
+    } else {
+      // Real auto ordering: the launcher child emits this event BEFORE it
+      // exits, so the give-up beats the launch return — no live watch yet.
+      // Record against the in-flight launch so the fuse is never armed for
+      // this round (same shape as earlyWorkingSignals). No markProgress:
+      // the stall watchdog keeps its clock.
+      const inFlight = await this.inFlightLaunchForEvent(evt, taskId);
+      if (inFlight !== undefined) {
+        this.earlyGiveUps.set(inFlight.key, evt);
+        this.log(`[${taskId}] delivery give-up arrived while the ${inFlight.launch.role} launch was still completing; short fuse will not be armed`);
+      }
+    }
+    const paneRole = this.roundRoleFromPane(taskId, evt.pane);
+    const roleSeg = paneRole !== undefined ? ` for ${paneRole}` : "";
+    const via = taskId !== evt.pane ? ` (pane ${evt.pane})` : "";
+    const hint = deliveryGiveUpHint(evt);
+    this.log(`[${taskId}] delivery gave up${roleSeg}${via} — ${hint}`);
+    const title = this.snapshot?.get(taskId)?.title ?? taskId;
+    await this.sendAll({
+      title: `TUT ${taskId}: prompt delivery gave up`,
+      body: `${title} — prompt delivery${roleSeg}${via} gave up: ${hint}`,
+      task_id: taskId,
+    });
+  }
+
   private async handleWorkingTimeout(key: string, watch: WorkingWatch): Promise<void> {
     // A publish/decision may have advanced or closed the task while the
     // signal was in flight. In that case the workflow itself is evidence of
@@ -1231,7 +1484,11 @@ export class Notifier {
           await this.handleWorkingSignal(evt, taskId);
           return;
         }
-        this.log(`working event pane '${evt.pane}' resolves to no task; stall refresh skipped`);
+        // Still unmatched after the catch-up compare — rate-limited.
+        const agg = this.rateLimitUnmatched(evt);
+        if (agg !== null) {
+          this.log(`working event pane '${evt.pane}' resolves to no task; stall refresh skipped${agg}`);
+        }
       })
       .catch((e: unknown) => {
         this.unresolvedWorkingEvents.delete(key);
@@ -1343,6 +1600,93 @@ export class Notifier {
     return waiting[0]?.task_id ?? null;
   }
 
+  /**
+   * Unmatched-event rate limit: reverse-lookup-miss events from one
+   * source (pane+agent) keep their FIRST degradation line/notify of a window
+   * exactly as before; further events inside the window (default 60s) are
+   * only counted — the pending count flushes as ONE aggregate log line when
+   * the next event escapes the window (suffixed to its emitting line) or the
+   * fallback timer fires at window expiry — one window after the last EMIT,
+   * so a mid-window burst cannot push the deadline out (sources that go
+   * silent still get their aggregate). The timer also evicts the idle source
+   * entry after firing, keeping `timers`/`unmatchedSources` bounded over long
+   * runs. Returns the suffix for the emitting
+   * line ("" for a plain first event) or null when this event is suppressed
+   * (no log, no channel notify; the caller's immediate-compare side effect
+   * is deliberately NOT suppressed). Matched events never pass through here.
+   */
+  private rateLimitUnmatched(evt: AgentEvent): string | null {
+    const key = `${evt.pane}\u0000${evt.agent}`;
+    const now = this.deps.now();
+    let source = this.unmatchedSources.get(key);
+    if (source === undefined) {
+      source = { lastEmitAt: Number.NEGATIVE_INFINITY, suppressed: 0, byEvent: new Map() };
+      this.unmatchedSources.set(key, source);
+    }
+    if (now - source.lastEmitAt < UNMATCHED_EVENT_WINDOW_MS) {
+      source.suppressed += 1;
+      source.byEvent.set(evt.event, (source.byEvent.get(evt.event) ?? 0) + 1);
+      this.armUnmatchedFlushTimer(key, source, now); // no-op when already armed
+      return null;
+    }
+    const suffix = source.suppressed > 0
+      ? ` (+${source.suppressed} suppressed in window: ${this.describeUnmatchedMix(source)})`
+      : "";
+    source.lastEmitAt = now;
+    source.suppressed = 0;
+    source.byEvent.clear();
+    this.clearUnmatchedFlushTimer(source);
+    // Arm even with nothing pending: the expiry callback doubles as idle-source
+    // eviction, so a source that emits once and goes silent is also reclaimed.
+    this.armUnmatchedFlushTimer(key, source, now);
+    return suffix;
+  }
+
+  /**
+   * Arms the per-source fallback timer to fire exactly when the current
+   * window expires: `lastEmitAt + UNMATCHED_EVENT_WINDOW_MS - now` from now
+   * (clamped at 0) — NOT a fresh full window from the arming moment, so a
+   * burst arriving mid-window is still flushed on the original schedule. On
+   * expiry the callback (log-only) flushes any pending aggregate, removes its
+   * own handle from `timers` (spent handles must not linger), and deletes the
+   * — by then idle — source entry: a future event from this source escapes
+   * the expired window and starts fresh, so neither structure grows across
+   * long runs.
+   */
+  private armUnmatchedFlushTimer(key: string, source: UnmatchedSource, now: number): void {
+    if (source.flushTimer !== undefined) return;
+    const delay = Math.max(0, source.lastEmitAt + UNMATCHED_EVENT_WINDOW_MS - now);
+    const [pane, agent] = key.split("\u0000");
+    const timer = setTimeout(() => {
+      source.flushTimer = undefined;
+      this.timers.delete(timer);
+      if (source.suppressed > 0) {
+        this.log(
+          `unmatched events pane '${pane}' (agent '${agent}'): ` +
+            `${source.suppressed} further event(s) suppressed in the rate-limit window (${this.describeUnmatchedMix(source)})`,
+        );
+        source.suppressed = 0;
+        source.byEvent.clear();
+      }
+      // Evict the idle entry (guard: only delete what we still own — close()
+      // clears the map outright, a replaced entry is not ours to take).
+      if (this.unmatchedSources.get(key) === source) this.unmatchedSources.delete(key);
+    }, delay);
+    this.timers.add(timer);
+    source.flushTimer = timer;
+  }
+
+  private describeUnmatchedMix(source: UnmatchedSource): string {
+    return [...source.byEvent.entries()].map(([event, count]) => `${event}×${count}`).join(", ");
+  }
+
+  private clearUnmatchedFlushTimer(source: UnmatchedSource): void {
+    if (source.flushTimer === undefined) return;
+    clearTimeout(source.flushTimer);
+    this.timers.delete(source.flushTimer);
+    source.flushTimer = undefined;
+  }
+
   /** Handles a validated event; safe to call from the HTTP handler directly. */
   receiveEvent(evt: AgentEvent): void {
     const taskId = this.resolveEventTask(evt.pane);
@@ -1362,23 +1706,37 @@ export class Notifier {
       case "blocked": {
         // An observed signal refreshes the stall timer too (judgment: a stuck
         // agent is alive; a stall reminder right after this would be noise).
-        const known = taskId !== null;
-        if (known) this.markProgress(taskId, this.deps.now());
-        else this.log(`blocked event pane '${evt.pane}' matches no task (4.4 convention broken)`);
         // blocked is an追加触发 immediate compare (system-design 6.1):
         // the stuck agent may have just published; a compare picks it up now.
+        // The UNMATCHED degradation (log + notify) is rate-limited
+        // per source — the immediate compare above is never suppressed.
+        if (taskId !== null) {
+          this.markProgress(taskId, this.deps.now());
+          void this.sendAll({
+            title: `TUT ${taskId}: agent stuck`,
+            body: `Agent ${evt.agent} appears blocked in pane ${evt.pane}${taskId !== evt.pane ? ` (task ${taskId})` : ""}`,
+            // task_id only when a task was really resolved — an unmatched pane
+            // name is not a task id, and the body already carries it.
+            task_id: taskId,
+          });
+        } else {
+          const agg = this.rateLimitUnmatched(evt);
+          if (agg !== null) {
+            this.log(`blocked event pane '${evt.pane}' matches no task (4.4 convention broken)${agg}`);
+            void this.sendAll({
+              title: `TUT ${evt.pane}: agent stuck`,
+              body: `Agent ${evt.agent} appears blocked in pane ${evt.pane}`,
+            });
+          }
+        }
         void this.requestCompare();
-        void this.sendAll({
-          title: `TUT ${known ? taskId : evt.pane}: agent stuck`,
-          body: `Agent ${evt.agent} appears blocked in pane ${evt.pane}${known && taskId !== evt.pane ? ` (task ${taskId})` : ""}`,
-          // task_id only when a task was really resolved — an unmatched pane
-          // name is not a task id, and the body already carries it.
-          ...(known ? { task_id: taskId } : {}),
-        });
         return;
       }
       case "done":
         void this.handleDone(evt, taskId);
+        return;
+      case "delivery_giveup":
+        void this.handleDeliveryGiveUp(evt, taskId);
         return;
     }
   }
@@ -1397,7 +1755,12 @@ export class Notifier {
    */
   private async handleDone(evt: AgentEvent, taskId: string | null): Promise<void> {
     if (taskId === null) {
-      this.log(`done event pane '${evt.pane}' matches no task (4.4 convention broken); degrading to compare`);
+      // The degradation LINE is rate-limited per source; the
+      // degrading compare itself always runs.
+      const agg = this.rateLimitUnmatched(evt);
+      if (agg !== null) {
+        this.log(`done event pane '${evt.pane}' matches no task (4.4 convention broken); degrading to compare${agg}`);
+      }
       await this.requestCompare();
       return;
     }
@@ -1556,18 +1919,43 @@ export class Notifier {
       sendJson(res, 400, { error: "invalid JSON" });
       return;
     }
-    const evt = parsed as { event?: unknown; agent?: unknown; pane?: unknown };
+    const evt = parsed as {
+      event?: unknown;
+      agent?: unknown;
+      pane?: unknown;
+      box?: unknown;
+      transport?: unknown;
+      probe?: unknown;
+    };
     if (typeof evt.event !== "string" || typeof evt.agent !== "string" || typeof evt.pane !== "string") {
       this.log("ignoring event with invalid shape (need string event/agent/pane)");
       sendJson(res, 400, { error: "invalid event shape" });
       return;
     }
-    if (evt.event !== "working" && evt.event !== "blocked" && evt.event !== "done") {
+    if (evt.event !== "working" && evt.event !== "blocked" && evt.event !== "done" && evt.event !== "delivery_giveup") {
       this.log(`ignoring unknown event: ${evt.event}`);
       sendJson(res, 200, { ok: true, ignored: true });
       return;
     }
-    this.receiveEvent({ event: evt.event, agent: evt.agent, pane: evt.pane });
+    // Give-up evidence (7.2.1 additive fields): the required core pair
+    // box + transport is normalized ATOMICALLY — both pass through only
+    // when both are well-typed; a half-valid payload degrades to no
+    // evidence (conservative hint), never to a trusted box.  probe is
+    // optional and independent; legacy three-field bodies and typo'd
+    // fields drop out the same way.
+    const box = evt.box;
+    const transport = evt.transport;
+    const atomic = (box === "held" || box === "cleared" || box === "unknown") && typeof transport === "boolean";
+    const probe =
+      evt.probe === "observed" || evt.probe === "failed" || evt.probe === "unavailable" ? evt.probe : undefined;
+    this.receiveEvent({
+      event: evt.event,
+      agent: evt.agent,
+      pane: evt.pane,
+      ...(atomic ? { box } : {}),
+      ...(atomic ? { transport } : {}),
+      ...(probe === undefined ? {} : { probe }),
+    });
     sendJson(res, 200, { ok: true });
   }
 
@@ -1590,9 +1978,11 @@ export class Notifier {
     this.workingWatches.clear();
     this.inFlightLaunches.clear();
     this.earlyWorkingSignals.clear();
+    this.earlyGiveUps.clear();
     this.unresolvedWorkingEvents.clear();
     this.pendingApprovalTasks.clear();
     this.sweepBarriers.clear();
+    this.unmatchedSources.clear();
     const server = this.server;
     this.server = null;
     if (server !== null) {

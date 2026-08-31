@@ -9,11 +9,10 @@
 import path from "node:path";
 import { HerdrClient, type HerdrPane } from "./herdr-client.js";
 import {
-  assertCurrentCheckout,
   resolveCheckout,
   type CheckoutProvider,
 } from "./checkout.js";
-import type { ExecutionContext, LaunchAnchor } from "../types.js";
+import type { CheckoutRoute, ExecutionContext, LaunchAnchor } from "../types.js";
 
 export type AnchorSource = "tut-hub" | "tut-notify" | "split-base";
 
@@ -46,7 +45,11 @@ export interface ResolveExecutionContextOptions {
   /** Explicit dry-run switch; otherwise TUT_DRY_RUN === "1". */
   dry_run?: boolean;
   dryRun?: boolean;
-  /** Checkout seam; defaults to the current-only provider (design §6). */
+  /** Task-frozen checkout route; absent keeps the current checkout. */
+  checkout?: CheckoutRoute;
+  /** Programmatic alias for checkout. */
+  checkoutRoute?: CheckoutRoute;
+  /** Checkout seam; defaults to the explicit-path provider. */
   checkoutProvider?: CheckoutProvider;
 }
 
@@ -138,20 +141,26 @@ export async function resolveWorkspaceSnapshot(
 
   const selected = selectAnchor(panes, environment.TUT_SPLIT_BASE);
   // The checkout seam is resolved inside the one-shot context snapshot:
-  // current keeps hubRoot=checkoutRoot=anchor.cwd; routingRoot may differ via
-  // TUT_PROJECT_ROOT.  A future provider refusing loudly is fail-closed.
+  // current keeps hubRoot=checkoutRoot=anchor.cwd; a worktree changes only
+  // checkoutRoot, while routingRoot still follows TUT_PROJECT_ROOT or the
+  // shared hub root.  Include caller cwd only when an explicit route needs a
+  // relative path; the no-route call shape stays backward compatible.
+  const requestedCheckout = options.checkoutRoute ?? options.checkout;
+  const checkoutInput = {
+    ...(selected?.anchor.cwd !== undefined ? { anchorCwd: selected.anchor.cwd } : {}),
+    ...(requestedCheckout !== undefined ? { checkout: requestedCheckout, baseCwd: caller } : {}),
+  };
   const checkout = await resolveCheckout(
-    { ...(selected?.anchor.cwd !== undefined ? { anchorCwd: selected.anchor.cwd } : {}) },
+    checkoutInput,
     options.checkoutProvider,
   );
-  assertCurrentCheckout(checkout);
   const context: ExecutionContext = selected === undefined
     ? {
         ...(dryRun ? { anchor: PLACEHOLDER_ANCHOR } : {}),
         hubRoot: checkout.hubRoot,
         routingRoot: configuredRoot ?? "<routing-root>",
         checkoutRoot: checkout.checkoutRoot,
-        checkout: { kind: "current" },
+        checkout: checkout.checkout,
         context: { kind: "shared" },
         source: dryRun ? "placeholder" : "legacy",
         caller_cwd: caller,
@@ -162,7 +171,7 @@ export async function resolveWorkspaceSnapshot(
         hubRoot: checkout.hubRoot,
         routingRoot: configuredRoot ?? checkout.hubRoot,
         checkoutRoot: checkout.checkoutRoot,
-        checkout: { kind: "current" },
+        checkout: checkout.checkout,
         context: { kind: "shared" },
         source: "anchor",
       };

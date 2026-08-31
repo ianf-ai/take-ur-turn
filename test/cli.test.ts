@@ -1182,3 +1182,91 @@ describe("tut create --cast (parse + hubCreate wiring)", () => {
     }
   });
 });
+
+describe("tut create --checkout (parse + hubCreate wiring)", () => {
+  const base = ["create", "--title", "T", "--description", "D", "--creator", "C", "--role", "R"] as const;
+
+  it("parses current and explicit worktree path/ref routes", () => {
+    expect(parseArgs([...base, "--checkout", "current"])).toEqual({
+      command: "create", title: "T", description: "D", creator: "C", role: "R", checkout: { kind: "current" },
+    });
+    expect(parseArgs([...base, "--checkout", "worktree:/tmp/tut-a", "--checkout-ref", "task-a"])).toEqual({
+      command: "create", title: "T", description: "D", creator: "C", role: "R",
+      checkout: { kind: "worktree", path: "/tmp/tut-a", ref: "task-a" },
+    });
+    expect(parseArgs([...base, "--checkout", "worktree", "--checkout-path", "/tmp/tut-b"])).toMatchObject({
+      checkout: { kind: "worktree", path: "/tmp/tut-b" },
+    });
+  });
+
+  it("rejects a worktree without a path and current plus worktree fields", () => {
+    expect(parseArgs([...base, "--checkout", "worktree"]).command).toBe("usage");
+    expect(parseArgs([...base, "--checkout", "current", "--checkout-path", "/tmp/tut-c"]).command).toBe("usage");
+    // Ref-only is rejected on every spelling; the error must not guide
+    // toward ref-only usage (that route can never launch).
+    for (const args of [
+      [...base, "--checkout-ref", "task-a"],
+      [...base, "--checkout", "worktree", "--checkout-ref", "task-a"],
+      [...base, "--checkout-kind", "worktree", "--checkout-ref", "task-a"],
+      [...base, "--checkout", JSON.stringify({ kind: "worktree", ref: "task-a" })],
+    ]) {
+      const parsed = parseArgs(args);
+      expect(parsed.command).toBe("usage");
+      if (parsed.command === "usage") {
+        expect(parsed.error).toContain("requires a path");
+        // The message must not guide toward ref-only usage.
+        expect(parsed.error).not.toContain("--checkout-ref");
+      }
+    }
+  });
+
+  it("runCreate warns without blocking when the worktree path does not exist", async () => {
+    vi.mocked(hubCreate).mockResolvedValue({ task_id: "warn-1", status: "implementing", version: 0 });
+    const io = captureIo();
+    try {
+      const missing = path.join(os.tmpdir(), "tut-no-such-worktree-xyz");
+      const code = await main([...base, "--flow", "direct", "--checkout", `worktree:${missing}`]);
+      expect(code).toBe(0);
+      expect(io.out()).toBe('{"task_id":"warn-1","status":"implementing","version":0}\n');
+      expect(io.err()).toContain("warning: worktree checkout path");
+      expect(io.err()).toContain("does not exist yet");
+      expect(vi.mocked(hubCreate)).toHaveBeenCalledWith("http://127.0.0.1:3001", expect.objectContaining({
+        checkout: { kind: "worktree", path: missing },
+      }));
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("runCreate stays silent when the worktree path exists", async () => {
+    vi.mocked(hubCreate).mockResolvedValue({ task_id: "warn-0", status: "implementing", version: 0 });
+    const real = mkdtempSync(path.join(os.tmpdir(), "tut-real-worktree-"));
+    const io = captureIo();
+    try {
+      const code = await main([...base, "--flow", "direct", "--checkout", `worktree:${real}`]);
+      expect(code).toBe(0);
+      expect(io.err()).not.toContain("warning");
+    } finally {
+      io.restore();
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  it("runCreate forwards an explicit checkout route", async () => {
+    vi.mocked(hubCreate).mockResolvedValue({ task_id: "checkout-1", status: "implementing", version: 0 });
+    const io = captureIo();
+    try {
+      await main([...base, "--flow", "direct", "--checkout", "worktree:/tmp/tut-a"]);
+      expect(vi.mocked(hubCreate)).toHaveBeenCalledWith("http://127.0.0.1:3001", {
+        title: "T",
+        description: "D",
+        creator: "C",
+        role: "R",
+        flow: "direct",
+        checkout: { kind: "worktree", path: "/tmp/tut-a" },
+      });
+    } finally {
+      io.restore();
+    }
+  });
+});

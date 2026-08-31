@@ -15,7 +15,7 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Cast, ContextRecord, Flow, Warning } from "./types.js";
+import type { Cast, CheckoutRoute, ContextRecord, Flow, Warning } from "./types.js";
 
 /**
  * CLI Hub calls are short-lived.  Do not leave an undici keep-alive socket
@@ -42,6 +42,8 @@ export interface HubCreateInput {
   flow?: Flow;
   /** Per-task cast routes: mirrors context.create's cast? — absent = default lineup. */
   cast?: Cast;
+  /** Task-frozen checkout route; absent keeps the current checkout. */
+  checkout?: CheckoutRoute;
 }
 export interface HubCreateResult {
   task_id: string;
@@ -82,6 +84,8 @@ export interface HubReadResult {
   flow?: Flow;
   /** Per-task cast routes: present only when the task carries one. */
   cast?: Cast;
+  /** Task-frozen checkout route; absent keeps the current checkout. */
+  checkout?: CheckoutRoute;
   status?: string;
   versions: ContextRecord[];
 }
@@ -100,6 +104,8 @@ export interface HubListEntry {
   flow?: Flow;
   /** Per-task cast routes: present only when the task carries one. */
   cast?: Cast;
+  /** Task-frozen checkout route; absent keeps the current checkout. */
+  checkout?: CheckoutRoute;
 }
 export interface HubListResult {
   tasks: HubListEntry[];

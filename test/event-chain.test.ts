@@ -217,6 +217,18 @@ describe("on-agent-event.mjs (canonical entry: argv contract + fetch transport)"
     8000,
   );
 
+  it("accepts the launcher-emitted delivery_giveup (7.2.1): same POST transport, exits 0", async () => {
+    const capture = await startCaptureServer();
+    const result = await runNode(ON_AGENT_EVENT_MJS, ["delivery_giveup", "pi", "t1.executor"], {
+      env: entryEnv(capture.url),
+    });
+    expect(result.code).toBe(0);
+    await expectDeliveries(capture, [{ event: "delivery_giveup", agent: "pi", pane: "t1.executor" }], false);
+    expect(capture.requests[0]!.body).toBe(
+      JSON.stringify({ event: "delivery_giveup", agent: "pi", pane: "t1.executor" }),
+    );
+  }, 8000);
+
   it("preserves spaces and Unicode in agent/pane byte-for-byte (JSON.stringify, not printf)", async () => {
     const capture = await startCaptureServer();
     const agent = "àgent ✓ ünicode";

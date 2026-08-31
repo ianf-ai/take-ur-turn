@@ -181,6 +181,11 @@ describe("launcher argv boundary", () => {
     ...process.env,
     PATH: `${FIXTURE_BIN}:${process.env.PATH ?? ""}`,
     TUT_DRY_RUN: "1",
+    // Deterministic: hub down → degrade current/default. These are mechanical
+    // argv-boundary tests with dummy task ids; a live hub on the default port
+    // must never leak its real /state into them (and a missing task on a live
+    // hub now refuses).
+    TUT_HUB_URL: "http://127.0.0.1:1",
     TUT_USER_CONFIG_DIR: mkdtempSync(path.join(os.tmpdir(), "tut-route-empty-")),
     ...extra,
   });

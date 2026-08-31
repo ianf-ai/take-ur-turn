@@ -33,7 +33,7 @@ import {
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { autoSectionOf, readConfig, writeFlowMode } from "./config.js";
 import { createMcpServer } from "./mcp.js";
-import { PROJECT_TASK_ID, type AgentRoute } from "./types.js";
+import { PROJECT_TASK_ID, type AgentRoute, type CheckoutRoute } from "./types.js";
 import { Store } from "./store.js";
 
 export interface RequestHandlerDeps {
@@ -82,7 +82,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 /** /state entry — the frozen fields plus additive
  *  revisions: `version`, `flow` (always present, normalized
- *  "full") and `cast?` — same additive pattern as the top-level notify key. */
+ *  "full"), `cast?`, and `checkout?` — same additive pattern as the
+ *  top-level notify key. */
 interface StateTaskEntry {
   task_id: string;
   title: string;
@@ -93,6 +94,7 @@ interface StateTaskEntry {
   version: number;
   flow: string;
   cast?: Record<string, AgentRoute>;
+  checkout?: CheckoutRoute;
 }
 
 export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
@@ -118,6 +120,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
         version: entry.version,
         flow: entry.flow ?? "full",
         ...(entry.cast !== undefined ? { cast: entry.cast } : {}),
+        ...(entry.checkout !== undefined ? { checkout: entry.checkout } : {}),
       });
     }
     // Optional `notify` key: echoed only when a real,

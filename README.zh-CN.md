@@ -287,7 +287,8 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 - **npm 安装的 agent CLI 以 `.cmd` shim 形态存在**，TUT 出于加固考虑不执行 shim。请将角色指向 direct Node entry 路由，例如 `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`，或使用带原生可执行文件的 agent
 - 若 PowerShell 执行策略拦截 script block（`tut up` 通过向 pane 键入命令来供给），先执行一次 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 - `tut up` 需要存在当前 pane 上下文（交互式 Herdr pane 内运行，或 `HERDR_PANE_ID` 指向有效 pane id）；无头运行会失败，报错中会点名原因
-- 桌面通知在 Windows 上降级为终端响铃（toast 通道尚未实现）
+- Windows 桌面通知通过 PowerShell 使用原生 toast；若 PowerShell 或 toast API 不可用，TUT 会降级为终端响铃。已知边界：系统通知被抑制时（如专注助手/勿扰模式），toast 静默不显示——Windows 不会向 TUT 报错
+- 每次尝试发送 toast 时，TUT 都会刷新 `HKCU` 下的用户级 AppUserModelID 注册；无需管理员安装步骤
 - Herdr 的 Windows zip 依赖 VC++ 运行库（`vc_redist.x64`）——缺失时二进制静默退出
 
 **排障**：
