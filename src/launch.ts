@@ -11,7 +11,7 @@ import { hubPublish, hubRead, type HubPublishResult } from "./hub-client.js";
 import { commandHead, commandArgs } from "./agent-command.js";
 import { resolveAgentRouteWithSource } from "./workspace.js";
 import type { ResolveOptions } from "./workspace.js";
-import type { AgentRoute, Cast, ContextRecord, LaunchMarkerProjection, LaunchRouteSource } from "./types.js";
+import type { AgentRoute, Cast, CheckoutRoute, ContextRecord, LaunchMarkerProjection, LaunchRouteSource } from "./types.js";
 
 export type LaunchVia = "start-next" | "auto";
 
@@ -92,6 +92,8 @@ export interface LaunchTarget {
   args?: string[];
   /** The task's cast, when /state exposes one (for callers that want the whole picture). */
   cast?: Cast;
+  /** The task's frozen checkout route, when /state exposes one. */
+  checkout?: CheckoutRoute;
   /** Provenance of the normalized route for the canonical invocation planner. */
   route_source?: LaunchRouteSource;
 }
@@ -118,7 +120,7 @@ export async function resolveLaunchTargetWithSource(
 ): Promise<LaunchTarget> {
   const res = await fetch(new URL("/state", url), { headers: { Connection: "close" } });
   if (!res.ok) throw new Error(`GET ${url}/state → HTTP ${res.status}`);
-  const state = (await res.json()) as { tasks?: Array<{ task_id: string; cast?: Cast }> };
+  const state = (await res.json()) as { tasks?: Array<{ task_id: string; cast?: Cast; checkout?: CheckoutRoute }> };
   const entry = state.tasks?.find((t) => t.task_id === taskId);
   if (entry === undefined) throw new Error(`task ${taskId} not in /state`);
   const cast = entry.cast;
@@ -130,6 +132,7 @@ export async function resolveLaunchTargetWithSource(
     agent: normalizedAgent,
     ...(args.length > 0 ? { args } : {}),
     ...(cast !== undefined ? { cast } : {}),
+    ...(entry.checkout !== undefined ? { checkout: entry.checkout } : {}),
     route_source: resolved.source,
   };
 }

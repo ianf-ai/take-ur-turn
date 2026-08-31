@@ -9,7 +9,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 import { execFile } from "node:child_process";
-import { createChannels, type Channel } from "../src/channels.js";
+import { buildWindowsToastPowerShellScript, createChannels, type Channel } from "../src/channels.js";
 
 const execFileMock = execFile as unknown as Mock;
 
@@ -105,6 +105,144 @@ describe("desktop channel", () => {
     expect(args[1]).toBe(NOTIFY_SCRIPT); // script source unchanged by the payload
     expect(args[4]).toBe(title); // payload arrives verbatim as argv — never executed
     expect(args.filter((a, i) => i !== 4 && a.includes("do shell script"))).toEqual([]);
+  });
+
+  it("uses the native PowerShell toast path on Windows", async () => {
+    mockExec({ "powershell.exe": null });
+    const title = "TUT O'Brien — 审批";
+    const body = "body & <safe> — 已就绪";
+    await first(createChannels(undefined, { platform: "win32" })).send({ title, body });
+
+    const powershell = callsTo("powershell.exe");
+    expect(powershell).toHaveLength(1);
+    expect(powershell[0]?.[1]).toEqual([
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      buildWindowsToastPowerShellScript({ title, body }),
+    ]);
+    const script = (powershell[0]?.[1] as string[])[4] as string;
+    expect(script).toContain("Windows.UI.Notifications.ToastNotificationManager");
+    expect(script).toContain("Windows.Data.Xml.Dom.XmlDocument");
+    expect(script).toContain("TUT.Notifier");
+    expect(script).toContain("HKCU:\\Software\\Classes\\AppUserModelId");
+    expect(script).toContain("New-Item -Path $registrationPath -Force");
+    expect(script).toContain("Set-ItemProperty -Path $registrationPath -Name 'DisplayName' -Value 'TUT Notifier'");
+    expect(script).toContain("Set-ItemProperty -Path $registrationPath -Name 'IconUri' -Value $iconUri");
+    expect(script).not.toContain("Add-Type");
+    expect(script).not.toContain("IPropertyStore");
+    expect(script).not.toContain("DllImport");
+    expect(script).not.toContain("WScript.Shell");
+    expect(script).toContain("<?xml version='1.0' encoding='utf-8'?>");
+    expect(script).toContain("O''Brien — 审批");
+    expect(script).toContain("body & <safe> — 已就绪");
+    expect(script).toContain("CreateToastNotifier($appId)");
+    expect(script).toContain("$ErrorActionPreference = 'Stop'");
+    expect(script).toContain("} catch {");
+    expect(script).toContain("exit 1");
+    expect(script).not.toContain("osascript");
+    expect(script).not.toContain("notify-send");
+    expect(callsTo("osascript")).toHaveLength(0);
+    expect(callsTo("notify-send")).toHaveLength(0);
+    expect(stderrLines).toEqual([]);
+  });
+
+  it("folds CR/LF in Windows toast title/body into spaces with a warning — the toast still ships, no silent bell", async () => {
+    mockExec({ "powershell.exe": null });
+    const title = "TUT t9: line1\nline2\r\nline3";
+    const body = "body\rwith\rcarriage\nreturns";
+    await first(createChannels(undefined, { platform: "win32" })).send({ title, body });
+
+    expect(callsTo("powershell.exe")).toHaveLength(1);
+    const script = (callsTo("powershell.exe")[0]?.[1] as string[])[4] as string;
+    // one space per CR/LF run — single-quoted literals hold the folded text
+    expect(script).toContain("'TUT t9: line1 line2 line3'");
+    expect(script).toContain("'body with carriage returns'");
+    expect(stderrLines).toEqual([
+      "tut: warning: windows toast: folded newlines in notification title into spaces\n",
+      "tut: warning: windows toast: folded newlines in notification body into spaces\n",
+    ]);
+    expect(stderrLines).not.toContain("\u0007");
+  });
+
+  it("collapses every CR/LF run — LF-LF, CR-CR, mixed CRLF-LF — into exactly one space, no bell", async () => {
+    mockExec({ "powershell.exe": null });
+    const title = "a\n\nb";
+    const body = "x\r\ry\r\n\nz";
+    await first(createChannels(undefined, { platform: "win32" })).send({ title, body });
+
+    expect(callsTo("powershell.exe")).toHaveLength(1);
+    const script = (callsTo("powershell.exe")[0]?.[1] as string[])[4] as string;
+    expect(script).toContain("'a b'"); // \n\n → one space
+    expect(script).toContain("'x y z'"); // \r\r and \r\n\n → one space each
+    expect(stderrLines).toEqual([
+      "tut: warning: windows toast: folded newlines in notification title into spaces\n",
+      "tut: warning: windows toast: folded newlines in notification body into spaces\n",
+    ]);
+    expect(stderrLines).not.toContain("\u0007");
+  });
+
+  it("drops NUL bytes from Windows toast text and says exactly that (no newline warning)", async () => {
+    mockExec({ "powershell.exe": null });
+    await first(createChannels(undefined, { platform: "win32" })).send({ title: "a\u0000b", body: "plain" });
+
+    expect(callsTo("powershell.exe")).toHaveLength(1); // toast still ships
+    const script = (callsTo("powershell.exe")[0]?.[1] as string[])[4] as string;
+    expect(script).toContain("'ab'");
+    expect(stderrLines).toEqual([
+      "tut: warning: windows toast: dropped NUL bytes from notification title\n",
+    ]);
+    expect(stderrLines).not.toContain("\u0007");
+  });
+
+  it("NUL + newline together produce both accurate diagnostics, one line per transformation", async () => {
+    mockExec({ "powershell.exe": null });
+    await first(createChannels(undefined, { platform: "win32" })).send({ title: "a\u0000\nb", body: "plain" });
+
+    const script = (callsTo("powershell.exe")[0]?.[1] as string[])[4] as string;
+    expect(script).toContain("'a b'");
+    expect(stderrLines).toEqual([
+      "tut: warning: windows toast: folded newlines in notification title into spaces\n",
+      "tut: warning: windows toast: dropped NUL bytes from notification title\n",
+    ]);
+  });
+
+  it("keeps macOS/Linux paths verbatim for newline-bearing text (no folding, no warning)", async () => {
+    mockExec({ osascript: null });
+    const title = "TUT t9: line1\nline2";
+    const body = "body\nline2";
+    await first(createChannels(undefined)).send({ title, body });
+    const args = (callsTo("osascript")[0]?.[1] as string[]) ?? [];
+    expect(args.slice(3)).toEqual([body, title]); // newlines intact in argv
+    expect(stderrLines).toEqual([]);
+  });
+
+  it("falls back directly to the terminal bell when PowerShell is unavailable", async () => {
+    mockExec({});
+    const desktop = first(createChannels({ channels: ["desktop"] }, { platform: "win32" }));
+    await expect(desktop.send({ title: "t", body: "b" })).resolves.toBeUndefined();
+    expect(callsTo("powershell.exe")).toHaveLength(1);
+    expect(callsTo("osascript")).toHaveLength(0);
+    expect(callsTo("notify-send")).toHaveLength(0);
+    expect(stderrLines).toContain("\u0007");
+  });
+
+  it("bells exactly once when the PowerShell toast command reports an API failure", async () => {
+    mockExec({ "powershell.exe": new Error("toast API failed") });
+    const desktop = first(createChannels({ channels: ["desktop"] }, { platform: "win32" }));
+    await expect(desktop.send({ title: "t", body: "b" })).resolves.toBeUndefined();
+    expect(callsTo("powershell.exe")).toHaveLength(1);
+    expect(stderrLines).toEqual(["\u0007"]);
+  });
+
+  it("keeps the existing non-Windows degradation chain unchanged", async () => {
+    mockExec({ "notify-send": null });
+    await first(createChannels(undefined, { platform: "linux" })).send({ title: "a title", body: "a body" });
+    expect(callsTo("powershell.exe")).toHaveLength(0);
+    expect(callsTo("osascript")).toHaveLength(1);
+    expect(callsTo("notify-send")).toHaveLength(1);
+    expect(stderrLines).toEqual([]);
   });
 });
 

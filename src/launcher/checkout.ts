@@ -1,27 +1,24 @@
 /**
  * Checkout seam (launcher port design §6).
  *
- * A launch has exactly one checkout route.  This period the provider always
- * answers `current`: hubRoot and checkoutRoot are the anchor cwd, the
- * Context Hub stays shared at hubRoot, and no git lifecycle is touched.  The
- * future worktree shape exists only as a pure-object route so later units
- * can widen the provider without re-designing the boundary; a non-current
- * selection is refused loudly today (fail closed, no silent degradation).
+ * A launch has exactly one checkout route.  `current` keeps the existing
+ * anchor checkout; `worktree` points at an already-created checkout.  The
+ * Context Hub stays shared at hubRoot and this provider never creates, moves,
+ * or removes a git worktree.
  *
  * `birthCwdOf` is the only consumer that turns a checkoutRoot into the pane
  * cwd used by tab create / pane split.
  */
 
-import type { ExecutionContext } from "../types.js";
+import path from "node:path";
+import type { CheckoutRoute, ExecutionContext } from "../types.js";
 
 /**
- * Current checkout (this period) or the future worktree route.
- * `worktree` carries the path/ref pair the future provider will resolve;
- * nothing in this period reads, guesses, or executes those fields.
+ * Current checkout or an explicitly named, pre-created worktree route.
+ * The route is carried as frozen metadata; this provider resolves a path but
+ * never creates, guesses, or removes a worktree.
  */
-export type CheckoutRoute =
-  | { kind: "current" }
-  | { kind: "worktree"; path?: string; ref?: string };
+export type { CheckoutRoute } from "../types.js";
 
 /** What one checkout resolution freezes for the execution context. */
 export interface CheckoutSelection {
@@ -35,6 +32,14 @@ export interface CheckoutSelection {
 export interface CheckoutProviderInput {
   /** Anchor cwd captured once by anchor discovery; undefined when absent. */
   anchorCwd?: string;
+  /** Caller cwd used only to resolve a relative explicit worktree path. */
+  baseCwd?: string;
+  /** Programmatic alias for baseCwd. */
+  callerCwd?: string;
+  /** Task-frozen route; absent means current for compatibility. */
+  checkout?: CheckoutRoute;
+  /** Programmatic alias for checkout. */
+  checkoutRoute?: CheckoutRoute;
 }
 
 export interface CheckoutProvider {
@@ -47,18 +52,64 @@ const PLACEHOLDER_SELECTION: CheckoutSelection = {
   checkout: { kind: "current" },
 };
 
-/** The only provider this period: current — Hub and checkout share the anchor cwd. */
+function routeString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0 || /[\u0000\r\n]/u.test(value)) {
+    throw new Error(`${field} must be a non-empty string without NUL/CR/LF`);
+  }
+  return value;
+}
+
+function routeOf(input: CheckoutProviderInput): CheckoutRoute {
+  const requested = input.checkoutRoute ?? input.checkout;
+  if (requested === undefined || requested.kind === "current") return { kind: "current" };
+  if (requested.kind !== "worktree") throw new Error("unsupported checkout route");
+  const checkoutPath = routeString(requested.path, "worktree checkout path");
+  const ref = routeString(requested.ref, "worktree checkout ref");
+  if (checkoutPath === undefined && ref === undefined) {
+    throw new Error("worktree checkout requires an explicit path or ref");
+  }
+  return {
+    kind: "worktree",
+    ...(checkoutPath !== undefined ? { path: checkoutPath } : {}),
+    ...(ref !== undefined ? { ref } : {}),
+  };
+}
+
+/** The default provider resolves current and explicit pre-created worktree paths. */
 export const currentCheckoutProvider: CheckoutProvider = {
-  resolve: async (input) =>
-    input.anchorCwd === undefined
-      ? PLACEHOLDER_SELECTION
-      : { hubRoot: input.anchorCwd, checkoutRoot: input.anchorCwd, checkout: { kind: "current" } },
+  resolve: async (input) => {
+    const route = routeOf(input);
+    if (route.kind === "current") {
+      return input.anchorCwd === undefined
+        ? PLACEHOLDER_SELECTION
+        : { hubRoot: input.anchorCwd, checkoutRoot: input.anchorCwd, checkout: route };
+    }
+
+    // This period intentionally accepts only the explicit path half of a
+    // worktree route.  A ref alone would require git worktree automation,
+    // which is a later lifecycle unit and must not be guessed here.
+    if (route.path === undefined) {
+      throw new Error("worktree checkout ref has no resolved path; automatic git worktree creation is not enabled");
+    }
+    const baseCwd = input.anchorCwd ?? input.baseCwd ?? input.callerCwd ?? process.cwd();
+    const checkoutRoot = path.resolve(baseCwd, route.path);
+    return {
+      hubRoot: input.anchorCwd ?? "<hub-root>",
+      checkoutRoot,
+      checkout: {
+        kind: "worktree",
+        path: checkoutRoot,
+        ...(route.ref !== undefined ? { ref: route.ref } : {}),
+      },
+    };
+  },
 };
 
 /**
- * Resolve the checkout selection for one launch.  Pure provider default;
- * a future provider is expected to stay side-effect free in this boundary
- * (no git execution — that lands with its own approved design).
+ * Resolve the checkout selection for one launch.  Providers stay side-effect
+ * free in this boundary: this module does not execute git or inspect the
+ * filesystem.
  */
 export async function resolveCheckout(
   input: CheckoutProviderInput,

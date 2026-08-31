@@ -67,7 +67,8 @@ import {
   type HubListResult,
   type HubReadResult,
 } from "./hub-client.js";
-import type { AgentRoute, Cast, Flow, LaunchRequest } from "./types.js";
+import type { AgentRoute, Cast, CheckoutRoute, Flow, LaunchRequest } from "./types.js";
+import { worktreePathWarning } from "./checkout-warning.js";
 
 /** Human rendering of a cast: "executor=pi, reviewer=codex" (insertion order). */
 function formatCast(cast: Cast): string {
@@ -111,6 +112,9 @@ Usage:
   tut launch [--fresh] <task_id> <role> [<agent> [<arg>...]]
   tut launch --cleanup <task_id>
       Internal launch entry used by start-next, Notifier, and the POSIX shim.
+      Task routing applies to this legacy positional door too: the task's
+      frozen checkout (and cast) are read from /state at planning, so a
+      worktree task born here still lands on its checkout root.
   tut watch [<task_id>] [--url <u>] [--interval <s>]
       Watch a task until its derived state changes, then exit with a code
       for the situation: 0 = round boundary (a new record advanced the
@@ -122,7 +126,7 @@ Usage:
       task waiting for an agent (same default selection as start-next).
       Default interval 5s; transient fetch failures are retried with a
       throttled warning.
-  tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=command>]... [--url <u>]
+  tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=command>]... [--checkout <current|worktree:path>] [--checkout-path <p>] [--checkout-ref <ref>] [--url <u>]
       Create a task; prints task_id, status, version. flow picks the workflow
       (immutable after creation, default full): full = design → implement →
       review → approval; direct = design already exists, starts implementing;
@@ -131,6 +135,15 @@ Usage:
       --cast executor=pi --cast 'reviewer=codex --model gpt-5.6'); routing
       only, immutable like flow. The legacy comma form remains supported;
       command values are shell-neutral argv words.
+      checkout optionally freezes where this task's panes are born: use
+      --checkout current (default) or --checkout worktree:<path> (equivalent
+      to --checkout worktree --checkout-path <path>). The path must name a
+      worktree prepared by the caller; TUT does not run git worktree create.
+      A worktree checkout must carry the path: --checkout-ref is accepted
+      only as an annotation next to a path, never instead of one — the
+      launcher resolves the path and never creates worktrees, so a ref-only
+      task could never start. Create warns (non-blocking) when the path does
+      not exist yet.
       create is the initiating-side action (host/human): the task exists before
       any delivery, and the first round is an ordinary round — manual mode
       starts it with tut start-next <task_id>; auto mode lets the Notifier
@@ -203,7 +216,17 @@ export type ParsedArgs =
   | { command: "start-next"; task_id?: string; url: string; force: boolean; fresh: boolean }
   | { command: "launch"; args: string[] }
   | { command: "watch"; task_id?: string; url: string; interval: number }
-  | { command: "create"; title: string; description: string; creator: string; role: string; flow?: Flow; cast?: Cast; url?: string }
+  | {
+      command: "create";
+      title: string;
+      description: string;
+      creator: string;
+      role: string;
+      flow?: Flow;
+      cast?: Cast;
+      checkout?: CheckoutRoute;
+      url?: string;
+    }
   | {
       command: "publish";
       task_id: string;
@@ -485,9 +508,106 @@ function parseCastPairs(raw: string): Cast | { error: string } {
   return out;
 }
 
+function checkoutPart(value: unknown, field: string): string | undefined | { error: string } {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0 || /[\u0000\r\n]/u.test(value)) {
+    return { error: `--${field} must be a non-empty string without NUL/CR/LF` };
+  }
+  return value;
+}
+
+/** Parse the CLI's explicit checkout route without resolving it against cwd. */
+function parseCheckoutSpec(
+  raw: string | undefined,
+  pathValue: string | undefined,
+  refValue: string | undefined,
+): CheckoutRoute | undefined | { error: string } {
+  if (raw === undefined && pathValue === undefined && refValue === undefined) return undefined;
+
+  let route: CheckoutRoute;
+  if (raw === undefined) {
+    route = { kind: "worktree" };
+  } else {
+    const spec = raw.trim();
+    if (spec === "current") {
+      route = { kind: "current" };
+    } else if (spec === "worktree") {
+      route = { kind: "worktree" };
+    } else if (spec.startsWith("worktree:") || spec.startsWith("worktree=")) {
+      route = { kind: "worktree", path: spec.slice("worktree:".length) };
+      if (spec.startsWith("worktree=")) route = { kind: "worktree", path: spec.slice("worktree=".length) };
+    } else if (spec.startsWith("{")) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(spec);
+      } catch {
+        return { error: "--checkout JSON must be valid JSON" };
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        return { error: "--checkout JSON must be a checkout object" };
+      }
+      const candidate = parsed as Record<string, unknown>;
+      if (candidate.kind === "current") route = { kind: "current" };
+      else if (candidate.kind === "worktree") {
+        const parsedPath = checkoutPart(candidate.path, "checkout.path");
+        if (typeof parsedPath === "object") return parsedPath;
+        const parsedRef = checkoutPart(candidate.ref, "checkout.ref");
+        if (typeof parsedRef === "object") return parsedRef;
+        route = {
+          kind: "worktree",
+          ...(parsedPath !== undefined ? { path: parsedPath } : {}),
+          ...(parsedRef !== undefined ? { ref: parsedRef } : {}),
+        };
+      } else {
+        return { error: "--checkout.kind must be current or worktree" };
+      }
+    } else if (path.isAbsolute(spec) || spec.startsWith("./") || spec.startsWith("../") || /^[A-Za-z]:[\\/]/u.test(spec) || spec.startsWith("\\\\")) {
+      // A path-only spelling is accepted as a convenience; the documented
+      // unambiguous form remains `worktree:<path>`.
+      route = { kind: "worktree", path: spec };
+    } else {
+      return { error: `--checkout must be current, worktree:<path>, or a checkout JSON object; got: ${raw}` };
+    }
+  }
+
+  if (route.kind === "current") {
+    if (pathValue !== undefined || refValue !== undefined) {
+      return { error: "--checkout current cannot be combined with --checkout-path/--checkout-ref" };
+    }
+    return route;
+  }
+
+  if (route.path !== undefined && pathValue !== undefined) {
+    return { error: "checkout path was specified more than once" };
+  }
+  if (route.ref !== undefined && refValue !== undefined) {
+    return { error: "checkout ref was specified more than once" };
+  }
+  const mergedPath = route.path ?? pathValue;
+  const mergedRef = route.ref ?? refValue;
+  const checkedPath = checkoutPart(mergedPath, "checkout-path");
+  if (typeof checkedPath === "object") return checkedPath;
+  const checkedRef = checkoutPart(mergedRef, "checkout-ref");
+  if (typeof checkedRef === "object") return checkedRef;
+  if (checkedPath === undefined) {
+    return {
+      error:
+        "worktree checkout requires a path (--checkout worktree:<path> or --checkout-path <path>); ref alone is not launchable — a ref may only annotate a path",
+    };
+  }
+  return {
+    kind: "worktree",
+    ...(checkedPath !== undefined ? { path: checkedPath } : {}),
+    ...(checkedRef !== undefined ? { ref: checkedRef } : {}),
+  };
+}
+
 function parseCreate(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, {
-    values: new Set(["title", "description", "creator", "role", "flow", "cast", "url"]),
+    values: new Set([
+      "title", "description", "creator", "role", "flow", "cast", "checkout",
+      "checkout-kind", "checkout-path", "checkout-ref", "worktree", "worktree-path", "worktree-ref", "url",
+    ]),
     repeatable: new Set(["cast"]),
   });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -511,6 +631,35 @@ function parseCreate(args: readonly string[]): ParsedArgs {
     if ("error" in parsed) return { command: "usage", error: parsed.error };
     cast = { ...(cast ?? {}), ...parsed };
   }
+  let checkoutSpec = strFlag(t, "checkout") ?? strFlag(t, "worktree");
+  if (strFlag(t, "checkout") !== undefined && strFlag(t, "worktree") !== undefined) {
+    return { command: "usage", error: "--checkout and --worktree are mutually exclusive" };
+  }
+  const checkoutKind = strFlag(t, "checkout-kind");
+  if (checkoutKind !== undefined && checkoutKind !== "current" && checkoutKind !== "worktree") {
+    return { command: "usage", error: "--checkout-kind must be current or worktree" };
+  }
+  if (checkoutKind === "current") {
+    if (checkoutSpec !== undefined && checkoutSpec !== "current") {
+      return { command: "usage", error: "--checkout-kind current conflicts with the worktree checkout spec" };
+    }
+    checkoutSpec = "current";
+  } else if (checkoutKind === "worktree") {
+    if (checkoutSpec === "current") {
+      return { command: "usage", error: "--checkout-kind worktree conflicts with --checkout current" };
+    }
+    checkoutSpec ??= "worktree";
+  }
+  const checkoutPath = strFlag(t, "checkout-path") ?? strFlag(t, "worktree-path");
+  if (strFlag(t, "checkout-path") !== undefined && strFlag(t, "worktree-path") !== undefined) {
+    return { command: "usage", error: "--checkout-path and --worktree-path are mutually exclusive" };
+  }
+  const checkoutRef = strFlag(t, "checkout-ref") ?? strFlag(t, "worktree-ref");
+  if (strFlag(t, "checkout-ref") !== undefined && strFlag(t, "worktree-ref") !== undefined) {
+    return { command: "usage", error: "--checkout-ref and --worktree-ref are mutually exclusive" };
+  }
+  const checkout = parseCheckoutSpec(checkoutSpec, checkoutPath, checkoutRef);
+  if (checkout !== undefined && "error" in checkout) return { command: "usage", error: checkout.error };
   const url = strFlag(t, "url");
   return {
     command: "create",
@@ -520,6 +669,7 @@ function parseCreate(args: readonly string[]): ParsedArgs {
     role: role.value,
     ...(flow !== undefined ? { flow } : {}),
     ...(cast !== undefined ? { cast } : {}),
+    ...(checkout !== undefined ? { checkout } : {}),
     ...(url !== undefined ? { url } : {}),
   };
 }
@@ -920,6 +1070,7 @@ interface StateSnapshot {
     needs_attention?: boolean;
     version?: number;
     cast?: Cast;
+    checkout?: CheckoutRoute;
   }>;
 }
 
@@ -1082,6 +1233,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
       caller_cwd: process.cwd(),
       env: launchEnvironment,
       dry_run: launchEnvironment.TUT_DRY_RUN === "1",
+      ...(entry.checkout !== undefined ? { checkout: entry.checkout } : {}),
     });
     const projectRoot = executionContext.routingRoot.startsWith("<")
       ? executionContext.caller_cwd ?? process.cwd()
@@ -1089,6 +1241,9 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
     const workspaceSnapshot = await readWorkspaceConfigSnapshot({
       projectRoot,
       userConfigDir: defaultUserConfigDir(launchEnvironment),
+      ...(executionContext.checkout.kind === "worktree" && !executionContext.hubRoot.startsWith("<")
+        ? { fallbackProjectRoot: executionContext.hubRoot }
+        : {}),
     });
     const resolved = await resolveAgentRouteWithSource(
       role,
@@ -1291,6 +1446,11 @@ async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Prom
 
 async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Promise<number> {
   try {
+    // Non-blocking typo mitigation: the route is frozen and never repaired,
+    // so surface a missing worktree path right at create time (stderr keeps
+    // stdout machine-parseable; the task is still created).
+    const warning = worktreePathWarning(parsed.checkout);
+    if (warning !== undefined) process.stderr.write(`${warning}\n`);
     printJson(
       await hubCreate(parsed.url ?? DEFAULT_HUB_URL, {
         title: parsed.title,
@@ -1299,6 +1459,7 @@ async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Pr
         role: parsed.role,
         ...(parsed.flow !== undefined ? { flow: parsed.flow } : {}),
         ...(parsed.cast !== undefined ? { cast: parsed.cast } : {}),
+        ...(parsed.checkout !== undefined ? { checkout: parsed.checkout } : {}),
       }),
     );
     return 0;

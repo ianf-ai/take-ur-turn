@@ -16,6 +16,7 @@ import {
 import type {
   AgentCommand,
   AgentRoute,
+  CheckoutRoute,
   ExecutionContext,
   LaunchInvocation,
   LaunchMarkerProjection,
@@ -39,6 +40,8 @@ export interface LaunchStateTask {
   status?: string;
   needs_attention?: boolean;
   version?: number;
+  /** Task-frozen checkout route, absent on legacy state snapshots. */
+  checkout?: CheckoutRoute;
 }
 
 /**
@@ -354,6 +357,34 @@ function stringMap(value: unknown, field: string): Record<string, string> {
   return out;
 }
 
+function cloneCheckout(value: unknown): CheckoutRoute {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new LaunchInvocationError("invocation.context.checkout must be an object");
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.kind === "current") return { kind: "current" };
+  if (raw.kind !== "worktree") {
+    throw new LaunchInvocationError("invocation.context.checkout.kind must be current or worktree");
+  }
+  const routeString = (candidate: unknown, field: string): string | undefined => {
+    if (candidate === undefined) return undefined;
+    if (typeof candidate !== "string" || candidate.trim().length === 0 || /[\u0000\r\n]/u.test(candidate)) {
+      throw new LaunchInvocationError(`${field} must be a non-empty string without NUL/CR/LF`);
+    }
+    return candidate;
+  };
+  const checkoutPath = routeString(raw.path, "invocation.context.checkout.path");
+  const ref = routeString(raw.ref, "invocation.context.checkout.ref");
+  if (checkoutPath === undefined && ref === undefined) {
+    throw new LaunchInvocationError("invocation.context.checkout worktree requires path or ref");
+  }
+  return {
+    kind: "worktree",
+    ...(checkoutPath !== undefined ? { path: checkoutPath } : {}),
+    ...(ref !== undefined ? { ref } : {}),
+  };
+}
+
 function validateExecutionContext(value: unknown): ExecutionContext {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new LaunchInvocationError("invocation.context must be an object");
@@ -366,9 +397,7 @@ function validateExecutionContext(value: unknown): ExecutionContext {
     throw new LaunchInvocationError("invocation.context.source is invalid");
   }
   const checkout = raw.checkout;
-  if (typeof checkout !== "object" || checkout === null || (checkout as { kind?: unknown }).kind !== "current") {
-    throw new LaunchInvocationError("invocation.context.checkout.kind must be current");
-  }
+  const checkoutRoute = cloneCheckout(checkout);
   const context = raw.context;
   if (typeof context !== "object" || context === null || (context as { kind?: unknown }).kind !== "shared") {
     throw new LaunchInvocationError("invocation.context.context.kind must be shared");
@@ -398,7 +427,7 @@ function validateExecutionContext(value: unknown): ExecutionContext {
     hubRoot,
     routingRoot,
     checkoutRoot,
-    checkout: { kind: "current" },
+    checkout: checkoutRoute,
     context: { kind: "shared" },
     source: raw.source as ExecutionContext["source"],
   };

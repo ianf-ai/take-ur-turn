@@ -87,6 +87,15 @@ export interface LaunchAnchor {
   pane_id: string;
 }
 
+/**
+ * Task-frozen checkout routing.  `current` keeps the legacy anchor checkout;
+ * `worktree` names an already-created checkout.  The route is metadata, not a
+ * git lifecycle instruction: automatic worktree creation remains out of scope.
+ */
+export type CheckoutRoute =
+  | { kind: "current" }
+  | { kind: "worktree"; path?: string; ref?: string };
+
 export interface ExecutionContext {
   /** Herdr anchor; absent only for a dry-run/legacy degraded preview. */
   anchor?: LaunchAnchor;
@@ -95,7 +104,7 @@ export interface ExecutionContext {
   hubRoot: string;
   routingRoot: string;
   checkoutRoot: string;
-  checkout: { kind: "current" };
+  checkout: CheckoutRoute;
   context: { kind: "shared" };
   source: "anchor" | "project-root" | "placeholder" | "legacy";
 }

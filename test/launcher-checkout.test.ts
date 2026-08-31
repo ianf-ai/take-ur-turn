@@ -1,12 +1,9 @@
 /**
  * Checkout seam (launcher port design §6) — unit 3.
  *
- * This period the provider always answers `current`: hubRoot and
- * checkoutRoot share the anchor cwd, the Context Hub stays shared, and no
- * git lifecycle exists.  The future worktree shape is exercised only as a
- * pure-object alternate provider: the seam must show that a future checkout
- * changes ONLY the pane cwd source, never the shared Hub root — and that a
- * non-current selection is refused loudly today instead of degrading.
+ * The default provider supports current and explicit pre-created worktree
+ * paths: hubRoot remains shared while checkoutRoot becomes the pane cwd.
+ * There is still no git lifecycle in this seam.
  */
 
 import { vi, describe, expect, it } from "vitest";
@@ -46,6 +43,36 @@ describe("current checkout provider (this period)", () => {
       checkoutRoot: "<checkout-root>",
       checkout: { kind: "current" },
     });
+  });
+
+  it("resolves an explicit worktree path without moving the shared Hub root", async () => {
+    await expect(resolveCheckout({
+      anchorCwd: "/hub/project",
+      checkout: { kind: "worktree", path: "/worktrees/a", ref: "task-a" },
+    })).resolves.toEqual({
+      hubRoot: "/hub/project",
+      checkoutRoot: "/worktrees/a",
+      checkout: { kind: "worktree", path: "/worktrees/a", ref: "task-a" },
+    });
+  });
+
+  it("resolves a relative worktree path against the captured anchor", async () => {
+    await expect(resolveCheckout({
+      anchorCwd: "/hub/project",
+      baseCwd: "/caller",
+      checkout: { kind: "worktree", path: "../worktrees/a" },
+    })).resolves.toMatchObject({
+      hubRoot: "/hub/project",
+      checkoutRoot: "/hub/worktrees/a",
+      checkout: { kind: "worktree", path: "/hub/worktrees/a" },
+    });
+  });
+
+  it("refuses a ref-only route because git worktree creation is not automatic", async () => {
+    await expect(resolveCheckout({
+      anchorCwd: "/hub/project",
+      checkout: { kind: "worktree", ref: "task-a" },
+    })).rejects.toThrowError(/automatic git worktree creation is not enabled/u);
   });
 
   it("flows through the one-shot workspace snapshot with an independent routingRoot", async () => {
@@ -92,7 +119,7 @@ describe("future worktree checkout (pure-object alternate only)", () => {
     })).toBe("/worktrees/t-42");
   });
 
-  it("is refused loudly by the execution-context snapshot — no silent degradation", async () => {
+  it("flows a worktree through the execution-context snapshot", async () => {
     const source = { paneList: vi.fn(async () => ({ panes: [hubPane] })) };
     await expect(resolveWorkspaceSnapshot({
       client: source,
@@ -100,8 +127,12 @@ describe("future worktree checkout (pure-object alternate only)", () => {
       env: {},
       dry_run: false,
       checkoutProvider: futureProvider,
-    })).rejects.toThrowError(/non-current checkout route 'worktree'/u);
-    // Anchor discovery only: the refusal happens before anything else runs.
+    })).resolves.toMatchObject({
+      hubRoot: "/hub/project",
+      checkoutRoot: "/worktrees/t-42",
+      checkout: { kind: "worktree", ref: "t-42" },
+      routingRoot: "/hub/project",
+    });
     expect(source.paneList).toHaveBeenCalledTimes(1);
   });
 

@@ -560,7 +560,7 @@ describe("compat boundary with a Windows platform plan", () => {
     // command — pwsh configured, pwsh rendered (never the host-default
     // POSIX form), and the birth pane-run text carries this plan's payload.
     const saved: Record<string, string | undefined> = {};
-    for (const key of ["PATH", "TUT_DRY_RUN", "TUT_USER_CONFIG_DIR"]) {
+    for (const key of ["PATH", "TUT_DRY_RUN", "TUT_USER_CONFIG_DIR", "TUT_HUB_URL"]) {
       saved[key] = process.env[key];
     }
     const outText: string[] = [];
@@ -571,6 +571,9 @@ describe("compat boundary with a Windows platform plan", () => {
     const userConfig = mkdtempSync(path.join(os.tmpdir(), "tut-legacy-dialect-"));
     process.env.PATH = `${FIXTURE_BIN}:${saved.PATH ?? ""}`; // fixture `pi` satisfies the legacy preflight
     process.env.TUT_DRY_RUN = "1";
+    // Deterministic: hub down → degrade current/default (dummy task id; a
+    // live hub on the default port must not leak its real /state here).
+    process.env.TUT_HUB_URL = "http://127.0.0.1:1";
     process.env.TUT_USER_CONFIG_DIR = path.join(userConfig, "no-config");
     process.env.TUT_PANE_SHELL = "pwsh";
     try {

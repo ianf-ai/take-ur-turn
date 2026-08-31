@@ -122,6 +122,22 @@ describe("GET /state (frozen shape)", () => {
     expect(body.tasks.find((task) => task.task_id === created.task_id)?.cast).toEqual(cast);
   });
 
+  it("exposes an explicit task checkout route on the HTTP state seam", async () => {
+    const checkout = { kind: "worktree" as const, path: "/worktrees/http-task", ref: "http-task" };
+    const created = await store.createTask({
+      title: "Parameterized HTTP checkout",
+      description: "state route",
+      creator: "tester",
+      role: "architect",
+      checkout,
+    });
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { tasks: Array<{ task_id: string; checkout?: unknown }> };
+    expect(body.tasks.find((task) => task.task_id === created.task_id)?.checkout).toEqual(checkout);
+  });
+
   it("skips a task with a corrupt record file instead of 500ing ", async () => {
     // A second, healthy task so the listing still has derived content.
     const created = await store.createTask({

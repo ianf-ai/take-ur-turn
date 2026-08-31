@@ -474,15 +474,22 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
       rmSync(herdrLog, { force: true });
       process.env.TUT_HERDR_LOG = herdrLog;
       // Closed-loop birth-delivery timeline: boot → paint (gate
-      // releases) → prompt text lands → submit reaction; fast knobs.
+      // releases on the FOUR-sample quiescence, TUT_READY_STABLE_POLLS
+      // default 4) → prompt text lands → submit reaction; fast knobs.
+      // The landed view embeds every role's prompt head-fragment — the
+      // text-match landing criterion (7.2.1 step 3) only accepts a
+      // screen that actually shows the sent text.
       process.env.TUT_HERDR_READ_SCRIPT = JSON.stringify([
         "",
         "",
         "pi ready",
         "pi ready",
-        "pi ready ▎prompt",
+        "pi ready",
+        "pi ready",
+        "pi ready ▎轮到你了（role: architect）：请用 轮到你了（role: executor）：请用 轮到你了（role: reviewer）：请用 开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）",
         "working",
       ]);
+      process.env.TUT_DELIVERY_NONCE = "A1B2C3D4";
       process.env.TUT_READY_POLL_MS = "20";
       process.env.TUT_READY_FLOOR_MS = "0";
       process.env.TUT_READY_TIMEOUT_MS = "300";
@@ -493,6 +500,7 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
         rmSync(herdrLog, { force: true });
         delete process.env.TUT_HERDR_LOG;
         delete process.env.TUT_HERDR_READ_SCRIPT;
+        delete process.env.TUT_DELIVERY_NONCE;
         delete process.env.TUT_READY_POLL_MS;
         delete process.env.TUT_READY_FLOOR_MS;
         delete process.env.TUT_READY_TIMEOUT_MS;

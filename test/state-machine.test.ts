@@ -180,4 +180,35 @@ describe("derive: unit properties beyond the fixtures", () => {
       ],
     } satisfies DerivedState);
   });
+
+  it("solo keeps an architect code_changes record out of table while designing", () => {
+    // Regression case from an observed solo validation run: the launch note
+    // leaves a new solo task in designing, so an architect's direct delivery
+    // cannot skip the design-to-implementing transition.
+    const records: ContextRecord[] = [
+      {
+        version: 1,
+        task_id: "solo-architect-direct-delivery",
+        role: "human",
+        content_type: "note",
+        timestamp: "2026-08-27T04:42:40.511Z",
+        payload: { summary: "launch: architect (base v0)", body: "launch note" },
+      },
+      {
+        version: 2,
+        task_id: "solo-architect-direct-delivery",
+        role: "architect",
+        content_type: "code_changes",
+        timestamp: "2026-08-27T04:44:47.209Z",
+        payload: { summary: "validation delivery", body: "ceremony delivery" },
+      },
+    ];
+
+    expect(derive("solo-architect-direct-delivery", records, "solo")).toStrictEqual({
+      status: "designing",
+      waiting_for: "human",
+      needs_attention: true,
+      warnings: [{ version: 2, code: "OUT_OF_TABLE" }],
+    } satisfies DerivedState);
+  });
 });

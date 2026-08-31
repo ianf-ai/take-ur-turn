@@ -21,7 +21,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { Store, StoreError } from "./store.js";
-import type { Payload } from "./types.js";
+import { worktreePathWarning } from "./checkout-warning.js";
+import type { CheckoutRoute, Payload } from "./types.js";
 
 /**
  * Run a Store operation and shape it as a tool result. Success → the result
@@ -103,7 +104,11 @@ export function createMcpServer(store: Store): McpServer {
         "e.g. {executor: \"pi\"}); it is a routing parameter only — it never restricts who may publish — and is " +
         "immutable after creation, like flow. A route may be a legacy bare string or " +
         "{agent, args} with ordered shell-neutral argv words; parameterized values are " +
-        "preserved without interpretation.",
+        "preserved without interpretation. checkout optionally freezes the execution checkout for this task: " +
+        "{kind: \"current\"} preserves the anchor checkout; {kind: \"worktree\", path, ref?} points at a " +
+        "pre-created worktree (path required — ref alone never launches, it may only annotate a path). " +
+        "TUT does not create or remove git worktrees automatically; create warns (non-blocking) when the " +
+        "path does not exist yet.",
       inputSchema: {
         title: z.string(),
         description: z.string(),
@@ -111,19 +116,36 @@ export function createMcpServer(store: Store): McpServer {
         role: z.string(),
         flow: FLOW_ENUM.optional(),
         cast: castSchema,
+        checkout: z.union([
+          z.object({ kind: z.literal("current") }),
+          z
+            .object({
+              kind: z.literal("worktree"),
+              path: z.string().optional(),
+              ref: z.string().optional(),
+            })
+            .refine((route) => route.path !== undefined, {
+              message: "worktree checkout requires a path; ref alone is not accepted (ref may only annotate a path)",
+            }),
+        ]).optional(),
       },
     },
     async (input) =>
-      runTool(() =>
-        store.createTask({
+      runTool(async () => {
+        const result = await store.createTask({
           title: input.title,
           description: input.description,
           creator: input.creator,
           role: input.role,
           ...(input.flow !== undefined ? { flow: input.flow } : {}),
           ...(input.cast !== undefined ? { cast: input.cast } : {}),
-        }),
-      ),
+          ...(input.checkout !== undefined ? { checkout: input.checkout as CheckoutRoute } : {}),
+        });
+        // Non-blocking typo mitigation: the route is frozen and never
+        // repaired, so surface a missing path right at create time.
+        const warning = worktreePathWarning(input.checkout as CheckoutRoute | undefined);
+        return warning === undefined ? result : { ...result, warning };
+      }),
   );
 
   server.registerTool(
@@ -168,7 +190,8 @@ export function createMcpServer(store: Store): McpServer {
         "Read a task's full record sequence plus its derived status; pass since_version to fetch only records at or " +
         "after that version for incremental sync. Returns { task_id, title, description, flow, cast?, status, versions } — " +
         "description is the task's requirement text from creation; flow is always present for task scope (normalized to " +
-        "\"full\") and cast appears only when the task was created with one; the project scope has no status/flow/cast keys.",
+        "\"full\"), cast and checkout appear only when the task was created with them; the project scope has no " +
+        "status/flow/cast/checkout keys.",
       inputSchema: {
         task_id: z.string(),
         // Deliberately tighter than the Store contract (>= 0): record versions start at 1, so 0 is meaningless as a filter.
@@ -189,8 +212,8 @@ export function createMcpServer(store: Store): McpServer {
       description:
         "List all tasks with their derived status (optionally filtered by status). Returns { tasks: [...] } where " +
         "each entry carries task_id/title/updated_at/status/waiting_for/needs_attention/version plus flow (normalized " +
-        "\"full\") and cast? when present; the project scope entry carries scope \"project\" instead of a status " +
-        "and is only shown unfiltered.",
+        "\"full\"), cast? and checkout? when present; the project scope entry carries scope \"project\" instead of " +
+        "a status and is only shown unfiltered.",
       inputSchema: {
         status: STATUS_ENUM.optional(),
       },

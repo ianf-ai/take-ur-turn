@@ -293,7 +293,8 @@ Native Windows works end to end (hub, MCP, CLI, flow driving were verified again
 - **Agent CLIs installed via npm ship as `.cmd` shims**, which TUT deliberately does not execute (spawn-injection hardening). Point the role at a direct Node entry route instead, e.g. `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`, or install an agent that ships a native executable
 - If PowerShell's execution policy blocks script blocks (`tut up` provisions panes by typing commands into panes), run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once
 - `tut up` must run where a current pane context exists (an interactive Herdr pane, or `HERDR_PANE_ID` pointing at a valid pane id); headless runs fail with that named in the error
-- Desktop notifications degrade to a terminal bell on Windows (toast channel not implemented yet)
+- Desktop notifications use a native Windows toast through PowerShell; if PowerShell or the toast API is unavailable, TUT falls back to a terminal bell. Known edge: with system notifications suppressed (e.g. Focus Assist / Do Not Disturb), the toast silently does not appear — Windows reports no error back to TUT
+- On each toast attempt, TUT refreshes its per-user AppUserModelID registration under `HKCU`; no administrator install step is required
 - Herdr's Windows zip needs the VC++ runtime (`vc_redist.x64`) — without it the binary exits silently
 
 **Troubleshooting**:

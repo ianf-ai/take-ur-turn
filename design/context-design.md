@@ -45,7 +45,7 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 
 ### 1.3 原则
 
-- **读者是下一个 Agent 和人，不是 Server**。Hub 不做入口校验、不处理内容；payload 为 LLM 的阅读效果优化，不为机器处理优化
+- **读者是下一个 Agent 和人，不是 Server**。Hub 不做流程校验（基本合法性——task 存在、必填字段完整——仍校验，与主设计 4.1 一致）、不处理内容；payload 为 LLM 的阅读效果优化，不为机器处理优化
 - **外层结构化，内层完整叙述**（谁、何时、什么类型、第几版、针对谁 + Markdown 正文保推理过程）
 - **append-only**：记录是快照不是活文档——design 被打回后新发一条，不回头改旧的
 
@@ -85,7 +85,8 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
                                     //   派生消费字段之一（另有 ack / decision）；缺失/非法 → needs_attention
   "commits": ["a1b2c3d"],           // 仅 code_changes / revision 可选：对应的 git commit
                                     //   权威的文件清单与 diff 从 commit 取（git show）
-  "ref_version": 2                  // 可选：本条针对的记录版本
+  "ref_version": 2,                 // 可选：本条针对的记录版本
+  "launch": { … }                   // 仅 launch note：系统写入的启动痕（主设计 6.2，代码侧 LaunchMarker），人不必手写
 }
 ```
 
@@ -98,8 +99,9 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 | decision | decision 可选 | **派生函数**（approve/reject/close 的状态依据） |
 | commits | 可选 | 读者（`git show` 取权威清单与 diff）、未来工具链 |
 | ref_version | 可选 | 读者（链路回溯） |
+| launch | launch 轮由系统写入（人不必手写） | 读者（启动痕审计；见主设计 6.2 LaunchMarker） |
 
-信封字段**只增不改**；Server 不做入口校验（与主设计 4.1 一致）。
+信封字段**只增不改**；Server 不做流程校验，基本合法性（task 存在、必填字段完整）仍校验（与主设计 4.1 一致）。
 
 **cast 不进信封**：任务级点将（role → agent route）是 TaskMeta 字段，随 create 落库、随 read/list/state 暴露——它是路由参数不是记录内容，信封 schema 零改动（见主设计 4.1/6.2）。裸 agent 仍是字符串；带参命令使用 `{agent,args}`，args 按顺序保留。
 

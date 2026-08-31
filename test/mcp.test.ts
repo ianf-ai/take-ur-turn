@@ -104,6 +104,68 @@ describe("context.create", () => {
     expect(entry?.cast).toEqual(cast);
   });
 
+  it("round-trips an explicit worktree checkout route through create, read, and list", async () => {
+    const checkout = { kind: "worktree", path: "/worktrees/mcp-task", ref: "mcp-task" };
+    const created = await call("context.create", {
+      title: "Worktree route",
+      description: "preserve task checkout",
+      creator: "tester",
+      role: "architect",
+      flow: "direct",
+      checkout,
+    });
+    expect(created.isError).toBe(false);
+    const taskId = created.json?.task_id as string;
+    expect((await call("context.read", { task_id: taskId })).json?.checkout).toEqual(checkout);
+    const listed = await call("context.list", {});
+    const entry = (listed.json?.tasks as Array<Record<string, unknown>>).find((task) => task.task_id === taskId);
+    expect(entry?.checkout).toEqual(checkout);
+  });
+
+  it("rejects a worktree checkout without a path — ref alone is not accepted", async () => {
+    for (const checkout of [{ kind: "worktree" }, { kind: "worktree", ref: "mcp-task" }]) {
+      const out = await call("context.create", {
+        title: "Invalid worktree route",
+        description: "must fail validation",
+        creator: "tester",
+        role: "architect",
+        checkout,
+      });
+      expect(out.isError).toBe(true);
+      expect(out.text).toContain("worktree checkout requires a path; ref alone is not accepted");
+    }
+  });
+
+  it("warns without blocking when a worktree path does not exist yet", async () => {
+    const created = await call("context.create", {
+      title: "Typo route",
+      description: "warn but create",
+      creator: "tester",
+      role: "architect",
+      flow: "direct",
+      checkout: { kind: "worktree", path: path.join(tmp, "no-such-worktree") },
+    });
+    expect(created.isError).toBe(false);
+    expect(created.json?.task_id).toBeTruthy();
+    expect(String(created.json?.warning)).toContain("does not exist yet");
+
+    const existing = mkdtempSync(path.join(tmp, "real-worktree-"));
+    try {
+      const quiet = await call("context.create", {
+        title: "Real route",
+        description: "no warning",
+        creator: "tester",
+        role: "architect",
+        flow: "direct",
+        checkout: { kind: "worktree", path: existing },
+      });
+      expect(quiet.isError).toBe(false);
+      expect(quiet.json).not.toHaveProperty("warning");
+    } finally {
+      rmSync(existing, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a missing required field as an input-validation tool error", async () => {
     const out = await call("context.create", {
       title: "x",

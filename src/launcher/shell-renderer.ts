@@ -204,6 +204,8 @@ export interface PaneRuntimeOptions {
   nodeExecutable: string;
   /** Absolute dist/launcher/pane-runner.js entry. */
   paneRunnerEntry: string;
+  /** Absolute dist/launcher/probe-runner.js entry used by Agent births. */
+  probeRunnerEntry?: string;
 }
 
 /** Resolve the package-absolute pane-runner entry from either src or dist. */
@@ -211,6 +213,7 @@ export function defaultPaneRuntime(metaUrl: string = import.meta.url): PaneRunti
   return {
     nodeExecutable: process.execPath,
     paneRunnerEntry: fileURLToPath(new URL("../../dist/launcher/pane-runner.js", metaUrl)),
+    probeRunnerEntry: fileURLToPath(new URL("../../dist/launcher/probe-runner.js", metaUrl)),
   };
 }
 

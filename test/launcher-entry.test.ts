@@ -241,8 +241,18 @@ describe("compat birth plan", () => {
 
       expect(code).toBe(0);
       const herdrLines = readFileSync(herdrLog, "utf8").split("\n").filter((line) => line.length > 0);
-      expect(herdrLines).toContain("pane run FIX:root1 cd -- '/work/project' && env 'PLAN_FLAG=yes' 'codex' '--model' 'fast'");
-      expect(herdrLines.join("\n")).not.toContain("check_for_update_on_startup=false");
+      const runLine = herdrLines.find((line) => line.startsWith("pane run FIX:root1 "));
+      expect(runLine).toBeDefined();
+      expect(runLine).toContain("probe-runner.js");
+      const token = runLine?.match(/'--payload' '([A-Za-z0-9_-]+)'/u)?.[1];
+      expect(token).toBeDefined();
+      expect(JSON.parse(Buffer.from(token ?? "", "base64url").toString("utf8"))).toMatchObject({
+        cwd: "/work/project",
+        executable: "codex",
+        args: ["--model", "fast"],
+        env: { PLAN_FLAG: "yes" },
+        purpose: "agent",
+      });
       expect(plan.marker_projection?.target_digest).toBe(privateDigestOf(plan));
     } finally {
       output.mockRestore();
