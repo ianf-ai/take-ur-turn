@@ -138,7 +138,7 @@ describe("GET /state (frozen shape)", () => {
     expect(body.tasks.find((task) => task.task_id === created.task_id)?.checkout).toEqual(checkout);
   });
 
-  it("skips a task with a corrupt record file instead of 500ing ", async () => {
+  it("degrades a task with a corrupt record file: absent from tasks[], present in degraded[], never a 500, system-design 4.3)", async () => {
     // A second, healthy task so the listing still has derived content.
     const created = await store.createTask({
       title: "Healthy Task",
@@ -160,12 +160,19 @@ describe("GET /state (frozen shape)", () => {
     const res = await fetch(`${baseUrl}/state`);
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { tasks: { task_id: string }[] };
+    const body = (await res.json()) as { tasks: { task_id: string }[]; degraded?: string[] };
     expect(body.tasks.map((t) => t.task_id)).toEqual([created.task_id]);
+    expect(body.degraded).toEqual(["routing-task"]); // visible, not silently gone
 
-    // The skip is visible server-side: a one-line stderr warning naming the task.
+    // The degradation is visible server-side: a one-line stderr warning naming the task.
     const stderr = stderrWrite.mock.calls.flat().join("");
     expect(stderr).toContain("routing-task");
+  });
+
+  it("omits the degraded key entirely when every task folds (absence = healthy)", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect("degraded" in body).toBe(false);
   });
 });
 
@@ -507,3 +514,218 @@ function requestNoHost(pathname: string): Promise<RawResponse> {
     sock.once("error", reject);
   });
 }
+
+// --- repair/recovery endpoints + concurrent /mode -----------------------------------
+
+describe("POST /repair-meta (A-class entry, system-design 4.3)", () => {
+  it("rebuilds a corrupt meta over HTTP: next /state moves the task out of degraded, decide-side append works", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    writeFileSync(path.join(dir, "meta.json"), "{ broken");
+
+    let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    const res = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", title: "Routing Task", description: "rebuilt over HTTP" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { task_id: string; version: number; status?: string };
+    expect(body).toMatchObject({ task_id: "routing-task", version: 1 }); // server-computed from disk max
+
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toBeUndefined();
+    expect(state.tasks.map((t) => t.task_id)).toContain("routing-task");
+  });
+
+  it("400 on a readable meta, 404 on an unknown task, 405 on GET", async () => {
+    const healthy = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", title: "rogue overwrite" }),
+    });
+    expect(healthy.status).toBe(400);
+    expect(((await healthy.json()) as { error: string }).error).toContain("readable");
+
+    const missing = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "ghost-task" }),
+    });
+    expect(missing.status).toBe(404);
+
+    const get = await fetch(`${baseUrl}/repair-meta`);
+    expect(get.status).toBe(405);
+  });
+
+  it("rejects a malformed body with 400", async () => {
+    const noBody = await fetch(`${baseUrl}/repair-meta`, { method: "POST", body: "{}" });
+    expect(noBody.status).toBe(400);
+    const badJson = await fetch(`${baseUrl}/repair-meta`, { method: "POST", body: "{nope" });
+    expect(badJson.status).toBe(400);
+  });
+
+  it("P2-1: a present-but-invalid KNOWN field is a 400, never silently dropped — no rebuild, no disk change", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    writeFileSync(path.join(dir, "meta.json"), "{ broken");
+    let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string; flow: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    const badBodies: [label: string, unknown][] = [
+      ["title of wrong type", { task_id: "routing-task", title: 123 }],
+      ["empty-string title", { task_id: "routing-task", title: "" }],
+      ["flow outside the enum", { task_id: "routing-task", flow: "bogus" }],
+      ["description of wrong type", { task_id: "routing-task", description: false }],
+      ["cast not an object", { task_id: "routing-task", cast: "pi" }],
+      ["checkout not an object", { task_id: "routing-task", checkout: [] }],
+      ["created_at of wrong type", { task_id: "routing-task", created_at: 42 }],
+    ];
+    for (const [label, body] of badBodies) {
+      const res = await fetch(`${baseUrl}/repair-meta`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(res.status, label).toBe(400);
+      const payload = (await res.json()) as { error: string };
+      expect(payload.error.length, label).toBeGreaterThan(0);
+    }
+
+    // Nothing landed and nothing changed: meta still the same corrupt bytes, still degraded.
+    expect(readFileSync(path.join(dir, "meta.json"), "utf8")).toBe("{ broken");
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { degraded?: string[]; tasks: { task_id: string; flow: string }[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    // A valid explicit value still repairs — including the previously-silently-dropped flow.
+    const ok = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", title: "Routing Task", flow: "direct" }),
+    });
+    expect(ok.status).toBe(200);
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { degraded?: string[]; tasks: { task_id: string; flow: string }[] };
+    expect(state.degraded).toBeUndefined();
+    expect(state.tasks.find((t) => t.task_id === "routing-task")?.flow).toBe("direct");
+
+    // Unknown extension fields stay ignored (additive-only surface).
+    writeFileSync(path.join(dir, "meta.json"), "{ broken");
+    const withUnknown = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", zzz_future_field: 1, title: "Routing Task" }),
+    });
+    expect(withUnknown.status).toBe(200);
+  });
+});
+
+describe("POST /recover-record (B-class entry, system-design 4.3)", () => {
+  it("registers recovery over HTTP: task leaves degraded, folding uses the recovered copy", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+    const original = readFileSync(path.join(dir, recordFile));
+    const snapshotPath = path.join(tmp, "snapshot-copy.json");
+    writeFileSync(snapshotPath, original);
+    writeFileSync(path.join(dir, recordFile), "{ broken");
+
+    let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    const res = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", record_file: recordFile, from_path: snapshotPath, source: "http test snapshot" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { seq: number; recovered_file: string };
+    expect(body).toEqual({ task_id: "routing-task", record_file: recordFile, seq: 1, recovered_file: `${recordFile}.recovered` });
+
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toBeUndefined();
+    expect(state.tasks.map((t) => t.task_id)).toContain("routing-task");
+    // The corrupt original is still on disk, byte-for-byte.
+    expect(readFileSync(path.join(dir, recordFile), "utf8")).toBe("{ broken");
+  });
+
+  it("400 on validation (healthy record / bad shape / bad source) and 404 on unknown task", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+
+    const healthy = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", record_file: recordFile, from_path: "/etc/hostname" }),
+    });
+    expect(healthy.status).toBe(400);
+    expect(((await healthy.json()) as { error: string }).error).toContain("parses");
+
+    const badShape = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", record_file: "meta.json", from_path: "/etc/hostname" }),
+    });
+    expect(badShape.status).toBe(400);
+
+    const missingFields = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task" }),
+    });
+    expect(missingFields.status).toBe(400);
+
+    const ghost = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "ghost", record_file: recordFile, from_path: "/etc/hostname" }),
+    });
+    expect(ghost.status).toBe(404);
+  });
+});
+
+describe("GET /state under structural damage", () => {
+  it("a syntactically-valid but structurally-invalid record never 500s: 200, degraded listing, absent from tasks[]", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+    // The exact derive-crash shape from the review: parses as JSON, has no payload.
+    writeFileSync(path.join(dir, recordFile), JSON.stringify({ content_type: "note" }));
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200); // never a TypeError 500 — the fold never sees the malformed artifact
+    const state = (await res.json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+    expect(state.tasks.map((t) => t.task_id)).not.toContain("routing-task");
+  });
+
+  it("a structurally-invalid meta (flow outside the enum) is degraded too — not a garbage tasks[] entry", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const meta = JSON.parse(readFileSync(path.join(dir, "meta.json"), "utf8")) as Record<string, unknown>;
+    meta.flow = "bogus";
+    writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta));
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200);
+    const state = (await res.json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+    expect(state.tasks.map((t) => t.task_id)).not.toContain("routing-task");
+  });
+});
+
+describe("POST /mode concurrency", () => {
+  it("100 concurrent switches never corrupt config.json (unique temp + serialized write chain)", async () => {
+    const responses = await Promise.all(
+      Array.from({ length: 100 }, (_, i) =>
+        fetch(`${baseUrl}/mode`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ flow_mode: i % 2 === 0 ? "auto" : "manual" }),
+        }),
+      ),
+    );
+    expect(responses.every((r) => r.status === 200)).toBe(true);
+
+    const raw = readFileSync(path.join(root, "config.json"), "utf8");
+    const config = JSON.parse(raw) as { flow_mode: string }; // throws on the corruption shape
+    expect(config.flow_mode === "manual" || config.flow_mode === "auto").toBe(true);
+    expect(readdirSync(root).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+});

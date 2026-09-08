@@ -13,7 +13,7 @@
  * DEFAULT_HUB_URL applied in the handler). No deps.
  */
 
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,12 +43,19 @@ import {
   UnsupportedWindowsShimError,
   resolvePlatformExecutionPlan,
 } from "./launcher/target-resolver.js";
-import { cliEntryPath, runInternalLaunch, runInternalLaunchInvocation, spawnDirect } from "./launcher/process.js";
+import {
+  DEFAULT_CHILD_TIMEOUT_MS,
+  cliEntryPath,
+  runInternalLaunch,
+  runInternalLaunchInvocation,
+  spawnDirect,
+} from "./launcher/process.js";
 import { parseLaunchEntry, runLaunchEntry } from "./launcher/entry.js";
 import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
 import { HerdrClient, type HerdrPane as HerdrClientPane } from "./launcher/herdr-client.js";
 import {
   KNOWN_ROLES,
+  UNKNOWN_ROLE_AGENT,
   defaultUserConfigDir,
   readWorkspaceConfigSnapshot,
   resolveAgentRoute,
@@ -69,6 +76,7 @@ import {
 } from "./hub-client.js";
 import type { AgentRoute, Cast, CheckoutRoute, Flow, LaunchRequest } from "./types.js";
 import { worktreePathWarning } from "./checkout-warning.js";
+import { renderDoctorReport, runDoctor as runDoctorChecks } from "./doctor.js";
 
 /** Human rendering of a cast: "executor=pi, reviewer=codex" (insertion order). */
 function formatCast(cast: Cast): string {
@@ -77,15 +85,49 @@ function formatCast(cast: Cast): string {
     .join(", ");
 }
 
+// --- single-source defaults ------------------------------------------------------
+// Every parser default, handler fallback, rendered service command, and help
+// text in this file derives from these three constants — re-forking a literal
+// copy elsewhere re-introduces the drift this block removed (pinned by test:
+// the quoted hub-url literal appears exactly once in this source).
+
+/** Hub BASE url for every CLI default (`--url` absent everywhere). */
+export const DEFAULT_HUB_URL = "http://127.0.0.1:3001";
+
+/** The port `tut serve` binds by default — the port a --url-less call speaks to. */
+const DEFAULT_HUB_PORT = 3001;
+
+/**
+ * Default notifier event-listener port. Single source for notify's `--event-port`
+ * default and up's probe/provisioning target (render and probe must be
+ * the same port).
+ */
+export const DEFAULT_EVENT_PORT = 3002;
+
+// --- bounded CLI-side fetch (CLI half) -------------------------------------------
+
+/**
+ * Every CLI-side HTTP call waits at most this long: a half-open connection
+ * fails in 10s with a diagnosable error instead of hanging for the fetch
+ * default (~5 minutes). hub-client's MCP transport is the other half of the split.
+ */
+export const CLI_FETCH_TIMEOUT_MS = 10_000;
+
+/** Shared fetch init for CLI-side calls: bounded abort deadline, socket closed after use. */
+function cliFetchInit(extra: RequestInit = {}): RequestInit {
+  return { ...extra, signal: AbortSignal.timeout(CLI_FETCH_TIMEOUT_MS) };
+}
+
 export const USAGE = `tut — Take Ur Turn Context Hub
 
 Usage:
   tut serve [--port <n>] [--root <dir>]
-      Start the Context Hub (MCP + /state). Default 127.0.0.1:3001; port 0 = ephemeral.
+      Start the Context Hub (MCP + /state). Default ${DEFAULT_HUB_URL}; port 0 = ephemeral.
   tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>] [--working-timeout <s>]
       Run the Notifier (poll /state, receive agent events, notify via channels).
-      Defaults: url http://127.0.0.1:3001, interval 5s, event-port 3002,
-      stall-timeout 30min, launch-working timeout 300s.
+      Defaults: url ${DEFAULT_HUB_URL}, interval 5s, event-port ${DEFAULT_EVENT_PORT},
+      stall-timeout 30min, launch-working timeout 300s. --interval is clamped
+      to a 1s floor (polling faster self-excites against the hub).
   tut mode <manual|auto> [--url <u>]
       Switch flow_mode (takes effect on the next poll cycle).
   tut config get <key> [--root <dir>]
@@ -150,7 +192,7 @@ Usage:
       auto-launch it (per its whitelist).
   tut publish <task_id> --role <r> --content-type <t> --summary <s>
              (--body <text> | --payload-file <md>)
-             [--verdict <pass|fail_code|fail_design>] [--commits <a,b>]
+             [--verdict <pass|blocked_external|fail_code|fail_design>] [--commits <a,b>]
              [--ref-version <n>] [--expected-version <n>] [--agent <a>] [--model <m>] [--url <u>]
       Append a context record. --summary required; body via --body or --payload-file.
   tut read <task_id> [--since-version <n>] [--json] [--url <u>]
@@ -167,11 +209,16 @@ Usage:
       currently effective lineup (all three roles) first; a corrupt file is
       never clobbered. User-level ~/.config/tut/workspace.json is maintained
       by hand (a low-frequency machine-wide declaration).
-  tut up [--url <u>] [--dry-run]
+  tut up [--url <u>] [--event-port <p>] [--dry-run]
       Provision the workspace power switch (idempotent): hub + notify panes
       only — role/agent panes are no longer pre-provisioned: launchers
       raise agent panes on demand at hand-off time. --url targets a
-      non-default local hub (loopback + explicit port).
+      non-default local hub (loopback + explicit port; it must not equal the
+      event port — up refuses the collision up front). --event-port moves the
+      notifier's event listener off ${DEFAULT_EVENT_PORT}: up probes, provisions,
+      and renders the notify command against the same port (a non-default port
+      is passed through explicitly so the provisioned notifier cannot drift
+      back to the default).
   tut ack <task_id> [--note <text>] [--url <u>]
       Acknowledge a task's anomalies as handled: appends a human note with
       ack=true — accumulated warnings clear and needs_attention resets on
@@ -181,6 +228,37 @@ Usage:
       every task — needs_attention first, then newest updates first.
       One-shot snapshot (continuous watching is tut notify's job); --json
       prints the same filtered/sorted snapshot for scripts.
+  tut doctor [--root <dir>] [--url <u>] [--json]
+      Report-only environment & assembly self-check: eight checks — hub
+      reachability (/state), notifier event port, config & workspace chain,
+      agent executables, storage health, path safety & probe endpoints,
+      platform info, agent-channel network verdicts. Checks never modify
+      anything; every problem comes with a fix command to run by hand.
+      Exit 0 = no failing check (warnings allowed), 1 = at least one failing
+      check; --json prints the machine-readable DoctorReport (the same
+      report the text rendering draws from). Defaults: --root .context-hub
+      (relative to cwd), --url the default hub.
+  tut repair-meta <task_id> [--title <t>] [--description <d>] [--creator <c>] [--created-at <iso>]
+                  [--flow <full|direct|solo>] [--cast <role=command>]... [--checkout <current|worktree:path>] [--url <u>]
+      A-class storage repair (system-design 4.3): rebuild a corrupt/missing
+      meta.json through the RUNNING hub (POST /repair-meta, its single-writer
+      queue — same discipline as tut mode; a second process writing meta
+      directly would race concurrent appends). version is computed
+      server-side from the record files, never caller input. Rebuild fields
+      are your best available archive (notifier snapshot, read response,
+      notes); omit what is unknown — title falls back to the task_id, flow to
+      full. A readable meta is refused (repair is not an overwrite path),
+      records are never touched, and the repair itself does not close the
+      task — decide close afterwards if that was the intent.
+  tut recover-record <task_id> <record_file> --from <path> [--source <text>] [--url <u>]
+      B-class recovery registration (system-design 4.3): register the
+      recovered ORIGINAL bytes of a corrupt record file. Fetch them from an
+      external snapshot yourself (backup / shared repo / team git — the hub
+      never fetches backups); --from points at that copy, --source is the
+      provenance note for the audit trail. The corrupt original stays on
+      disk byte-for-byte (pinned evidence); the recovered copy lands as
+      <record_file>.recovered and the fold substitutes it deterministically.
+      Diagnosis of which file is corrupt: tut doctor (report-only).
   tut skill <host|architect|executor|reviewer>
       Print a role skill's full text. The skills directory is resolved
       module-relative (../skills — npm install, git clone, and npm link
@@ -196,6 +274,11 @@ Usage:
       agents receiving "act as TUT Host / drive this task" instructions to
       run 'tut skill host'; worker-role skills are supplied automatically
       by the launcher.
+
+--url selects the Hub for any command that talks to one (default
+${DEFAULT_HUB_URL}). Running several hubs side by side? Pass --url
+explicitly on every call — a --url-less command always speaks to the
+default port, which may be the wrong hub.
 `;
 
 // --- parsed shapes (frozen — handlers consume these) -------------------------
@@ -246,10 +329,24 @@ export type ParsedArgs =
   | { command: "read"; task_id: string; sinceVersion?: number; json: boolean; url?: string }
   | { command: "list"; status?: string; json: boolean; url?: string }
   | { command: "status"; json: boolean; url?: string }
+  | { command: "doctor"; root: string; url: string; json: boolean }
+  | {
+      command: "repair-meta";
+      task_id: string;
+      title?: string;
+      description?: string;
+      creator?: string;
+      createdAt?: string;
+      flow?: Flow;
+      cast?: Cast;
+      checkout?: CheckoutRoute;
+      url: string;
+    }
+  | { command: "recover-record"; task_id: string; recordFile: string; from: string; source?: string; url: string }
   | { command: "decide"; task_id: string; decision: "approve" | "reject" | "close"; by: string; reason?: string; url?: string }
   | { command: "ack"; task_id: string; note?: string; url?: string }
   | { command: "assign"; role: "architect" | "executor" | "reviewer"; agent: AgentRoute }
-  | { command: "up"; dryRun: boolean; url?: string }
+  | { command: "up"; dryRun: boolean; url?: string; eventPort?: number }
   | { command: "skill"; role: SkillRole }
   | { command: "init" }
   | { command: "usage"; error?: string };
@@ -342,6 +439,14 @@ function intFlag(tokens: Tokens, name: string): FlagResult<number> | { value?: u
   return { value: Number.parseInt(raw, 10) };
 }
 
+/** Listener ports cannot use serve's special ephemeral-port value (0). */
+function positiveIntFlag(tokens: Tokens, name: string): FlagResult<number> | { value?: undefined; error?: undefined } {
+  const parsed = intFlag(tokens, name);
+  if ("error" in parsed) return parsed;
+  if (parsed.value === 0) return { error: `--${name} requires a positive integer, got: 0` };
+  return parsed;
+}
+
 function strFlag(tokens: Tokens, name: string): string | undefined {
   return tokens.flags.get(name);
 }
@@ -384,10 +489,13 @@ function parseNotify(args: readonly string[]): ParsedArgs {
     values: new Set(["url", "interval", "event-port", "stall-timeout", "working-timeout", "launch-working-timeout", "launch-timeout"]),
   });
   if ("error" in t) return { command: "usage", error: t.error };
-  for (const name of ["interval", "event-port", "stall-timeout"] as const) {
+  for (const name of ["interval", "stall-timeout"] as const) {
     const err = flagError(intFlag(t, name));
     if (err !== undefined) return { command: "usage", error: err };
   }
+  const eventPort = positiveIntFlag(t, "event-port");
+  const eventPortErr = flagError(eventPort);
+  if (eventPortErr !== undefined) return { command: "usage", error: eventPortErr };
   const workingFlags = ["working-timeout", "launch-working-timeout", "launch-timeout"] as const;
   const workingValues: number[] = [];
   for (const name of workingFlags) {
@@ -402,9 +510,9 @@ function parseNotify(args: readonly string[]): ParsedArgs {
   const workingTimeoutSec = workingValues[0];
   return {
     command: "notify",
-    url: strFlag(t, "url") ?? "http://127.0.0.1:3001",
+    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
     interval: flagValue(intFlag(t, "interval")) ?? 5,
-    eventPort: flagValue(intFlag(t, "event-port")) ?? 3002,
+    eventPort: flagValue(eventPort) ?? DEFAULT_EVENT_PORT,
     stallTimeoutMin: flagValue(intFlag(t, "stall-timeout")) ?? 30,
     ...(workingTimeoutSec !== undefined ? { workingTimeoutSec } : {}),
   };
@@ -419,7 +527,7 @@ function parseMode(args: readonly string[]): ParsedArgs {
   if (mode !== "manual" && mode !== "auto") {
     return { command: "usage", error: `mode must be manual or auto, got: ${mode ?? "(missing)"}` };
   }
-  return { command: "mode", mode, url: strFlag(t, "url") ?? "http://127.0.0.1:3001" };
+  return { command: "mode", mode, url: strFlag(t, "url") ?? DEFAULT_HUB_URL };
 }
 
 function parseConfig(args: readonly string[]): ParsedArgs {
@@ -456,7 +564,7 @@ function parseStartNext(args: readonly string[]): ParsedArgs {
   return {
     command: "start-next",
     ...(taskId !== undefined ? { task_id: taskId } : {}),
-    url: strFlag(t, "url") ?? "http://127.0.0.1:3001",
+    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
     force: t.bools.has("force"),
     fresh: t.bools.has("fresh"),
   };
@@ -473,7 +581,7 @@ function parseWatch(args: readonly string[]): ParsedArgs {
   return {
     command: "watch",
     ...(taskId !== undefined ? { task_id: taskId } : {}),
-    url: strFlag(t, "url") ?? "http://127.0.0.1:3001",
+    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
     interval: flagValue(intFlag(t, "interval")) ?? 5,
   };
 }
@@ -774,6 +882,104 @@ function parseStatus(args: readonly string[]): ParsedArgs {
   return { command: "status", json: t.bools.has("json"), ...(url !== undefined ? { url } : {}) };
 }
 
+/** doctor's run entry needs only the storage root and the hub base URL —
+ *  the same defaults serve/config use (cwd's .context-hub, DEFAULT_HUB_URL). */
+function parseDoctor(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(["root", "url"]), bools: JSON_BOOLS });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 0);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  return {
+    command: "doctor",
+    root: strFlag(t, "root") ?? ".context-hub",
+    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
+    json: t.bools.has("json"),
+  };
+}
+
+/**
+ * tut repair-meta — the CLI client of POST /repair-meta (A-class,
+ * system-design 4.3). Every flag mirrors one JSON body field of the
+ * endpoint; absent flags OMIT the field so the store-side fallbacks apply
+ * (title → task_id, flow → full). Values pass through untouched — the store
+ * is the single validation authority, so a bad value comes back as an
+ * honest 400 rather than a silently repaired default (http.ts's
+ * parseRepairMetaBody discipline). Reuses create's --cast/--checkout
+ * parsers so the rebuild surfaces accept the same spellings create does.
+ */
+function parseRepairMeta(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, {
+    values: new Set(["title", "description", "creator", "created-at", "flow", "cast", "checkout", "url"]),
+    repeatable: new Set(["cast"]),
+  });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 1);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  const taskId = t.positionals[0];
+  if (taskId === undefined) return { command: "usage", error: "repair-meta requires a task_id" };
+  const flow = strFlag(t, "flow");
+  if (flow !== undefined && flow !== "full" && flow !== "direct" && flow !== "solo") {
+    return { command: "usage", error: `--flow must be full|direct|solo, got: ${flow}` };
+  }
+  let cast: Cast | undefined;
+  for (const castRaw of strFlags(t, "cast")) {
+    const parsed = parseCastPairs(castRaw);
+    if ("error" in parsed) return { command: "usage", error: parsed.error };
+    cast = { ...(cast ?? {}), ...parsed };
+  }
+  const checkout = parseCheckoutSpec(strFlag(t, "checkout"), undefined, undefined);
+  if (checkout !== undefined && "error" in checkout) return { command: "usage", error: checkout.error };
+  const title = strFlag(t, "title");
+  const description = strFlag(t, "description");
+  const creator = strFlag(t, "creator");
+  const createdAt = strFlag(t, "created-at");
+  const url = strFlag(t, "url");
+  return {
+    command: "repair-meta",
+    task_id: taskId,
+    ...(title !== undefined ? { title } : {}),
+    ...(description !== undefined ? { description } : {}),
+    ...(creator !== undefined ? { creator } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {}),
+    ...(flow !== undefined ? { flow } : {}),
+    ...(cast !== undefined ? { cast } : {}),
+    ...(checkout !== undefined ? { checkout } : {}),
+    url: url ?? DEFAULT_HUB_URL,
+  };
+}
+
+/**
+ * tut recover-record — the CLI client of POST /recover-record (B-class,
+ * system-design 4.3): exactly the endpoint's three required fields
+ * (task_id, record_file, from_path) plus the optional provenance note.
+ * record_file is a file NAME within the task directory (v003.note.json),
+ * not a path; --from is the local path to the recovered original bytes.
+ */
+function parseRecoverRecord(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(["from", "source", "url"]) });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 2);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  const taskId = t.positionals[0];
+  if (taskId === undefined) return { command: "usage", error: "recover-record requires a task_id" };
+  const recordFile = t.positionals[1];
+  if (recordFile === undefined) {
+    return { command: "usage", error: "recover-record requires a record file name (e.g. v003.note.json)" };
+  }
+  const from = requireStr(t, "from");
+  if ("error" in from) return { command: "usage", error: from.error };
+  const source = strFlag(t, "source");
+  const url = strFlag(t, "url");
+  return {
+    command: "recover-record",
+    task_id: taskId,
+    recordFile,
+    from: from.value,
+    ...(source !== undefined ? { source } : {}),
+    url: url ?? DEFAULT_HUB_URL,
+  };
+}
+
 function parseDecide(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, { values: new Set(["decision", "by", "reason", "url"]) });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -838,12 +1044,21 @@ function parseAssign(args: readonly string[]): ParsedArgs {
 }
 
 function parseUp(args: readonly string[]): ParsedArgs {
-  const t = tokenize(args, { values: new Set(["url"]), bools: new Set(["dry-run"]) });
+  const t = tokenize(args, { values: new Set(["url", "event-port"]), bools: new Set(["dry-run"]) });
   if ("error" in t) return { command: "usage", error: t.error };
   const extra = extraPositionalError(t, 0);
   if (extra !== undefined) return { command: "usage", error: extra };
+  const parsedEventPort = positiveIntFlag(t, "event-port");
+  const eventPortErr = flagError(parsedEventPort);
+  if (eventPortErr !== undefined) return { command: "usage", error: eventPortErr };
   const url = strFlag(t, "url");
-  return { command: "up", dryRun: t.bools.has("dry-run"), ...(url !== undefined ? { url } : {}) };
+  const eventPort = flagValue(parsedEventPort);
+  return {
+    command: "up",
+    dryRun: t.bools.has("dry-run"),
+    ...(url !== undefined ? { url } : {}),
+    ...(eventPort !== undefined ? { eventPort } : {}),
+  };
 }
 
 /** The roles that ship a skill file (skills/<role>.md in the package). */
@@ -900,6 +1115,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     case "read": return parseRead(rest);
     case "list": return parseList(rest);
     case "status": return parseStatus(rest);
+    case "doctor": return parseDoctor(rest);
+    case "repair-meta": return parseRepairMeta(rest);
+    case "recover-record": return parseRecoverRecord(rest);
     case "decide": return parseDecide(rest);
     case "ack": return parseAck(rest);
     case "assign": return parseAssign(rest);
@@ -911,7 +1129,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
 }
 
 // --- handlers -----------------------------------------------------------------
-// All seventeen subcommands are wired (notify; mode/config/start-next/watch;
+// All twenty-one subcommands are wired (notify; mode/config/start-next/watch;
+// doctor is the report-only self-check over src/doctor.ts; repair-meta /
+// recover-record are the storage-repair clients of the 4.3 endpoints;
 // ack reuses the context publish path as a fixed human ack note; status is a
 // human overview over the context list path). Task creation is the
 // initiating side's action (tut create); the first round is an ordinary
@@ -947,22 +1167,56 @@ async function runServe(parsed: Extract<ParsedArgs, { command: "serve" }>): Prom
 
 // --- context/approval command handlers -------------------------------------------
 
-/** Hub BASE url for the context subcommands (--url override; default when the flag is absent). */
-const DEFAULT_HUB_URL = "http://127.0.0.1:3001";
-
 /**
  * Uniform failure exit: HubError prints "CODE: message" so the first stderr
  * line is the machine-parseable code (the same discipline as the MCP tool
- * surface); anything else (unreachable Hub, unreadable --payload-file, ...)
- * prints a plain one-liner. Always exit code 1.
+ * surface); a network-level failure with a known Hub url prints the unified
+ * HUB_UNREACHABLE diagnosis; anything else (unreadable --payload-file,
+ * ...) prints a plain one-liner. Always exit code 1.
  */
-function failWith(e: unknown): number {
+function failWith(e: unknown, url?: string): number {
   if (e instanceof HubError) {
     process.stderr.write(`${e.code}: ${e.message}\n`);
+  } else if (url !== undefined && isHubUnreachable(e)) {
+    process.stderr.write(hubUnreachableLine(url, e));
   } else {
     process.stderr.write(`tut: ${(e as Error).message}\n`);
   }
   return 1;
+}
+
+/**
+ * Network-level failure classes that mean "the Hub did not answer": undici's
+ * TypeError "fetch failed" (with the errno on .cause), plain connection-refused
+ * messages from test/seam stubs, and aborted/timed-out requests (the CLI-side
+ * 10s deadline). HTTP-level failures (5xx, wrong shape) are NOT this —
+ * the hub answered, it is just unhealthy.
+ */
+function isHubUnreachable(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  if (e.name === "TimeoutError" || e.name === "AbortError") return true;
+  if (e.message.includes("fetch failed")) return true;
+  if (/econnrefused|connection refused|econnreset|ehostunreach|enetunreach|enotfound|eai_again/iu.test(e.message)) return true;
+  const cause = (e as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    return code !== undefined || cause.message.includes("fetch failed");
+  }
+  return false;
+}
+
+/** The one hub-unreachable flavor: code-first line + the tut serve remedy. */
+function hubUnreachableLine(url: string, e: unknown): string {
+  const cause = (e as { cause?: { code?: string } })?.cause;
+  const detail = cause?.code ?? (e instanceof Error ? e.message : String(e));
+  return `HUB_UNREACHABLE: cannot reach the Hub at ${url} (${detail}) — start it with: tut serve\n`;
+}
+
+/** /state fetch failure for start-next/watch: unified flavor when unreachable, command context otherwise. */
+function stateFetchErrorLine(url: string, e: unknown): string {
+  return isHubUnreachable(e)
+    ? hubUnreachableLine(url, e)
+    : `tut: cannot read state from ${url}: ${(e as Error).message}\n`;
 }
 
 function printJson(value: unknown): void {
@@ -972,13 +1226,17 @@ function printJson(value: unknown): void {
 async function runMode(parsed: Extract<ParsedArgs, { command: "mode" }>): Promise<number> {
   let res: Response;
   try {
-    res = await fetch(new URL("/mode", parsed.url), {
+    res = await fetch(new URL("/mode", parsed.url), cliFetchInit({
       method: "POST",
       headers: { "content-type": "application/json", Connection: "close" },
       body: JSON.stringify({ flow_mode: parsed.mode }),
-    });
+    }));
   } catch (e) {
-    process.stderr.write(`tut: cannot reach Hub at ${parsed.url} (is tut serve running?): ${(e as Error).message}\n`);
+    process.stderr.write(
+      isHubUnreachable(e)
+        ? hubUnreachableLine(parsed.url, e)
+        : `tut: cannot reach Hub at ${parsed.url} (is tut serve running?): ${(e as Error).message}\n`,
+    );
     return 1;
   }
   const body = (await res.json().catch(() => null)) as { flow_mode?: string; error?: string } | null;
@@ -988,6 +1246,67 @@ async function runMode(parsed: Extract<ParsedArgs, { command: "mode" }>): Promis
   }
   printJson({ flow_mode: body.flow_mode });
   return 0;
+}
+
+// --- tut repair-meta / recover-record (storage repair clients, 4.3) ----------------
+
+/**
+ * Shared client for the two repair endpoints (system-design 4.3): POST the
+ * JSON body to the running hub — repairs must go through the hub's
+ * single-writer queue, never a second process writing files directly. Owns
+ * the failure surface the same way tut mode does: a network-level failure
+ * prints the unified HUB_UNREACHABLE line (with the tut serve remedy), an
+ * HTTP-level failure the "HTTP <status>: <error>" one-liner. Returns the
+ * process exit code.
+ */
+async function runRepairPost(pathname: string, url: string, body: unknown, command: string): Promise<number> {
+  let res: Response;
+  try {
+    res = await fetch(new URL(pathname, url), cliFetchInit({
+      method: "POST",
+      headers: { "content-type": "application/json", Connection: "close" },
+      body: JSON.stringify(body),
+    }));
+  } catch (e) {
+    process.stderr.write(
+      isHubUnreachable(e)
+        ? hubUnreachableLine(url, e)
+        : `tut: cannot reach Hub at ${url} (is tut serve running?): ${(e as Error).message}\n`,
+    );
+    return 1;
+  }
+  const out = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!res.ok || out === null) {
+    const error = typeof out?.error === "string" ? out.error : "unexpected response";
+    process.stderr.write(`tut: ${command} failed: HTTP ${res.status}: ${error}\n`);
+    return 1;
+  }
+  printJson(out);
+  return 0;
+}
+
+/** tut repair-meta — A-class rebuild of a corrupt meta.json (system-design 4.3). */
+async function runRepairMeta(parsed: Extract<ParsedArgs, { command: "repair-meta" }>): Promise<number> {
+  return runRepairPost("/repair-meta", parsed.url, {
+    task_id: parsed.task_id,
+    ...(parsed.title !== undefined ? { title: parsed.title } : {}),
+    ...(parsed.description !== undefined ? { description: parsed.description } : {}),
+    ...(parsed.creator !== undefined ? { creator: parsed.creator } : {}),
+    ...(parsed.createdAt !== undefined ? { created_at: parsed.createdAt } : {}),
+    ...(parsed.flow !== undefined ? { flow: parsed.flow } : {}),
+    ...(parsed.cast !== undefined ? { cast: parsed.cast } : {}),
+    ...(parsed.checkout !== undefined ? { checkout: parsed.checkout } : {}),
+  }, "repair-meta");
+}
+
+/** tut recover-record — B-class recovery registration (system-design 4.3). */
+async function runRecoverRecord(parsed: Extract<ParsedArgs, { command: "recover-record" }>): Promise<number> {
+  return runRepairPost("/recover-record", parsed.url, {
+    task_id: parsed.task_id,
+    record_file: parsed.recordFile,
+    from_path: parsed.from,
+    ...(parsed.source !== undefined ? { source: parsed.source } : {}),
+  }, "recover-record");
 }
 
 // --- tut config ------------------------------------------------------------------
@@ -1076,7 +1395,7 @@ interface StateSnapshot {
 
 /** GET <hub>/state and status-check; throws on fetch/HTTP failure (callers own the message). */
 async function fetchStateSnapshot(url: string): Promise<StateSnapshot> {
-  const res = await fetch(new URL("/state", url), { headers: { Connection: "close" } });
+  const res = await fetch(new URL("/state", url), cliFetchInit({ headers: { Connection: "close" } }));
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as StateSnapshot;
 }
@@ -1164,7 +1483,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
   try {
     state = await fetchStateSnapshot(parsed.url);
   } catch (e) {
-    process.stderr.write(`tut: cannot read state from ${parsed.url}: ${(e as Error).message}\n`);
+    process.stderr.write(stateFetchErrorLine(parsed.url, e));
     return 1;
   }
   // No-arg default: resolve the task_id first (zero/multiple are branch
@@ -1201,7 +1520,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
   try {
     records = await readLaunchLog(parsed.url, taskId);
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url);
   }
   let baseVersion: number;
   try {
@@ -1312,12 +1631,14 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
   try {
     await markLaunched(parsed.url, taskId, role, baseVersion, "start-next", invocation.marker_projection);
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url);
   }
 
   // --fresh is already frozen in the invocation.  The child receives no raw
-  // route values, so there is no second parse or route-source drift.
-  const run = await runInternalLaunchInvocation(invocation);
+  // route values, so there is no second parse or route-source drift. Carry
+  // the same environment snapshot across the manual boundary as well: a
+  // moved TUT_EVENT_PORT_URL must reach delivery give-up escalation.
+  const run = await runInternalLaunchInvocation(invocation, { env: launchEnvironment });
   if (run.error !== undefined) {
     process.stderr.write(`tut: cannot run internal launcher ${cliEntryPath()}: ${run.error.message}\n`);
     process.stderr.write("tut: relaunch with --force once the pane is fixed\n");
@@ -1343,6 +1664,30 @@ const WATCH_EXIT_TERMINAL = 2;
 const WATCH_EXIT_ATTENTION = 3;
 
 type WatchOutcome = "round" | "terminal" | "attention";
+
+/**
+ * Production floor for --interval (notify/watch): a 0s interval
+ * self-excites against the hub (hundreds of full /state derivations per
+ * second). TUT_TEST_INTERVAL_FLOOR_SEC is the dedicated TEST knob — unset in
+ * production, it never changes the default floor; tests that need a tight
+ * poll loop set it to 0 instead of loosening the production path.
+ */
+const MIN_POLL_INTERVAL_SEC = 1;
+
+function pollIntervalFloorSec(): number {
+  const raw = process.env.TUT_TEST_INTERVAL_FLOOR_SEC;
+  return raw !== undefined && /^\d+$/u.test(raw) ? Number.parseInt(raw, 10) : MIN_POLL_INTERVAL_SEC;
+}
+
+/** Clamp to the floor with a visible note; explicit larger values pass through unchanged. */
+function clampPollInterval(command: "notify" | "watch", seconds: number): number {
+  const floor = pollIntervalFloorSec();
+  if (seconds < floor) {
+    process.stderr.write(`tut: ${command}: --interval ${seconds} is below the ${floor}s floor — clamped to ${floor}s\n`);
+    return floor;
+  }
+  return seconds;
+}
 
 /** terminal outranks attention: a closed task carrying leftover warnings is still over. */
 function classifyWatch(entry: NonNullable<StateSnapshot["tasks"]>[number]): WatchOutcome {
@@ -1375,12 +1720,13 @@ function watchChanged(
  * already terminal or flagged needs no waiting and exits at once.
  */
 async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Promise<number> {
-  const intervalMs = parsed.interval * 1000;
+  const intervalSec = clampPollInterval("watch", parsed.interval);
+  const intervalMs = intervalSec * 1000;
   let state: StateSnapshot;
   try {
     state = await fetchStateSnapshot(parsed.url);
   } catch (e) {
-    process.stderr.write(`tut: cannot read state from ${parsed.url}: ${(e as Error).message}\n`);
+    process.stderr.write(stateFetchErrorLine(parsed.url, e));
     return WATCH_EXIT_ERROR;
   }
   const target = selectTargetTask(state, parsed.task_id);
@@ -1410,7 +1756,7 @@ async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Prom
   const baseline = classifyWatch(entry);
   if (baseline !== "round") return report(baseline);
   process.stderr.write(
-    `watch: ${entry.task_id} v${entry.version ?? "?"} (status=${entry.status ?? "?"}, waiting_for=${entry.waiting_for ?? "?"}) — polling every ${parsed.interval}s\n`,
+    `watch: ${entry.task_id} v${entry.version ?? "?"} (status=${entry.status ?? "?"}, waiting_for=${entry.waiting_for ?? "?"}) — polling every ${intervalSec}s\n`,
   );
 
   let fetchOk = true;
@@ -1451,6 +1797,17 @@ async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Pr
     // stdout machine-parseable; the task is still created).
     const warning = worktreePathWarning(parsed.checkout);
     if (warning !== undefined) process.stderr.write(`${warning}\n`);
+    // Same non-blocking discipline: a free-form creator role outside
+    // the conventional set is almost certainly a typo, and everything
+    // downstream of an unknown role is a silent fallback (workspace routing
+    // resolves it to the UNKNOWN_ROLE_AGENT builtin; no skills/<role>.md
+    // ships). Visible at create — the last cheap moment to catch it.
+    if (!([...KNOWN_ROLES, "human"] as readonly string[]).includes(parsed.role)) {
+      process.stderr.write(
+        `warning: role '${parsed.role}' is outside the conventional set (${[...KNOWN_ROLES, "human"].join("|")}) — ` +
+        `routing for unknown roles falls back to the '${UNKNOWN_ROLE_AGENT}' builtin and no skills/${parsed.role}.md ships; the task is still created\n`,
+      );
+    }
     printJson(
       await hubCreate(parsed.url ?? DEFAULT_HUB_URL, {
         title: parsed.title,
@@ -1464,7 +1821,7 @@ async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Pr
     );
     return 0;
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1498,7 +1855,7 @@ async function runPublish(parsed: Extract<ParsedArgs, { command: "publish" }>): 
     printJson(result);
     return 0;
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1552,7 +1909,7 @@ async function runRead(parsed: Extract<ParsedArgs, { command: "read" }>): Promis
     else process.stdout.write(renderRead(result));
     return 0;
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1583,7 +1940,7 @@ async function runList(parsed: Extract<ParsedArgs, { command: "list" }>): Promis
     else process.stdout.write(renderList(result));
     return 0;
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1650,8 +2007,19 @@ async function runStatus(parsed: Extract<ParsedArgs, { command: "status" }>): Pr
     else process.stdout.write(renderStatus(result));
     return 0;
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
+}
+
+/** tut doctor — report-only self-check. Both faces (text and --json) draw
+ *  from the SAME DoctorReport; runDoctor's robustness contract is that it
+ *  never rejects (a bad input becomes that check's failure item), so the
+ *  exit code is purely report.ok. Warnings do not flip it. */
+async function runDoctor(parsed: Extract<ParsedArgs, { command: "doctor" }>): Promise<number> {
+  const report = await runDoctorChecks({ root: parsed.root, url: parsed.url });
+  if (parsed.json) printJson(report);
+  else process.stdout.write(`${renderDoctorReport(report)}\n`);
+  return report.ok ? 0 : 1;
 }
 
 async function runDecide(parsed: Extract<ParsedArgs, { command: "decide" }>): Promise<number> {
@@ -1664,7 +2032,7 @@ async function runDecide(parsed: Extract<ParsedArgs, { command: "decide" }>): Pr
       ...(parsed.reason !== undefined ? { reason: parsed.reason } : {}),
     });
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
   printJson(result);
   // decide(close) hooks the fresh-session lifecycle: reap the task's round
@@ -1676,6 +2044,10 @@ async function runDecide(parsed: Extract<ParsedArgs, { command: "decide" }>): Pr
     const run = await runInternalLaunch(["--cleanup", parsed.task_id]);
     if (run.error !== undefined) {
       process.stderr.write(`tut: cannot run internal launcher ${cliEntryPath()}: ${run.error.message} (pane cleanup skipped)\n`);
+    } else if (run.timedOut === true) {
+      process.stderr.write(
+        `tut: launch --cleanup ${parsed.task_id} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed (task is closed regardless)\n`,
+      );
     } else if (run.code !== 0) {
       process.stderr.write(`tut: pane cleanup exited with code ${run.code} (task is closed regardless)\n`);
     }
@@ -1716,7 +2088,7 @@ async function runAck(parsed: Extract<ParsedArgs, { command: "ack" }>): Promise<
     );
     return 0;
   } catch (e) {
-    return failWith(e);
+    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1755,12 +2127,19 @@ async function runAssign(parsed: Extract<ParsedArgs, { command: "assign" }>): Pr
     raw = { roles: seeded };
   }
   const roles = (raw as { roles?: unknown })?.roles;
-  if (typeof raw !== "object" || raw === null || typeof roles !== "object" || roles === null) {
+  // An array IS typeof "object", so `{"roles": []}` used to slip
+  // through this guard — the later property write landed on the array and
+  // JSON.stringify silently dropped it (exit 0 with a success message,
+  // nothing written). Arrays are rejected explicitly at every level.
+  if (
+    typeof raw !== "object" || raw === null || Array.isArray(raw) ||
+    typeof roles !== "object" || roles === null || Array.isArray(roles)
+  ) {
     process.stderr.write(`tut: assign: ${file} is malformed (expected an object with a "roles" object); nothing written\n`);
     return 1;
   }
   const entry = (roles as Record<string, unknown>)[parsed.role];
-  if (entry !== undefined && entry !== null && typeof entry !== "object") {
+  if (Array.isArray(entry) || (entry !== undefined && entry !== null && typeof entry !== "object")) {
     process.stderr.write(`tut: assign: ${file}: roles.${parsed.role} is not an object; nothing written\n`);
     return 1;
   }
@@ -1821,6 +2200,25 @@ function agentsBlock(): string {
 /** `/<!-- TUT:BEGIN -->[\s\S]*?<!-- TUT:END -->/` as a source literal. */
 const TUT_BLOCK_RE = /<!-- TUT:BEGIN -->[\s\S]*?<!-- TUT:END -->/;
 
+/**
+ * Atomic file replace (runAssign's pattern): the new content lands in
+ * a temp SIBLING first and rename() swaps it in — an interrupted write can
+ * only leave the target at its old content or the new content, never a
+ * truncated mix (the old direct writeFileSync truncated AGENTS.md/.gitignore
+ * when the process died mid-write). Failure removes the temp; the target is
+ * never touched.
+ */
+async function atomicReplace(file: string, content: string): Promise<void> {
+  const temp = `${file}.${process.pid}.tmp`;
+  try {
+    await writeFile(temp, content, "utf8");
+    await rename(temp, file);
+  } catch (e) {
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw e;
+  }
+}
+
 async function runSkill(parsed: Extract<ParsedArgs, { command: "skill" }>): Promise<number> {
   const file = path.join(SKILLS_DIR, `${parsed.role}.md`);
   let text: string;
@@ -1864,7 +2262,7 @@ async function runInit(): Promise<number> {
       giExisting = null; // absent (any other read failure resurfaces at the write below)
     }
     if (giExisting === null) {
-      writeFileSync(gitignore, `${GITIGNORE_ENTRY}\n`, "utf8");
+      await atomicReplace(gitignore, `${GITIGNORE_ENTRY}\n`);
       process.stdout.write(`init: created ${gitignore} ignoring ${GITIGNORE_ENTRY}\n`);
     } else if (
       giExisting.split("\n").some((line) => {
@@ -1875,7 +2273,7 @@ async function runInit(): Promise<number> {
       process.stdout.write(`init: .gitignore already ignores ${GITIGNORE_ENTRY} (idempotent — no change)\n`);
     } else {
       const base = giExisting.replace(/\s+$/, "");
-      writeFileSync(gitignore, base.length === 0 ? `${GITIGNORE_ENTRY}\n` : `${base}\n${GITIGNORE_ENTRY}\n`, "utf8");
+      await atomicReplace(gitignore, base.length === 0 ? `${GITIGNORE_ENTRY}\n` : `${base}\n${GITIGNORE_ENTRY}\n`);
       process.stdout.write(`init: appended ${GITIGNORE_ENTRY} to ${gitignore}\n`);
     }
   } catch (e) {
@@ -1894,13 +2292,13 @@ async function runInit(): Promise<number> {
   }
   try {
     if (existing === null) {
-      writeFileSync(target, `${block}\n`, "utf8");
+      await atomicReplace(target, `${block}\n`);
       process.stdout.write(`init: created ${target} with the TUT block\n`);
     } else if (TUT_BLOCK_RE.test(existing)) {
-      writeFileSync(target, existing.replace(TUT_BLOCK_RE, block), "utf8");
+      await atomicReplace(target, existing.replace(TUT_BLOCK_RE, block));
       process.stdout.write(`init: refreshed the TUT block in ${target} (idempotent — no duplicate)\n`);
     } else {
-      writeFileSync(target, `${existing.replace(/\s*$/, "\n\n")}${block}\n`, "utf8");
+      await atomicReplace(target, `${existing.replace(/\s*$/, "\n\n")}${block}\n`);
       process.stdout.write(`init: appended the TUT block to ${target}\n`);
     }
   } catch (e: unknown) {
@@ -1927,10 +2325,15 @@ async function runInit(): Promise<number> {
 //   herdr pane move <id> --tab <t> --split down --ratio 0.5 [--target-pane <id>] --no-focus
 //   herdr pane close <id> → {"result":{"type":"ok"}}
 
-/** Event-port probe target — the Notifier answers 405 on non-POST. */
-const UP_EVENT_URL = "http://127.0.0.1:3002/agent-event";
-const UP_HUB_WAIT_DEFAULT_MS = 10_000;
+/** Event-port probe target — the Notifier answers 405 on non-POST. Derived from the single-source default. */
+const UP_EVENT_URL = `http://127.0.0.1:${DEFAULT_EVENT_PORT}/agent-event`;
+const UP_WAIT_DEFAULT_MS = 10_000;
 const UP_POLL_INTERVAL_MS = 250;
+
+/** The event-port probe URL for a given port — up's rendering and probing are the same source. */
+function eventPortUrl(port: number): string {
+  return `http://127.0.0.1:${port}/agent-event`;
+}
 
 /**
  * The dedicated tab hosting the two system panes,
@@ -1948,7 +2351,20 @@ const SYS_NOTIFY_PANE_LABEL = "tut-notify";
  */
 function hubWaitMs(): number {
   const parsed = Number(process.env.TUT_UP_HUB_WAIT_MS);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : UP_HUB_WAIT_DEFAULT_MS;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : UP_WAIT_DEFAULT_MS;
+}
+
+/**
+ * How long tut up waits for a freshly provisioned notifier to answer the
+ * event port — the notify twin of hubWaitMs. Spawn ok ≠ listening: a pane
+ * run into a pane still occupied by a live foreground process swallows the
+ * command while herdr still reports ok, so the notify success report is
+ * gated on this probe. TUT_UP_NOTIFY_WAIT_MS (read per call) shortens the
+ * wait — test/ops knob, the same discipline as TUT_UP_HUB_WAIT_MS.
+ */
+function notifyWaitMs(): number {
+  const parsed = Number(process.env.TUT_UP_NOTIFY_WAIT_MS);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : UP_WAIT_DEFAULT_MS;
 }
 
 /**
@@ -1981,7 +2397,7 @@ async function pollUntil(check: () => Promise<boolean>, timeoutMs: number, inter
  */
 async function hubHealthy(baseUrl: string): Promise<boolean> {
   try {
-    const res = await fetch(new URL("/state", baseUrl), { headers: { Connection: "close" } });
+    const res = await fetch(new URL("/state", baseUrl), cliFetchInit({ headers: { Connection: "close" } }));
     if (!res.ok) return false;
     const body: unknown = await res.json();
     if (body === null || typeof body !== "object") return false;
@@ -1999,7 +2415,7 @@ async function hubHealthy(baseUrl: string): Promise<boolean> {
  */
 export async function notifyHealthy(url: string = UP_EVENT_URL): Promise<boolean> {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, cliFetchInit());
     if (res.status !== 405) return false;
     const allow = (res.headers.get("allow") ?? "").toUpperCase();
     return allow.split(/[\s,]+/).includes("POST");
@@ -2144,12 +2560,19 @@ async function reportedPaneId(label: string, fallback: string): Promise<string> 
  * 0. dev-layout guard: running from src/ means the pane commands would embed a
  *    non-runnable `node src/cli.ts` — build first (no tsx dependency);
  * 0b. cwd guardrail (package.json or .context-hub/ required);
+ * 0c. event-port pre-flight: both event-port probes (moved-port
+ *     coexistence + the provisioning target) run BEFORE any provisioning,
+ *     memoized for step 2; the known-occupied reuse shape (moved port down,
+ *     live default-port notifier, labelled tut-notify pane) refuses up
+ *     front — exit 1 without touching any pane;
  * 1. hub: /state shape-check → skip, or provision and WAIT for /state to turn
  *    healthy (spawn success ≠ serving);
  * 1b. seed hint: hub reachable → project scope read; no invariants note →
  *     print the exact publish command (reads only — dry-run included);
- * 2. notify: /agent-event 405+Allow:POST probe → skip, or provision (no wait
- *     mandated: the probe covers the next run);
+ * 2. notify: /agent-event 405+Allow:POST probe (pre-flighted) → skip, or
+ *     provision and WAIT for the event port to answer (pane run into an
+ *     occupied pane is a silent no-op — spawn success ≠ listening, the
+ *     same discipline as the hub's /state wait);
  * Per-pane idempotency ladder: healthy skip (upstream probe) → dead-pane
  * reuse (labelled pane in the snapshot: rerun the command in place, never a
  * second split) → full provisioning (split → ensure tut-sys tab → move
@@ -2159,9 +2582,9 @@ async function reportedPaneId(label: string, fallback: string): Promise<string> 
  * skipped, exit 0 — never a hidden background process.
  */
 
-/** Guard message: up provisions a LOCAL hub, so --url must be loopback http with an explicit port. */
+/** Guard message: up provisions a LOCAL hub, so --url must be loopback http with an explicit port (the example deliberately avoids the event port). */
 function upUrlError(url: string): string {
-  return `tut: up: --url must be an http loopback URL with an explicit port (e.g. http://127.0.0.1:3002), got: ${url}\n`;
+  return `tut: up: --url must be an http loopback URL with an explicit port (e.g. http://127.0.0.1:3003), got: ${url}\n`;
 }
 
 /**
@@ -2193,6 +2616,23 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
     hubPort = Number(u.port);
   } catch {
     process.stderr.write(upUrlError(hubUrl));
+    return 1;
+  }
+
+  // --event-port moves the notifier's event listener; probe, provisioning,
+  // and the rendered notify command all use this one value.
+  const eventPort = parsed.eventPort ?? DEFAULT_EVENT_PORT;
+  const eventUrl = eventPortUrl(eventPort);
+
+  // Port-conflict pre-check: the hub and the notifier's event
+  // listener cannot share a port — serve would bind it and the provisioned
+  // notify would die with EADDRINUSE while up still reported success
+  // (`up --url :3002` used to be up's OWN error example). Refused before any
+  // probe, spawn, or pane read, with non-colliding examples.
+  if (hubPort === eventPort) {
+    process.stderr.write(
+      `tut: up: the hub port and the notifier event port are both ${eventPort} — they cannot share one port (the hub binds it; notify would die with EADDRINUSE); use a different hub port (e.g. --url http://127.0.0.1:3011) or move the event port (e.g. --event-port 3005)\n`,
+    );
     return 1;
   }
 
@@ -2255,20 +2695,32 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
   // Windows carries the absolute node.exe the cmd/PowerShell forms quote;
   // POSIX keeps the bare PATH-resolved `node` word of the legacy bytes.
   const nodeWord = process.platform === "win32" ? process.execPath : "node";
-  const renderServiceCommand = (args: readonly string[]): string =>
+  const renderServiceCommand = (args: readonly string[], env: Readonly<Record<string, string>> = {}): string =>
     renderPaneCommand({
       cwd,
       executable: nodeWord,
       args: [...args],
-      env: {},
+      env,
       dialect,
       purpose: "service",
     } as PaneCommand).command_text;
   let serveCmd: string;
   let notifyCmd: string;
   try {
-    serveCmd = renderServiceCommand([self, "serve", ...(hubPort === 3001 ? [] : ["--port", String(hubPort)])]);
-    notifyCmd = renderServiceCommand([self, "notify", ...(hubPort === 3001 ? [] : ["--url", hubUrl])]);
+    serveCmd = renderServiceCommand([self, "serve", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--port", String(hubPort)])]);
+    // Full-chain pass-through: a non-default event port rides the
+    // rendered notify command explicitly (the provisioned notifier cannot
+    // drift back to the default), and TUT_EVENT_PORT_URL is exported into the
+    // pane so every launcher the notifier spawns (auto mode) escalates
+    // give-up events to the port that notifier actually listens on. Defaults
+    // stay byte-identical to the legacy command (no flag, no env prefix).
+    notifyCmd =
+      eventPort === DEFAULT_EVENT_PORT
+        ? renderServiceCommand([self, "notify", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--url", hubUrl])])
+        : renderServiceCommand(
+            [self, "notify", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--url", hubUrl]), "--event-port", String(eventPort)],
+            { TUT_EVENT_PORT_URL: eventUrl },
+          );
   } catch (error) {
     process.stderr.write(`tut: up: cannot render the service pane command: ${(error as Error).message}\n`);
     return 1;
@@ -2279,6 +2731,30 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
   const listing = await herdrPaneList();
   const panes = "panes" in listing ? listing.panes : null;
   const herdrError = "error" in listing ? listing.error : "";
+
+  // Event-port pre-flight: both event-port probes run
+  // BEFORE any provisioning and their results are memoized for step 2 — no
+  // URL is probed twice. The known-occupied shape refuses up front: a moved
+  // event port that is down while the default-port notifier is still alive
+  // AND a labelled tut-notify pane exists. provisionSysPane would take that
+  // pane for dead and `pane run` into it — but a pane still hosting the
+  // running notifier cannot start a second process; herdr reports ok and up
+  // would print "notify running" over a dead provisioning (false success).
+  // Refuse WITHOUT touching any pane (fail fast, before even the hub step):
+  // non-zero exit + actionable stop-first remedy. A target that already
+  // answers never reaches this refusal; the shapes the pre-flight cannot
+  // see (occupant on a non-default port) are caught by step 2's probe gate.
+  const oldNotifierAlive = eventPort !== DEFAULT_EVENT_PORT && (await notifyHealthy(UP_EVENT_URL));
+  const targetListening = await notifyHealthy(eventUrl);
+  if (oldNotifierAlive && !targetListening) {
+    const occupied = panes?.find((p) => p.label === SYS_NOTIFY_PANE_LABEL);
+    if (occupied !== undefined) {
+      process.stderr.write(
+        `tut: up: cannot start the notifier on ${eventUrl} — another notifier is still listening on ${UP_EVENT_URL} and the ${SYS_NOTIFY_PANE_LABEL} pane (${occupied.pane_id}) is the reuse candidate; pane run into a still-occupied pane cannot start a second process. Stop the old pane first (herdr pane close ${occupied.pane_id}), or drop --event-port to keep the existing notifier, then rerun tut up\n`,
+      );
+      return 1;
+    }
+  }
 
   // C-layout sys-tab state, shared across the two provisioning steps: the
   // discovered/created tut-sys tab plus its anchor pane (the move --target).
@@ -2300,6 +2776,12 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
    * --ratio 0.5, even halves) → close the tab's empty root (only when we
    * created the tab this run) → rename → run. Returns the running pane id,
    * or null with the failure already printed.
+   *
+   * The label⇒dead assumption is guarded, not blind: a snapshot cannot tell
+   * an occupied pane from a dead one. For notify, the up pre-flight refuses
+   * the known-occupied shape outright and the post-run event-port probe
+   * gates the success report — a `pane run` that lands in a live foreground
+   * process is swallowed while herdr still reports ok.
    */
   const provisionSysPane = async (
     label: string,
@@ -2416,15 +2898,37 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
     printInvariantsHint(hubUrl);
   }
 
-  // Step 2 — notifier (no wait mandated: the probe covers the next run).
-  if (await notifyHealthy()) {
-    process.stdout.write(`up: notify already listening (${UP_EVENT_URL})\n`);
+  // Step 2 — notifier. The probes already ran in the pre-flight (memoized):
+  // the double-notifier warning rides oldNotifierAlive, the skip rides
+  // targetListening. Fresh-pane provisioning may continue past the warning
+  // — the stale notifier is the user's to stop; up never kills panes it does
+  // not own (the reuse-on-top-of-it shape was refused up front instead).
+  if (oldNotifierAlive) {
+    process.stderr.write(
+      `tut: up: another notifier is already listening on ${UP_EVENT_URL} — provisioning ${eventUrl} would leave two notifiers running; stop the old pane (label ${SYS_NOTIFY_PANE_LABEL}) or drop --event-port to reuse it\n`,
+    );
+  }
+  if (targetListening) {
+    process.stdout.write(`up: notify already listening (${eventUrl})\n`);
   } else if (panes === null) {
     manual.push(notifyCmd);
   } else {
     const provisioned = await provisionSysPane(SYS_NOTIFY_PANE_LABEL, "notify", notifyCmd);
     if (provisioned === null) return 1;
     if (!dryRun) {
+      // Occupancy gate: spawn ok ≠ listening. A pane run
+      // into a pane still hosting a live foreground process is swallowed
+      // while herdr reports ok, so the success report waits for the event
+      // port to actually answer — the same discipline as the hub's /state
+      // wait. On timeout up fails loud instead of printing "notify running"
+      // over a dead provisioning.
+      const waitMs = notifyWaitMs();
+      if (!(await pollUntil(() => notifyHealthy(eventUrl), waitMs, UP_POLL_INTERVAL_MS))) {
+        process.stderr.write(
+          `tut: up: notify pane ${provisioned.paneId} ran but ${eventUrl} never answered — the pane may still be occupied by a live process (pane run cannot start a second one); stop it (herdr pane close ${provisioned.paneId} or exit the process in the pane) and rerun tut up\n`,
+        );
+        return 1;
+      }
       process.stdout.write(
         `up: notify running (pane ${await reportedPaneId(SYS_NOTIFY_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""})\n`,
       );
@@ -2454,7 +2958,7 @@ export const HANDLERS = {
     try {
       await runNotify({
         url: parsed.url,
-        interval: parsed.interval,
+        interval: clampPollInterval("notify", parsed.interval),
         eventPort: parsed.eventPort,
         stallTimeoutMin: parsed.stallTimeoutMin,
         ...(parsed.workingTimeoutSec !== undefined ? { workingTimeoutSec: parsed.workingTimeoutSec } : {}),
@@ -2476,6 +2980,9 @@ export const HANDLERS = {
   read: runRead,
   list: runList,
   status: runStatus,
+  doctor: runDoctor,
+  repairMeta: runRepairMeta,
+  recoverRecord: runRecoverRecord,
   decide: runDecide,
   ack: runAck,
   assign: runAssign,
@@ -2505,6 +3012,9 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     case "read": return HANDLERS.read(parsed);
     case "list": return HANDLERS.list(parsed);
     case "status": return HANDLERS.status(parsed);
+    case "doctor": return HANDLERS.doctor(parsed);
+    case "repair-meta": return HANDLERS.repairMeta(parsed);
+    case "recover-record": return HANDLERS.recoverRecord(parsed);
     case "decide": return HANDLERS.decide(parsed);
     case "ack": return HANDLERS.ack(parsed);
     case "assign": return HANDLERS.assign(parsed);

@@ -1,8 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// These tests inject a rename() failure to prove init's writes are atomic:
+// the mock delegates to the real fs/promises everywhere else.
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs/promises")>()),
+  rename: vi.fn(
+    async (from: string, to: string) =>
+      (await importOriginal<typeof import("node:fs/promises")>()).rename(from, to),
+  ),
+}));
+
+import { rename } from "node:fs/promises";
 import { main, parseArgs, SKILL_ROLES, USAGE } from "../src/cli.js";
 
 // tut skill / tut init — the path-free delivery pair: a subcommand that
@@ -266,3 +277,66 @@ function writeOriginal(dir: string, text: string): void {
 function countBlocks(text: string): number {
   return (text.match(/<!-- TUT:BEGIN -->/g) ?? []).length;
 }
+
+// --- init writes are atomic (temp + rename) ---------------------------------------
+
+describe("init atomic writes", () => {
+  /** Files in dir ending with the temp suffix — must be none after a healthy init. */
+  const leftoverTemps = (dir: string): string[] =>
+    readdirSync(dir).filter((f) => f.endsWith(".tmp"));
+
+  it("a healthy init leaves no temp siblings behind", async () => {
+    const dir = tempProject();
+    writeOriginal(dir, "# Existing prose\n"); // forces both AGENTS.md and .gitignore writes
+    process.chdir(dir);
+    const io = captureIo();
+    try {
+      const code = await main(["init"]);
+      expect(code).toBe(0);
+      expect(leftoverTemps(dir)).toEqual([]);
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("a write interrupted between temp and rename cannot truncate existing content", async () => {
+    const dir = tempProject();
+    const gitignore = "# project ignores\nnode_modules/\n"; // no .context-hub entry → append path
+    writeFileSync(path.join(dir, ".gitignore"), gitignore, "utf8");
+    const agents = "# Precious project conventions\n\nNever delete this prose.\n";
+    writeOriginal(dir, agents);
+    process.chdir(dir);
+    // Kill the swap, not the temp write: every rename() fails this run.
+    vi.mocked(rename).mockRejectedValue(new Error("injected: renamed mid-flight"));
+    const io = captureIo();
+    try {
+      const code = await main(["init"]);
+
+      expect(code).toBe(1);
+      expect(io.err()).toContain("tut: cannot write");
+      // The inviolable property: an interrupted write leaves the ORIGINAL
+      // bytes — the old direct write truncated these files on a mid-write kill.
+      expect(readFileSync(path.join(dir, ".gitignore"), "utf8")).toBe(gitignore);
+      expect(readFileSync(path.join(dir, "AGENTS.md"), "utf8")).toBe(agents);
+    } finally {
+      io.restore();
+      vi.mocked(rename).mockRestore();
+    }
+  });
+
+  it("a failed swap cleans its temp sibling up (no dot-tmp litter)", async () => {
+    const dir = tempProject();
+    writeOriginal(dir, "# Existing\n");
+    process.chdir(dir);
+    vi.mocked(rename).mockRejectedValue(new Error("injected"));
+    const io = captureIo();
+    try {
+      const code = await main(["init"]);
+      expect(code).toBe(1);
+      expect(leftoverTemps(dir)).toEqual([]);
+    } finally {
+      io.restore();
+      vi.mocked(rename).mockRestore();
+    }
+  });
+});

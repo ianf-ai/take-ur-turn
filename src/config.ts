@@ -44,9 +44,39 @@ export function configPath(root: string): string {
   return path.join(root, "config.json");
 }
 
-/** Same temp-file scheme as store.ts: sibling temp + atomic rename, best-effort cleanup on error. */
+/** Same temp-file scheme as store.ts: sibling temp + atomic rename, best-effort cleanup on error.
+ *  The temp name carries a per-call monotonic counter next to the pid:
+ *  concurrent writers in THIS process used to share one `<pid>.tmp` name and
+ *  truncate each other mid-write (a 4-round POST /mode burst corrupted
+ *  config.json in production); a unique suffix makes every writer's temp
+ *  distinct, and the per-path write chain below serializes the
+ *  read-modify-write so the last writer wins instead of the fastest one. */
+let tempSeq = 0;
 function tempPathFor(filePath: string): string {
-  return `${filePath}.${process.pid}.tmp`;
+  tempSeq += 1;
+  return `${filePath}.${process.pid}.${tempSeq}.tmp`;
+}
+
+/**
+ * Per-config-path serialized write chain: every RMW writer
+ * (writeFlowMode, writeConfigKey, ensureConfig's create branch) runs inside
+ * this chain, so concurrent POST /mode calls read-modify-write one at a time
+ * — no lost updates, no interleaved temp/rename. The chain is
+ * failure-tolerant: a rejected predecessor never blocks later writers.
+ */
+const configWriteChains = new Map<string, Promise<unknown>>();
+
+function chainedConfigWrite<T>(filePath: string, op: () => Promise<T>): Promise<T> {
+  const prev = configWriteChains.get(filePath) ?? Promise.resolve();
+  const run = prev.then(op, op); // a failed predecessor must not wedge the chain
+  configWriteChains.set(
+    filePath,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return run;
 }
 
 async function writeConfigAtomic(filePath: string, config: Config): Promise<void> {
@@ -72,9 +102,20 @@ export async function ensureConfig(root: string): Promise<Config> {
     raw = await readFile(filePath, "utf8");
   } catch (e) {
     if (!isErrnoException(e, "ENOENT")) throw e;
-    await mkdir(root, { recursive: true });
-    await writeConfigAtomic(filePath, DEFAULT_CONFIG);
-    return { ...DEFAULT_CONFIG };
+    // Missing file: create atomically INSIDE the write chain (a concurrent
+    // POST /mode racing serve startup must not interleave with this create).
+    return chainedConfigWrite(filePath, async () => {
+      // Re-check under the chain: a concurrent writer may have created it.
+      try {
+        const existing = await readFile(filePath, "utf8");
+        return parseConfigStrict(existing, filePath);
+      } catch (e2) {
+        if (!isErrnoException(e2, "ENOENT")) throw e2;
+      }
+      await mkdir(root, { recursive: true });
+      await writeConfigAtomic(filePath, DEFAULT_CONFIG);
+      return { ...DEFAULT_CONFIG };
+    });
   }
   // Existing corrupt config throws to the caller: ensureConfig runs once at
   // serve startup where failing fast is correct (readFlowMode owns the
@@ -182,15 +223,18 @@ export function autoSectionOf(config: Config | null | undefined): AutoConfig | u
  * clobber keys it cannot read — POST /mode surfaces that as a 500.
  */
 export async function writeFlowMode(root: string, mode: FlowMode): Promise<Config> {
-  const outcome = await readConfigFile(root);
-  if (outcome.status === "invalid") {
-    throw new Error(`cannot switch flow_mode: ${configPath(root)} is unreadable or corrupt`);
-  }
-  const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
-  config.flow_mode = mode;
-  await mkdir(root, { recursive: true });
-  await writeConfigAtomic(configPath(root), config);
-  return config;
+  const filePath = configPath(root);
+  return chainedConfigWrite(filePath, async () => {
+    const outcome = await readConfigFile(root);
+    if (outcome.status === "invalid") {
+      throw new Error(`cannot switch flow_mode: ${filePath} is unreadable or corrupt`);
+    }
+    const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
+    config.flow_mode = mode;
+    await mkdir(root, { recursive: true });
+    await writeConfigAtomic(filePath, config);
+    return config;
+  });
 }
 
 // --- tut config get/set engine -------------------------------------------------
@@ -265,20 +309,23 @@ export function parseConfigValue(
  */
 export async function writeConfigKey(root: string, assignment: ConfigKeyAssignment): Promise<Config> {
   const { key } = assignment;
-  const outcome = await readConfigFile(root);
-  if (outcome.status === "invalid") {
-    throw new Error(`cannot set ${key}: ${configPath(root)} is unreadable or corrupt`);
-  }
-  const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
-  if (assignment.key === "flow_mode") {
-    config.flow_mode = assignment.value;
-  } else {
-    const existing = typeof config.auto === "object" && config.auto !== null ? config.auto : {};
-    config.auto = { ...existing, launch_roles: assignment.value }; // siblings inside auto survive
-  }
-  await mkdir(root, { recursive: true });
-  await writeConfigAtomic(configPath(root), config);
-  return config;
+  const filePath = configPath(root);
+  return chainedConfigWrite(filePath, async () => {
+    const outcome = await readConfigFile(root);
+    if (outcome.status === "invalid") {
+      throw new Error(`cannot set ${key}: ${filePath} is unreadable or corrupt`);
+    }
+    const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
+    if (assignment.key === "flow_mode") {
+      config.flow_mode = assignment.value;
+    } else {
+      const existing = typeof config.auto === "object" && config.auto !== null ? config.auto : {};
+      config.auto = { ...existing, launch_roles: assignment.value }; // siblings inside auto survive
+    }
+    await mkdir(root, { recursive: true });
+    await writeConfigAtomic(filePath, config);
+    return config;
+  });
 }
 
 function isErrnoException(e: unknown, code: string): boolean {

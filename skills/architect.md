@@ -6,7 +6,7 @@
 
 ## 何时介入
 
-- **新设计任务**：`context.list {"status": "designing"}`（CLI `tut list --status designing`）找到任务，按「接手读序」接手。**不由你建任务**（create 是发起侧动作）；列表里没有对应任务 → 不自建，发 note 说明情况交人处置。
+- **新设计任务**：`context.list {"status": "designing"}`（CLI `tut list --status designing`）找到任务，按「接手读序」接手。**不由你建任务**（create 是发起侧动作）；列表里没有对应任务 → 不自建，向 `project` scope 发 note 说明情况交人处置。
 - **被打回重设计**：review 的 verdict 是 `fail_design` 时任务派生回 designing。入口与首轮相同，但接手后必读打回你的那条 review，逐条回应（见「关闭条件」）。
 - status / waiting_for 是派生出来的路由建议，不是指令——人可以让任何 Agent 接任何一手。被指派的任务不在 designing 态时，先读任务日志弄清进行到哪再决定动作；实在对不上就发 note 说明并交人处置，不要猜。
 
@@ -20,7 +20,7 @@ flow 由发起侧建任务时选定（create 的 `--flow` / MCP `flow` 字段，
 
 1. **工作单元分解**：design body 增「工作单元分解」节，表格式，列 = 单元 | 依赖 | 接口契约 | 完成定义——边界切在接口稳定处（拆得对不求拆得细）；完成定义必须可验证，它就是下游 direct 单的验收句来源。
 2. **设计即交付物**：deliverable = 设计文档时，design 记录写骨架与关键决策，文档成文与 commit 由 executor 交付（code_changes 引用文档 commit），review 与审批作用于设计本身。
-3. **设计文档存放**：设计交付物落 `design/<task_id>.md`（文档名 = 任务 id，Hub ↔ git 双向互链）。活文档由人维护，任务不顺手改；交付物晋升为活文档是人的动作。
+3. **设计文档存放**：设计交付物落 `design/<task_id>.md`（文档名 = 任务 id；design body 写明文档路径 `design/<task_id>.md`，文档引用任务 id，Hub ↔ git 双向互链）。活文档由人维护，任务不顺手改；交付物晋升为活文档是人的动作。
 4. **分工线**：分解权归你、编排权归 host——你交分解表，host 按表逐个发起 direct 施工单；你不参与投递编排。
 
 ## 接手读序（三层）
@@ -36,7 +36,7 @@ flow 由发起侧建任务时选定（create 的 `--flow` / MCP `flow` 字段，
 ## 发布 design
 
 - 信封：`summary` 必填一句话（列表展示与通知文案都用它）；`body` 必填 Markdown，完整推理过程；CLI 长 body 用 `--payload-file`（整个文件作为 body）。
-- **expected_version** = 你看到的任务当前版本（read 到最新记录 version 是 N 就带 N，首轮接手通常是投递你的 launch note）；上一次 publish 返回 version 4，下一次就带 4。带对能抓并发写入——别人先写一手，你的发布报版本冲突（MCP isError；CLI 非零退出码、stderr 首行 VERSION_CONFLICT），重读日志再发。不带也能写（跳过校验），带上是更好的习惯。
+- **expected_version** = 你看到的任务当前版本（read 到最新记录 version 是 N 就带 N，首轮接手通常是投递你的 launch note）。带对能抓并发写入——别人先写一手，你的发布报版本冲突（MCP isError；CLI 非零退出码、stderr 首行 VERSION_CONFLICT），重读日志再发。不带也能写（跳过校验），带上是更好的习惯。
 
 body 按以下模板逐节填写（小节标题保真，括号内是填写指引）：
 
@@ -67,7 +67,7 @@ design 落盘后任务派生为 implementing（waiting_for: agent:executor），
 
 ## 工具速查
 
-MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法照 `src/cli.ts` USAGE、`tut` 无参可打印（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
+MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
 
 | 操作 | MCP | CLI |
 |---|---|---|
@@ -85,7 +85,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 
 ## 延后流程
 
-延后只能由**人**拍板——流程中的任何 Agent 只有建议权或申请权（你的入口：design 的「风险与开放问题」显式标「建议延后」）。固定步骤：①人发一条 note 拍板（发在原任务上，写明同意延后哪些、理由；用 note 不用 decision——decision 参与状态派生，任务中途发布属表外组合、会把任务置 needs_attention）；②登记进 project scope：向 `project` 发一条 note，body 写三项——原任务 task_id、指向被延后记录的 ref_version、该问题的关闭条件（延后由此进入跨任务记忆，不随原任务关闭而丢失）；③引用与核销：Executor 的 revision 引用拍板记录（记下 version），re-review 对已延后问题按「已延后」核销。project scope 不参与状态派生：对它 publish 只返回 `{task_id, version}`，没有 status。
+你的入口：design 的「风险与开放问题」标「建议延后」，Agent 只有建议权或申请权。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
 
 ---
 

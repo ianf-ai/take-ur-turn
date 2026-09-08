@@ -10,9 +10,16 @@
  *                   field (additive revision, absent by default)
  *                   + optional top-level `auto` key echoing the validated auto
  *                   whitelist section (same additive pattern)
+ *                   + optional top-level `degraded` key: storage-corrupted
+ *                   tasks that failed to fold — non-empty when present
  *                   + per-entry `version` (additive revision)
  *   POST   /mode  → flow_mode switch for `tut mode`:
  *                   validate → key-preserving read-modify-write → echo {flow_mode}
+ *   POST   /repair-meta    → A-class meta rebuild (system-design 4.3):
+ *                   server-computed version + human-supplied rebuild fields
+ *   POST   /recover-record  → B-class recovery registration (4.3):
+ *                   pin corrupt bytes, land the .recovered copy, append the
+ *                   recovery.jsonl registration line
  *   other         → 404 JSON
  *
  * DNS-rebinding guard: Host must be 127.0.0.1 / localhost / [::1]
@@ -33,8 +40,8 @@ import {
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { autoSectionOf, readConfig, writeFlowMode } from "./config.js";
 import { createMcpServer } from "./mcp.js";
-import { PROJECT_TASK_ID, type AgentRoute, type CheckoutRoute } from "./types.js";
-import { Store } from "./store.js";
+import { ErrorCode, PROJECT_TASK_ID, type AgentRoute, type Cast, type CheckoutRoute, type Flow } from "./types.js";
+import { Store, StoreError, type RecoverRecordInput, type RepairMetaInput } from "./store.js";
 
 export interface RequestHandlerDeps {
   store: Store;
@@ -97,6 +104,37 @@ interface StateTaskEntry {
   checkout?: CheckoutRoute;
 }
 
+/** StoreError → HTTP status for the repair endpoints (404 unknown task, 409 conflict, 400 validation). */
+function storeErrorStatus(code: ErrorCode): number {
+  if (code === ErrorCode.TASK_NOT_FOUND) return 404;
+  if (code === ErrorCode.VERSION_CONFLICT) return 409;
+  return 400;
+}
+
+/**
+ * Map a JSON body field set onto the RepairMetaInput. Unknown fields are
+ * ignored (additive-only surface). KNOWN fields, once present, are passed
+ * through EXACTLY as sent: Store.repairMeta is the single validation
+ * authority, and an invalid value comes back as an honest 400. The previous
+ * silently-drop shaping let `flow:"bogus"` or a numeric
+ * title return 200 while quietly rebuilding as full/default — a semantic
+ * change the caller could not see. Callers wanting a field's default must
+ * OMIT it, not send garbage.
+ */
+function parseRepairMetaBody(parsed: unknown): { task_id: string; input: RepairMetaInput } | { error: string } {
+  if (typeof parsed !== "object" || parsed === null) return { error: "body must be a JSON object" };
+  const raw = parsed as Record<string, unknown>;
+  if (typeof raw.task_id !== "string" || raw.task_id.length === 0) return { error: "task_id must be a non-empty string" };
+  const input: RepairMetaInput = {};
+  for (const field of ["title", "description", "creator", "created_at"] as const) {
+    if (raw[field] !== undefined) input[field] = raw[field] as string; // store validates non-empty string
+  }
+  if (raw.flow !== undefined) input.flow = raw.flow as Flow; // store validates the enum
+  if (raw.cast !== undefined) input.cast = raw.cast as Cast; // store validates the shape
+  if (raw.checkout !== undefined) input.checkout = raw.checkout as CheckoutRoute; // store validates the shape
+  return { task_id: raw.task_id, input };
+}
+
 export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
   const { store, root } = deps;
   const transports = new Set<StreamableHTTPServerTransport>();
@@ -104,10 +142,10 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
   async function handleState(res: ServerResponse): Promise<void> {
     // One readConfig call per request: flow_mode is DERIVED from the
     // same snapshot that carries `notify` — one request, one config view.
-    const [config, entries] = await Promise.all([readConfig(root), store.listTasks()]);
+    const [config, snapshot] = await Promise.all([readConfig(root), store.snapshotTasks()]);
     const flowMode = config?.flow_mode ?? "manual";
     const tasks: StateTaskEntry[] = [];
-    for (const entry of entries) {
+    for (const entry of snapshot.tasks) {
       // project scope never appears in /state (system-design 4.3) — it has no derived state
       if (entry.task_id === PROJECT_TASK_ID) continue;
       tasks.push({
@@ -128,10 +166,16 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     // Optional `auto` key (same additive pattern): the validated
     // launch whitelist section — absent when missing/corrupt/malformed, so the
     // notifier's conservative default (empty = withhold all) applies.
+    // Optional `degraded` key (system-design 4.3 additive revision):
+    // storage-corrupted tasks that failed to fold — present only when non-empty,
+    // so consumers may treat absence as healthy. A vanished directory is
+    // invisible here by construction; consumers diff tasks∪degraded against
+    // their previous snapshot to detect disappearance.
     const auto = autoSectionOf(config);
     sendJson(res, 200, {
       flow_mode: flowMode,
       tasks,
+      ...(snapshot.degraded.length > 0 ? { degraded: snapshot.degraded } : {}),
       ...(config !== null && "notify" in config ? { notify: config.notify } : {}),
       ...(auto !== undefined ? { auto } : {}),
     });
@@ -165,6 +209,79 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     }
     await writeFlowMode(root, flowMode); // throws on a corrupt config → outer guard 500s
     sendJson(res, 200, { flow_mode: flowMode });
+  }
+
+  /**
+   * A-class repair entry (system-design 4.3): rebuild a corrupt/missing
+   * meta.json through the hub's single-writer queue. Runs on the LIVE hub
+   * only — a second process writing meta directly would race concurrent
+   * appends (lost updates / version clobbers). The CLI client is `tut
+   * repair-meta` (same discipline as `tut mode`).
+   */
+  async function handleRepairMetaPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readBody(req));
+    } catch {
+      sendJson(res, 400, { error: "invalid JSON body" });
+      return;
+    }
+    const shaped = parseRepairMetaBody(parsed);
+    if ("error" in shaped) {
+      sendJson(res, 400, { error: shaped.error });
+      return;
+    }
+    try {
+      const result = await store.repairMeta(shaped.task_id, shaped.input);
+      sendJson(res, 200, result);
+    } catch (e) {
+      if (e instanceof StoreError) {
+        sendJson(res, storeErrorStatus(e.code), { error: e.message });
+        return;
+      }
+      throw e; // outer guard 500s
+    }
+  }
+
+  /**
+   * B-class recovery registration entry (system-design 4.3): pin the corrupt
+   * bytes, land the recovered copy, append the registration line. The
+   * recovered bytes come from the caller (human-held external snapshot) —
+   * the hub never fetches backups itself.
+   */
+  async function handleRecoverRecordPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readBody(req));
+    } catch {
+      sendJson(res, 400, { error: "invalid JSON body" });
+      return;
+    }
+    const raw = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+    const taskId = typeof raw.task_id === "string" ? raw.task_id : undefined;
+    const recordFile = typeof raw.record_file === "string" ? raw.record_file : undefined;
+    const fromPath = typeof raw.from_path === "string" ? raw.from_path : undefined;
+    if (!taskId || !recordFile || !fromPath) {
+      sendJson(res, 400, { error: "task_id, record_file, and from_path must be non-empty strings" });
+      return;
+    }
+    const input: RecoverRecordInput = {
+      record_file: recordFile,
+      from_path: fromPath,
+      // Present-but-invalid source is NOT silently dropped (same principle as
+      // repair-meta): pass it through, the store validates.
+      ...(raw.source !== undefined ? { source: raw.source as string } : {}),
+    };
+    try {
+      const result = await store.recoverRecord(taskId, input);
+      sendJson(res, 200, result);
+    } catch (e) {
+      if (e instanceof StoreError) {
+        sendJson(res, storeErrorStatus(e.code), { error: e.message });
+        return;
+      }
+      throw e; // outer guard 500s
+    }
   }
 
   async function handleMcpPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -235,6 +352,26 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
         }
         res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "method not allowed: use POST /mode" }));
+        return;
+      }
+
+      if (pathname === "/repair-meta") {
+        if (req.method === "POST") {
+          await handleRepairMetaPost(req, res);
+          return;
+        }
+        res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "method not allowed: use POST /repair-meta" }));
+        return;
+      }
+
+      if (pathname === "/recover-record") {
+        if (req.method === "POST") {
+          await handleRecoverRecordPost(req, res);
+          return;
+        }
+        res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "method not allowed: use POST /recover-record" }));
         return;
       }
 

@@ -155,10 +155,11 @@ export function createMcpServer(store: Store): McpServer {
         "Append a context record (design, code_changes, review, revision, note, decision — any content_type) to a " +
         "task. Appends are unconditional: no flow/role/order check ever rejects a write; only basic validity " +
         "(task exists, summary/body non-empty) errors. role convention: \"architect\" | \"executor\" | \"reviewer\" | " +
-        "\"human\". For review records, payload.verdict must be exactly \"pass\" | \"fail_code\" | \"fail_design\" — " +
-        "these exact strings drive the state machine; any other value still lands but sets needs_attention. " +
-        "Returns { task_id, version, status, needs_attention, warnings? } for task scope, or { task_id, version } " +
-        "for the project scope.",
+        "\"human\". For review records, payload.verdict must be exactly \"pass\" | \"blocked_external\" | " +
+        "\"fail_code\" | \"fail_design\" (blocked_external: code fine, verification blocked on external conditions " +
+        "— derives like pass) — these exact strings drive the state machine; any other value still lands but sets " +
+        "needs_attention. Returns { task_id, version, status, needs_attention, warnings? } for task scope, or " +
+        "{ task_id, version } for the project scope.",
       inputSchema: {
         task_id: z.string(),
         role: z.string(),

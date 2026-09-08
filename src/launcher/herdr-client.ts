@@ -55,9 +55,11 @@ export interface HerdrCommandResult {
   stdout: string;
   stderr: string;
   error?: Error;
+  /** True when the command timed out and the child was killed. */
+  timedOut?: true;
 }
 
-export type HerdrErrorCode = "SPAWN_ERROR" | "EXIT_ERROR" | "INVALID_RESPONSE" | "INVALID_ARGUMENT";
+export type HerdrErrorCode = "SPAWN_ERROR" | "EXIT_ERROR" | "INVALID_RESPONSE" | "INVALID_ARGUMENT" | "TIMEOUT";
 
 /** A stable, inspectable error shape for all Herdr client failures. */
 export class HerdrClientError extends Error {
@@ -92,7 +94,23 @@ export interface HerdrClientOptions {
   spawnFn?: DirectSpawn;
   /** Platform override for resolver tests; production defaults to process.platform. */
   platform?: NodeJS.Platform;
+  /**
+   * Liveness backstop per control command: kill the child and
+   * settle as a timeout failure after this many milliseconds.  Defaults to
+   * DEFAULT_HERDR_TIMEOUT_MS (env escape hatch TUT_HERDR_TIMEOUT_MS); a
+   * non-positive or non-finite value disables the backstop.
+   */
+  timeoutMs?: number;
 }
+
+/**
+ * Default per-command herdr timeout: herdr control commands are
+ * single short-lived CLI invocations — anything still running after this is
+ * wedged (hung pane IPC, stopped process) and must become a failure return
+ * so callers take their existing error/degradation paths instead of
+ * awaiting forever.
+ */
+export const DEFAULT_HERDR_TIMEOUT_MS = 10_000;
 
 export interface TabCreateOptions {
   workspaceId?: string;
@@ -259,6 +277,7 @@ export class HerdrClient {
   /** An explicit env is frozen; the default client follows the process env. */
   private readonly environment: NodeJS.ProcessEnv | undefined;
   private readonly spawnFn: DirectSpawn;
+  private readonly timeoutMs: number;
 
   constructor(options: HerdrClientOptions = {}) {
     if (options.executable !== undefined) argument(options.executable, "herdr executable");
@@ -266,6 +285,9 @@ export class HerdrClient {
     this.platform = options.platform ?? process.platform;
     this.environment = options.env === undefined ? undefined : { ...options.env };
     this.spawnFn = options.spawnFn ?? spawnDirect;
+    const envTimeout = Number.parseInt(String((options.env ?? process.env).TUT_HERDR_TIMEOUT_MS ?? ""), 10);
+    this.timeoutMs = options.timeoutMs
+      ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : DEFAULT_HERDR_TIMEOUT_MS);
   }
 
   /** Resolve late so a process-wide configured executable reaches module-level clients. */
@@ -277,13 +299,17 @@ export class HerdrClient {
     });
   }
 
-  /** Execute an exact Herdr argv and return its process result without throwing. */
+  /** Execute an exact Herdr argv and return its process result without throwing.
+   *  A command that exceeds the configured timeout is killed (SIGKILL reaches
+   *  even a stopped process) and resolved with timedOut: true — "never
+   *  returns" becomes "fails". */
   command(args: readonly string[]): Promise<HerdrCommandResult> {
     const argv = args.map((value, index) => argument(value, `herdr argv[${index}]`));
     return new Promise((resolve) => {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let timedOut = false;
       let child: ChildProcess;
       try {
         const options: DirectSpawnOptions = {
@@ -296,17 +322,29 @@ export class HerdrClient {
         resolve({ code: null, signal: null, stdout, stderr, error: error as Error });
         return;
       }
+      const killer = Number.isFinite(this.timeoutMs) && this.timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // An already-dead child still emits `close`; nothing to do.
+            }
+          }, this.timeoutMs)
+        : null;
+      const settle = (result: HerdrCommandResult): void => {
+        if (killer !== null) clearTimeout(killer);
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
       child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
       child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
       child.once("error", (error) => {
-        if (settled) return;
-        settled = true;
-        resolve({ code: null, signal: null, stdout, stderr, error });
+        settle({ code: null, signal: null, stdout, stderr, error });
       });
       child.once("close", (code, signal) => {
-        if (settled) return;
-        settled = true;
-        resolve({ code, signal, stdout, stderr });
+        settle({ code, signal, stdout, stderr, ...(timedOut ? { timedOut: true } : {}) });
       });
     });
   }
@@ -323,6 +361,14 @@ export class HerdrClient {
         "SPAWN_ERROR",
         operation,
         `${operation} failed to spawn: ${result.error.message}`,
+        { args, stderr: result.stderr },
+      );
+    }
+    if (result.timedOut === true) {
+      throw new HerdrClientError(
+        "TIMEOUT",
+        operation,
+        `${operation} timed out after ${this.timeoutMs}ms and was killed`,
         { args, stderr: result.stderr },
       );
     }

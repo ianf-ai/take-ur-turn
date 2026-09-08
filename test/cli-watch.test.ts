@@ -94,11 +94,16 @@ describe("watch handler (three-state exit codes, /state stubbed)", () => {
 
   beforeEach(() => {
     io = captureIo();
+    // Production clamps --interval to a 1s floor; these tight-loop
+    // tests use the DEDICATED test knob (never a production path) to keep
+    // 0s polls fast.
+    process.env.TUT_TEST_INTERVAL_FLOOR_SEC = "0";
   });
 
   afterEach(() => {
     io.restore();
     vi.unstubAllGlobals();
+    delete process.env.TUT_TEST_INTERVAL_FLOOR_SEC;
   });
 
   it("exit 0 — round boundary: a new record advanced the state to an agent's turn", async () => {
@@ -235,7 +240,7 @@ describe("watch handler (three-state exit codes, /state stubbed)", () => {
     expect(warnings).toHaveLength(1); // throttled: one line per outage, not per failure
   });
 
-  it("hub unreachable at baseline exits 1 with a diagnostic", async () => {
+  it("hub unreachable at baseline exits 1 with the unified HUB_UNREACHABLE diagnosis", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => {
@@ -246,8 +251,25 @@ describe("watch handler (three-state exit codes, /state stubbed)", () => {
     const code = await main(["watch", "t1"]);
 
     expect(code).toBe(1);
-    expect(io.err()).toContain("cannot read state");
+    const first = io.err().split("\n")[0] ?? "";
+    expect(first.startsWith("HUB_UNREACHABLE: cannot reach the Hub at http://127.0.0.1:3001 (")).toBe(true);
+    expect(first.endsWith("— start it with: tut serve")).toBe(true);
   });
+
+  it("interval clamp: without the test knob, --interval 0 is floored at 1s with a visible note", async () => {
+    delete process.env.TUT_TEST_INTERVAL_FLOOR_SEC;
+    const fetchMock = stubStateQueue([
+      [{ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 }],
+      [{ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", version: 2 }],
+    ]);
+
+    const code = await main(["watch", "t1", "--interval", "0"]);
+
+    expect(code).toBe(0);
+    expect(io.err()).toContain("tut: watch: --interval 0 is below the 1s floor — clamped to 1s");
+    expect(io.err()).toContain("polling every 1s"); // the effective interval is reported
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  }, 10_000);
 });
 
 // --- handler: task selection aligned with start-next ------------------------------
@@ -257,11 +279,13 @@ describe("watch task selection (aligned with start-next)", () => {
 
   beforeEach(() => {
     io = captureIo();
+    process.env.TUT_TEST_INTERVAL_FLOOR_SEC = "0"; // tight loop: dedicated test knob
   });
 
   afterEach(() => {
     io.restore();
     vi.unstubAllGlobals();
+    delete process.env.TUT_TEST_INTERVAL_FLOOR_SEC;
   });
 
   it("no-arg: the unique agent-waiting task is selected (human-waiting ignored)", async () => {

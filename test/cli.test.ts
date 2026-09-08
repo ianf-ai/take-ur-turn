@@ -17,12 +17,20 @@ vi.mock("../src/hub-client.js", async (importOriginal) => ({
   hubDecide: vi.fn(),
 }));
 
-import { USAGE, main, parseArgs, notifyHealthy } from "../src/cli.js";
+// The notify-clamp tests below need the handler boundary without running a
+// real Notifier loop — mock runNotify only, everything else stays real.
+vi.mock("../src/notifier.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/notifier.js")>()),
+  runNotify: vi.fn(),
+}));
+
+import { USAGE, main, parseArgs, notifyHealthy, DEFAULT_HUB_URL, DEFAULT_EVENT_PORT, CLI_FETCH_TIMEOUT_MS } from "../src/cli.js";
 import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError } from "../src/hub-client.js";
-import { Notifier } from "../src/notifier.js";
+import { Notifier, runNotify } from "../src/notifier.js";
 import { startServer, type RunningServer } from "../src/server.js";
 import { Store } from "../src/store.js";
 import http from "node:http";
+import { readFileSync } from "node:fs";
 
 /**
  * Hermetic workspace chain for agent-resolving handler tests: chdir into
@@ -126,6 +134,12 @@ describe("cli arg parsing (pure parseArgs)", () => {
       eventPort: 3100,
       stallTimeoutMin: 5,
     });
+  });
+
+  it("listener --event-port rejects 0 consistently for notify and up", () => {
+    const expected = { command: "usage", error: "--event-port requires a positive integer, got: 0" };
+    expect(parseArgs(["notify", "--event-port", "0"])).toEqual(expected);
+    expect(parseArgs(["up", "--event-port=0"])).toEqual(expected);
   });
 
   it("notify accepts a configurable launch→working short fuse", () => {
@@ -653,7 +667,7 @@ describe("context handlers (hub-client mocked: wiring + output contract)", () =>
     }
   });
 
-  it("status HubError exits 1 with the code line; ordinary errors exit 1 with a tut: line", async () => {
+  it("status HubError exits 1 with the code line; an unreachable hub prints the unified HUB_UNREACHABLE line", async () => {
     vi.mocked(hubList).mockRejectedValueOnce(new HubError("HUB_DOWN", "boom"));
     let code = await main(["status"]);
     expect(code).toBe(1);
@@ -665,7 +679,10 @@ describe("context handlers (hub-client mocked: wiring + output contract)", () =>
       vi.mocked(hubList).mockRejectedValueOnce(new Error("fetch failed"));
       code = await main(["status", "--json"]);
       expect(code).toBe(1);
-      expect(io2.err().split("\n")[0]).toBe("tut: fetch failed");
+      // One flavor everywhere — code-first line pointing at tut serve.
+      expect(io2.err().split("\n")[0]).toBe(
+        "HUB_UNREACHABLE: cannot reach the Hub at http://127.0.0.1:3001 (fetch failed) — start it with: tut serve",
+      );
     } finally {
       io2.restore();
     }
@@ -739,13 +756,15 @@ describe("context handlers (hub-client mocked: wiring + output contract)", () =>
     expect(io.err().split("\n")[0]).toBe("TASK_NOT_FOUND: task not found: ghost");
   });
 
-  it("ack against an unreachable hub exits 1 with a plain tut: message", async () => {
+  it("ack against an unreachable hub exits 1 with the unified HUB_UNREACHABLE diagnosis", async () => {
     vi.mocked(hubPublish).mockRejectedValue(new Error("fetch failed"));
 
     const code = await main(["ack", "t1"]);
 
     expect(code).toBe(1);
-    expect(io.err().split("\n")[0]).toBe("tut: fetch failed");
+    expect(io.err().split("\n")[0]).toBe(
+      "HUB_UNREACHABLE: cannot reach the Hub at http://127.0.0.1:3001 (fetch failed) — start it with: tut serve",
+    );
   });
 });
 
@@ -781,11 +800,13 @@ describe("mode / start-next handlers (real hub)", () => {
     expect(state.flow_mode).toBe("auto");
   });
 
-  it("mode against an unreachable hub exits 1 with a clear message", async () => {
+  it("mode against an unreachable hub exits 1 with the unified HUB_UNREACHABLE line", async () => {
     const code = await main(["mode", "auto", "--url", "http://127.0.0.1:9"]);
 
     expect(code).toBe(1);
-    expect(io.err()).toContain("cannot reach Hub");
+    const first = io.err().split("\n")[0] ?? "";
+    expect(first.startsWith("HUB_UNREACHABLE: cannot reach the Hub at http://127.0.0.1:9 (")).toBe(true);
+    expect(first.endsWith("— start it with: tut serve")).toBe(true);
   });
 
   it("start-next extracts the role from waiting_for and runs launch.sh (TUT_DRY_RUN passthrough)", async () => {
@@ -946,11 +967,21 @@ describe("mode / start-next handlers (real hub)", () => {
     // Deterministic routing for the launch pre-check: clean chain (no L1,
     // no L2) so executor resolves through DEFAULT_ROLES (pi, on PATH)
     // regardless of the repo's live config or the machine's user-level one.
+    // Herdr is stubbed with the anchor panes so the version race — not the
+    // ambient herdr server state (a foreign project's server must not
+    // change this test's outcome) — decides the flow.
     const prevCwd = process.cwd();
     const prevUserDir = process.env.TUT_USER_CONFIG_DIR;
+    const prevHerdr = process.env.TUT_HERDR_EXECUTABLE;
+    const prevPanes = process.env.TUT_HERDR_PANES;
     const chainTmp = mkdtempSync(path.join(os.tmpdir(), "tut-cli-race-"));
     process.chdir(chainTmp);
     process.env.TUT_USER_CONFIG_DIR = path.join(chainTmp, "user-config");
+    process.env.TUT_HERDR_EXECUTABLE = path.resolve(import.meta.dirname, "bin/herdr");
+    process.env.TUT_HERDR_PANES = JSON.stringify([
+      { pane_id: "FIX:hub", label: "tut-hub", workspace_id: "wX", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "FIX:notify", label: "tut-notify", workspace_id: "wX", cwd: "/repo", agent_status: "idle" },
+    ]);
     let code: number;
     try {
       code = await main(["start-next", created.task_id, "--url", baseUrl]);
@@ -958,6 +989,10 @@ describe("mode / start-next handlers (real hub)", () => {
       process.chdir(prevCwd);
       if (prevUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
       else process.env.TUT_USER_CONFIG_DIR = prevUserDir;
+      if (prevHerdr === undefined) delete process.env.TUT_HERDR_EXECUTABLE;
+      else process.env.TUT_HERDR_EXECUTABLE = prevHerdr;
+      if (prevPanes === undefined) delete process.env.TUT_HERDR_PANES;
+      else process.env.TUT_HERDR_PANES = prevPanes;
       rmSync(chainTmp, { recursive: true, force: true });
     }
 
@@ -1184,14 +1219,14 @@ describe("tut create --cast (parse + hubCreate wiring)", () => {
 });
 
 describe("tut create --checkout (parse + hubCreate wiring)", () => {
-  const base = ["create", "--title", "T", "--description", "D", "--creator", "C", "--role", "R"] as const;
+  const base = ["create", "--title", "T", "--description", "D", "--creator", "C", "--role", "human"] as const;
 
   it("parses current and explicit worktree path/ref routes", () => {
     expect(parseArgs([...base, "--checkout", "current"])).toEqual({
-      command: "create", title: "T", description: "D", creator: "C", role: "R", checkout: { kind: "current" },
+      command: "create", title: "T", description: "D", creator: "C", role: "human", checkout: { kind: "current" },
     });
     expect(parseArgs([...base, "--checkout", "worktree:/tmp/tut-a", "--checkout-ref", "task-a"])).toEqual({
-      command: "create", title: "T", description: "D", creator: "C", role: "R",
+      command: "create", title: "T", description: "D", creator: "C", role: "human",
       checkout: { kind: "worktree", path: "/tmp/tut-a", ref: "task-a" },
     });
     expect(parseArgs([...base, "--checkout", "worktree", "--checkout-path", "/tmp/tut-b"])).toMatchObject({
@@ -1261,12 +1296,187 @@ describe("tut create --checkout (parse + hubCreate wiring)", () => {
         title: "T",
         description: "D",
         creator: "C",
-        role: "R",
+        role: "human",
         flow: "direct",
         checkout: { kind: "worktree", path: "/tmp/tut-a" },
       });
     } finally {
       io.restore();
+    }
+  });
+});
+
+// --- single-source default URLs ----------------------------------------------------
+
+describe("default URL/port convergence", () => {
+  it("parsers and handlers derive from the exported single-source constants", () => {
+    expect(DEFAULT_HUB_URL).toBe("http://127.0.0.1:3001");
+    expect(DEFAULT_EVENT_PORT).toBe(3002);
+    expect(parseArgs(["notify"])).toMatchObject({ command: "notify", url: DEFAULT_HUB_URL, eventPort: DEFAULT_EVENT_PORT });
+    expect(parseArgs(["mode", "auto"])).toMatchObject({ command: "mode", url: DEFAULT_HUB_URL });
+    expect(parseArgs(["start-next"])).toMatchObject({ command: "start-next", url: DEFAULT_HUB_URL });
+    expect(parseArgs(["watch"])).toMatchObject({ command: "watch", url: DEFAULT_HUB_URL });
+  });
+
+  it("structural guard: the quoted hub-url literal appears exactly once in src/cli.ts", () => {
+    // The constant's definition is the ONLY quoted literal; a re-forked copy
+    // in a parser, handler, or rendered command trips this count.
+    const src = readFileSync(path.resolve(import.meta.dirname, "../src/cli.ts"), "utf8");
+    expect(src.split('"http://127.0.0.1:3001"').length - 1).toBe(1);
+  });
+
+  it("USAGE teaches the multi-hub --url discipline and documents up --event-port", () => {
+    expect(USAGE).toContain("Running several hubs side by side? Pass --url");
+    expect(USAGE).toContain("tut up [--url <u>] [--event-port <p>] [--dry-run]");
+  });
+});
+
+// --- unified HUB_UNREACHABLE diagnosis ----------------------------------------------
+
+describe("HUB_UNREACHABLE unification", () => {
+  it("start-next against a refused hub prints the unified first line", async () => {
+    // A really-free port: nothing listens, fetch fails at the TCP level.
+    const server = http.createServer(() => undefined);
+    const freePort: number = await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port)));
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+    const io = captureIo();
+    try {
+      const code = await main(["start-next", "t1", "--url", `http://127.0.0.1:${freePort}`]);
+      expect(code).toBe(1);
+      const first = io.err().split("\n")[0] ?? "";
+      expect(first.startsWith(`HUB_UNREACHABLE: cannot reach the Hub at http://127.0.0.1:${freePort} (`)).toBe(true);
+      expect(first.endsWith("— start it with: tut serve")).toBe(true);
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("a non-network failure keeps its command context (watch on an HTTP 500)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("boom", { status: 500 })),
+    );
+    const io = captureIo();
+    try {
+      const code = await main(["watch", "t1"]);
+      expect(code).toBe(1);
+      // Not HUB_UNREACHABLE: the hub answered, it is just unhealthy — the
+      // command-context flavor stays (and no clamp note: the 5s default).
+      expect(io.err()).toContain("tut: cannot read state from http://127.0.0.1:3001: HTTP 500");
+      expect(io.err()).not.toContain("HUB_UNREACHABLE");
+    } finally {
+      io.restore();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// --- bounded fetch (CLI half) -------------------------------------------------------
+
+describe("CLI-side fetch timeout wiring", () => {
+  it("every raw CLI fetch carries a 10s abort signal", async () => {
+    expect(CLI_FETCH_TIMEOUT_MS).toBe(10_000);
+    // Capture the RequestInit mode passes to fetch: the signal is wired at
+    // every call site (mode's POST here; /state and the up probes share the
+    // same helper), and the deadline value is pinned above.
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response("{}", { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const io = captureIo();
+    try {
+      await main(["mode", "auto", "--url", "http://127.0.0.1:1"]);
+      expect(fetchMock).toHaveBeenCalled();
+      const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      expect((init?.signal as AbortSignal).aborted).toBe(false);
+    } finally {
+      io.restore();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// --- create warns on unconventional roles --------------------------------------------
+
+describe("create unknown-role warning", () => {
+  const base = ["create", "--title", "T", "--description", "D", "--creator", "C"] as const;
+
+  it("warns (non-blocking) for a role outside the conventional set, naming the codex fallback", async () => {
+    vi.mocked(hubCreate).mockResolvedValue({ task_id: "role-1", status: "designing", version: 0 });
+    const io = captureIo();
+    try {
+      const code = await main([...base, "--role", "architekt"]); // typo shape
+      expect(code).toBe(0); // non-blocking: the task is still created
+      expect(io.err()).toContain("warning: role 'architekt' is outside the conventional set (architect|executor|reviewer|human)");
+      expect(io.err()).toContain("falls back to the 'codex' builtin");
+      expect(io.err()).toContain("no skills/architekt.md ships");
+      expect(vi.mocked(hubCreate)).toHaveBeenCalledWith("http://127.0.0.1:3001", expect.objectContaining({ role: "architekt" }));
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("conventional roles (three seats + human) stay silent", async () => {
+    vi.mocked(hubCreate).mockResolvedValue({ task_id: "role-2", status: "designing", version: 0 });
+    for (const role of ["architect", "executor", "reviewer", "human"]) {
+      const io = captureIo();
+      try {
+        const code = await main([...base, "--role", role]);
+        expect(code).toBe(0);
+        expect(io.err()).not.toContain("outside the conventional set");
+      } finally {
+        io.restore();
+      }
+    }
+  });
+});
+
+// --- notify --interval floor ----------------------------------------------------------
+
+describe("notify --interval clamp", () => {
+  it("--interval 0 is clamped to the 1s floor with a visible note; larger values pass through", async () => {
+    vi.mocked(runNotify).mockResolvedValue(undefined);
+    const io = captureIo();
+    try {
+      let code = await main(["notify", "--interval", "0"]);
+      expect(code).toBe(0);
+      expect(io.err()).toContain("tut: notify: --interval 0 is below the 1s floor — clamped to 1s");
+      expect(runNotify).toHaveBeenCalledWith(expect.objectContaining({ interval: 1, eventPort: 3002 }));
+
+      code = await main(["notify", "--interval", "2"]);
+      expect(code).toBe(0);
+      expect(runNotify).toHaveBeenLastCalledWith(expect.objectContaining({ interval: 2 }));
+
+      io.restore();
+      const io2 = captureIo();
+      try {
+        code = await main(["notify"]);
+        expect(code).toBe(0);
+        expect(io2.err()).not.toContain("floor"); // the 5s default never clamps
+        expect(runNotify).toHaveBeenLastCalledWith(expect.objectContaining({ interval: 5 }));
+      } finally {
+        io2.restore();
+      }
+    } finally {
+      io.restore();
+      vi.mocked(runNotify).mockReset();
+    }
+  });
+
+  it("the floor is a production constant: no env knob widens it except the dedicated test knob", async () => {
+    vi.mocked(runNotify).mockResolvedValue(undefined);
+    const io = captureIo();
+    try {
+      // A random env var must NOT loosen the floor (test knobs are dedicated,
+      // never ambient): only TUT_TEST_INTERVAL_FLOOR_SEC does.
+      process.env.TUT_SOME_RANDOM_KNOB = "0";
+      await main(["notify", "--interval", "0"]);
+      expect(runNotify).toHaveBeenLastCalledWith(expect.objectContaining({ interval: 1 }));
+    } finally {
+      delete process.env.TUT_SOME_RANDOM_KNOB;
+      io.restore();
+      vi.mocked(runNotify).mockReset();
     }
   });
 });

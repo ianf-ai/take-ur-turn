@@ -15,7 +15,7 @@ TUT（Take Ur Turn）：多 coding agent 协作系统。核心是 Context Hub—
 
 - **语言**：TypeScript（Node.js ≥ 20）
 - **MCP SDK**：@modelcontextprotocol/sdk
-- **存储**：当前为本地 JSON 文件（`.context-hub/` 目录，按 task 组织，每次写入带版本号），存储层设计为可插拔，后续可换 git/GitHub 后端
+- **存储**：本地 JSON 文件（`.context-hub/` 目录，按 task 组织，每次写入带版本号）；全部读写经 Store/HTTP 接口进行，新功能不得绕过接口直接操作存储文件
 - **依赖原则**：当前零运行时外部依赖（MCP SDK 除外，zod 与 SDK 并列显式声明以保单实例），不引入数据库
 
 ## 目录结构（约定）

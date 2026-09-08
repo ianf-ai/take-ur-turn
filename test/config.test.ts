@@ -361,3 +361,41 @@ describe("writeConfigKey (tut config set engine)", () => {
     expect(leftovers).toEqual([]);
   });
 });
+
+// --- concurrent write safety ---------------------------------------------------
+
+describe("concurrent config writes (unique temp suffix + serialized write chain)", () => {
+  it("100 concurrent writeFlowMode calls never corrupt config.json and never lose the notify keys", async () => {
+    // Seed a config with unknown keys that must survive every interleaving.
+    writeFileSync(
+      path.join(root, "config.json"),
+      JSON.stringify({ flow_mode: "manual", notify: { channels: ["desktop"], webhook_url: "https://example/hook" } }, null, 2) + "\n",
+      "utf8",
+    );
+
+    const results = await Promise.all(
+      Array.from({ length: 100 }, (_, i) => writeFlowMode(root, i % 2 === 0 ? "auto" : "manual")),
+    );
+    expect(results).toHaveLength(100);
+
+    const raw = readFileSync(path.join(root, "config.json"), "utf8");
+    const onDisk = JSON.parse(raw) as Config; // throws on corruption — the failure shape
+    expect(onDisk.flow_mode === "manual" || onDisk.flow_mode === "auto").toBe(true);
+    expect(onDisk.notify).toEqual({ channels: ["desktop"], webhook_url: "https://example/hook" });
+    // No temp litter left behind after the storm.
+    expect(readdirSync(root).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("writeFlowMode and writeConfigKey serialize on the same chain — no lost updates between engines", async () => {
+    writeFileSync(path.join(root, "config.json"), '{"flow_mode":"manual"}\n', "utf8");
+    await Promise.all([
+      writeFlowMode(root, "auto"),
+      writeConfigKey(root, { key: "auto.launch_roles", value: ["executor", "reviewer"] }),
+      writeConfigKey(root, { key: "flow_mode", value: "manual" }),
+      writeFlowMode(root, "auto"),
+    ]);
+    const onDisk = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8")) as Config;
+    expect(onDisk.flow_mode === "manual" || onDisk.flow_mode === "auto").toBe(true);
+    expect(onDisk.auto).toEqual({ launch_roles: ["executor", "reviewer"] });
+  });
+});

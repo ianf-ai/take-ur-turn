@@ -25,8 +25,8 @@ export type Status =
   | "approved"
   | "closed";
 
-/** system-design 3.1. Only meaningful on review records (context-design 2.3). */
-export type Verdict = "pass" | "fail_code" | "fail_design";
+/** system-design 3.1 four-tier vocabulary. Only meaningful on review records (context-design 2.3). */
+export type Verdict = "pass" | "blocked_external" | "fail_code" | "fail_design";
 
 /**
  * Workflow variant (system-design 3.1): selects the transition table.

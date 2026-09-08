@@ -34,7 +34,7 @@ export const DEFAULT_ROLES: Record<string, string> = {
   reviewer: "codex",
 };
 
-/** Final fallback for a role DEFAULT_ROLES does not know (parity with tut-resolve.mjs). */
+/** Final fallback for a role DEFAULT_ROLES does not know (parity with tut-resolve.mjs). Visible face: `tut create` warns (non-blocking) when the creator role is outside the conventional set — this fallback is what the warning explains. */
 export const UNKNOWN_ROLE_AGENT = "codex";
 
 export const KNOWN_ROLES = ["architect", "executor", "reviewer"] as const;

@@ -104,7 +104,17 @@ export function continuityRoleSet(value?: string): Set<string> {
 }
 
 export function paneIsAlive(pane: Pick<LifecyclePane, "agent_status">): boolean {
-  return pane.agent_status === "idle" || pane.agent_status === "working" || pane.agent_status === "blocked";
+  // "done" is turn-complete, not process-death: the agent process keeps
+  // running with its TUI waiting for the next prompt (F1 live evidence:
+  // a "done" pi pane still had its node.exe in the foreground process
+  // group). Excluding it made same-role continuation unreachable at the
+  // only moment it exists for — right after the worker finished its turn.
+  return (
+    pane.agent_status === "idle" ||
+    pane.agent_status === "working" ||
+    pane.agent_status === "blocked" ||
+    pane.agent_status === "done"
+  );
 }
 
 export function taskPaneLabel(taskId: string, role: string): string {
@@ -207,7 +217,8 @@ async function closePlanned(
     stdout: ((text: string) => void) | undefined;
     stderr: ((text: string) => void) | undefined;
   },
-): Promise<void> {
+): Promise<number> {
+  let realCloses = 0;
   for (const pane of plan.working) {
     write(
       options.stderr,
@@ -231,6 +242,7 @@ async function closePlanned(
       );
       continue;
     }
+    realCloses += 1; // an attempted close (success OR failure) dirties the snapshot
     try {
       const result = await options.client.closePane(pane.pane_id);
       const failed = typeof result === "object" && result !== null && (
@@ -252,6 +264,7 @@ async function closePlanned(
       );
     }
   }
+  return realCloses;
 }
 
 /** Execute continuation/birth lifecycle policy around caller-owned delivery. */
@@ -270,10 +283,41 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
     ? continuityRoleSet(options.continuityRoles)
     : options.continuityRoles ?? continuityRoleSet();
 
+  // Back-to-back full pane lists with ZERO mutations between them are
+  // merged — each list is a full herdr child spawn.  A snapshot stays
+  // reusable until a real close attempt dirties it; an unusable snapshot
+  // never serves reuse (a transient inventory failure deserves a fresh
+  // retry, not a cached dead end).
+  let snapshot: PaneListSnapshot | undefined;
+  let snapshotDirty = false;
+  const listFresh = async (): Promise<PaneListSnapshot> => {
+    snapshot = await list(options.client);
+    snapshotDirty = false;
+    return snapshot;
+  };
+  const listCurrent = async (): Promise<PaneListSnapshot> => {
+    if (snapshot !== undefined && !snapshotDirty && snapshot.usable) return snapshot;
+    return await listFresh();
+  };
+  const closePlannedAndMark = async (plan: ReapPlan): Promise<void> => {
+    // Always run: closePlanned also emits the working/keptContinuity
+    // warnings, which an empty close list must not swallow (a survivor-only
+    // reap is exactly when the working warning matters most).
+    const realCloses = await closePlanned(plan, {
+      client: options.client,
+      dryRun,
+      stdout: options.stdout,
+      stderr: options.stderr,
+    });
+    // Only an attempted (non-dry-run) close mutates Herdr and dirties the
+    // snapshot — a dry-run/empty plan cannot.
+    if (realCloses > 0) snapshotDirty = true;
+  };
+
   if (!options.invocation.fresh && continuity.has(role)) {
-    const snapshot = await list(options.client);
-    if (snapshot.usable) {
-      const candidates = livePanesForLabel(snapshot.panes, paneLabel);
+    const current = await listFresh();
+    if (current.usable) {
+      const candidates = livePanesForLabel(current.panes, paneLabel);
       if (candidates.length > 1) {
         const first = candidates[0]!;
         write(
@@ -302,19 +346,18 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
       (text) => process.stderr.write(text),
       `launch: --fresh — force-closing panes labeled '${paneLabel}' (explicit fresh choice, working included)\n`,
     );
-    const forced = await list(options.client);
+    const forced = await listCurrent();
     if (!forced.usable && !dryRun) {
       const reason = forced.error ?? "pane list unavailable";
       write(options.stderr, (text) => process.stderr.write(text), `launch: cannot inspect panes for --fresh: ${reason}\n`);
       return { kind: "failed", reason };
     }
-    await closePlanned(
+    await closePlannedAndMark(
       planReap(forced.panes, { task_id: taskId, continuityRoles: continuity, mode: "force", onlyRole: role }),
-      { client: options.client, dryRun, stdout: options.stdout, stderr: options.stderr },
     );
   }
 
-  const reap = await list(options.client);
+  const reap = await listCurrent();
   if (!reap.usable && !dryRun) {
     const reason = reap.error ?? "pane list unavailable";
     write(options.stderr, (text) => process.stderr.write(text), `launch: cannot inspect panes before birth: ${reason}\n`);
@@ -326,10 +369,10 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
     ...(options.invocation.fresh ? { skipLabel: paneLabel } : {}),
   };
   const reapPlan = planReap(reap.panes, reapOptions);
-  await closePlanned(reapPlan, { client: options.client, dryRun, stdout: options.stdout, stderr: options.stderr });
+  await closePlannedAndMark(reapPlan);
 
   if (!dryRun) {
-    const after = await list(options.client);
+    const after = await listCurrent();
     if (!after.usable) {
       const reason = after.error ?? "pane list unavailable";
       write(options.stderr, (text) => process.stderr.write(text), `launch: cannot verify pane addressing key '${paneLabel}': ${reason}\n`);

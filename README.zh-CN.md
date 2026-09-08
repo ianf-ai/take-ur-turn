@@ -170,7 +170,7 @@ tut read <task_id> [--since-version <n>] [--json] [--url <u>]
 tut list [--status <s>] [--json] [--url <u>]
 tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
 tut assign <role> <command...>
-tut up [--url <u>] [--dry-run]
+tut up [--url <u>] [--event-port <p>] [--dry-run]
 tut skill <host|architect|executor|reviewer>
 tut init
 tut ack <task_id> [--note <text>] [--url <u>]
@@ -250,7 +250,7 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 |---|---|---|
 | `--port <n>` | `tut serve` 的监听端口 | `3001` |
 | `--url <u>` | Hub 地址覆盖（`tut up` 与上下文/审批命令；仅接受 loopback + 显式端口的地址） | `http://127.0.0.1:3001` |
-| `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | `tut notify` 的轮询间隔 / Agent 事件端口 / stall 超时 | `5s` / `3002` / `30min` |
+| `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | `tut notify` 的轮询间隔 / Agent 事件端口 / stall 超时（`--event-port` 同时决定 `tut up` 探测与供给的端口；轮询间隔下限 1s） | `5s` / `3002` / `30min` |
 | `--working-timeout <s>` | `tut notify` 的 launch → working 短引信；超时未收到 working 信号时告警 | `300s` |
 | `--root <dir>` | `tut serve` 的存储根目录 | 当前目录 |
 | env `TUT_UP_CLI_SELF` | `tut up` 供给 panes 时用的自身 CLI 路径 | 自动解析（dist 布局） |
@@ -294,7 +294,7 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 **排障**：
 
 - **Agent 说看不到 context.* 工具**：确认 `tut serve` 在跑（`curl http://127.0.0.1:3001/state` 有响应即活）；确认该 CLI 的 MCP 配置指向 `/mcp` 端点；个别 CLI 会话可能被沙箱挡住 localhost 回连——此时让该 Agent 改用 CLI 通道（`tut read` / `tut publish`），行为完全等价
-- **3001 端口被占用（EADDRINUSE）**：`tut serve --port <n>` 换端口，其余命令以 `--url` 指向新地址（`tut up` 的供给探测同指向）
+- **3001 端口被占用（EADDRINUSE）**：`tut serve --port <n>` 换端口，其余命令以 `--url` 指向新地址（`tut up` 的供给探测同指向）。不要把 `--url` 指向事件端口（`:3002`）——`tut up` 会在动工前明确拒绝该冲突；需要挪事件端口用 `--event-port`。任何命令连不上 Hub 都会打印同一口径的 `HUB_UNREACHABLE` 一行并指路 `tut serve`；多个 Hub 并存时每次调用都显式带 `--url`（缺省 `--url` 的命令永远打到默认端口）
 - **`npm i -g` 后自定义的阵容丢了**——已解决：阵容存于项目（`.context-hub/workspace.json`）或用户级（`~/.config/tut/`），升级不动它们。迁移步骤见[配置 ②](#-工作区阵容--三级解析链项目--用户--内置)
 
 **已知限制**（设计取舍，非 bug）：

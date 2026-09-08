@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +17,7 @@ import {
 } from "../src/launcher/invocation.js";
 import { parseLaunchEntry, runLaunchEntry } from "../src/launcher/entry.js";
 import { privateDigestOf } from "../src/launcher/compat.js";
-import { cliEntryPath, runInternalLaunchInvocation, runNodeCommand, type DirectSpawn } from "../src/launcher/process.js";
+import { cliEntryPath, DEFAULT_CHILD_TIMEOUT_MS, runInternalLaunchInvocation, runNodeCommand, type DirectSpawn } from "../src/launcher/process.js";
 import { Notifier } from "../src/notifier.js";
 import type { ContextRecord, LaunchInvocation } from "../src/types.js";
 
@@ -167,6 +168,88 @@ describe("internal Node process boundary", () => {
 
     expect(seenStdio).toEqual(["ignore", "ignore", "ignore"]);
     expect(result).toMatchObject({ code: 0, stdout: "", stderr: "" });
+  });
+
+  /** A wedged child in the SIGSTOP shape: never closes on its own — only
+   *  SIGKILL (kill()) ends it.  Paired with a fake clock so the PRODUCTION
+   *  default budget can be exercised without a real 120s wall wait. */
+  function hungChild(): ChildProcess & { stdout: PassThrough; stderr: PassThrough } {
+    const child = new EventEmitter() as ChildProcess & { stdout: PassThrough; stderr: PassThrough };
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    (child as unknown as { kill: () => boolean }).kill = () => {
+      child.emit("close", null, "SIGKILL");
+      return true;
+    };
+    return child;
+  }
+
+  it("kills a stopped (SIGSTOP) child at the timeout backstop and settles as a timeout failure", async () => {
+    // Real process, real timers: the child stops itself — the kill -STOP
+    // shape.  SIGKILL reaches a stopped process;
+    // the promise must settle as a failure return (timedOut), never hang.
+    const spawnFn: DirectSpawn = (file, args) =>
+      spawn(file, [...args], { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const result = await runNodeCommand(
+      ["-e", "process.kill(process.pid, 'SIGSTOP'); setInterval(() => {}, 100);"],
+      { spawnFn, timeoutMs: 400 },
+    );
+    expect(result.timedOut).toBe(true);
+    expect(result.code === null || result.code !== 0).toBe(true);
+  }, 10_000);
+
+  it("kills a wedged child at the PRODUCTION default budget with no per-call override (default-budget evidence)", async () => {
+    // Same wedged shape as the real-SIGSTOP test above, but NO timeoutMs is
+    // injected: the window under test is exactly DEFAULT_CHILD_TIMEOUT_MS
+    // (fake clock — no real 120s wait).  One ms before the deadline the
+    // promise must still be pending; at the deadline the backstop kills the
+    // child and settles as the failure return that feed autoLaunchFailed.
+    vi.useFakeTimers();
+    try {
+      const spawnFn: DirectSpawn = () => hungChild();
+      const pending = runNodeCommand(["launch", "budget-unit", "executor"], { spawnFn });
+      await vi.advanceTimersByTimeAsync(DEFAULT_CHILD_TIMEOUT_MS - 1);
+      const early = await Promise.race([pending.then(() => "settled"), Promise.resolve("still-pending")]);
+      expect(early).toBe("still-pending"); // window pinned to the default constant
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+      expect(result.timedOut).toBe(true);
+      expect(result.signal).toBe("SIGKILL");
+      expect(result.code).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a healthy child completes under the PRODUCTION default budget — the backstop never fires", async () => {
+    // Real child, real timers, no timeout override: a healthy launch-shaped
+    // child finishes in milliseconds, far inside DEFAULT_CHILD_TIMEOUT_MS —
+    // settling at all (well under the test timeout) is the not-killed
+    // evidence.  Full healthy launches run the same default path (no override
+    // seam exists on spawnLaunch*) in notifier.test.ts's real-subprocess tee
+    // and TUT_DRY_RUN launch tests.
+    const result = await runNodeCommand([
+      "-e",
+      "setTimeout(() => { process.stdout.write('healthy child done'); }, 25);",
+    ]);
+    expect(result).toMatchObject({ code: 0, stdout: "healthy child done" });
+    expect(result.timedOut).toBeUndefined();
+  });
+
+  it("a non-positive timeoutMs disables the backstop (explicit opt-out)", async () => {
+    let closed = false;
+    const spawnFn: DirectSpawn = () => {
+      const child = new EventEmitter() as ChildProcess;
+      queueMicrotask(() => {
+        child.emit("close", 0, null);
+        closed = true;
+      });
+      return child;
+    };
+    const result = await runNodeCommand(["--ok"], { spawnFn, timeoutMs: 0 });
+    expect(result).toMatchObject({ code: 0 });
+    expect(result.timedOut).toBeUndefined();
+    expect(closed).toBe(true);
   });
 });
 

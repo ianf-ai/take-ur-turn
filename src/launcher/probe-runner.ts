@@ -10,9 +10,9 @@
  */
 
 import type { ChildProcess } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
-import { createServer, type Server, type Socket } from "node:net";
+import { realpathSync, statSync } from "node:fs";
+import { mkdir, rename, stat, unlink } from "node:fs/promises";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -21,12 +21,14 @@ import {
   spawnPlanFor,
 } from "./pane-runner.js";
 import { deliveryProbeCommand } from "./delivery.js";
+import { ENDPOINT_PATH_MAX, endpointPathBytes } from "./probe-channel.js";
 import type { ShellDialect } from "./shell-renderer.js";
 import { spawnDirect, type DirectSpawn } from "./process.js";
 
 const MARKER = /^TUT-DELIVERY-PROBE-[0-9A-F]{8}$/u;
 const DIALECTS: ReadonlySet<string> = new Set(["posix", "powershell5", "pwsh", "cmd"]);
 const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\";
+const SHIELD_SUFFIX = ".tut-close-shield";
 
 export interface ProbeRunnerArgs {
   endpoint: string;
@@ -39,6 +41,23 @@ export interface ProbeRunnerDeps {
   spawnFn?: DirectSpawn;
   /** Injectable server factory for protocol tests. */
   createServerFn?: typeof createServer;
+}
+
+/** Restore a shielded peer endpoint only while the public name is vacant.
+ * A third relay may bind after the shield rename but before the old server
+ * finishes closing; replacing that live endpoint would strand the newcomer. */
+export async function restoreShieldedEndpoint(endpoint: string): Promise<void> {
+  try {
+    await stat(endpoint);
+    return; // occupied by a newer relay: leave the shielded peer where it is
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+  }
+  try {
+    await rename(`${endpoint}${SHIELD_SUFFIX}`, endpoint);
+  } catch {
+    // Missing shield or a concurrent restore/bind: keep the live name intact.
+  }
 }
 
 function usage(): string {
@@ -70,8 +89,69 @@ function isWindowsPipe(endpoint: string): boolean {
   return endpoint.startsWith(WINDOWS_PIPE_PREFIX);
 }
 
+/** Handshake marker for the pre-listen liveness probe: a regular marker
+ *  line, so the request reuses the relay's frozen single-line protocol. */
+const HANDSHAKE_MARKER = "TUT-DELIVERY-PROBE-00000000";
+const HANDSHAKE_TIMEOUT_MS = 500;
+
+/** Pre-listen liveness probe: ask whoever currently serves the
+ *  endpoint, reusing the marker protocol.  A reply line (ok/failed — either
+ *  proves a live peer) means a previous relay never died; the caller steals
+ *  the endpoint LOUDLY.  No listener, a timeout, or an empty line resolves
+ *  undefined — the common stale-socket-file case costs one refused connect. */
+async function probeLivePeer(endpoint: string): Promise<string | undefined> {
+  return await new Promise((resolve) => {
+    let socket: Socket;
+    try {
+      socket = createConnection(endpoint);
+    } catch {
+      resolve(undefined);
+      return;
+    }
+    let reply = "";
+    let settled = false;
+    const finish = (value: string | undefined): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setEncoding("utf8");
+    socket.setTimeout(HANDSHAKE_TIMEOUT_MS, () => finish(undefined));
+    socket.once("connect", () => {
+      socket.write(`${HANDSHAKE_MARKER}\n`);
+    });
+    socket.on("data", (chunk: string | Buffer) => {
+      reply += chunk.toString();
+      const newline = reply.indexOf("\n");
+      if (newline >= 0) finish(reply.slice(0, newline).trim() || undefined);
+    });
+    socket.once("error", () => finish(undefined));
+    socket.once("end", () => finish(undefined));
+    socket.once("close", () => {
+      if (!settled) finish(undefined);
+    });
+  });
+}
+
 async function prepareEndpoint(endpoint: string): Promise<void> {
-  if (isWindowsPipe(endpoint)) return;
+  const pipe = isWindowsPipe(endpoint);
+  if (!pipe && endpointPathBytes(endpoint) > ENDPOINT_PATH_MAX) {
+    // An over-long endpoint used to fail listen() INSIDE the pane —
+    // a dead pane burning the whole delivery budget before the misaligned
+    // alert. Refuse loudly at startup instead.  The limit counts UTF-8
+    // bytes (sun_path is a raw byte array), matching the planner's guard.
+    throw new Error(
+      `socket endpoint exceeds the AF_UNIX sun_path limit (${ENDPOINT_PATH_MAX} bytes): ${endpoint}`,
+    );
+  }
+  const peer = await probeLivePeer(endpoint);
+  if (peer !== undefined) {
+    process.stderr.write(
+      `probe-runner: endpoint '${endpoint}' is still served by a live peer relay (handshake reply: ${peer}) — stealing the endpoint for this pane; the stale peer keeps its orphaned socket\n`,
+    );
+  }
+  if (pipe) return;
   await mkdir(path.dirname(endpoint), { recursive: true });
   try {
     await unlink(endpoint);
@@ -218,15 +298,64 @@ export async function runProbeRunner(
   let target: ChildProcess | undefined;
   let listening = false;
   let settled = false;
+  /** Ownership token of this relay's socket file: the inode captured right
+   *  after listen().  A newer relay that STEALS the endpoint unlinks this
+   *  file and binds its own — cleanup must never delete that newer file
+   *  (it would kill the live relay's endpoint and future probes would read
+   *  as unavailable).  undefined = never captured: cleanup skips the unlink
+   *  (the next relay's pre-listen sweep tolerates a stale file). */
+  let ownedInode: number | undefined;
   const activeProbes = new Set<Promise<void>>();
   const signalHandlers = new Map<NodeJS.Signals, () => void>();
 
   const removeEndpoint = async (): Promise<void> => {
     if (isWindowsPipe(parsed.endpoint)) return;
+    if (ownedInode === undefined) return; // cannot prove ownership: never unlink
+    try {
+      const current = await stat(parsed.endpoint);
+      // Only remove the file THIS relay bound: a stolen endpoint now belongs
+      // to the newer relay (different inode), and its socket must survive us.
+      if (current.ino !== ownedInode) return;
+    } catch {
+      return; // gone or uninspectable: nothing safe to unlink
+    }
     try {
       await unlink(parsed.endpoint);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    } catch {
+      // best-effort: a leftover stale file is cleaned by the next relay
+    }
+  };
+
+  /** Recent Node releases (observed on Node 26; the shield is a no-op on
+   *  versions without the behavior) remove the listen PATH from the
+   *  filesystem on server.close()
+   *  — by path, with no ownership check.  After a steal that path is the
+   *  NEWER relay's socket file, and a plain close would delete it out from
+   *  under the live relay (every later probe reads unavailable).  When the
+   *  path no longer carries our inode, shield it across the close under a
+   *  fixed stale name and restore it after; the fixed name bounds the
+   *  damage of a crash between the two renames to one file, which the next
+   *  relay's pre-listen sweep eventually overwrites anyway. */
+  const closeServerShielded = async (): Promise<void> => {
+    if (server === undefined || !listening) return;
+    let shielded = false;
+    if (!isWindowsPipe(parsed.endpoint) && ownedInode !== undefined) {
+      try {
+        const current = await stat(parsed.endpoint);
+        if (current.ino !== ownedInode) {
+          await rename(parsed.endpoint, `${parsed.endpoint}${SHIELD_SUFFIX}`);
+          shielded = true;
+        }
+      } catch {
+        // path gone or uninspectable: close's path removal finds nothing
+      }
+    }
+    try {
+      await new Promise<void>((done) => server?.close(() => done()));
+    } finally {
+      if (shielded) {
+        await restoreShieldedEndpoint(parsed.endpoint);
+      }
     }
   };
 
@@ -240,9 +369,7 @@ export async function runProbeRunner(
       settled = true;
       cleanupSignals();
       const closeServer = async (): Promise<void> => {
-        if (server !== undefined && listening) {
-          await new Promise<void>((done) => server?.close(() => done()));
-        }
+        await closeServerShielded();
         await removeEndpoint();
         resolve(code);
       };
@@ -270,6 +397,13 @@ export async function runProbeRunner(
       server.once("error", () => finish(1));
       server.listen(parsed.endpoint, () => {
         listening = true;
+        if (!isWindowsPipe(parsed.endpoint)) {
+          try {
+            ownedInode = statSync(parsed.endpoint).ino;
+          } catch {
+            // No ownership token: cleanup will skip the unlink (see above).
+          }
+        }
         try {
           target = spawnTarget(parsed.payload, parsed.dialect, spawnFn);
         } catch (error) {

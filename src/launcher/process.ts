@@ -47,6 +47,8 @@ export interface ChildRunResult {
   stdout: string;
   stderr: string;
   error?: Error;
+  /** True when the liveness backstop killed the child after timeoutMs. */
+  timedOut?: true;
 }
 
 export interface RunNodeCommandOptions extends DirectSpawnOptions {
@@ -54,7 +56,23 @@ export interface RunNodeCommandOptions extends DirectSpawnOptions {
   teeStderr?: (chunk: string) => void;
   /** Override only for tests; production always uses spawnDirect. */
   spawnFn?: DirectSpawn;
+  /**
+   * Liveness backstop: kill the child and settle as a timeout failure after
+   * this many milliseconds (default DEFAULT_CHILD_TIMEOUT_MS).  A non-positive
+   * or non-finite value disables the backstop.
+   */
+  timeoutMs?: number;
 }
+
+/**
+ * Default child timeout: generous by design — it must sit above
+ * every legitimate launcher phase budget summed up (submit retry window 30s,
+ * gate ~15s, land ~5s, plus birth/observe/cleanup spawns) so healthy
+ * launches are never killed.  A wedged child (ancestor sent SIGSTOP, a
+ * dependency path hangs) becomes a failure return instead of a pending
+ * promise that freezes its caller forever.
+ */
+export const DEFAULT_CHILD_TIMEOUT_MS = 120_000;
 
 /** Run a direct child and collect its stdio without turning spawn errors into throws. */
 export function runNodeCommand(
@@ -62,10 +80,12 @@ export function runNodeCommand(
   options: RunNodeCommandOptions = {},
 ): Promise<ChildRunResult> {
   const spawnFn = options.spawnFn ?? spawnDirect;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CHILD_TIMEOUT_MS;
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
     let child: ChildProcess;
     try {
       child = spawnFn(process.execPath, args, {
@@ -78,6 +98,25 @@ export function runNodeCommand(
       resolve({ code: null, signal: null, stdout, stderr, error: error as Error });
       return;
     }
+    // Liveness backstop: a wedged child must become a failure
+    // return, never a pending promise.  SIGKILL reaches even a stopped
+    // process; the resulting `close` settles the promise below.
+    const killer = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // An already-dead child still emits `close`; nothing to do.
+          }
+        }, timeoutMs)
+      : null;
+    const settle = (result: ChildRunResult): void => {
+      if (killer !== null) clearTimeout(killer);
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8");
     });
@@ -87,14 +126,10 @@ export function runNodeCommand(
       options.teeStderr?.(text);
     });
     child.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      resolve({ code: null, signal: null, stdout, stderr, error });
+      settle({ code: null, signal: null, stdout, stderr, error });
     });
     child.once("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      resolve({ code, signal, stdout, stderr });
+      settle({ code, signal, stdout, stderr, ...(timedOut ? { timedOut: true } : {}) });
     });
   });
 }

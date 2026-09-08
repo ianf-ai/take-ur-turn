@@ -355,13 +355,13 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
 });
 
 describe("narrowed reap (birth branch): continuity seats survive, corpses and non-continuity roles go", () => {
-  it("dead continuity panes are reaped (done AND missing agent_status); working still skipped with a warning", async () => {
+  it("turn-complete (done) continuity seats survive the reap; missing-status corpses close; working still skipped with a warning", async () => {
     const r = await runLogged(
       ["t1", "reviewer", "pi"],
       [
         HUB_PANE,
         { pane_id: "w11:p5", label: "t1.architect", workspace_id: "w11", cwd: "/repo", agent_status: "working" },
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "done" }, // dead corpse
+        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "done" }, // turn-complete, process alive — protected
         { pane_id: "w11:p7", label: "t1.reviewer", workspace_id: "w11", cwd: "/repo" }, // agent_status missing = dead
       ],
       { TUT_HERDR_READ_SCRIPT: BORN_SCREENS },
@@ -369,7 +369,7 @@ describe("narrowed reap (birth branch): continuity seats survive, corpses and no
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("pane 't1.architect' (w11:p5) still working"); // the original working-skip semantics survive
     expect(r.lines).not.toContain("pane close w11:p5");
-    expect(r.lines).toContain("pane close w11:p6"); // done corpse — continuity does not protect the dead
+    expect(r.lines).not.toContain("pane close w11:p6"); // done = turn-complete seat, continuity protects it
     expect(r.lines).toContain("pane close w11:p7"); // missing-field corpse likewise
     expect(r.lines).toContain("tab create --workspace w11 --cwd /repo --label TUT reviewer --no-focus"); // birth proceeded
   });
@@ -546,6 +546,11 @@ describe("self-update suppression: the agent run command disables startup update
     const r = await runLogged(["t1", "executor", "codex"], [HUB_PANE], {
       TUT_HERDR_FAIL: "pane:rename:1",
       TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+      // The sweep budget no longer leans on lifecycle list counts (it must
+      // out-wait real list lag alone), so these no-lag fixtures pin it low
+      // — the sweep itself is covered by the lag test below.
+      TUT_ROOT_SWEEP_RETRIES: "1",
+      TUT_ROOT_SWEEP_RETRY_MS: "10",
     });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("falling back to the anchored split sequence");
@@ -606,6 +611,8 @@ describe("adopt-root fallback: anchored split sequence when root adoption fails"
     const r = await runLogged(["t1", "executor", "pi"], panes, {
       TUT_HERDR_FAIL: "pane:rename:1",
             TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+      TUT_ROOT_SWEEP_RETRIES: "1", // no list lag here — keep the sweep single-shot (see the lag test)
+      TUT_ROOT_SWEEP_RETRY_MS: "10",
     });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("falling back to the anchored split sequence");
@@ -664,6 +671,99 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     // Exactly one create (the unparseable success) — never a twin.
     expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
   });
+
+  it("a colliding template label from another LIVE task is never adopted — the pristine tab wins", async () => {
+    // The default tab template `TUT executor` collides across tasks.
+    // The tab list returns the FOREIGN task's tab FIRST (label match, live
+    // work pane `<task>.<role>` inside); first-match recovery would rename
+    // its work pane and inject commands — validated recovery must skip it
+    // and reclaim the pristine single-root tab instead.
+    const r = await runLogged(["t1", "executor", "pi"], [
+      HUB_PANE,
+      { pane_id: "FIX:fx1", label: "other-task.executor", workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "working" },
+      { pane_id: "FIX:root1", label: "", workspace_id: "w11", cwd: "/repo", tab_id: "FIX:t1", agent_status: "idle" },
+    ], {
+      TUT_HERDR_TAB_CREATE_RAW: "created a tab",
+      TUT_HERDR_TABS: JSON.stringify([
+        { label: "TUT executor", tab_id: "FIX:t9" }, // foreign tab listed FIRST
+        { label: "TUT executor", tab_id: "FIX:t1" },
+      ]),
+      TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
+    });
+    expect(r.code).toBe(0);
+    expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+    expect(r.stderr).toContain("tab id recovered via tab list ('FIX:t1')");
+    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines.some((l) => l.startsWith("pane rename FIX:fx1"))).toBe(false); // the foreign pane is untouched
+    expect(r.lines.some((l) => l.startsWith("pane close FIX:fx1"))).toBe(false);
+    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
+    expectDelivered(r.lines, "FIX:root1");
+  });
+
+  it("only a foreign LIVE tab matches → recovery refuses, never adopts (no second create either)", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [
+      HUB_PANE,
+      { pane_id: "FIX:fx1", label: "other-task.executor", workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "working" },
+    ], {
+      TUT_HERDR_TAB_CREATE_RAW: "created a tab",
+      TUT_HERDR_TABS: JSON.stringify([{ label: "TUT executor", tab_id: "FIX:t9" }]),
+    });
+    expect(r.code).toBe(1);
+    expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+    expect(r.stderr).toContain("refusing a second create");
+    expect(r.lines.some((l) => l.startsWith("pane rename FIX:fx1"))).toBe(false);
+    expect(r.lines.some((l) => l.startsWith("pane run"))).toBe(false);
+  });
+
+  it("a used root (labeled, even dead) is not an empty root — recovery refuses", async () => {
+    // The dead-but-labeled root belongs to another task's finished round:
+    // adopting it would still destroy that tab's addressing key.  Only a
+    // pristine (unlabeled) root qualifies as “root 为空”.
+    const r = await runLogged(["t1", "executor", "pi"], [
+      HUB_PANE,
+      { pane_id: "FIX:fx1", label: "other-task.executor", workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "done" },
+    ], {
+      TUT_HERDR_TAB_CREATE_RAW: "created a tab",
+      TUT_HERDR_TABS: JSON.stringify([{ label: "TUT executor", tab_id: "FIX:t9" }]),
+    });
+    expect(r.code).toBe(1);
+    expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+    expect(r.stderr).toContain("refusing a second create");
+    expect(r.lines.some((l) => l.startsWith("pane rename"))).toBe(false);
+  });
+
+  it("an unlabeled single root whose agent is not idle is never adopted", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [
+      HUB_PANE,
+      { pane_id: "FIX:busy", label: "", workspace_id: "w11", cwd: "/repo", tab_id: "FIX:t9", agent_status: "working" },
+    ], {
+      TUT_HERDR_TAB_CREATE_RAW: "created a tab",
+      TUT_HERDR_TABS: JSON.stringify([{ label: "TUT executor", tab_id: "FIX:t9" }]),
+    });
+    expect(r.code).toBe(1);
+    expect(r.lines.filter((line) => line.startsWith("tab create"))).toHaveLength(1);
+    expect(r.stderr).toContain("refusing a second create");
+    expect(r.lines.some((line) => line.startsWith("pane rename FIX:busy"))).toBe(false);
+  });
+
+  it("two pristine colliding tabs are ambiguity, not a pick — adoption refuses", async () => {
+    const r = await runLogged(["t1", "executor", "pi"], [
+      HUB_PANE,
+      { pane_id: "FIX:ra", label: "", tab_id: "FIX:ta", agent_status: "idle" },
+      { pane_id: "FIX:rb", label: "", tab_id: "FIX:tb", agent_status: "idle" },
+    ], {
+      TUT_HERDR_TAB_CREATE_RAW: "created a tab",
+      TUT_HERDR_TABS: JSON.stringify([
+        { label: "TUT executor", tab_id: "FIX:ta" },
+        { label: "TUT executor", tab_id: "FIX:tb" },
+      ]),
+    });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("multiple pristine tabs carry label 'TUT executor'");
+    expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
+    expect(r.lines.some((l) => l.startsWith("pane rename"))).toBe(false);
+    expect(r.lines.some((l) => l.startsWith("pane run"))).toBe(false);
+  });
 });
 
 // --- tab-create edge: signal termination may have created a remote tab --------
@@ -714,9 +814,10 @@ describe("fallback root cleanup survives pane-list lag (bounded retry + post-run
     ], {
       TUT_HERDR_FAIL: "tab:create:1",
       TUT_HERDR_PANES_LAG: JSON.stringify([HUB_PANE]), // stale view: the new tab's root is invisible
-      // Lists before the sweep: entry anchor + continuation probe + cleanup
-      // scan + addressing-key guard; the first TWO sweep attempts stay stale
-      // too, so the third (lag-expired) re-list is what finds the root.
+      // The sweep's own budget must out-wait the lag INDEPENDENTLY: the
+      // lifecycle consumes just ONE list now (snapshot reuse), so the
+      // lag-expired list #7 is reached by the sweep's sixth attempt — not
+      // by any incidental earlier list.
       TUT_HERDR_LIST_LAG_POLLS: "6",
       TUT_ROOT_SWEEP_RETRY_MS: "10",
             TUT_HERDR_READ_SCRIPT: BORN_SCREENS,

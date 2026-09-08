@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { derive } from "../src/state-machine.js";
+import { derive, foldOntoCursor, initialCursor } from "../src/state-machine.js";
 import type { ContextRecord, DerivedState, Flow } from "../src/types.js";
 
 /**
@@ -210,5 +210,99 @@ describe("derive: unit properties beyond the fixtures", () => {
       needs_attention: true,
       warnings: [{ version: 2, code: "OUT_OF_TABLE" }],
     } satisfies DerivedState);
+  });
+});
+
+describe("foldOntoCursor: incremental fold", () => {
+  // foldOntoCursor is the store's cache-carrying fold — its contract is
+  // EXACT equivalence with folding the whole sequence at once, at every
+  // split point, under every flow. Proven two ways: all golden vectors at
+  // every split, and randomized sequences over the full content-type /
+  // payload-field alphabet (deterministic seed — reproducible failures).
+  it("every golden vector, every split point: fold(prefix) + foldOntoCursor(rest) === derive(all)", () => {
+    for (const vector of vectors) {
+      if (vector.expected === null) continue;
+      const ordered = [...vector.records].sort((a, b) => a.version - b.version);
+      for (let split = 0; split <= ordered.length; split++) {
+        const whole = derive(vector.task_id, ordered, vector.flow);
+        const cursor = initialCursor(vector.flow ?? "full");
+        const head = foldOntoCursor(cursor, ordered.slice(0, split), vector.flow ?? "full");
+        const { prevVersion: _p, ...headState } = head;
+        expect(headState).toStrictEqual(derive(vector.task_id, ordered.slice(0, split), vector.flow));
+        const tail = foldOntoCursor(
+          { status: head.status, prevVersion: head.prevVersion, warnings: head.warnings },
+          ordered.slice(split),
+          vector.flow ?? "full",
+        );
+        const { prevVersion: _q, ...tailState } = tail;
+        expect(tailState).toStrictEqual(whole);
+      }
+    }
+  });
+
+  it("randomized sequences: every split point agrees with derive (deterministic seed)", () => {
+    let seed = 0x2a2a2a2a;
+    const rand = (): number => {
+      // xorshift32 — deterministic, no deps
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      return (seed >>> 0) / 2 ** 32;
+    };
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(rand() * items.length)]!;
+    const contentTypes = ["design", "code_changes", "review", "revision", "decision", "note", "mystery"] as const;
+    const flows: Flow[] = ["full", "direct", "solo"];
+    const decisions = ["approve", "reject", "close"] as const;
+    const verdicts = ["pass", "fail_code", "fail_design", "blocked_external", "nonsense"] as const;
+
+    for (let trial = 0; trial < 200; trial++) {
+      const flow = pick(flows);
+      const length = 1 + Math.floor(rand() * 12);
+      // Versions: mostly contiguous, sometimes gapped/duplicated (structural
+      // anomaly warnings must survive the split too).
+      const records: ContextRecord[] = [];
+      let version = 0;
+      for (let i = 0; i < length; i++) {
+        const jump = rand();
+        if (jump < 0.08) version += 2; // gap
+        else if (jump < 0.14) version += 0; // duplicate
+        else version += 1;
+        const content_type = pick(contentTypes);
+        records.push({
+          version,
+          task_id: "prop-task",
+          role: pick(["architect", "executor", "reviewer", "human"]),
+          content_type,
+          timestamp: "2026-09-02T00:00:00.000Z",
+          // The randomized domain deliberately includes out-of-vocabulary
+          // verdicts (INVALID_VERDICT must survive a split) — wider than the
+          // typed write-side vocabulary on purpose.
+          payload: {
+            summary: "s",
+            body: "b",
+            ...(content_type === "decision" ? { decision: pick(decisions) } : {}),
+            ...(content_type === "review" ? { verdict: pick(verdicts) } : {}),
+            ...(content_type === "note" && rand() < 0.2 ? { ack: true } : {}),
+          } as ContextRecord["payload"],
+        });
+      }
+      const ordered = [...records].sort((a, b) => a.version - b.version);
+      const whole = derive("prop-task", ordered, flow);
+      const split = Math.floor(rand() * (ordered.length + 1));
+      const head = foldOntoCursor(initialCursor(flow), ordered.slice(0, split), flow);
+      const tail = foldOntoCursor(head, ordered.slice(split), flow);
+      const { prevVersion: _drop, ...tailState } = tail;
+      expect(tailState).toStrictEqual(whole);
+    }
+  });
+
+  it("foldOntoCursor never mutates the incoming cursor (cached cursors are shared)", () => {
+    const cursor = initialCursor("full");
+    cursor.warnings.push({ version: 1, code: "OUT_OF_TABLE" });
+    const warningsBefore = [...cursor.warnings];
+    const out = foldOntoCursor(cursor, [], "full");
+    expect(out.warnings).toStrictEqual(warningsBefore);
+    expect(out.warnings).not.toBe(cursor.warnings);
+    expect(cursor.warnings).toStrictEqual(warningsBefore);
   });
 });

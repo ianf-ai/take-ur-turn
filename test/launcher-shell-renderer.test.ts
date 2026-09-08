@@ -71,11 +71,11 @@ describe("sq / psq / cmdq primitives", () => {
     expect(psq("β %")).toBe("'β %'");
   });
 
-  it("cmdUnsafe flags exactly the cmd expansion set", () => {
-    for (const bad of ["%", "!", "^", "&", "|", "<", ">", "(", ")", ";", '"', "a\rb", "a\nb", "a\u0000b"]) {
+  it("cmdUnsafe flags exactly the cmd expansion set (parens are safe inside double quotes)", () => {
+    for (const bad of ["%", "!", "^", "&", "|", "<", ">", ";", '"', "a\rb", "a\nb", "a\u0000b"]) {
       expect(cmdUnsafe(bad), `unsafe: ${JSON.stringify(bad)}`).toBe(true);
     }
-    for (const good of ["plain", "a b", "C:\\Program Files\\nodejs\\node.exe", "β", "'quoted'", "a,b=c"]) {
+    for (const good of ["plain", "a b", "C:\\Program Files\\nodejs\\node.exe", "C:\\Program Files (x86)\\nodejs\\node.exe", "(x)", "a(x)b", "β", "'quoted'", "a,b=c"]) {
       expect(cmdUnsafe(good), `safe: ${JSON.stringify(good)}`).toBe(false);
     }
   });
@@ -89,9 +89,14 @@ describe("sq / psq / cmdq primitives", () => {
   });
 
   it("cmdq refuses every unsafe value (no caret escaping, no second parse)", () => {
-    for (const bad of ["100%", "a!b", "x^y", "a&b", "a|b", "<x>", "(x)", "a;b", 'say "hi"', "a\rb"]) {
+    for (const bad of ["100%", "a!b", "x^y", "a&b", "a|b", "<x>", "a;b", 'say "hi"', "a\rb"]) {
       expect(() => cmdq(bad), `refuse: ${JSON.stringify(bad)}`).toThrow(PaneCommandError);
     }
+  });
+
+  it("cmdq keeps parenthesised x86 install paths literal (double quotes do not expand ())", () => {
+    expect(cmdq("C:\\Program Files (x86)\\nodejs\\node.exe"))
+      .toBe('"C:\\Program Files (x86)\\nodejs\\node.exe"');
   });
 });
 
@@ -142,10 +147,16 @@ describe("golden vector: quote-punctuation", () => {
   it("powershell5/pwsh: doubled apostrophe inside the conservative script block", () => {
     const expected =
       "& { $savedPath = (Get-Location).Path; $exitCode = 1; " +
-      "try { Set-Location -LiteralPath '/tmp/O''Brien & semicolon;'; & 'codex' '--model' 'gpt 5' 'β'; $exitCode = $LASTEXITCODE } " +
+      "try { Set-Location -LiteralPath '/tmp/O''Brien & semicolon;' -ErrorAction Stop; & 'codex' '--model' 'gpt 5' 'β'; $exitCode = $LASTEXITCODE } " +
       "finally { Set-Location -LiteralPath $savedPath }; $global:LASTEXITCODE = $exitCode }";
     expect(renderPaneCommand(agent({ ...input, dialect: "powershell5" })).command_text).toBe(expected);
     expect(renderPaneCommand(agent({ ...input, dialect: "pwsh" })).command_text).toBe(expected);
+  });
+
+  it("powershell5/pwsh: a failed Set-Location terminates the block instead of birthing in the wrong directory", () => {
+    const { command_text } = renderPaneCommand(agent({ ...input, dialect: "powershell5" }));
+    expect(command_text).toContain("Set-Location -LiteralPath '/tmp/O''Brien & semicolon;' -ErrorAction Stop");
+    expect(command_text).not.toContain("Set-Location -LiteralPath $savedPath -ErrorAction Stop"); // restore stays best-effort
   });
 
   it("cmd: the punctuation cwd forces the encoded runner", () => {
@@ -246,12 +257,17 @@ describe("golden vector: cmd-expansion-characters (dynamic values never meet cmd
     });
   });
 
-  it("the safe direct form keeps cd /d semantics: spaces quoted, no encoding", () => {
+  it("the safe direct form keeps cd /d semantics: spaces and parens quoted, no encoding", () => {
     const { command_text } = renderPaneCommand(
       agent({ cwd: "C:\\work dir", executable: "C:\\pi\\pi.exe", args: ["--model", "gpt 5"], dialect: "cmd" }),
       RUNTIME,
     );
     expect(command_text).toBe('cd /d "C:\\work dir" && "C:\\pi\\pi.exe" "--model" "gpt 5"');
+    const x86 = renderPaneCommand(
+      agent({ cwd: "C:\\work dir", executable: "C:\\Program Files (x86)\\pi\\pi.exe", args: [], dialect: "cmd" }),
+      RUNTIME,
+    );
+    expect(x86.command_text).toBe('cd /d "C:\\work dir" && "C:\\Program Files (x86)\\pi\\pi.exe"');
   });
 
   it("an empty-string arg survives both cmd modes", () => {
@@ -350,12 +366,38 @@ describe("golden vector: route-order-and-suppression (renderer consumes the froz
 // --- service legacy parity + runtime path policy --------------------------------------
 
 describe("service commands: POSIX legacy bytes through the shared renderer", () => {
-  it("byte-identical cd && node form, with and without flags", () => {
+  it("byte-identical cd && node form for safe values, with and without flags", () => {
     const base = { executable: "node", env: {}, dialect: "posix", purpose: "service" } as const;
     expect(renderPaneCommand({ ...base, cwd: "/x/proj", args: ["/x/proj/dist/cli.js", "serve"] }).command_text)
       .toBe("cd /x/proj && node /x/proj/dist/cli.js serve");
     expect(renderPaneCommand({ ...base, cwd: "/x/proj", args: ["/x/proj/dist/cli.js", "notify", "--url", "http://127.0.0.1:3101"] }).command_text)
       .toBe("cd /x/proj && node /x/proj/dist/cli.js notify --url http://127.0.0.1:3101");
+  });
+
+  it("space paths quote on demand — every word still crosses the shell byte-for-byte", () => {
+    const base = { executable: "node", env: {}, dialect: "posix", purpose: "service" } as const;
+    expect(renderPaneCommand({ ...base, cwd: "/x/my proj", args: ["/x/my proj/dist/cli.js", "serve"] }).command_text)
+      .toBe("cd '/x/my proj' && node '/x/my proj/dist/cli.js' serve");
+    expect(renderPaneCommand({ ...base, cwd: "/x/O'Brien & co", args: ["/x/O'Brien & co/dist/cli.js", "notify", "--url", "http://127.0.0.1:3101"] }).command_text)
+      .toBe("cd '/x/O'\\''Brien & co' && node '/x/O'\\''Brien & co/dist/cli.js' notify --url http://127.0.0.1:3101");
+    // The metacharacter boundary: the safe set stays bare, everything else degrades.
+    expect(renderPaneCommand({ ...base, cwd: "/x/a=b,c%d~e", args: ["/x/cli.js"] }).command_text)
+      .toBe("cd '/x/a=b,c%d~e' && node /x/cli.js"); // ~ forces quoting; = , % . : / stay bare
+    expect(renderPaneCommand({ ...base, cwd: "/x/β项目", args: ["/x/cli.js", "serve"] }).command_text)
+      .toBe("cd '/x/β项目' && node /x/cli.js serve"); // non-ASCII quotes, never re-splits
+  });
+
+  it("service env prefixes quote as one assignment word when the value needs it", () => {
+    const rendered = renderPaneCommand({
+      cwd: "/x/proj", executable: "node", args: ["serve"],
+      env: { TUT_EVENT_PORT_URL: "http://127.0.0.1:3002" }, dialect: "posix", purpose: "service",
+    });
+    expect(rendered.command_text).toBe("cd /x/proj && TUT_EVENT_PORT_URL=http://127.0.0.1:3002 node serve");
+    const spaced = renderPaneCommand({
+      cwd: "/x/proj", executable: "node", args: ["serve"],
+      env: { TOKEN: "a b'c" }, dialect: "posix", purpose: "service",
+    });
+    expect(spaced.command_text).toBe("cd /x/proj && TOKEN='a b'\\''c' node serve");
   });
 
   it("service + PowerShell: the pane never sees && nor a POSIX env", () => {
@@ -394,12 +436,22 @@ describe("cmd runtime path policy (CmdRuntimePathError before Herdr mutation)", 
 
   it("runtime paths with cmd expansion characters are refused", () => {
     expect(() => renderPaneCommand(agent(unsafePlan), { ...RUNTIME, nodeExecutable: "C:\\node^1\\node.exe" })).toThrowError(CmdRuntimePathError);
-    expect(() => renderPaneCommand(agent(unsafePlan), { ...RUNTIME, paneRunnerEntry: "C:\\tut(x)\\pane-runner.js" })).toThrowError(CmdRuntimePathError);
+    expect(() => renderPaneCommand(agent(unsafePlan), { ...RUNTIME, paneRunnerEntry: "C:\\tut%1\\pane-runner.js" })).toThrowError(CmdRuntimePathError);
   });
 
   it("spaces in runtime paths are supported (Program Files)", () => {
     const { command_text } = renderPaneCommand(agent(unsafePlan), RUNTIME);
     expect(command_text).toContain('"C:\\Program Files\\nodejs\\node.exe"');
+  });
+
+  it("parentheses in runtime paths are supported (x86 install layout)", () => {
+    const { command_text } = renderPaneCommand(agent(unsafePlan), {
+      ...RUNTIME,
+      nodeExecutable: "C:\\Program Files (x86)\\nodejs\\node.exe",
+      paneRunnerEntry: "C:\\Program Files (x86)\\tut\\dist\\launcher\\pane-runner.js",
+    });
+    expect(command_text).toContain('"C:\\Program Files (x86)\\nodejs\\node.exe"');
+    expect(command_text).toContain('"C:\\Program Files (x86)\\tut\\dist\\launcher\\pane-runner.js"');
   });
 
   it("the direct form never inspects runtime paths — only encoded mode needs them", () => {
