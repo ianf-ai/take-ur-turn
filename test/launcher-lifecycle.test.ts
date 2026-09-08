@@ -41,14 +41,20 @@ function lifecycleFixture(initial: HerdrPane[]): {
   client: LifecycleClient;
   panes: HerdrPane[];
   closed: string[];
+  lists: () => number;
 } {
   const panes = [...initial];
   const closed: string[] = [];
+  let lists = 0;
   return {
     panes,
     closed,
+    lists: () => lists,
     client: {
-      listPanes: async () => ({ panes: [...panes], usable: true }),
+      listPanes: async () => {
+        lists += 1;
+        return { panes: [...panes], usable: true };
+      },
       closePane: async (paneId) => {
         closed.push(paneId);
         const index = panes.findIndex((item) => item.pane_id === paneId);
@@ -60,6 +66,44 @@ function lifecycleFixture(initial: HerdrPane[]): {
 }
 
 describe("launcher lifecycle policy", () => {
+  it("a turn-complete (done) seat continues — the agent process is alive and waiting for the next prompt", async () => {
+    // F1 live evidence: pi reports agent_status=done the moment it finishes a
+    // turn while its node.exe stays in the foreground process group. The
+    // hand-off to the next same-role round happens exactly then, so a "done"
+    // seat is the canonical continuation target, not a corpse.
+    const fixture = lifecycleFixture([pane("p6", "t1.executor", "done")]);
+    const onContinuation = vi.fn(async () => true);
+    const onBirth = vi.fn(async () => "new-pane");
+
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("executor"),
+      client: fixture.client,
+      onContinuation,
+      onBirth,
+    });
+
+    expect(outcome.kind).toBe("continuation");
+    expect(outcome.pane_id).toBe("p6");
+    expect(onBirth).not.toHaveBeenCalled();
+    expect(fixture.closed).toEqual([]);
+    expect(
+      planRoundLifecycle(fixture.panes, { task_id: "t1", role: "executor", fresh: false }),
+    ).toMatchObject({ branch: "continuation", continuation: { pane_id: "p6" } });
+  });
+
+  it("planReap protects done continuity seats and still closes done non-continuity panes", () => {
+    const planned = planReap(
+      [
+        pane("arch-done", "t1.architect", "done"),
+        pane("exec-done", "t1.executor", "done"),
+      ],
+      { task_id: "t1", continuityRoles: new Set(["executor", "reviewer"]) },
+    );
+
+    expect(planned.keptContinuity.map((item) => item.pane_id)).toEqual(["exec-done"]);
+    expect(planned.close.map((item) => item.pane_id)).toEqual(["arch-done"]);
+  });
+
   it("same-role continuation is the full branch: one exact live key, no reap or birth", async () => {
     const fixture = lifecycleFixture([pane("p6", "t1.executor", "working")]);
     const onContinuation = vi.fn(async () => true);
@@ -91,7 +135,7 @@ describe("launcher lifecycle policy", () => {
     const fixture = lifecycleFixture([
       pane("architect", "t1.architect", "idle"),
       pane("executor", "t1.executor", "working"),
-      pane("dead", "t1.reviewer", "done"),
+      pane("dead", "t1.reviewer", "unknown"),
     ]);
     const stderr: string[] = [];
     const outcome = await runRoundLifecycle({
@@ -165,7 +209,7 @@ describe("launcher lifecycle policy", () => {
       [
         pane("work", "t1.architect", "working"),
         pane("keep", "t1.executor", "blocked"),
-        pane("dead", "t1.reviewer", "done"),
+        pane("dead", "t1.reviewer", "unknown"),
         pane("foreign", "t10.executor", "idle"),
       ],
       { task_id: "t1", continuityRoles: new Set(["executor", "reviewer"]) },
@@ -220,6 +264,105 @@ describe("launcher lifecycle policy", () => {
   });
 });
 
+
+describe("zero-mutation pane lists are merged (spawn count)", () => {
+  it("a plain birth with nothing to close performs ONE full pane list (was three)", async () => {
+    const fixture = lifecycleFixture([pane("foreign", "t2.executor", "idle")]);
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("executor"),
+      client: fixture.client,
+      onContinuation: vi.fn(async () => true),
+      onBirth: vi.fn(async () => "new-pane"),
+    });
+    expect(outcome).toMatchObject({ kind: "birth", pane_id: "new-pane" });
+    expect(fixture.lists()).toBe(1); // continuation check serves reap AND survivor verify
+  });
+
+  it("a role-change reap that closes panes re-lists once for the survivor check (two total, was three)", async () => {
+    const fixture = lifecycleFixture([
+      pane("architect", "t1.architect", "idle"),
+      pane("executor", "t1.executor", "working"),
+      pane("dead", "t1.reviewer", "unknown"),
+    ]);
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("reviewer"),
+      client: fixture.client,
+      onContinuation: vi.fn(async () => true),
+      onBirth: vi.fn(async () => "new-reviewer"),
+    });
+    expect(outcome).toMatchObject({ kind: "birth", pane_id: "new-reviewer" });
+    expect(fixture.closed).toEqual(["architect", "dead"]);
+    expect(fixture.lists()).toBe(2); // fresh discovery + post-close verification
+  });
+
+  it("--fresh (live) lists twice: forced close, then reap on the post-close state (was three)", async () => {
+    const fixture = lifecycleFixture([
+      pane("old-idle", "t1.executor", "idle"),
+      pane("old-working", "t1.executor", "working"),
+      pane("other", "t1.reviewer", "idle"),
+    ]);
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("executor", true),
+      client: fixture.client,
+      onContinuation: vi.fn(async () => true),
+      onBirth: vi.fn(async () => "fresh-pane"),
+    });
+    expect(outcome).toMatchObject({ kind: "birth", pane_id: "fresh-pane" });
+    expect(fixture.closed).toEqual(["old-idle", "old-working"]);
+    expect(fixture.lists()).toBe(2);
+  });
+
+  it("--fresh dry-run closes nothing, so every phase reuses ONE list (was two)", async () => {
+    const fixture = lifecycleFixture([pane("old-idle", "t1.executor", "idle")]);
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("executor", true),
+      client: fixture.client,
+      dryRun: true,
+      onContinuation: vi.fn(async () => true),
+      onBirth: vi.fn(async () => "fresh-pane"),
+    });
+    expect(outcome).toMatchObject({ kind: "birth", pane_id: "fresh-pane" });
+    expect(fixture.closed).toEqual([]);
+    expect(fixture.lists()).toBe(1);
+  });
+
+  it("the addressing-key guard reads the reused snapshot — one list, no birth", async () => {
+    const fixture = lifecycleFixture([pane("p6", "t1.executor", "working")]);
+    const onBirth = vi.fn(async () => "should-not-exist");
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("executor"),
+      client: fixture.client,
+      continuityRoles: "",
+      onContinuation: vi.fn(async () => true),
+      onBirth,
+    });
+    expect(outcome.kind).toBe("duplicate");
+    expect(onBirth).not.toHaveBeenCalled();
+    expect(fixture.lists()).toBe(1);
+  });
+
+  it("an unusable snapshot never serves reuse — each phase retries fresh", async () => {
+    let calls = 0;
+    const client: LifecycleClient = {
+      listPanes: async () => {
+        calls += 1;
+        return calls === 1
+          ? { panes: [], usable: false, error: "transient" }
+          : { panes: [], usable: true };
+      },
+      closePane: vi.fn(async () => result()),
+    };
+    const outcome = await runRoundLifecycle({
+      invocation: invocation("executor"),
+      client,
+      onContinuation: vi.fn(async () => true),
+      onBirth: vi.fn(async () => "new-pane"),
+    });
+    expect(outcome).toMatchObject({ kind: "birth", pane_id: "new-pane" });
+    expect(calls).toBeGreaterThanOrEqual(2); // the dead snapshot was not cached as truth
+  });
+});
+
 describe("launcher pane birth", () => {
   it("adopts the tab-create root through direct argv and does not split the anchor", async () => {
     const calls: string[][] = [];
@@ -262,7 +405,7 @@ describe("launcher pane birth", () => {
           return result(JSON.stringify({ result: { tabs: [{ tab_id: "tab1", label: "TUT executor" }] } }));
         }
         if (args[0] === "pane" && args[1] === "list") {
-          return result(JSON.stringify({ result: { panes: [{ pane_id: "root1", tab_id: "tab1" }] } }));
+          return result(JSON.stringify({ result: { panes: [{ pane_id: "root1", tab_id: "tab1", agent_status: "idle" }] } }));
         }
         return result();
       }),
@@ -293,7 +436,7 @@ describe("launcher pane birth", () => {
           return result(JSON.stringify({ result: { tabs: [{ tab_id: "tab1", label: "TUT executor" }] } }));
         }
         if (args[0] === "pane" && args[1] === "list") {
-          return result(JSON.stringify({ result: { panes: [{ pane_id: "root1", tab_id: "tab1" }] } }));
+          return result(JSON.stringify({ result: { panes: [{ pane_id: "root1", tab_id: "tab1", agent_status: "idle" }] } }));
         }
         return result();
       }),

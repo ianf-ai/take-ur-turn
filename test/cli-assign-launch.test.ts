@@ -169,6 +169,45 @@ describe("tut assign handler (temp project root, project-level .context-hub/work
     expect(io.err()).toContain("malformed");
     expect(readFileSync(wsFile(), "utf8")).toBe(malformed);
   });
+
+  it("roles as an ARRAY is rejected explicitly — no silent drop, no success message", async () => {
+    mkdirSync(path.dirname(wsFile()), { recursive: true });
+    // An array IS typeof "object": this shape used to slip the guard, the
+    // seat write landed on the array, and JSON.stringify dropped it —
+    // exit 0 with a success line while nothing was written.
+    const arrayRoles = '{ "roles": [] }\n';
+    writeFileSync(wsFile(), arrayRoles);
+
+    const code = await main(["assign", "executor", "pi"]);
+
+    expect(code).toBe(1);
+    expect(io.err()).toContain('malformed (expected an object with a "roles" object)');
+    expect(io.out()).not.toContain("assign:"); // the success line never prints
+    expect(readFileSync(wsFile(), "utf8")).toBe(arrayRoles); // byte-untouched
+  });
+
+  it("a top-level array and an array-valued seat are both rejected", async () => {
+    mkdirSync(path.dirname(wsFile()), { recursive: true });
+    const topLevel = "[]\n";
+    writeFileSync(wsFile(), topLevel);
+    let code = await main(["assign", "executor", "pi"]);
+    expect(code).toBe(1);
+    expect(io.err()).toContain("malformed");
+    expect(readFileSync(wsFile(), "utf8")).toBe(topLevel);
+
+    io.restore();
+    const io2 = captureIo();
+    try {
+      const seatArray = '{ "roles": { "executor": ["pi"] } }\n';
+      writeFileSync(wsFile(), seatArray);
+      code = await main(["assign", "executor", "codex"]);
+      expect(code).toBe(1);
+      expect(io2.err()).toContain("roles.executor is not an object");
+      expect(readFileSync(wsFile(), "utf8")).toBe(seatArray);
+    } finally {
+      io2.restore();
+    }
+  });
 });
 
 // --- launch.sh resolution ------------------------------------------------------

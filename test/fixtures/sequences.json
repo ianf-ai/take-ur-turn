@@ -1,6 +1,6 @@
 [
   {
-    "$comment": "Golden vectors for the derive seam (per-flow suites per system-design 3.1). Each vector carries an optional 'flow' field: \"full\" (default — absent means full) | \"direct\" | \"solo\". Flow selects the transition table (system-design 3.1 three-table definition): full = create→designing, design designing→implementing, code_changes implementing→reviewing, review pass/fail_code/fail_design → pending_approval/revising/designing, revision revising→reviewing, reject pending_approval→revising; direct = create→implementing, design in implementing is a REFERENCE record (no transition, no warning) and out-of-table in every other state, review fail_design is OUT_OF_TABLE (no designing to return to), everything else as full; solo = create→designing, design designing→implementing, code_changes implementing→pending_approval (review phase skipped), review and revision records are OUT_OF_TABLE in ANY state (with OUT_OF_TABLE taking precedence over INVALID_VERDICT), reject pending_approval→implementing (rework). Warning code vocabulary (mirrors WarningCode in src/types.ts): OUT_OF_TABLE = record does not fit current state, no fold + needs_attention; CLOSED_ABSORB = non-note/non-close record after closed, stays closed + needs_attention; INVALID_VERDICT = review with missing/invalid verdict, no transition + needs_attention (full/direct only — in solo every review is out-of-table before the verdict is evaluated); VERSION_GAP = version skips a number, fold by version order anyway (warning attached to the record after the gap); VERSION_DUPLICATE = repeated version, fold by version order anyway (warning attached to the duplicated version). Structural warnings are flow-independent. Rules: create produces no record so derive([]) is the flow's initial state (designing for full/solo, implementing for direct); note never changes status and never warns; decision(close) is valid in any state, idempotent in closed; needs_attention overrides waiting_for to human in any status including closed; note with payload.ack === true clears all warnings accumulated so far (no-op when clean); warnings are asserted as {version, code} only, never as text; project scope (task_id 'project') derives to null."
+    "$comment": "Golden vectors for the derive seam (per-flow suites per system-design 3.1). Each vector carries an optional 'flow' field: \"full\" (default — absent means full) | \"direct\" | \"solo\". Flow selects the transition table (system-design 3.1 three-table definition): full = create→designing, design designing→implementing, code_changes implementing→reviewing, review pass/blocked_external/fail_code/fail_design → pending_approval(=blocked_external)/revising/designing, revision revising→reviewing, reject pending_approval→revising; direct = create→implementing, design in implementing is a REFERENCE record (no transition, no warning) and out-of-table in every other state, review fail_design is OUT_OF_TABLE (no designing to return to), blocked_external targets pending_approval like pass, everything else as full; solo = create→designing, design designing→implementing, code_changes implementing→pending_approval (review phase skipped), review and revision records are OUT_OF_TABLE in ANY state (with OUT_OF_TABLE taking precedence over INVALID_VERDICT), reject pending_approval→implementing (rework). Warning code vocabulary (mirrors WarningCode in src/types.ts): OUT_OF_TABLE = record does not fit current state, no fold + needs_attention; CLOSED_ABSORB = non-note/non-close record after closed, stays closed + needs_attention; INVALID_VERDICT = review with missing/invalid verdict, no transition + needs_attention (full/direct only — in solo every review is out-of-table before the verdict is evaluated); VERSION_GAP = version skips a number, fold by version order anyway (warning attached to the record after the gap); VERSION_DUPLICATE = repeated version, fold by version order anyway (warning attached to the duplicated version). Structural warnings are flow-independent. Rules: create produces no record so derive([]) is the flow's initial state (designing for full/solo, implementing for direct); note never changes status and never warns EXCEPT the 3.1 exception row: a non-ack note with role=executor while status=reviewing reclaims the round (reviewing → revising; full/direct — solo has no reviewing state so the row is unreachable there; ack notes never transition; the closed absorbing state outranks the exception); decision(close) is valid in any state, idempotent in closed; needs_attention overrides waiting_for to human in any status including closed; note with payload.ack === true clears all warnings accumulated so far (no-op when clean); warnings are asserted as {version, code} only, never as text; project scope (task_id 'project') derives to null."
   },
   {
     "name": "empty-sequence-designing",
@@ -41,7 +41,9 @@
         "payload": {
           "summary": "Implemented middleware per design",
           "body": "## Implementation\nAdded middleware and tests.\n## Verification\nvitest green.",
-          "commits": ["a1b2c3d"]
+          "commits": [
+            "a1b2c3d"
+          ]
         }
       },
       {
@@ -119,7 +121,9 @@
         "payload": {
           "summary": "Cache layer implemented",
           "body": "## Implementation\nLRU with TTL.\n## Verification\nvitest green.",
-          "commits": ["e4f5a6b"]
+          "commits": [
+            "e4f5a6b"
+          ]
         }
       },
       {
@@ -170,7 +174,9 @@
         "payload": {
           "summary": "Retry helper implemented",
           "body": "## Implementation\nBackoff with jitter.\n## Verification\nvitest green.",
-          "commits": ["c3d4e5f"]
+          "commits": [
+            "c3d4e5f"
+          ]
         }
       },
       {
@@ -198,7 +204,9 @@
           "summary": "Added jitter bounds test",
           "body": "## Response\nAdded the requested test, it passes.\n## Verification\nvitest green.",
           "ref_version": 3,
-          "commits": ["b7c8d9e"]
+          "commits": [
+            "b7c8d9e"
+          ]
         }
       },
       {
@@ -249,7 +257,9 @@
         "payload": {
           "summary": "Config loader implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["d9e0f1a"]
+          "commits": [
+            "d9e0f1a"
+          ]
         }
       },
       {
@@ -300,7 +310,9 @@
         "payload": {
           "summary": "Logger implemented",
           "body": "## Implementation\nJSON lines to stdout.\n## Verification\nvitest green.",
-          "commits": ["f1a2b3c"]
+          "commits": [
+            "f1a2b3c"
+          ]
         }
       },
       {
@@ -364,7 +376,9 @@
         "payload": {
           "summary": "Health endpoint implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["a4b5c6d"]
+          "commits": [
+            "a4b5c6d"
+          ]
         }
       },
       {
@@ -490,7 +504,9 @@
         "payload": {
           "summary": "Rate limiter implemented",
           "body": "## Implementation\nToken bucket with tests.\n## Verification\nvitest green.",
-          "commits": ["b8c9d0e"]
+          "commits": [
+            "b8c9d0e"
+          ]
         }
       },
       {
@@ -540,7 +556,9 @@
         "payload": {
           "summary": "Validator implemented",
           "body": "## Implementation\nSchema walker.\n## Verification\nvitest green.",
-          "commits": ["c0d1e2f"]
+          "commits": [
+            "c0d1e2f"
+          ]
         }
       },
       {
@@ -604,7 +622,9 @@
         "payload": {
           "summary": "Flags parser implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["d2e3f4a"]
+          "commits": [
+            "d2e3f4a"
+          ]
         }
       },
       {
@@ -668,7 +688,9 @@
         "payload": {
           "summary": "Debounce util implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["e5f6a7b"]
+          "commits": [
+            "e5f6a7b"
+          ]
         }
       },
       {
@@ -807,19 +829,21 @@
         "payload": {
           "summary": "Migration runner implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["f8a9b0c"]
+          "commits": [
+            "f8a9b0c"
+          ]
         }
       },
       {
         "version": 3,
         "task_id": "note-reviewing",
-        "role": "executor",
-        "agent": "pi",
+        "role": "reviewer",
+        "agent": "codex-cli",
         "content_type": "note",
         "timestamp": "2026-08-15T09:02:00Z",
         "payload": {
-          "summary": "Context for the reviewer",
-          "body": "Note: commit f8a9b0c also includes the lock-file test the design required."
+          "summary": "Reviewer's working note",
+          "body": "Note: cross-checking the migration lock against the design while reviewing."
         }
       }
     ],
@@ -856,7 +880,9 @@
         "payload": {
           "summary": "Sort helpers implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["a0b1c2d"]
+          "commits": [
+            "a0b1c2d"
+          ]
         }
       },
       {
@@ -919,7 +945,9 @@
         "payload": {
           "summary": "Env check implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["b2c3d4e"]
+          "commits": [
+            "b2c3d4e"
+          ]
         }
       },
       {
@@ -991,7 +1019,12 @@
       "status": "designing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 1,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -1028,7 +1061,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -1057,7 +1095,9 @@
         "payload": {
           "summary": "ID generator implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["c4d5e6f"]
+          "commits": [
+            "c4d5e6f"
+          ]
         }
       },
       {
@@ -1077,7 +1117,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -1106,7 +1151,9 @@
         "payload": {
           "summary": "Throttle util implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["d6e7f8a"]
+          "commits": [
+            "d6e7f8a"
+          ]
         }
       },
       {
@@ -1133,7 +1180,9 @@
         "payload": {
           "summary": "Fix published as code_changes instead of revision",
           "body": "## Implementation\nFixed the timer; used the wrong content type.\n## Verification\nvitest green.",
-          "commits": ["e8f9a0b"]
+          "commits": [
+            "e8f9a0b"
+          ]
         }
       }
     ],
@@ -1141,7 +1190,12 @@
       "status": "revising",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 4, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 4,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -1208,7 +1262,9 @@
         "payload": {
           "summary": "Changes after close",
           "body": "## Implementation\nExecutor missed the close and published changes.\n## Verification\nvitest green.",
-          "commits": ["f0a1b2c"]
+          "commits": [
+            "f0a1b2c"
+          ]
         }
       }
     ],
@@ -1216,7 +1272,12 @@
       "status": "closed",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "CLOSED_ABSORB" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "CLOSED_ABSORB"
+        }
+      ]
     }
   },
   {
@@ -1254,7 +1315,12 @@
       "status": "closed",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "CLOSED_ABSORB" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "CLOSED_ABSORB"
+        }
+      ]
     }
   },
   {
@@ -1283,7 +1349,9 @@
         "payload": {
           "summary": "Path utils implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["a3b4c5d"]
+          "commits": [
+            "a3b4c5d"
+          ]
         }
       },
       {
@@ -1304,7 +1372,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "INVALID_VERDICT" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "INVALID_VERDICT"
+        }
+      ]
     }
   },
   {
@@ -1333,7 +1406,9 @@
         "payload": {
           "summary": "Diff printer implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["b5c6d7e"]
+          "commits": [
+            "b5c6d7e"
+          ]
         }
       },
       {
@@ -1355,7 +1430,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "INVALID_VERDICT" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "INVALID_VERDICT"
+        }
+      ]
     }
   },
   {
@@ -1397,7 +1477,9 @@
         "payload": {
           "summary": "Timer utils implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["c7d8e9f"]
+          "commits": [
+            "c7d8e9f"
+          ]
         }
       }
     ],
@@ -1405,7 +1487,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -1518,7 +1605,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 4, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 4,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -1571,7 +1663,9 @@
         "payload": {
           "summary": "Chunker implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["d9e0f1b"]
+          "commits": [
+            "d9e0f1b"
+          ]
         }
       }
     ],
@@ -1608,7 +1702,9 @@
         "payload": {
           "summary": "Pluralize util implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["e1f2a3b"]
+          "commits": [
+            "e1f2a3b"
+          ]
         }
       },
       {
@@ -1647,7 +1743,9 @@
         "payload": {
           "summary": "Url utils implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["f3a4b5c"]
+          "commits": [
+            "f3a4b5c"
+          ]
         }
       },
       {
@@ -1710,7 +1808,9 @@
         "payload": {
           "summary": "Template engine implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["a6b7c8d"]
+          "commits": [
+            "a6b7c8d"
+          ]
         }
       }
     ],
@@ -1785,7 +1885,9 @@
         "payload": {
           "summary": "Queue implemented, v2 missing on disk",
           "body": "## Implementation\nAs designed; v2 was lost to an external edit.\n## Verification\nvitest green.",
-          "commits": ["b8c9d0f"]
+          "commits": [
+            "b8c9d0f"
+          ]
         }
       }
     ],
@@ -1793,7 +1895,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "VERSION_GAP" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "VERSION_GAP"
+        }
+      ]
     }
   },
   {
@@ -1822,7 +1929,9 @@
         "payload": {
           "summary": "Stack implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["c0d1e2a"]
+          "commits": [
+            "c0d1e2a"
+          ]
         }
       },
       {
@@ -1842,7 +1951,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "VERSION_DUPLICATE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "VERSION_DUPLICATE"
+        }
+      ]
     }
   },
   {
@@ -1891,7 +2005,12 @@
       "status": "designing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 1,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -2021,7 +2140,9 @@
         "payload": {
           "summary": "Changes after close",
           "body": "## Implementation\nPublished after close, absorbed with a warning.\n## Verification\nvitest green.",
-          "commits": ["d2e3f4b"]
+          "commits": [
+            "d2e3f4b"
+          ]
         }
       },
       {
@@ -2072,7 +2193,9 @@
         "payload": {
           "summary": "Ring buffer implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["a7b8c9e"]
+          "commits": [
+            "a7b8c9e"
+          ]
         }
       },
       {
@@ -2094,7 +2217,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "INVALID_VERDICT" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "INVALID_VERDICT"
+        }
+      ]
     }
   },
   {
@@ -2124,7 +2252,9 @@
         "payload": {
           "summary": "Interner implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["b9c0d1f"]
+          "commits": [
+            "b9c0d1f"
+          ]
         }
       },
       {
@@ -2145,7 +2275,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "VERSION_DUPLICATE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "VERSION_DUPLICATE"
+        }
+      ]
     }
   },
   {
@@ -2175,7 +2310,9 @@
         "payload": {
           "summary": "Hash wrapper implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["c1d2e3a"]
+          "commits": [
+            "c1d2e3a"
+          ]
         }
       },
       {
@@ -2209,7 +2346,12 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 4, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 4,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -2234,7 +2376,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 5, "code": "VERSION_GAP" }]
+      "warnings": [
+        {
+          "version": 5,
+          "code": "VERSION_GAP"
+        }
+      ]
     }
   },
   {
@@ -2301,7 +2448,9 @@
         "payload": {
           "summary": "Implemented per the reference design",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["aa11bb2"]
+          "commits": [
+            "aa11bb2"
+          ]
         }
       },
       {
@@ -2367,7 +2516,9 @@
         "payload": {
           "summary": "Implemented straight from the pre-existing design",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["bb22cc3"]
+          "commits": [
+            "bb22cc3"
+          ]
         }
       },
       {
@@ -2395,7 +2546,9 @@
           "summary": "Guard added with test",
           "body": "## Response\nAdded the guard and the test.\n## Verification\nvitest green.",
           "ref_version": 2,
-          "commits": ["cc33dd4"]
+          "commits": [
+            "cc33dd4"
+          ]
         }
       }
     ],
@@ -2422,7 +2575,9 @@
         "payload": {
           "summary": "Implemented per the pre-existing design",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["dd44ee5"]
+          "commits": [
+            "dd44ee5"
+          ]
         }
       },
       {
@@ -2444,7 +2599,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -2463,7 +2623,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ee55ff6"]
+          "commits": [
+            "ee55ff6"
+          ]
         }
       },
       {
@@ -2483,7 +2645,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -2501,7 +2668,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ff66aa1"]
+          "commits": [
+            "ff66aa1"
+          ]
         }
       },
       {
@@ -2554,7 +2723,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["aa77bb8"]
+          "commits": [
+            "aa77bb8"
+          ]
         }
       },
       {
@@ -2595,7 +2766,9 @@
           "summary": "Fixed the rejected issue",
           "body": "## Response\nFixed.\n## Verification\nvitest green.",
           "ref_version": 3,
-          "commits": ["bb88cc9"]
+          "commits": [
+            "bb88cc9"
+          ]
         }
       },
       {
@@ -2687,7 +2860,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["cc99dd0"]
+          "commits": [
+            "cc99dd0"
+          ]
         }
       },
       {
@@ -2726,7 +2901,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["dd00ee1"]
+          "commits": [
+            "dd00ee1"
+          ]
         }
       },
       {
@@ -2843,7 +3020,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ee11ff2"]
+          "commits": [
+            "ee11ff2"
+          ]
         }
       },
       {
@@ -2863,7 +3042,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -2889,7 +3073,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 1,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -2907,7 +3096,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ff22aa3"]
+          "commits": [
+            "ff22aa3"
+          ]
         }
       },
       {
@@ -2928,7 +3119,12 @@
       "status": "reviewing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "INVALID_VERDICT" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "INVALID_VERDICT"
+        }
+      ]
     }
   },
   {
@@ -2946,7 +3142,9 @@
         "payload": {
           "summary": "Implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["aa33bb4"]
+          "commits": [
+            "aa33bb4"
+          ]
         }
       },
       {
@@ -3019,7 +3217,12 @@
       "status": "closed",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "CLOSED_ABSORB" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "CLOSED_ABSORB"
+        }
+      ]
     }
   },
   {
@@ -3044,7 +3247,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 1,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3112,7 +3320,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ab12cd3"]
+          "commits": [
+            "ab12cd3"
+          ]
         }
       }
     ],
@@ -3150,7 +3360,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["bc23de4"]
+          "commits": [
+            "bc23de4"
+          ]
         }
       },
       {
@@ -3215,7 +3427,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["cd34ef5"]
+          "commits": [
+            "cd34ef5"
+          ]
         }
       },
       {
@@ -3266,7 +3480,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["de45fa6"]
+          "commits": [
+            "de45fa6"
+          ]
         }
       },
       {
@@ -3292,7 +3508,9 @@
         "payload": {
           "summary": "Reworked in the right module",
           "body": "## Implementation\nFixed the scope.\n## Verification\nvitest green.",
-          "commits": ["ef56ab7"]
+          "commits": [
+            "ef56ab7"
+          ]
         }
       },
       {
@@ -3357,7 +3575,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["fa67bc8"]
+          "commits": [
+            "fa67bc8"
+          ]
         }
       },
       {
@@ -3379,7 +3599,12 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3409,7 +3634,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ab78cd9"]
+          "commits": [
+            "ab78cd9"
+          ]
         }
       },
       {
@@ -3431,7 +3658,12 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3461,7 +3693,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["bc89de0"]
+          "commits": [
+            "bc89de0"
+          ]
         }
       },
       {
@@ -3483,7 +3717,12 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3509,7 +3748,12 @@
       "status": "designing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 1,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3549,7 +3793,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3580,7 +3829,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["cd90ef1"]
+          "commits": [
+            "cd90ef1"
+          ]
         }
       },
       {
@@ -3600,7 +3851,12 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3625,7 +3881,12 @@
       "status": "designing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 1, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 1,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3655,7 +3916,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["de01fa2"]
+          "commits": [
+            "de01fa2"
+          ]
         }
       },
       {
@@ -3675,7 +3938,12 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3713,7 +3981,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3751,7 +4024,12 @@
       "status": "implementing",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 2, "code": "OUT_OF_TABLE" }]
+      "warnings": [
+        {
+          "version": 2,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   },
   {
@@ -3807,7 +4085,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["ef12ab3"]
+          "commits": [
+            "ef12ab3"
+          ]
         }
       },
       {
@@ -3922,7 +4202,9 @@
         "payload": {
           "summary": "Small change implemented",
           "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
-          "commits": ["fa23bc4"]
+          "commits": [
+            "fa23bc4"
+          ]
         }
       },
       {
@@ -4008,7 +4290,12 @@
       "status": "closed",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "CLOSED_ABSORB" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "CLOSED_ABSORB"
+        }
+      ]
     }
   },
   {
@@ -4039,7 +4326,9 @@
         "payload": {
           "summary": "Implemented, v2 missing on disk",
           "body": "## Implementation\nAs designed; v2 was lost to an external edit.\n## Verification\nvitest green.",
-          "commits": ["ab34cd5"]
+          "commits": [
+            "ab34cd5"
+          ]
         }
       }
     ],
@@ -4047,7 +4336,550 @@
       "status": "pending_approval",
       "waiting_for": "human",
       "needs_attention": true,
-      "warnings": [{ "version": 3, "code": "VERSION_GAP" }]
+      "warnings": [
+        {
+          "version": 3,
+          "code": "VERSION_GAP"
+        }
+      ]
+    }
+  },
+  {
+    "name": "note-executor-reviewing-reclaims-revising",
+    "task_id": "note-reclaim",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-reclaim",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "## Selected approach\nPorts recovery protocol."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "note-reclaim",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 3,
+        "task_id": "note-reclaim",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:02:00Z",
+        "payload": {
+          "summary": "Found a gap in my own delivery",
+          "body": "The lock-file test is missing — reclaiming the round to fix it."
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-executor-reviewing-ack-stays",
+    "task_id": "note-ack-stay",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-ack-stay",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "## Selected approach\nPorts recovery protocol."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "note-ack-stay",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 3,
+        "task_id": "note-ack-stay",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:02:00Z",
+        "payload": {
+          "summary": "Anomaly handled",
+          "body": "Acknowledging the needs_attention flag from the previous record.",
+          "ack": true
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-executor-implementing-stays",
+    "task_id": "note-impl-stay",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-impl-stay",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "## Selected approach\nPorts recovery protocol."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "note-impl-stay",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Mid-work supplement",
+          "body": "Design gap found while implementing; proceeding with the obvious interpretation."
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-executor-closed-stays-closed",
+    "task_id": "note-closed-stay",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "note-closed-stay",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "## Selected approach\nPorts recovery protocol."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "note-closed-stay",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 3,
+        "task_id": "note-closed-stay",
+        "role": "reviewer",
+        "content_type": "review",
+        "timestamp": "2026-09-01T09:02:00Z",
+        "payload": {
+          "summary": "Review: pass",
+          "body": "## Verdict\nSee payload.",
+          "verdict": "pass",
+          "ref_version": 2
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 4,
+        "task_id": "note-closed-stay",
+        "role": "human",
+        "content_type": "decision",
+        "timestamp": "2026-09-01T09:03:00Z",
+        "payload": {
+          "summary": "Approved",
+          "body": "Ship it.",
+          "decision": "approve"
+        }
+      },
+      {
+        "version": 5,
+        "task_id": "note-closed-stay",
+        "role": "human",
+        "content_type": "decision",
+        "timestamp": "2026-09-01T09:04:00Z",
+        "payload": {
+          "summary": "Closed",
+          "body": "Done.",
+          "decision": "close"
+        }
+      },
+      {
+        "version": 6,
+        "task_id": "note-closed-stay",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:05:00Z",
+        "payload": {
+          "summary": "Post-close remark",
+          "body": "Archival note after close — the reclaim exception must not fire in the absorbing state."
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "closed",
+      "waiting_for": "none",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "note-reclaim-then-revision-returns-to-reviewing",
+    "task_id": "reclaim-loop",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "reclaim-loop",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "## Selected approach\nPorts recovery protocol."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "reclaim-loop",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 3,
+        "task_id": "reclaim-loop",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:02:00Z",
+        "payload": {
+          "summary": "Self-reported delivery problem",
+          "body": "Reclaiming the round: the lock-file test is missing."
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 4,
+        "task_id": "reclaim-loop",
+        "role": "executor",
+        "content_type": "revision",
+        "timestamp": "2026-09-01T09:03:00Z",
+        "payload": {
+          "summary": "Revision delivered",
+          "body": "## Response\nLock-file test added.\n## Verification\nvitest green.",
+          "commits": [
+            "e4f5g6h"
+          ],
+          "ref_version": 3
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "reviewing",
+      "waiting_for": "agent:reviewer",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "review-blocked-external-to-pending-approval",
+    "task_id": "blocked-ext",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "blocked-ext",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "## Selected approach\nPorts recovery protocol."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "blocked-ext",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 3,
+        "task_id": "blocked-ext",
+        "role": "reviewer",
+        "content_type": "review",
+        "timestamp": "2026-09-01T09:02:00Z",
+        "payload": {
+          "summary": "Review: blocked_external",
+          "body": "## Verdict\nCode meets the design; verification is blocked on an external condition (real-machine run) the review round cannot complete.",
+          "verdict": "blocked_external",
+          "ref_version": 2
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 4,
+        "task_id": "blocked-ext",
+        "role": "human",
+        "content_type": "decision",
+        "timestamp": "2026-09-01T09:04:00Z",
+        "payload": {
+          "summary": "Approved with external verification pending",
+          "body": "External run delegated to the release checklist.",
+          "decision": "approve"
+        }
+      }
+    ],
+    "expected": {
+      "status": "approved",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-note-executor-reviewing-reclaims-revising",
+    "task_id": "direct-reclaim",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-reclaim",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 2,
+        "task_id": "direct-reclaim",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Self-reported delivery problem",
+          "body": "Reclaiming the round to fix a gap in v1."
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "revising",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "direct-review-blocked-external-to-pending-approval",
+    "task_id": "direct-blocked-ext",
+    "flow": "direct",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "direct-blocked-ext",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "## Implementation\nAs designed.\n## Verification\nvitest green.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 2,
+        "task_id": "direct-blocked-ext",
+        "role": "reviewer",
+        "content_type": "review",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Review: blocked_external",
+          "body": "## Verdict\nCode fine; external verification pending.",
+          "verdict": "blocked_external",
+          "ref_version": 1
+        },
+        "agent": "codex-cli"
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-note-executor-implementing-stays",
+    "task_id": "solo-note-stay",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-note-stay",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "Small change."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "solo-note-stay",
+        "role": "executor",
+        "content_type": "note",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Mid-work supplement",
+          "body": "Solo has no reviewing state, so the reclaim row is unreachable by construction."
+        },
+        "agent": "pi"
+      }
+    ],
+    "expected": {
+      "status": "implementing",
+      "waiting_for": "agent:executor",
+      "needs_attention": false,
+      "warnings": []
+    }
+  },
+  {
+    "name": "solo-review-blocked-external-out-of-table",
+    "task_id": "solo-blocked-ext",
+    "flow": "solo",
+    "records": [
+      {
+        "version": 1,
+        "task_id": "solo-blocked-ext",
+        "role": "architect",
+        "content_type": "design",
+        "timestamp": "2026-09-01T09:00:00Z",
+        "payload": {
+          "summary": "Design",
+          "body": "Small change."
+        },
+        "agent": "codex-cli"
+      },
+      {
+        "version": 2,
+        "task_id": "solo-blocked-ext",
+        "role": "executor",
+        "content_type": "code_changes",
+        "timestamp": "2026-09-01T09:01:00Z",
+        "payload": {
+          "summary": "Implemented",
+          "body": "Done.",
+          "commits": [
+            "a1b2c3d"
+          ]
+        },
+        "agent": "pi"
+      },
+      {
+        "version": 3,
+        "task_id": "solo-blocked-ext",
+        "role": "reviewer",
+        "content_type": "review",
+        "timestamp": "2026-09-01T09:02:00Z",
+        "payload": {
+          "summary": "Review in a review-free flow",
+          "body": "blocked_external is a legal verdict value but the solo table has no review row at all.",
+          "verdict": "blocked_external",
+          "ref_version": 2
+        },
+        "agent": "codex-cli"
+      }
+    ],
+    "expected": {
+      "status": "pending_approval",
+      "waiting_for": "human",
+      "needs_attention": true,
+      "warnings": [
+        {
+          "version": 3,
+          "code": "OUT_OF_TABLE"
+        }
+      ]
     }
   }
 ]

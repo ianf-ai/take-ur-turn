@@ -99,6 +99,11 @@ export function buildWindowsToastPowerShellScript(msg: Notification): string {
     "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\$appId).Show(\$toast)",
     "exit 0",
     "} catch {",
+    // Surface the failure cause as ONE prefixed stderr line. Write-Error's
+    // error record is multi-line, and powershell -Command additionally
+    // echoes the script's first line into stderr, so the notifier greps
+    // for the prefix instead of guessing which line carries the cause.
+    "[Console]::Error.WriteLine('tut-toast-failed: ' + $_.Exception.Message)",
     "exit 1",
     "}",
   ].join("\n");
@@ -138,7 +143,23 @@ function createDesktopChannel(platform: NodeJS.Platform): Channel {
             { timeout: EXEC_TIMEOUT_MS },
           );
           return;
-        } catch {
+        } catch (err) {
+          // Common cause: the notifier runs in a SYSTEM/non-interactive
+          // context (e.g. an elevated launcher), where Windows denies
+          // toast delivery outright. Keep the bell fallback, but make the
+          // failure visible — a silently swallowed toast failure is
+          // indistinguishable from a working channel. The script's catch
+          // writes one prefixed stderr line; stderr otherwise starts with
+          // powershell's echo of the script's first line, and error.message
+          // embeds the whole script — neither is a compact cause.
+          const stderr = (err as { stderr?: unknown }).stderr;
+          const prefixed =
+            typeof stderr === "string"
+              ? stderr.split(/\r?\n/).find((line) => line.startsWith("tut-toast-failed: "))
+              : undefined;
+          const cause =
+            prefixed ?? ((err instanceof Error ? err.message : String(err)).split("\n")[0] ?? "");
+          warn(`windows toast failed, falling back to terminal bell: ${cause}`);
           ringBell();
           return;
         }

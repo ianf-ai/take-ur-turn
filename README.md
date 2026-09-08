@@ -171,7 +171,7 @@ tut read <task_id> [--since-version <n>] [--json] [--url <u>]
 tut list [--status <s>] [--json] [--url <u>]
 tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
 tut assign <role> <command...>
-tut up [--url <u>] [--dry-run]
+tut up [--url <u>] [--event-port <p>] [--dry-run]
 tut skill <host|architect|executor|reviewer>
 tut init
 tut ack <task_id> [--note <text>] [--url <u>]
@@ -254,7 +254,7 @@ launcher. Codex receives TUT's update suppression after user args (`-c check_for
 |---|---|---|
 | `--port <n>` | listen port for `tut serve` | `3001` |
 | `--url <u>` | Hub address override (for `tut up` and the context/approval commands; accepts loopback addresses with an explicit port only) | `http://127.0.0.1:3001` |
-| `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | polling interval / agent event port / stall timeout for `tut notify` | `5s` / `3002` / `30min` |
+| `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | polling interval / agent event port / stall timeout for `tut notify` (`--event-port` also selects the port `tut up` probes and provisions; the interval is clamped to a 1s floor) | `5s` / `3002` / `30min` |
 | `--working-timeout <s>` | launch-to-working short-fuse timeout for `tut notify`; alerts when no working signal arrives | `300s` |
 | `--root <dir>` | storage root for `tut serve` | current directory |
 | env `TUT_UP_CLI_SELF` | path of the tut CLI itself, used when `tut up` provisions panes | auto-detected (dist layout) |
@@ -300,7 +300,7 @@ Native Windows works end to end (hub, MCP, CLI, flow driving were verified again
 **Troubleshooting**:
 
 - **Agent reports it cannot see the context.* tools**: make sure `tut serve` is running (`curl http://127.0.0.1:3001/state` responding means it is alive); check that the CLI's MCP config points at the `/mcp` endpoint; some CLI sessions may be sandboxed off from localhost loopback — in that case have that agent use the CLI channel (`tut read` / `tut publish`) instead; behavior is fully equivalent
-- **Port 3001 already in use (EADDRINUSE)**: switch ports with `tut serve --port <n>` and point the remaining commands at the new address via `--url` (`tut up`'s provisioning probe included)
+- **Port 3001 already in use (EADDRINUSE)**: switch ports with `tut serve --port <n>` and point the remaining commands at the new address via `--url` (`tut up`'s provisioning probe included). Do not point `--url` at the event port (`:3002`) — `tut up` refuses that collision up front; move the event listener with `--event-port` instead. Every CLI command that cannot reach the hub prints one `HUB_UNREACHABLE` line pointing at `tut serve`; when running several hubs side by side, pass `--url` explicitly on every call (a `--url`-less command always speaks to the default port)
 - **Custom lineup lost after `npm i -g`** — resolved: the lineup lives in the project (`.context-hub/workspace.json`) or at the user level (`~/.config/tut/`); upgrades never touch either. See [Configuration ②](#-workspace-lineup--three-level-resolution-chain-project--user--built-in) for the migration steps
 
 **Known limitations** (design trade-offs, not bugs):

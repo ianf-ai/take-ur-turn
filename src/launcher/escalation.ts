@@ -27,7 +27,13 @@ export type GiveUpBoxEvidence = "held" | "cleared" | "unknown";
 
 /** Relay visibility for the last Enter (diagnostic only — never a submit
  *  confirmation). */
-export type GiveUpProbeEvidence = "observed" | "failed" | "unavailable";
+/**
+ * "not-attempted" marks give-ups that never reached the submit phase
+ * (land-never-observed: zero Enters, zero probes) — printing "unavailable"
+ * there masqueraded a never-run probe as a broken relay and misled the
+ * 0.7.0 real-machine triage into a false "pipe chain dead" finding.
+ */
+export type GiveUpProbeEvidence = "observed" | "failed" | "unavailable" | "not-attempted";
 
 /**
  * Evidence fields on a delivery_giveup event body.  `box` is the last

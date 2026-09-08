@@ -102,6 +102,47 @@ function pipeSimulatingRelay(): { server: Server; tornDown: () => number } {
   return { server, tornDown: () => tornDownClients };
 }
 
+
+describe("delivery probe endpoint derivation", () => {
+  it("mixes the hub instance into the digest — same task in two hubs never shares a relay", () => {
+    const a = deliveryProbeEndpoint("t1", "executor", {}, process.platform, "/hub/one");
+    const b = deliveryProbeEndpoint("t1", "executor", {}, process.platform, "/hub/two");
+    const aAgain = deliveryProbeEndpoint("t1", "executor", {}, process.platform, "/hub/one");
+    expect(a).not.toBe(b); // cross-instance steal / wrong-pane marker routing is gone
+    expect(a).toBe(aAgain); // stable across launches of the same instance
+  });
+
+  it("keeps POSIX endpoints under the sun_path limit — a long configured dir falls back to /tmp", () => {
+    if (process.platform === "win32") return; // the guard is POSIX-only
+    const longDir = `/${"d".repeat(120)}`;
+    const endpoint = deliveryProbeEndpoint("t1", "executor", { TUT_DELIVERY_PROBE_DIR: longDir }, process.platform);
+    expect(endpoint.startsWith("/tmp/tut-probe-")).toBe(true);
+    expect(endpoint.length).toBeLessThanOrEqual(104);
+    // A short configured dir is honored verbatim.
+    const okDir = temporaryDirectory();
+    const kept = deliveryProbeEndpoint("t1", "executor", { TUT_DELIVERY_PROBE_DIR: okDir }, process.platform);
+    expect(kept.startsWith(okDir)).toBe(true);
+  });
+
+  it("counts UTF-8 BYTES against sun_path — a multi-byte dir inside the CHAR limit still falls back", () => {
+    if (process.platform === "win32") return; // the guard is POSIX-only
+    // 39 characters (under 104) but 107 bytes (over 104): a character-count
+    // guard would pass it and listen() would still fail inside the pane.
+    const multibyteDir = `/tmp/${"あ".repeat(34)}`;
+    expect(multibyteDir.length).toBeLessThanOrEqual(104);
+    expect(Buffer.byteLength(multibyteDir, "utf8")).toBeGreaterThan(104);
+    const endpoint = deliveryProbeEndpoint("t1", "executor", { TUT_DELIVERY_PROBE_DIR: multibyteDir }, process.platform);
+    expect(endpoint.startsWith("/tmp/tut-probe-")).toBe(true); // planner fallback engaged
+    expect(Buffer.byteLength(endpoint, "utf8")).toBeLessThanOrEqual(104);
+    // The byte rule is not ASCII paranoia: a multi-byte dir that FITS in
+    // bytes is honored verbatim — same behavior as the runner's guard.
+    const fits = `/tmp/${"あ".repeat(8)}`;
+    const kept = deliveryProbeEndpoint("t1", "executor", { TUT_DELIVERY_PROBE_DIR: fits }, process.platform);
+    expect(kept.startsWith(`${fits}/tut-probe-`)).toBe(true);
+    expect(Buffer.byteLength(kept, "utf8")).toBeLessThanOrEqual(104);
+  });
+});
+
 describe("delivery probe wire protocol", () => {
   it("replies to clients that keep the write side open and tears down half-closing clients", async () => {
     const endpoint = ipcEndpoint(temporaryDirectory(), "win-probe-sim");

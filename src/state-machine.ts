@@ -13,16 +13,17 @@ import {
 /**
  * Derivation (system-design 3.1-3.3). Pure function: no IO, no
  * timestamp consumption, no mutation of inputs. Folding only ever reads
- * content_type + the payload fields ack / verdict / decision;
- * everything else in payload is ignored.
+ * content_type + the payload fields ack / verdict / decision, plus the
+ * record's role — solely for the reviewing-state executor-note exception row
+ * (system-design 3.1); everything else in payload is ignored.
  *
  * The transition table is selected by the task's flow ("full" | "direct"
  * | "solo", system-design 3.1 three-table definition); flow is absent = full,
  * so call sites that omit it are unchanged.
  */
 
-/** Base waiting_for map (system-design 3.1) — flow-independent. */
-const WAITING_FOR_BASE: Record<Status, WaitingFor> = {
+/** Base waiting_for map (system-design 3.1) — flow-independent. Exported for the store's cache-aware fold reconstruction. */
+export const WAITING_FOR_BASE: Record<Status, WaitingFor> = {
   designing: "agent:architect",
   implementing: "agent:executor",
   reviewing: "agent:reviewer",
@@ -39,9 +40,16 @@ const INITIAL_STATUS: Record<Flow, Status> = {
   solo: "designing",
 };
 
-/** full review verdict targets (also serves solo's unreachable review row). */
+/**
+ * full review verdict targets (also serves solo's unreachable review row).
+ * blocked_external targets pending_approval exactly like pass (system-design
+ * 3.1 four-tier vocabulary: code fine, verification blocked on external
+ * conditions — the external-verification decision belongs to the human at
+ * the approval gate, so the derivation path is shared with pass).
+ */
 const VERDICT_TARGET: Record<string, Status> = {
   pass: "pending_approval",
+  blocked_external: "pending_approval",
   fail_code: "revising",
   fail_design: "designing",
 };
@@ -53,13 +61,26 @@ const VERDICT_TARGET: Record<string, Status> = {
  */
 const VERDICT_TARGET_DIRECT: Record<string, Status> = {
   pass: "pending_approval",
+  blocked_external: "pending_approval",
   fail_code: "revising",
 };
 
 /** One fold step: next status plus an optional warning for this record. */
 function fold(status: Status, record: ContextRecord, flow: Flow): { status: Status; warning: WarningCode | null } {
-  // note: never changes status, never warns, in any state (including closed).
+  // note: never warns, in any state (including closed). The ONE transition
+  // exception (system-design 3.1): a non-ack note from the executor while
+  // reviewing hands the round back — the worker speaking up during the
+  // review wait IS reclaiming the turn. Constraints, all four enforced by
+  // this guard order: only in reviewing (any other state's note is the usual
+  // mid-work supplement), only role=executor (reviewer/architect/human notes
+  // are clarifications, not turn claims), never an ack note (anomaly-handling
+  // confirmation outranks turn reclaim), and closed absorbs first-class below
+  // — status "closed" fails this equality, so the exception never fires there.
+  // solo has no reviewing state, so the row is unreachable there by construction.
   if (record.content_type === "note") {
+    if (record.payload.ack !== true && record.role === "executor" && status === "reviewing") {
+      return { status: "revising", warning: null };
+    }
     return { status, warning: null };
   }
 
@@ -171,10 +192,46 @@ export const derive: DeriveFn = (
   // Sort by version without mutating the input. Array#sort is stable (ES2019+),
   // so duplicate versions keep input order.
   const ordered = [...records].sort((a, b) => a.version - b.version);
+  const { prevVersion: _cursorInternal, ...state } = foldOntoCursor(initialCursor(effectiveFlow), ordered, effectiveFlow);
+  return state; // prevVersion is incremental-fold plumbing — derive's contract stays DerivedState
+};
 
-  let status: Status = INITIAL_STATUS[effectiveFlow];
-  const warnings: Warning[] = [];
-  let prevVersion = 0;
+/**
+ * Resumable fold state (read-path cache): exactly the carried
+ * state between derive's record steps. `status` is the folded status,
+ * `prevVersion` the last folded record version (0 = nothing folded — the
+ * structural-anomaly comparator), `warnings` the accumulated warnings.
+ */
+export interface FoldCursor {
+  status: Status;
+  prevVersion: number;
+  warnings: Warning[];
+}
+
+/** Cursor of an empty sequence per flow (direct starts implementing). */
+export function initialCursor(flow: Flow): FoldCursor {
+  return { status: INITIAL_STATUS[flow], prevVersion: 0, warnings: [] };
+}
+
+/**
+ * Incremental sibling of derive: fold `records` — which must ALL
+ * carry versions > cursor.prevVersion, in ascending order after the same
+ * stable version sort derive applies — onto a resumed cursor. Byte-equal
+ * semantics with folding the whole sequence at once: the cursor carries
+ * everything the per-record fold reads. The incoming cursor's warnings array
+ * is copied, never mutated (cursors are cached and shared; results escape to
+ * callers), and the returned state's array is the new cursor's own.
+ */
+export function foldOntoCursor(
+  cursor: FoldCursor,
+  records: readonly ContextRecord[],
+  flow: Flow,
+): DerivedState & { prevVersion: number } {
+  const ordered = [...records].sort((a, b) => a.version - b.version);
+
+  let status: Status = cursor.status;
+  const warnings: Warning[] = [...cursor.warnings];
+  let prevVersion = cursor.prevVersion;
 
   for (const record of ordered) {
     // ack: clears warnings accumulated by PRECEDING records
@@ -193,7 +250,7 @@ export const derive: DeriveFn = (
     }
     prevVersion = record.version;
 
-    const step = fold(status, record, effectiveFlow);
+    const step = fold(status, record, flow);
     status = step.status;
     if (step.warning !== null) {
       warnings.push({ version: record.version, code: step.warning });
@@ -206,5 +263,6 @@ export const derive: DeriveFn = (
     waiting_for: needsAttention ? "human" : WAITING_FOR_BASE[status],
     needs_attention: needsAttention,
     warnings,
+    prevVersion,
   };
-};
+}

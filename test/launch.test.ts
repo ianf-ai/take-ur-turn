@@ -84,6 +84,36 @@ describe("markLaunched", () => {
 // --- resolveLaunchTarget (cast → workspace → routes → defaults) ---------------------
 
 describe("resolveLaunchTarget", () => {
+  it("aborts a stalled /state request after the 10-second Hub budget", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const fetchMock = vi.fn((_input: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const pending = resolveLaunchTarget("http://hub.test", "t1", "executor");
+      const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+      expect(timeout).toHaveBeenCalledWith(10_000);
+      expect(fetchMock).toHaveBeenCalledWith(new URL("http://hub.test/state"), {
+        headers: { Connection: "close" },
+        signal: controller.signal,
+      });
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(controller.signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await rejected;
+    } finally {
+      timeout.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
   it("cast hit overrides the file chain; partial cast falls back for unlisted roles", async () => {
     vi.stubGlobal(
       "fetch",

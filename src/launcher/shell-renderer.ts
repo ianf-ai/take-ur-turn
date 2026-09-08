@@ -10,8 +10,10 @@
  * never touched), and cmd (cmdq direct form, else the encoded pane-runner
  * payload so dynamic values never meet cmd expansion).
  *
- * Service commands keep the legacy POSIX bytes byte-for-byte (`cd <cwd> &&
- * node <cli> …`): the renderer is their single writer now, and existing
+ * Service commands keep the legacy POSIX bytes for safe values (`cd <cwd> &&
+ * node <cli> …` unquoted); a value containing whitespace or shell
+ * metacharacters degrades to sq quoting so the same bytes still cross the
+ * shell.  The renderer is their single writer now, and existing
  * provisioning output must not drift.
  */
 
@@ -121,8 +123,12 @@ export function psq(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-/** Characters cmd may expand or treat as operators inside any context. */
-const CMD_UNSAFE = /[%!^&|<>();"\u0000\r\n]/u;
+/**
+ * Characters cmd expands or treats as operators even inside double quotes
+ * (`()` is NOT in this set — parenthesised paths like "Program Files (x86)"
+ * are literal within double quotes and are supported).
+ */
+const CMD_UNSAFE = /[%!^&|<>;"\u0000\r\n]/u;
 
 /** True when a value must never enter a cmd command line unencoded. */
 export function cmdUnsafe(value: string): boolean {
@@ -233,19 +239,40 @@ function cmdRuntimePath(value: string, field: string): string {
 // Dialect renderers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// POSIX service words (on-demand quoting)
+// ---------------------------------------------------------------------------
+
+/**
+ * Words that never need POSIX quoting: the conservative portable safe set
+ * (letters, digits, `_ @ % + = : , . / -`).  Anything else — whitespace,
+ * quotes, glob/expansion characters, non-ASCII — degrades to sq so the
+ * value crosses the shell byte-for-byte instead of being re-split.
+ */
+const POSIX_UNQUOTED_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/u;
+
+/** Quote one POSIX service word only when it carries shell-meaningful bytes. */
+function posixServiceWord(value: string): string {
+  return POSIX_UNQUOTED_WORD.test(value) ? value : sq(value);
+}
+
 /**
  * POSIX.  Agent commands use the frozen `cd --` + sq algorithm; service
  * commands keep the legacy provisioning bytes (`cd <cwd> && node <cli> …`)
- * exactly — the renderer inherited them verbatim from tut up.
+ * for safe values — a word with whitespace or metacharacters degrades to
+ * sq quoting on demand, so space-y project paths launch instead of
+ * re-splitting into extra argv words.
  */
 function renderPosix(command: PaneCommand): string {
   if (command.purpose === "service") {
+    // Env prefix: only the VALUE may quote — a quoted `NAME=` loses
+    // assignment recognition in POSIX shells and becomes a command word.
     const words = [
-      ...Object.entries(command.env).map(([name, value]) => `${name}=${value}`),
-      command.executable,
-      ...command.args,
+      ...Object.entries(command.env).map(([name, value]) => `${name}=${posixServiceWord(value)}`),
+      posixServiceWord(command.executable),
+      ...command.args.map((arg) => posixServiceWord(arg)),
     ].join(" ");
-    return `cd ${command.cwd} && ${words}`;
+    return `cd ${posixServiceWord(command.cwd)} && ${words}`;
   }
   const invocation = [
     ...(Object.keys(command.env).length > 0
@@ -266,7 +293,10 @@ function renderPosix(command: PaneCommand): string {
 function renderPowerShell(command: PaneCommand, runtime: PaneRuntimeOptions): string {
   if (Object.keys(command.env).length === 0) {
     const invocation = [`& ${psq(command.executable)}`, ...command.args.map((arg) => psq(arg))].join(" ");
-    return `& { $savedPath = (Get-Location).Path; $exitCode = 1; try { Set-Location -LiteralPath ${psq(command.cwd)}; ${invocation}; $exitCode = $LASTEXITCODE } finally { Set-Location -LiteralPath $savedPath }; $global:LASTEXITCODE = $exitCode }`;
+    // -ErrorAction Stop makes a failed Set-Location terminate the block
+    // ($exitCode stays 1) instead of silently birthing the agent in the
+    // wrong directory — checkout isolation must fail closed.
+    return `& { $savedPath = (Get-Location).Path; $exitCode = 1; try { Set-Location -LiteralPath ${psq(command.cwd)} -ErrorAction Stop; ${invocation}; $exitCode = $LASTEXITCODE } finally { Set-Location -LiteralPath $savedPath }; $global:LASTEXITCODE = $exitCode }`;
   }
   const payload = encodePaneRunnerPayload(command);
   return `& ${psq(runtime.nodeExecutable)} ${psq(runtime.paneRunnerEntry)} --payload ${psq(payload)}; $global:LASTEXITCODE = $LASTEXITCODE`;

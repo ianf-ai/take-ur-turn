@@ -139,7 +139,19 @@ describe("desktop channel", () => {
     expect(script).toContain("body & <safe> — 已就绪");
     expect(script).toContain("CreateToastNotifier($appId)");
     expect(script).toContain("$ErrorActionPreference = 'Stop'");
+    // Exact WinRT type-load lines: PS 5.1 rejects a malformed literal at
+    // load time, and the failure surfaces only at runtime on real Windows —
+    // substring matches on the type name would miss a corrupted literal.
+    expect(script).toContain(
+      "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+    );
+    expect(script).toContain(
+      "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
+    );
     expect(script).toContain("} catch {");
+    expect(script).toContain(
+      "[Console]::Error.WriteLine('tut-toast-failed: ' + $_.Exception.Message)",
+    );
     expect(script).toContain("exit 1");
     expect(script).not.toContain("osascript");
     expect(script).not.toContain("notify-send");
@@ -228,12 +240,37 @@ describe("desktop channel", () => {
     expect(stderrLines).toContain("\u0007");
   });
 
-  it("bells exactly once when the PowerShell toast command reports an API failure", async () => {
+  it("bells exactly once when the PowerShell toast command reports an API failure, with a visible warning", async () => {
     mockExec({ "powershell.exe": new Error("toast API failed") });
     const desktop = first(createChannels({ channels: ["desktop"] }, { platform: "win32" }));
     await expect(desktop.send({ title: "t", body: "b" })).resolves.toBeUndefined();
     expect(callsTo("powershell.exe")).toHaveLength(1);
-    expect(stderrLines).toEqual(["\u0007"]);
+    // exactly one bell, preceded by one warning naming the cause — a
+    // silently swallowed toast failure is indistinguishable from a
+    // working channel (found live on the Windows VM: SYSTEM-context
+    // toasts are denied with E_ACCESSDENIED and were invisible)
+    expect(stderrLines).toEqual([
+      "tut: warning: windows toast failed, falling back to terminal bell: toast API failed\n",
+      "\u0007",
+    ]);
+  });
+
+  it("the toast warning quotes the prefixed stderr cause, not the command echo with the full script", async () => {
+    // powershell -Command echoes the script's first line into stderr, and
+    // the execFile error message embeds the whole -Command script; the
+    // script's catch writes one prefixed line — the warning should quote
+    // exactly that, one pane line total
+    const err = Object.assign(
+      new Error("Command failed: powershell.exe … <entire script>"),
+      { stderr: "$ErrorActionPreference = 'Stop'\r\ntut-toast-failed: denied: 0x80070005 (E_ACCESSDENIED)\r\nnoise" },
+    );
+    mockExec({ "powershell.exe": err });
+    const desktop = first(createChannels({ channels: ["desktop"] }, { platform: "win32" }));
+    await expect(desktop.send({ title: "t", body: "b" })).resolves.toBeUndefined();
+    expect(stderrLines).toEqual([
+      "tut: warning: windows toast failed, falling back to terminal bell: tut-toast-failed: denied: 0x80070005 (E_ACCESSDENIED)\n",
+      "\u0007",
+    ]);
   });
 
   it("keeps the existing non-Windows degradation chain unchanged", async () => {

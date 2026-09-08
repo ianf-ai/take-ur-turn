@@ -40,6 +40,7 @@ const SAVED_HERDR_PANE_ID = process.env.HERDR_PANE_ID;
 const SAVED_LAG_POLLS = process.env.TUT_HERDR_LIST_LAG_POLLS;
 const SAVED_LAG_SET = process.env.TUT_HERDR_PANES_LAG;
 const SAVED_WAIT = process.env.TUT_UP_HUB_WAIT_MS;
+const SAVED_NOTIFY_WAIT = process.env.TUT_UP_NOTIFY_WAIT_MS;
 const SAVED_SELF = process.env.TUT_UP_CLI_SELF;
 const TRASH: string[] = [];
 
@@ -170,6 +171,8 @@ afterEach(() => {
   else process.env.TUT_HERDR_PANES_LAG = SAVED_LAG_SET;
   if (SAVED_WAIT === undefined) delete process.env.TUT_UP_HUB_WAIT_MS;
   else process.env.TUT_UP_HUB_WAIT_MS = SAVED_WAIT;
+  if (SAVED_NOTIFY_WAIT === undefined) delete process.env.TUT_UP_NOTIFY_WAIT_MS;
+  else process.env.TUT_UP_NOTIFY_WAIT_MS = SAVED_NOTIFY_WAIT;
   if (SAVED_SELF === undefined) delete process.env.TUT_UP_CLI_SELF;
   else process.env.TUT_UP_CLI_SELF = SAVED_SELF;
   vi.unstubAllGlobals();
@@ -412,11 +415,18 @@ describe("tut up (behavior)", () => {
     const { project, logPath, self } = makeProject(true);
     useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: "tut-notify", tab_id: "w6:t1" }]);
     process.chdir(project);
-    stubFetch((url) =>
-      url.includes(":3001/state")
-        ? Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }))
-        : refused(),
-    );
+    // The reused pane's notifier must actually come up: the event probe is
+    // log-aware (405 once the rerun is logged) — the success report waits
+    // for the port to answer, a pane run alone is no longer enough.
+    stubFetch((url) => {
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3002/agent-event")) {
+        return readLog(logPath).includes("pane run w6:p1")
+          ? Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }))
+          : refused();
+      }
+      return refused();
+    });
     const io = captureIo();
     try {
       const code = await main(["up"]);
@@ -438,11 +448,17 @@ describe("tut up (behavior)", () => {
     const { project, logPath, self } = makeProject(true);
     useFixtureHerdr(logPath, [{ pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" }]);
     process.chdir(project);
-    stubFetch((url) =>
-      url.includes(":3001/state")
-        ? Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }))
-        : refused(),
-    );
+    // Log-aware event probe: the fresh pane's notifier binds once its run
+    // line is logged (the success report is gated on the probe).
+    stubFetch((url) => {
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3002/agent-event")) {
+        return readLog(logPath).includes("pane run FIX:p1")
+          ? Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }))
+          : refused();
+      }
+      return refused();
+    });
     const io = captureIo();
     try {
       const code = await main(["up"]);
@@ -868,8 +884,9 @@ describe("tut up --url (non-default local hub)", () => {
       const code = await main(["up", "--url", "http://example.com:3001"]);
 
       expect(code).toBe(1);
+      // The example must NOT teach the event port (3002) — it used to.
       expect(io.err()).toContain(
-        "--url must be an http loopback URL with an explicit port (e.g. http://127.0.0.1:3002), got: http://example.com:3001",
+        "--url must be an http loopback URL with an explicit port (e.g. http://127.0.0.1:3003), got: http://example.com:3001",
       );
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
@@ -1069,6 +1086,379 @@ describe("up service commands through the pane dialect renderer", () => {
     } finally {
       io.restore();
       process.chdir(SAVED_CWD);
+    }
+  });
+});
+
+// --- up --event-port -------------------------------------------------------------
+// The event port is one value across the whole up chain: the probe, the
+// rendered notify command, and the collision pre-check all derive from it.
+// Default flags keep the byte-pinned legacy commands (every test above).
+
+describe("tut up --event-port (parse)", () => {
+  it("absent stays undefined; both flag forms parse; non-integers rejected", () => {
+    expect(parseArgs(["up"])).toEqual({ command: "up", dryRun: false });
+    expect(parseArgs(["up", "--event-port", "3105"])).toEqual({ command: "up", dryRun: false, eventPort: 3105 });
+    expect(parseArgs(["up", "--event-port=3105", "--dry-run"])).toEqual({ command: "up", dryRun: true, eventPort: 3105 });
+    expect(parseArgs(["up", "--event-port", "notaport"]).command).toBe("usage");
+  });
+});
+
+describe("up port-conflict pre-check", () => {
+  it("up --url :3002 (the old broken example) is refused before any probe or spawn", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath);
+    process.chdir(project);
+    const fetchMock = stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--url", "http://127.0.0.1:3002"]);
+
+      expect(code).toBe(1);
+      expect(io.err()).toContain("the hub port and the notifier event port are both 3002");
+      expect(io.err()).toContain("notify would die with EADDRINUSE");
+      // Correct examples, none of which collides with the event port.
+      expect(io.err()).toContain("--url http://127.0.0.1:3011");
+      expect(io.err()).toContain("--event-port 3005");
+      expect(fetchMock).not.toHaveBeenCalled(); // pre-check, not post-mortem
+      expect(logLines(logPath)).toEqual([]); // no pane read either
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("matrix: --event-port equal to the hub port is refused from either side", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath);
+    process.chdir(project);
+    const fetchMock = stubFetch(() => refused());
+    let io = captureIo();
+    try {
+      // default hub 3001, event port moved ONTO it
+      let code = await main(["up", "--event-port", "3001"]);
+      expect(code).toBe(1);
+      expect(io.err()).toContain("the hub port and the notifier event port are both 3001");
+      io.restore();
+
+      io = captureIo();
+      // both explicitly equal
+      code = await main(["up", "--url", "http://127.0.0.1:3003", "--event-port", "3003"]);
+      expect(code).toBe(1);
+      expect(io.err()).toContain("the hub port and the notifier event port are both 3003");
+      io.restore();
+
+      io = captureIo();
+      // a DIFFERENT event port with the collision-url passes the pre-check
+      // (proceeds to the normal dry-run path — exit 0, no collision error)
+      code = await main(["up", "--url", "http://127.0.0.1:3002", "--event-port", "3005", "--dry-run"]);
+      expect(code).toBe(0);
+      expect(io.err()).not.toContain("cannot share one port");
+      // dry-run still probes: hub state + default event port (double-notifier
+      // check) + the moved event port.
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      io.restore();
+    }
+  });
+});
+
+describe("up --event-port full chain (render/probe same source)", () => {
+  it("dry-run: the probe hits the moved port and the notify command carries --event-port + TUT_EVENT_PORT_URL", async () => {
+    const { project, logPath, self } = makeProject(true);
+    useFixtureHerdr(logPath); // no preset panes → everything down, dry-run lists actions
+    process.chdir(project);
+    const seen: string[] = [];
+    stubFetch((url) => {
+      seen.push(url);
+      return refused();
+    });
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run", "--event-port", "3105"]);
+
+      expect(code).toBe(0);
+      // Probes: the moved port is the provisioning target; the default port
+      // is probed exactly once — the double-notifier coexistence check.
+      expect(seen.filter((u) => u.endsWith("/agent-event"))).toEqual([
+        "http://127.0.0.1:3002/agent-event", // coexistence check (refused → no warning)
+        "http://127.0.0.1:3105/agent-event", // the actual provisioning probe
+      ]);
+      // Rendered command: the port rides the notify command explicitly and
+      // TUT_EVENT_PORT_URL is exported into the pane (launchers the notifier
+      // spawns escalate to the port it actually listens on). serve untouched.
+      expect(io.out()).toContain(
+        `pane run <new-pane> cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`,
+      );
+      expect(io.out()).toContain(`pane run <new-pane> cd ${project} && node ${self} serve`);
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("healthy notifier on the moved port: already-listening echo names it, nothing provisioned", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath, [{ pane_id: "w1:p1", label: "tut-hub", tab_id: "w1:t1" }]);
+    process.chdir(project);
+    const seen: string[] = [];
+    stubFetch((url) => {
+      seen.push(url);
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3105/agent-event")) {
+        return Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }));
+      }
+      return refused(); // the default event port is DOWN → no double-notifier noise
+    });
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--event-port", "3105"]);
+
+      expect(code).toBe(0);
+      expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3001/state)");
+      expect(io.out()).toContain("up: notify already listening (http://127.0.0.1:3105/agent-event)");
+      expect(seen.some((u) => u.includes(":3105/agent-event"))).toBe(true); // probed the moved port
+      expect(logLines(logPath)).toEqual(["pane list"]); // reads only
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("double-notifier warning: a healthy notifier still on the default port while provisioning a moved one", async () => {
+    const { project, logPath, self } = makeProject(true);
+    useFixtureHerdr(logPath); // no preset panes → notify provisioning plans
+    process.chdir(project);
+    stubFetch((url) => {
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3002/agent-event")) {
+        return Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }));
+      }
+      return refused(); // :3105 is down → provisioning proceeds there
+    });
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run", "--event-port", "3105"]);
+
+      expect(code).toBe(0);
+      expect(io.err()).toContain(
+        "another notifier is already listening on http://127.0.0.1:3002/agent-event — provisioning http://127.0.0.1:3105/agent-event would leave two notifiers running",
+      );
+      expect(io.err()).toContain("drop --event-port to reuse it");
+      // Non-blocking: the moved-port plan still prints.
+      expect(io.out()).toContain(`node ${self} notify --event-port 3105`);
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("default flags keep the byte-pinned legacy commands (no --event-port, no env prefix)", async () => {
+    const { project, logPath, self } = makeProject(true);
+    useFixtureHerdr(logPath);
+    process.chdir(project);
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run"]);
+
+      expect(code).toBe(0);
+      const out = io.out();
+      expect(out).toContain(`pane run <new-pane> cd ${project} && node ${self} serve`);
+      expect(out).toContain(`pane run <new-pane> cd ${project} && node ${self} notify`);
+      expect(out).not.toContain("--event-port");
+      expect(out).not.toContain("TUT_EVENT_PORT_URL");
+    } finally {
+      io.restore();
+    }
+  });
+});
+
+// --- up occupied notify pane -----------------------------------------------------
+// The review's live fixture: tut-hub/tut-notify panes exist, the default
+// event port answers 405 (old notifier alive in the labelled pane), the
+// moved port refuses. provisionSysPane used to take the labelled pane for
+// dead, `pane run` into the occupied pane (swallowed by the foreground
+// notifier), and report "notify running" + exit 0 — false success. Guards:
+// the pre-flight refuses the known-occupied shape without any pane run; the
+// post-run probe gates every success report (spawn ok ≠ listening).
+
+describe("up occupied notify pane", () => {
+  /** The review fixture: sys panes present, old notifier alive on 3002, 3105 down. */
+  const OCCUPIED_FIXTURE = [
+    { pane_id: "w1:p1", label: "tut-hub", tab_id: "w1:t1" },
+    { pane_id: "w6:p1", label: "tut-notify", tab_id: "w1:t1" },
+  ];
+
+  function occupiedProbes(): (url: string) => Promise<Response> {
+    return (url) => {
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3002/agent-event")) {
+        return Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }));
+      }
+      return refused(); // the moved port is down
+    };
+  }
+
+  it("occupied reuse refused: no pane run at all, exit 1, actionable stop-first remedy", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath, OCCUPIED_FIXTURE);
+    process.chdir(project);
+    stubFetch(occupiedProbes());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--event-port", "3105"]);
+
+      expect(code).toBe(1);
+      // Refused WITHOUT any pane mutation — not even the hub step ran (fail fast).
+      expect(logLines(logPath)).toEqual(["pane list"]);
+      expect(io.err()).toContain("cannot start the notifier on http://127.0.0.1:3105/agent-event");
+      expect(io.err()).toContain("still listening on http://127.0.0.1:3002/agent-event");
+      expect(io.err()).toContain("herdr pane close w6:p1"); // the exact reuse-candidate pane
+      expect(io.err()).toContain("drop --event-port");
+      expect(io.err()).toContain("rerun tut up");
+      expect(io.out()).not.toContain("notify running");
+      expect(io.out()).not.toContain("hub already running"); // nothing provisioned, nothing echoed past the refusal
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("the same occupied fixture under --dry-run refuses identically (the plan could not execute)", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath, OCCUPIED_FIXTURE);
+    process.chdir(project);
+    stubFetch(occupiedProbes());
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--dry-run", "--event-port", "3105"]);
+
+      expect(code).toBe(1);
+      expect(logLines(logPath)).toEqual(["pane list"]);
+      expect(io.err()).toContain("cannot start the notifier on http://127.0.0.1:3105/agent-event");
+      // The misleading "would reuse pane" plan is gone — dry-run predicts the refusal.
+      expect(io.out()).not.toContain("would reuse pane w6:p1");
+      expect(io.out()).not.toContain("notify");
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("no over-fire: the moved port already answering → warning + already-listening echo, exit 0", async () => {
+    const { project, logPath } = makeProject(true);
+    useFixtureHerdr(logPath, OCCUPIED_FIXTURE);
+    process.chdir(project);
+    stubFetch((url) => {
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3002/agent-event") || url.includes(":3105/agent-event")) {
+        return Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }));
+      }
+      return refused();
+    });
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--event-port", "3105"]);
+
+      expect(code).toBe(0);
+      expect(logLines(logPath)).toEqual(["pane list"]); // skips only
+      expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3001/state)");
+      expect(io.out()).toContain("up: notify already listening (http://127.0.0.1:3105/agent-event)");
+      expect(io.err()).toContain("another notifier is already listening on http://127.0.0.1:3002/agent-event");
+      expect(io.err()).not.toContain("cannot start the notifier");
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("reused pane that never binds: 'ran but never answered' failure instead of false success", async () => {
+    const { project, logPath, self } = makeProject(true);
+    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: "tut-notify", tab_id: "w6:t1" }]);
+    process.env.TUT_UP_NOTIFY_WAIT_MS = "300"; // shorten the 10s default (per-call knob)
+    process.chdir(project);
+    // The event port never answers — the pane is occupied or the notifier
+    // died; either way `pane run` "succeeded" without a listener.
+    stubFetch((url) =>
+      url.includes(":3001/state")
+        ? Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }))
+        : refused(),
+    );
+    const io = captureIo();
+    try {
+      const code = await main(["up"]);
+
+      expect(code).toBe(1);
+      expect(logLines(logPath)).toEqual([
+        "pane list",
+        `pane run w6:p1 cd ${project} && node ${self} notify`,
+      ]);
+      expect(io.err()).toContain("notify pane w6:p1 ran but http://127.0.0.1:3002/agent-event never answered");
+      expect(io.err()).toContain("occupied");
+      expect(io.err()).toContain("herdr pane close w6:p1");
+      expect(io.out()).not.toContain("notify running");
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("moved-port reuse into an undetectably occupied pane: the probe gate catches it, exit 1", async () => {
+    // Nothing answers on the default port — the pre-flight cannot know the
+    // pane is occupied (e.g. the old notifier runs on yet another port). The
+    // post-run probe is the backstop: the run is swallowed, the moved port
+    // never answers → failure, never "notify running".
+    const { project, logPath, self } = makeProject(true);
+    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: "tut-notify", tab_id: "w6:t1" }]);
+    process.env.TUT_UP_NOTIFY_WAIT_MS = "300";
+    process.chdir(project);
+    stubFetch((url) =>
+      url.includes(":3001/state")
+        ? Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }))
+        : refused(), // 3002 AND the moved 3105 never answer
+    );
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--event-port", "3105"]);
+
+      expect(code).toBe(1);
+      expect(logLines(logPath)).toEqual([
+        "pane list",
+        `pane run w6:p1 cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`,
+      ]);
+      expect(io.err()).toContain("notify pane w6:p1 ran but http://127.0.0.1:3105/agent-event never answered");
+      expect(io.err()).not.toContain("cannot start the notifier"); // pre-flight stayed silent (nothing on 3002)
+      expect(io.out()).not.toContain("notify running");
+    } finally {
+      io.restore();
+    }
+  });
+
+  it("moved-port fresh provisioning is verified by the event-port probe before success", async () => {
+    const { project, logPath, self } = makeProject(true);
+    useFixtureHerdr(logPath, [{ pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" }]);
+    process.chdir(project);
+    stubFetch((url) => {
+      if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
+      if (url.includes(":3105/agent-event")) {
+        // the fresh pane's notifier binds once its command ran
+        return readLog(logPath).includes(" notify --event-port 3105")
+          ? Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }))
+          : refused();
+      }
+      return refused(); // default event port down → no coexistence warning
+    });
+    const io = captureIo();
+    try {
+      const code = await main(["up", "--event-port", "3105"]);
+
+      expect(code).toBe(0);
+      expect(logLines(logPath)).toEqual([
+        "pane list",
+        `pane split --current --direction right --no-focus --cwd ${project}`,
+        "pane move FIX:p1 --tab w5:t2 --split down --ratio 0.5 --no-focus --target-pane w5:p1",
+        "pane rename FIX:p1 tut-notify",
+        `pane run FIX:p1 cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`,
+        "pane list", // report-time id resolution
+      ]);
+      expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3001/state)");
+      expect(io.out()).toContain("up: notify running (pane FIX:p1, tab tut-sys)");
+      expect(io.err()).not.toContain("another notifier");
+    } finally {
+      io.restore();
     }
   });
 });

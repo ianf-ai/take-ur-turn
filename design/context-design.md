@@ -31,7 +31,7 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 | 代码 repo | 代码，及与代码工程绑定的约定文件（如 AGENTS.md） | 常规开发流 |
 | context repo · `design/` | 项目设计及开发文档 | PR 修订 |
 | context repo · `tasks/` | 任务日志 | 直 push 追加 |
-| context repo · `project-scope/` | 项目决策流 | 直 push 追加 |
+| context repo · `tasks/project/` | 项目决策流 | 直 push 追加 |
 
 代码不进 context repo 的三个理由：
 
@@ -40,8 +40,6 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 3. **权限模型不同**：团队读分区（按团队分 context repo）与代码写权限（CODEOWNERS）各管各的
 
 **代价与缝合**：上下文与代码版本失去直接关联（无法直接回答「commit X 时生效的是哪版设计」），由任务记录的 `commits` 字段引用 git commit 来补。
-
-**待定**：AGENTS.md 这类与代码工程绑定的 Agent 约定文件的最终归属（倾向代码 repo，Agent harness 自动加载）。
 
 ### 1.3 原则
 
@@ -72,7 +70,7 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 | code_changes | Executor | 实现、验证结果 | 触发流转 |
 | review | Reviewer | 评审意见（含 verdict） | 触发流转（verdict 决定去向） |
 | revision | Executor | 对 review 的修改与回应 | 触发流转 |
-| note | 任何人 | 补充说明、问题标记 | 无 |
+| note | 任何人 | 补充说明、问题标记 | 默认无（唯一例外：`reviewing` 态下 role=executor 的非 ack note 派生回 revising——收回回合，主设计 3.1；closed 吸收态与 ack note 不转态） |
 | decision | 人 | 拍板（approve/reject/close，或 project scope 里的决策） | 按主设计 3.1（仅 task scope；project scope 无流转） |
 
 ### 2.3 payload 信封（schema）
@@ -81,7 +79,8 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 {
   "summary": "一句话摘要",          // 必填。list 展示、通知文案用
   "body": "Markdown 正文",          // 必填。完整推理过程，写给下一个 Agent / 人看
-  "verdict": "pass",                // 仅 review：pass | fail_code | fail_design
+  "verdict": "pass",                // 仅 review：pass | blocked_external | fail_code | fail_design
+                                    //   blocked_external＝代码达标、验证卡外部条件，派生同 pass 进 pending_approval（主设计 3.1）；
                                     //   派生消费字段之一（另有 ack / decision）；缺失/非法 → needs_attention
   "commits": ["a1b2c3d"],           // 仅 code_changes / revision 可选：对应的 git commit
                                     //   权威的文件清单与 diff 从 commit 取（git show）
@@ -156,7 +155,7 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 
 **note**：无模板。**decision**：body 写决定理由，一到三句。
 
-**延后问题的流程**：延后有两个发起入口——Reviewer 在 review 的「延后候选」中提出，或 Executor 在 revision 中申请。无论哪个入口，**延后由人拍板**：人发一条 note 写明同意延后哪些问题、理由。拍板用 note 而非 decision——decision 参与状态派生，任务中途（如 reviewing 态）发布属于表外组合、会置 needs_attention；note 在任何状态都安全。revision 引用该拍板记录，re-review 按「已延后」核销。拍板的人（或委托的任一 Agent）随即将延后问题以一条 note 登记进 project scope（带原任务、ref_version、关闭条件），成为跨任务记忆，不随任务关闭而丢失——将来哪个任务把它捡起来，不用考古。
+**延后问题的流程**：延后有两个发起入口——Reviewer 在 review 的「延后候选」中提出，或 Executor 在 revision 中申请。无论哪个入口，**延后由人拍板**：人发一条 note 写明同意延后哪些问题、理由。拍板用 note 而非 decision——decision 参与状态派生，任务中途（如 reviewing 态）发布属于表外组合、会置 needs_attention；拍板 note（role=human）在任何状态都安全——note 的转态例外只认 `reviewing` 态的 role=executor（主设计 3.1），与人的拍板无涉。revision 引用该拍板记录，re-review 按「已延后」核销。拍板的人（或委托的任一 Agent）随即将延后问题以一条 note 登记进 project scope（带原任务、ref_version、关闭条件），成为跨任务记忆，不随任务关闭而丢失——将来哪个任务把它捡起来，不用考古。
 
 ### 2.5 链路回溯：ref_version
 
@@ -205,7 +204,8 @@ git 后端与 Hub 机制的能力映射：
 |------|----|------|
 | MCP 工具 | Agent（及人用的任意 MCP 客户端） | 读写记录 |
 | GET /state | Notifier、人 | 状态概览（派生视图） |
-| 直接读文件 | 人、调试、降级方案 | 存储就是本地 JSON，所选 Agent 不接 MCP 时的兜底 |
+| 修复入口（`tut repair-meta` / `tut recover-record`，HTTP） | 人（运维动作，不作为 MCP 工具暴露） | 存储损坏的受支持修复通道（主设计 4.3 处置协议） |
+| 直接读文件 | 人、调试、降级方案 | **只读**兜底——存储就是本地 JSON，所选 Agent 不接 MCP 时的读取退路；不构成写通道：对 meta / 记录 / 恢复登记的任何写入一律经 Store/HTTP（AGENTS.md 写通道约束），损坏修复走上行修复入口 |
 
 ### 3.4 规模与边界
 

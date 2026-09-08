@@ -212,6 +212,78 @@ describe("Herdr control-plane client", () => {
   });
 });
 
+describe("herdr command liveness backstop", () => {
+  /** A child that never closes on its own; kill() is the only way out. */
+  function hungChild(): ChildProcess & { stdout: PassThrough; stderr: PassThrough } {
+    const child = new EventEmitter() as ChildProcess & { stdout: PassThrough; stderr: PassThrough };
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    (child as unknown as { kill: () => boolean }).kill = () => {
+      child.emit("close", null, "SIGKILL");
+      return true;
+    };
+    return child;
+  }
+
+  it("kills a hung control command at the default timeout and reports timedOut", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new HerdrClient({ spawnFn: () => hungChild() });
+      const pending = client.command(["pane", "list"]);
+      await vi.advanceTimersByTimeAsync(10_000); // DEFAULT_HERDR_TIMEOUT_MS
+      const result = await pending;
+      expect(result.timedOut).toBe(true);
+      expect(result.signal).toBe("SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("TUT_HERDR_TIMEOUT_MS overrides the window (env escape hatch)", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new HerdrClient({ env: { TUT_HERDR_TIMEOUT_MS: "5000" }, spawnFn: () => hungChild() });
+      const pending = client.command(["pane", "list"]);
+      await vi.advanceTimersByTimeAsync(4_999);
+      const early = await Promise.race([pending, Promise.resolve("still-pending")]);
+      expect(early).toBe("still-pending"); // window not yet exhausted
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await pending).timedOut).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("verb helpers surface HerdrClientError TIMEOUT — a failure return, not a hang", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new HerdrClient({ spawnFn: () => hungChild() });
+      const attempt = client.paneList();
+      attempt.catch(() => undefined); // handled from the start — fake-timer flush may settle it before `rejects` attaches
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(attempt).rejects.toMatchObject({
+        name: "HerdrClientError",
+        code: "TIMEOUT",
+        operation: "herdr pane list",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a really stopped herdr child (kill -STOP shape) is killed and settled within the window", async () => {
+    // Real process, real timers: executable pointed at node, the "herdr
+    // command" stops itself — SIGKILL still reaches a stopped process.
+    const client = new HerdrClient({ executable: process.execPath, timeoutMs: 400 });
+    const result = await client.command([
+      "-e",
+      "process.kill(process.pid, 'SIGSTOP'); setInterval(() => {}, 100);",
+    ]);
+    expect(result.timedOut).toBe(true);
+    expect(result.code === null || result.code !== 0).toBe(true);
+  }, 10_000);
+});
+
 describe("workspace config planner snapshot", () => {
   it("freezes route and naming together so later file edits cannot split the plan", async () => {
     const projectRoot = mkdtempSync(path.join(os.tmpdir(), "tut-workspace-snapshot-project-"));

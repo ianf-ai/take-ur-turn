@@ -11,11 +11,23 @@
 
 import { createHash } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import type { DeliveryProbeDispatch } from "./delivery.js";
 
 const MARKER = /^TUT-DELIVERY-PROBE-[0-9A-F]{8}$/u;
+
+/** Strictest common AF_UNIX sun_path limit (macOS 104, Linux 108) — the
+ *  guard keeps every derived POSIX endpoint safely under it.  The limit is
+ *  a BYTE limit (sun_path is a raw byte array), so every length check on an
+ *  endpoint must count UTF-8 bytes, not JS characters — a non-ASCII
+ *  TUT_DELIVERY_PROBE_DIR can be under the limit in characters yet overflow
+ *  it in bytes. */
+export const ENDPOINT_PATH_MAX = 104;
+
+/** UTF-8 byte length of an endpoint path — the unit of the sun_path guard. */
+export function endpointPathBytes(endpoint: string): number {
+  return Buffer.byteLength(endpoint, "utf8");
+}
 
 export interface DeliveryProbeChannel {
   send(marker: string): Promise<DeliveryProbeDispatch>;
@@ -27,29 +39,59 @@ export interface DeliveryProbeChannelOptions {
   timeoutMs?: number;
 }
 
+/** The per-user discriminator mixed into the endpoint digest: a
+ *  shared machine's sticky /tmp keeps another user's socket file
+ *  un-unlinkable (EPERM) — different users must never derive the same
+ *  endpoint.  Windows pipes carry no uid; the instance discriminator below
+ *  does the disambiguation there. */
+function endpointUid(platform: NodeJS.Platform): string {
+  if (platform === "win32" || typeof process.getuid !== "function") return "";
+  return String(process.getuid());
+}
+
 /**
- * Derive the stable relay endpoint shared by a birth and later same-role
- * continuation launches.  The task/role values never enter a shell command;
- * only their SHA-256 basename is used as a filesystem/pipe identifier.
+ * Derive the relay endpoint shared by a birth and later same-role
+ * continuation launches.  The task/role/uid/instance values never enter a
+ * shell command; only their SHA-256 basename is used as a filesystem/pipe
+ * identifier.  The digest mixes in the OS uid (sticky /tmp EPERM across
+ * users) and — when known — the hub instance root: the same task id
+ * living in two independent hubs (two checkouts with their own
+ * `.context-hub`) would otherwise share one endpoint, and the newer relay
+ * would steal it or — on Windows named pipes — split marker traffic into
+ * the WRONG pane.  POSIX paths are length-guarded: a long
+ * `TUT_DELIVERY_PROBE_DIR` used to overflow sun_path at listen() time
+ * inside the pane, burning the whole delivery budget before anyone
+ * noticed; the guard falls back to /tmp and raises HERE — at planning time,
+ * loudly — if even that cannot fit.
  */
 export function deliveryProbeEndpoint(
   taskId: string,
   role: string,
   environment: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  /** Instance discriminator (the hub root); omit when unknown. */
+  instance?: string,
 ): string {
-  // macOS caps AF_UNIX sun_path at 104 bytes; $TMPDIR (/var/folders/...)
-  // plus a 32-hex digest overflowed it (106 chars), making probe-runner's
-  // listen() fail and the pane fall back to a bare shell. 12 hex chars
-  // keep the endpoint under every platform's limit while staying
-  // collision-safe for realistic task counts.
-  const digest = createHash("sha256").update(`${taskId}\u0000${role}`, "utf8").digest("hex").slice(0, 12);
+  const digest = createHash("sha256")
+    .update(`${taskId}\u0000${role}\u0000${endpointUid(platform)}\u0000${instance ?? ""}`, "utf8")
+    .digest("hex")
+    .slice(0, 12);
   if (platform === "win32") return `\\\\.\\pipe\\tut-delivery-${digest}`;
   const configured = environment.TUT_DELIVERY_PROBE_DIR;
   const directory = configured !== undefined && configured.length > 0
     ? configured
     : "/tmp";
-  return path.join(directory, `tut-probe-${digest}.sock`);
+  const endpoint = path.join(directory, `tut-probe-${digest}.sock`);
+  if (endpointPathBytes(endpoint) > ENDPOINT_PATH_MAX) {
+    const fallback = path.join("/tmp", `tut-probe-${digest}.sock`);
+    if (endpointPathBytes(fallback) > ENDPOINT_PATH_MAX) {
+      throw new Error(
+        `delivery probe endpoint exceeds the AF_UNIX sun_path limit (${ENDPOINT_PATH_MAX} bytes) even under /tmp: ${fallback}`,
+      );
+    }
+    return fallback;
+  }
+  return endpoint;
 }
 
 function isUnavailable(error: unknown): boolean {

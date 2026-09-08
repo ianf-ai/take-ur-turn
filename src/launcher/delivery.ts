@@ -7,30 +7,39 @@
  * clock inside ONE shared monotonic budget (the initial observation window
  * and every resend spend the same deadline — no window is ever re-armed),
  * and budget exhaustion still reports success so the caller cannot
- * re-deliver a duplicated prompt.  The born gate demands QUIESCENCE (N
+ * re-deliver a duplicated prompt.  Every phase window — the born gate, the
+ * land confirmation, the submit budget — is a CLOCK deadline: asynchronous
+ * control-call latency (herdr spawn delay) spends the same nominal window,
+ * so a slow machine stretches nothing.  The born gate demands QUIESCENCE (N
  * consecutive identical samples — banner TUIs repaint in pauses), landing
  * demands a NEW INSTANCE of a fragment of the SENT TEXT in the composer's
- * bottom region that ENDS the screen's final rows (any change once let a
- * banner repaint pose as a landed prompt — the false-confirm cascade;
- * whole-screen totals once let a viewport scroll or modal reveal fake or
- * hide an instance; a bare position window once let a re-revealed
- * transcript echo fire a blind Enter), every prompt is delivered with a
- * per-delivery NONCE suffix (deliveryText) so the landing evidence is
- * causally attributable to THIS send-text — a previous round's
- * byte-identical prompt ends with a DIFFERENT nonce, which kills the
- * re-revealed-history false confirm even in the zero-UI-row geometry
- * where a bare transcript line is indistinguishable from an occupied
- * composer row by content alone, and
+ * bottom region that ENDS the screen's final rows, every prompt is delivered
+ * with a per-delivery NONCE suffix (deliveryText) so the landing evidence is
+ * causally attributable to THIS send-text, and
  * a textless snapshot confirms nothing — an UNSEEN text means NO Enter at
- * all (a live reproduction caught the blind Enter confirming a modal
- * dialog): observe-only polling for a late landing, then give-up with
- * escalation if the text never appears.  Human-facing
- * wording follows the last
- * evidence (transport / box / probe): only box=held may claim the prompt is
- * still sitting in the composer.  The diagnostics are a
- * pure observer — one `tut-delivery t=<epoch-ms> …` line per delivery step to
- * stderr and, best-effort, to `<root>/.context-hub/delivery.log`; the switch
- * silences both sinks and no branch ever reads them back.
+ * all: observe-only polling for a late landing (a born pane's wait may SLIDE
+ * its deadline while the screen keeps changing — parallel cold starts have
+ * measured echoes past the base window — capped at a fixed multiple), then
+ * give-up with escalation if the text never appears.  The submit phase
+ * anchors its side-effect budget at the moment the text is first observed
+ * (nothing was sent during the wait, so a late landing inherits a full
+ * window); confirmation is transport=true AND box=cleared AND the cleared
+ * state SURVIVES one re-verification read a poll later (a startup repaint
+ * that fools one read cannot fool two — the false-confirm shape where a
+ * redraw above the composer flipped the bottom region while the text never
+ * left the box).  Box evidence derives from the SAME bottom-suffix rule as
+ * landing: the text is HELD while a sent fragment still ENDS the final rows
+ * — a repaint that changes the bottom region but leaves the text at the
+ * bottom edge is held, not cleared.  Enter resends skip the cleared state
+ * (the text left the box; a resend could hit an already-started round) and
+ * stop early when a held screen stays byte-identical for a bounded poll
+ * streak (a receiver that never repaints once is frozen for Enter
+ * purposes).  Human-facing wording follows the last evidence (transport /
+ * box / probe): only box=held may claim the prompt is still sitting in the
+ * composer.  The diagnostics are a pure observer — one `tut-delivery
+ * t=<epoch-ms> …` line per delivery step to stderr and, best-effort, to
+ * `<root>/.context-hub/delivery.log` (size-rotated, one generation kept);
+ * the switch silences both sinks and no branch ever reads them back.
  *
  * This module never resolves routes or naming: it consumes the prompt frozen
  * in a LaunchInvocation.  All pane reads use the visible source (the `recent`
@@ -40,7 +49,7 @@
 
 import { randomBytes } from "node:crypto";
 import { statSync } from "node:fs";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, rename, stat } from "node:fs/promises";
 import path from "node:path";
 import { psq, type ShellDialect } from "./shell-renderer.js";
 import type { GiveUpEvidence, GiveUpProbeEvidence } from "./escalation.js";
@@ -120,6 +129,29 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+/** Bounded, quote-free fragment text for the diag `frag=` field. */
+const fragLabel = (fragment: string): string => fragment.slice(0, LANDING_FRAGMENT_MAX).replaceAll("'", "");
+
+/** The final-rows suffix test shared by landing attribution and box-held
+ *  evidence: does any fragment END the last non-empty row, or the join of
+ *  the last two (healing a wrap straddling that pair)? */
+function endsFinalRows(rows: readonly string[], fragments: readonly string[]): boolean {
+  const last1 = normalizeForLanding(rows[rows.length - 1] ?? "");
+  const last2 = normalizeForLanding(`${rows[rows.length - 2] ?? ""}${rows[rows.length - 1] ?? ""}`);
+  return fragments.some((fragment) => {
+    const f = normalizeForLanding(fragment);
+    if (f.length === 0) return false;
+    return (last1.length > 0 && last1.endsWith(f)) || (last2.length > 0 && last2.endsWith(f));
+  });
+}
+
+function nonEmptyRows(screen: string): string[] {
+  return screen
+    .split("\n")
+    .map((line) => line.replace(/[ \t\r]+$/u, ""))
+    .filter((line) => line.length > 0);
+}
+
 /** Landing attribution, bound to the COMPOSER by two conditions that must
  *  BOTH hold (immediate loop and late-landing wait share this one rule):
  *
@@ -144,49 +176,38 @@ export function newLandingInstance(latest: string, baseline: string, fragments: 
   const latestBottom = normalizeForLanding(screenBottom(latest, 3));
   if (latestBottom.length === 0) return -1;
   const baselineBottom = normalizeForLanding(screenBottom(baseline, 3));
-  const rows = latest
-    .split("\n")
-    .map((line) => line.replace(/[ \t\r]+$/u, ""))
-    .filter((line) => line.length > 0);
-  const last1 = normalizeForLanding(rows[rows.length - 1] ?? "");
-  const last2 = normalizeForLanding(`${rows[rows.length - 2] ?? ""}${rows[rows.length - 1] ?? ""}`);
   return fragments.findIndex((fragment) => {
     const f = normalizeForLanding(fragment);
     if (f.length === 0) return false;
     if (countOccurrences(latestBottom, f) <= countOccurrences(baselineBottom, f)) return false;
-    return (last1.length > 0 && last1.endsWith(f)) || (last2.length > 0 && last2.endsWith(f));
+    return endsFinalRows(nonEmptyRows(latest), [fragment]);
   });
 }
 
-/** Bounded, quote-free fragment text for the diag `frag=` field. */
-const fragLabel = (fragment: string): string => fragment.slice(0, LANDING_FRAGMENT_MAX).replaceAll("'", "");
-
 /** Evidence state of the receiver's input box, derived from the visible
- *  screen: `cleared` — the bottom region let go of the with-text snapshot;
- *  `held` — the region still matches (the prompt is still visible in the
- *  composer); `unknown` — the read was empty (a glitch): the box state is
- *  simply not observable. */
+ *  screen: `held` — a fragment of the SENT text still ENDS the screen's
+ *  final rows (the same bottom-suffix rule that proved the landing; a
+ *  repaint that changes the bottom region while the text stays at the
+ *  bottom edge is still holding the text — the false-cleared shape caught
+ *  live when a startup banner redraw flipped the region within 547ms of
+ *  the Enter); `cleared` — a non-empty screen whose final rows no longer
+ *  end with any sent fragment; `unknown` — the read was empty (a glitch):
+ *  the box state is simply not observable. */
 export type BoxState = "held" | "cleared" | "unknown";
 
-/** Box evidence from one screen: empty reads are `unknown`, region change
- *  against the with-text snapshot is `cleared`, otherwise `held`. */
-export function boxState(screen: string, signature: string): BoxState {
-  if (screen.length === 0) return "unknown";
-  return screenBottom(screen, 3) !== signature ? "cleared" : "held";
+/** The held-box predicate (see `BoxState`).  An empty screen never holds
+ *  anything — emptiness is `unknown` at the call-site, never evidence. */
+export function boxHoldsText(screen: string, fragments: readonly string[]): boolean {
+  if (screen.length === 0) return false;
+  const rows = nonEmptyRows(screen);
+  if (rows.length === 0) return false;
+  return endsFinalRows(rows, fragments);
 }
 
-/**
- * Submit-confirmed box predicate: a NON-EMPTY screen whose bottom region no
- * longer matches the with-text snapshot's region.  Repaints above the region
- * do not count; an empty read is a glitch and never confirms.  Call-site
- * note: the predicate is only meaningful against a WITH-TEXT snapshot —
- * since text-match landing (7.2.1 step 3) the submit loop never feeds it a
- * textless signature (box evidence stays unknown until the text is seen),
- * so the historical empty-region false-positive window is structurally
- * unreachable in the live path.
- */
-export function boxCleared(screen: string, signature: string): boolean {
-  return boxState(screen, signature) === "cleared";
+/** Derive the three-state box evidence from one (probe-stripped) screen. */
+export function boxEvidenceOf(screen: string, fragments: readonly string[]): BoxState {
+  if (screen.length === 0) return "unknown";
+  return boxHoldsText(screen, fragments) ? "held" : "cleared";
 }
 
 /**
@@ -195,10 +216,7 @@ export function boxCleared(screen: string, signature: string): boolean {
  * quoted tail='…' field (bounded, safe to log).
  */
 export function diagTail(screen: string): string {
-  const lines = screen
-    .split("\n")
-    .map((line) => line.replace(/[ \t\r]+$/u, ""))
-    .filter((line) => line.length > 0);
+  const lines = nonEmptyRows(screen);
   const last = lines[lines.length - 1] ?? "";
   return last.slice(0, 40).replaceAll("'", "");
 }
@@ -278,12 +296,16 @@ export function withoutDeliveryProbe(
   }, screen);
 }
 
-/** The env knobs of the delivery loop, parsed once per delivery. */
+/** The env knobs of the delivery loop, parsed once per delivery.  Every
+ *  window- and cadence-class knob is clamped to ≥1: a zero window would
+ *  skip its phase outright (every delivery degrading to give-up) while
+ *  looking like a legal `\d+` value. */
 export interface DeliveryKnobs {
   /** Poll cadence shared by every loop step.  Minimum 1: a zero cadence
    *  would divide every poll-count window by zero (Infinity loops, or NaN
    *  from 0/0) — the parse clamps it so all windows stay finite. */
   pollMs: number;
+  /** Minimum 1 (window class: the floor may be tiny, never zero). */
   readyFloorMs: number;
   readyTimeoutMs: number;
   /** Quiescence depth: after the change from baseline, this many
@@ -296,7 +318,6 @@ export interface DeliveryKnobs {
   /** Attempt-1 initial observation sub-window — capped by the shared
    *  submit budget (the actual sub-window is min(now + this, deadline)). */
   submitTimeoutMs: number;
-  /** Minimum 1 like the legacy poll-count clamp. */
   submitRetryMs: number;
   /** The ONE submit-phase budget: from the first Enter to the last
    *  confirmation/give-up, monotonic, never re-armed after the initial
@@ -313,22 +334,33 @@ export interface DeliveryKnobs {
 export function parseDeliveryKnobs(environment: NodeJS.ProcessEnv): DeliveryKnobs {
   return {
     pollMs: Math.max(1, envInt(environment, "TUT_READY_POLL_MS", 250)),
-    readyFloorMs: envInt(environment, "TUT_READY_FLOOR_MS", 1500),
-    readyTimeoutMs: envInt(environment, "TUT_READY_TIMEOUT_MS", 15000),
+    readyFloorMs: Math.max(1, envInt(environment, "TUT_READY_FLOOR_MS", 1500)),
+    readyTimeoutMs: Math.max(1, envInt(environment, "TUT_READY_TIMEOUT_MS", 15000)),
     readyStablePolls: Math.max(2, envInt(environment, "TUT_READY_STABLE_POLLS", 4)),
-    textLandTimeoutMs: envInt(environment, "TUT_TEXT_LAND_TIMEOUT_MS", 5000),
-    submitTimeoutMs: envInt(environment, "TUT_SUBMIT_TIMEOUT_MS", 3000),
+    textLandTimeoutMs: Math.max(1, envInt(environment, "TUT_TEXT_LAND_TIMEOUT_MS", 5000)),
+    submitTimeoutMs: Math.max(1, envInt(environment, "TUT_SUBMIT_TIMEOUT_MS", 3000)),
     submitRetryMs: Math.max(1, envInt(environment, "TUT_SUBMIT_RETRY_MS", 1500)),
     submitRetryWindowMs: Math.max(1, envInt(environment, "TUT_SUBMIT_RETRY_TIMEOUT_MS", 30000)),
   };
 }
 
-/** Polls a window allows (legacy poll-count arithmetic, truncated). */
-function pollsOf(windowMs: number, pollMs: number): number {
-  return Math.trunc(windowMs / pollMs);
-}
+/** How many base submit windows a BORN pane's never-landed wait may span at
+ *  most: parallel cold starts have measured the echo landing past
+ *  the base window while the screen keeps painting; the wait deadline SLIDES
+ *  by one window per observed screen change, capped here.  Two windows keep
+ *  the worst-case phase sum (gate + land + extended wait + submit budget)
+ *  inside the launcher's production orchestration budget. */
+export const BORN_LANDWAIT_MAX_WINDOWS = 2;
 
-/** Monotonic milliseconds — the submit budget's production time source
+/** Stop-loss floor: a with-text screen that stays byte-identical and
+ *  held for this many consecutive polls means the receiver never repaints
+ *  once — frozen for Enter purposes.  The effective threshold is
+ *  max(this, 2/3 of the submit window in polls), so tiny test budgets never
+ *  trigger it while production (40 × 250ms = 10s minimum, 20s at the
+ *  default 30s window) stops well before burning the whole budget. */
+export const HELD_STALL_GIVEUP_POLLS = 40;
+
+/** Monotonic milliseconds — every phase budget's production time source
  *  (wall-clock independent; diagnostic epoch stamps keep Date.now). */
 const monotonicNow = (): number => performance.now();
 
@@ -346,7 +378,15 @@ export interface DiagnosticsFs {
   isDirectory(target: string): boolean;
   mkdir(dir: string): Promise<void>;
   append(file: string, text: string): Promise<void>;
+  /** Current byte size of the log file; -1 when absent (rotation setup). */
+  size(file: string): Promise<number>;
+  /** Rotation move (log → log.1); a failure disables rotation, never the log. */
+  rename(from: string, to: string): Promise<void>;
 }
+
+/** One rotated generation is kept (`delivery.log.1`); the active file never
+ *  grows past this (the log used to be unbounded). */
+export const DELIVERY_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 const nodeFs: DiagnosticsFs = {
   isDirectory: (target) => {
@@ -358,6 +398,14 @@ const nodeFs: DiagnosticsFs = {
   },
   mkdir: (dir) => mkdir(dir, { recursive: true }).then(() => undefined),
   append: (file, text) => appendFile(file, text, "utf8").then(() => undefined),
+  size: async (file) => {
+    try {
+      return (await stat(file)).size;
+    } catch {
+      return -1;
+    }
+  },
+  rename: (from, to) => rename(from, to).then(() => undefined),
 };
 
 export interface DeliveryDiagnosticsOptions {
@@ -394,7 +442,10 @@ const silentDiagnostics: DeliveryDiagnostics = {
  * Build the dual-sink delivery observer.  Persistence is resolved lazily at
  * the first emitted line (a silenced or diag-free run touches no disk), and
  * the first failing append disables persistence for the rest of the run —
- * never the delivery, never the stderr line.
+ * never the delivery, never the stderr line.  The durable file rotates by
+ * size (one `.1` generation kept) and the write chain can never reject into
+ * the caller: a diagnostics fault must not flip the launcher's exit 0 into
+ * a duplicate-delivery-triggering failure.
  */
 export function createDeliveryDiagnostics(options: DeliveryDiagnosticsOptions = {}): DeliveryDiagnostics {
   const environment = options.env ?? process.env;
@@ -408,6 +459,8 @@ export function createDeliveryDiagnostics(options: DeliveryDiagnosticsOptions = 
   let persistFile: string | undefined;
   let setupTried = false;
   let writes: Promise<void> = Promise.resolve();
+  let logBytes = 0;
+  let rotationUsable = true;
 
   const resolvePersistFile = async (): Promise<string | undefined> => {
     const configured = environment.TUT_PROJECT_ROOT;
@@ -429,10 +482,33 @@ export function createDeliveryDiagnostics(options: DeliveryDiagnosticsOptions = 
       if (!setupTried) {
         setupTried = true;
         persistFile = await resolvePersistFile();
+        if (persistFile !== undefined) {
+          try {
+            const existing = await fs.size(persistFile);
+            logBytes = Math.max(0, existing);
+          } catch {
+            rotationUsable = false;
+          }
+        }
       }
       if (persistFile === undefined) return;
+      const line = `tut-delivery t=${now} task=${task} role=${role} ${fields}\n`;
+      // The size cap counts BYTES (fs.size reports bytes): non-ASCII diag
+      // fields (pane tails carry user text) make a line's byte length exceed
+      // its character length, so the ledger tracks UTF-8 bytes throughout.
+      const lineBytes = Buffer.byteLength(line, "utf8");
       try {
-        await fs.append(persistFile, `tut-delivery t=${now} task=${task} role=${role} ${fields}\n`);
+        if (rotationUsable && logBytes > 0 && logBytes + lineBytes > DELIVERY_LOG_MAX_BYTES) {
+          try {
+            await fs.rename(persistFile, `${persistFile}.1`);
+            logBytes = 0;
+          } catch {
+            // Rotation is best-effort: keep appending to the same file.
+            rotationUsable = false;
+          }
+        }
+        await fs.append(persistFile, line);
+        logBytes += lineBytes;
       } catch {
         // First failing append disables persistence for the run.
         persistFile = undefined;
@@ -444,9 +520,12 @@ export function createDeliveryDiagnostics(options: DeliveryDiagnosticsOptions = 
       const now = clock();
       stderr(`tut-delivery t=${now} ${fields}\n`);
       writes = writes.then(() => persist(now, fields));
+      // The chain tail is guarded here AND at flush: no diagnostics fault
+      // may ever reject into the delivery caller (exit-0 invariant).
+      void writes.catch(() => undefined);
     },
     async flush() {
-      await writes;
+      await writes.catch(() => undefined);
     },
   };
 }
@@ -473,7 +552,7 @@ export interface DeliveryOptions {
   client: DeliveryClient;
   diagnostics?: DeliveryDiagnostics;
   env?: NodeJS.ProcessEnv;
-  /** Monotonic scheduling clock for the submit-phase budget; production
+  /** Monotonic scheduling clock for every phase budget; production
    *  default is performance.now.  Diagnostic epoch timestamps keep their
    *  own Date.now-based clock — the two never mix. */
   clock?: () => number;
@@ -546,78 +625,34 @@ export function createDelivery(options: DeliveryOptions): Delivery {
    *  never a previous attempt's result. */
   const probeUnobserved = (): ProbeResult => ({ marker: "", dispatch: "unavailable", found: false });
 
-  /**
-   * Verify the Enter path after one send-keys. The relay request and its read
-   * add no sleep to the existing submit cadence. A failed probe is deliberately
-   * a non-fatal submit failure: the caller's bounded Enter loop decides whether
-   * to try again. The probe is diagnostic only and self-guards on the submit
-   * deadline: neither the relay request nor its read may start at/past it —
-   * a skipped observation returns `unavailable`, never a stale result.
-   */
-  const probeEnter = async (paneId: string, prompt: string, attempt: number, phase: "initial" | "loop", deadline: number): Promise<ProbeResult> => {
-    const marker = deliveryProbeMarker(prompt);
-    probeMarkers.add(marker);
-    if (clock() >= deadline) {
-      diag(`probe-skip pane=${paneId} attempt=${attempt} phase=${phase} reason=deadline marker=${marker}`);
-      return probeUnobserved();
-    }
-    diag(`probe-send pane=${paneId} attempt=${attempt} phase=${phase} marker=${marker}`);
-    let dispatch: DeliveryProbeDispatch = "unavailable";
-    if (client.sendProbe !== undefined) {
-      try {
-        dispatch = await client.sendProbe(paneId, marker);
-      } catch {
-        dispatch = "failed";
-      }
-    }
-    if (clock() >= deadline) {
-      // The relay request started before the deadline but the budget is
-      // spent: the marker's visibility was never observed, and starting the
-      // read now would be a new side effect past the deadline.
-      diag(`probe-skip pane=${paneId} attempt=${attempt} phase=${phase} reason=deadline marker=${marker}`);
-      return probeUnobserved();
-    }
-    const screen = await client.readPane(paneId);
-    const found = dispatch === "sent" && screen.includes(marker);
-    diag(
-      `probe-result pane=${paneId} attempt=${attempt} phase=${phase} marker=${marker} dispatch=${dispatch} found=${found} len=${screen.length} tail='${diagTail(screen)}'`,
-    );
-    return { marker, dispatch, found };
-  };
-
-  /** Submit-phase evidence triple from the LATEST Enter: transport (the
-   *  send-keys control call itself), box (derived from the probe-stripped
-   *  screen), probe (relay visibility, diagnostic only).  Every
-   *  human-facing message is generated from it — only box=held may claim
-   *  the prompt still sits in the composer. */
-  interface SubmitEvidence {
-    transport: boolean;
-    box: BoxState;
-    probe: ProbeResult;
-  }
-
   /** Wait until the freshly born pane shows its receiver: output changed
    *  from the `pane run` baseline and QUIESCENT — `readyStablePolls`
    *  consecutive identical samples (two were fooled by a banner TUI's
-   *  drawing pauses) — no earlier than the floor (in legacy poll-count
-   *  arithmetic).  Timeout → deliver anyway (never worse). */
+   *  drawing pauses) — no earlier than the floor, all inside ONE clock
+   *  deadline (async control-call latency spends the same window, it no
+   *  longer stretches a poll-count budget).  Timeout → deliver anyway
+   *  (never worse). */
   const waitBornReady = async (paneId: string): Promise<string> => {
     const { pollMs, readyFloorMs, readyTimeoutMs, readyStablePolls } = knobs;
-    const maxPolls = pollsOf(readyTimeoutMs, pollMs);
-    const floorPolls = pollsOf(readyFloorMs, pollMs);
     diag(`gate-start pane=${paneId} floor_ms=${readyFloorMs} timeout_ms=${readyTimeoutMs} stable_polls=${readyStablePolls}`);
+    const start = clock();
+    const deadline = start + readyTimeoutMs;
     const baseline = await client.readPane(paneId);
     let previous = baseline;
     let latest = baseline;
     let stableRun = 0;
     let idx = 0;
-    while (idx < maxPolls) {
-      await sleep(pollMs);
+    while (clock() < deadline) {
+      await sleep(Math.min(pollMs, deadline - clock()));
       latest = await client.readPane(paneId);
       const changed = latest.length > 0 && latest !== baseline;
       stableRun = changed ? (latest === previous ? stableRun + 1 : 1) : 0;
       previous = latest;
-      if (changed && stableRun >= readyStablePolls && idx >= floorPolls) {
+      // A read that STARTED inside the deadline but RETURNED past it spent
+      // the budget: it stays an observation (the read diag below), never a
+      // release — the strict outcome is the gate timeout (deliver anyway,
+      // unchanged).
+      if (changed && clock() < deadline && stableRun >= readyStablePolls && clock() - start >= readyFloorMs) {
         diag(`gate-release pane=${paneId} idx=${idx} stable=${stableRun} len=${latest.length} tail='${diagTail(latest)}'`);
         return latest;
       }
@@ -625,7 +660,7 @@ export function createDelivery(options: DeliveryOptions): Delivery {
       idx += 1;
     }
     stderr(
-      `launch: born pane ${paneId} not observed ready within ${maxPolls * pollMs}ms — delivering anyway (if the text idles in the input box, press Enter there)\n`,
+      `launch: born pane ${paneId} not observed ready within ${readyTimeoutMs}ms — delivering anyway (if the text idles in the input box, press Enter there manually)\n`,
     );
     diag(`gate-timeout pane=${paneId} idx=${idx} len=${latest.length}`);
     return latest;
@@ -641,27 +676,28 @@ export function createDelivery(options: DeliveryOptions): Delivery {
 
   /** Poll the screen against the pre-send snapshot until a NEW INSTANCE
    *  of a fragment of the SENT TEXT appears in the COMPOSER REGION (last
-   *  3 non-empty lines, count above the baseline's same region) — mere
-   *  change no longer counts, whole-screen totals can not attribute a hit
-   *  (a viewport scroll or modal reveal shifts old instances across the
-   *  read window: 1→1 hides a real landing, 0→1 fabricates one), and
-   *  text already rendered before the send proves nothing.  Timeout →
-   *  honest signal (the receiver may not accept input — or may be showing
-   *  a modal): the submit phase enters its no-blind-Enter wait (Enter
-   *  only after the text is observed; give-up + escalation if it never
-   *  is). */
+   *  3 non-empty lines, count above the baseline's same region), inside
+   *  ONE clock deadline (control-call latency spends the window).  Timeout
+   *  → honest signal (the receiver may not accept input — or may be
+   *  showing a modal): the submit phase enters its no-blind-Enter wait
+   *  (Enter only after the text is observed; give-up + escalation if it
+   *  never is). */
   const confirmTextLanded = async (paneId: string, baseline: string, prompt: string): Promise<LandOutcome> => {
     const { pollMs, textLandTimeoutMs } = knobs;
     const fragments = promptLandingFragments(prompt);
-    const maxPolls = pollsOf(textLandTimeoutMs, pollMs);
     diag(`land-start pane=${paneId} timeout_ms=${textLandTimeoutMs} frags=${fragments.length}`);
+    const deadline = clock() + textLandTimeoutMs;
     let latest = baseline;
     let idx = 0;
-    while (idx < maxPolls) {
-      await sleep(pollMs);
+    while (clock() < deadline) {
+      await sleep(Math.min(pollMs, deadline - clock()));
       latest = await client.readPane(paneId);
       const matched = newLandingInstance(latest, baseline, fragments);
-      if (matched >= 0) {
+      // Same strict-deadline rule as the gate: a match returning past the
+      // deadline is an observation only — a landing is never reported from
+      // past the deadline; the honest outcome is the land timeout (a real
+      // late landing is adopted by the submit phase's no-blind-Enter wait).
+      if (matched >= 0 && clock() < deadline) {
         diag(`land-observed pane=${paneId} idx=${idx} len=${latest.length} frag='${fragLabel(fragments[matched] ?? "")}' tail='${diagTail(latest)}'`);
         return { screen: latest, landed: true };
       }
@@ -675,59 +711,61 @@ export function createDelivery(options: DeliveryOptions): Delivery {
     return { screen: latest, landed: false };
   };
 
-  /** Phase 0 (degraded entry): a textless screen never gets an Enter —
-   *  the relay probe stays silent too — only observe-only polls for a
-   *  late landing (same NEW-instance-vs-baseline attribution rule as the
-   *  immediate loop: old scrollback/composer fragments never adopt) inside
-   *  the SAME shared budget.  Phase 1 (landed): ONE
-   *  Enter, then verify by the layered evidence — confirmed only when
-   *  the Enter's transport succeeded AND the box let go of the text (the
-   *  probe stays diagnostic: it never confirms, never blocks, never
-   *  triggers a resend).  Phase 2: unconfirmed → resend Enter at most
-   *  once per retry interval inside the REMAINING shared budget,
-   *  verifying every poll — one monotonic deadline spans the whole
-   *  submit phase (the initial window and every control call spend the
-   *  same budget; nothing new starts at/past the deadline; a call
-   *  already in flight only updates the last observation).
-   *  Exhaustion → the evidence-based manual-fallback note and return (the
-   *  caller still exits 0).  The text is never re-sent. */
+  /**
+   * The verified submit, split into its four phases: the degraded
+   * never-landed wait, the informed initial Enter + observation window, the
+   * clocked resend loop, and the shared give-up.  Phase 0 (degraded entry):
+   * a textless screen never gets an Enter — the relay probe stays silent
+   * too — only observe-only polls for a late landing (same NEW-instance
+   * attribution rule) run here; a BORN pane may slide this wait's deadline
+   * by one window per observed screen change (parallel cold-start echo
+   * latency), capped at BORN_LANDWAIT_MAX_WINDOWS windows.  Phase 1
+   * (landed): ONE Enter, then verify by the layered evidence — confirmed
+   * only when the Enter's transport succeeded AND the box let go of the
+   * text AND that cleared state survives one re-verification read a poll
+   * later.  Phase 2: unconfirmed → resend Enter at most once per retry
+   * interval inside the REMAINING shared budget (never in the cleared
+   * state — the text already left the box; a resend could hit a started
+   * round), stop early on a frozen held screen.  Exhaustion → the
+   * evidence-based manual-fallback note and return (the caller still exits
+   * 0).  The text is never re-sent.
+   */
   const verifiedSubmit = async (
     paneId: string,
     withText: string,
     prompt: string,
     landed: boolean,
     baseline: string,
+    branch: "born" | "continuation",
   ): Promise<void> => {
     const { pollMs, submitTimeoutMs, submitRetryMs, submitRetryWindowMs } = knobs;
     const fragments = promptLandingFragments(prompt);
-    let signature = screenBottom(withText, 3);
+    const boxOf = (screen: string): BoxState => boxEvidenceOf(screen, fragments);
+    const start = clock();
+    const probeField = (probe: ProbeResult): GiveUpProbeEvidence =>
+      probe.dispatch === "unavailable" ? "unavailable" : probe.found ? "observed" : "failed";
+    const evidence: SubmitEvidence = { transport: false, box: "unknown", probe: probeUnobserved() };
     /** Whether the sent text has been observed on screen.  False only
      *  after a land-confirm timeout; until a (late) landing is seen the
      *  box criterion is meaningless and stays unknown — the textless-
      *  snapshot cascade is structurally dead. */
     let hasLanded = landed;
-    const start = clock();
-    const deadline = start + submitRetryWindowMs;
-    const probeField = (probe: ProbeResult): GiveUpProbeEvidence =>
-      probe.dispatch === "unavailable" ? "unavailable" : probe.found ? "observed" : "failed";
-    const evidence: SubmitEvidence = { transport: false, box: "unknown", probe: probeUnobserved() };
 
-    // Degraded entry (land-confirm timed out): ONE rule — Enter is never
-    // blind.  The textless screen may be a modal (a live reproduction
-    // caught Enter confirming a trust dialog), so no Enter and no probe
-    // fire until the TEXT ITSELF is observed.  Observe-only polls watch
-    // for a late landing inside the SAME shared budget; the moment the
-    // text appears, the live screen becomes the with-text baseline and
-    // the landed path below takes over (informed Enter + verification).
+    // ---- phase 0: the no-blind-Enter wait for a late landing -----------------
     if (!hasLanded) {
       stderr(
         `launch: prompt text never appeared on ${paneId} — no Enter will be sent until the text is observed (the receiver may be showing a dialog); bounded wait within the ${submitRetryWindowMs}ms budget, then give-up\n`,
       );
-      diag(`land-wait pane=${paneId} budget_ms=${submitRetryWindowMs}`);
+      diag(
+        `land-wait pane=${paneId} budget_ms=${submitRetryWindowMs}${branch === "born" ? ` cap_windows=${BORN_LANDWAIT_MAX_WINDOWS}` : ""}`,
+      );
+      const cap = start + submitRetryWindowMs * (branch === "born" ? BORN_LANDWAIT_MAX_WINDOWS : 1);
+      let waitDeadline = start + submitRetryWindowMs;
+      let previous = withoutDeliveryProbe(withText, [...probeMarkers], probeDialect);
       let waitIdx = 0;
-      while (!hasLanded && clock() < deadline) {
-        await sleep(Math.min(pollMs, deadline - clock()));
-        if (clock() >= deadline) break; // budget spent: no new reads
+      while (!hasLanded && clock() < waitDeadline) {
+        await sleep(Math.min(pollMs, waitDeadline - clock()));
+        if (clock() >= waitDeadline) break; // budget spent: no new reads
         const latest = await client.readPane(paneId);
         const stripped = withoutDeliveryProbe(latest, [...probeMarkers], probeDialect);
         // SAME attribution rule as the immediate land loop: only a NEW
@@ -736,57 +774,167 @@ export function createDelivery(options: DeliveryOptions): Delivery {
         const matched = newLandingInstance(stripped, baseline, fragments);
         if (matched >= 0) {
           hasLanded = true;
-          signature = screenBottom(stripped, 3);
           diag(`land-late pane=${paneId} phase=wait idx=${waitIdx} len=${latest.length} frag='${fragLabel(fragments[matched] ?? "")}' tail='${diagTail(latest)}'`);
         } else {
           diag(`read pane=${paneId} step=landwait idx=${waitIdx} len=${latest.length} box=unknown tail='${diagTail(latest)}'`);
+          if (branch === "born" && stripped !== previous) {
+            // The receiver is visibly alive (a cold start still painting):
+            // slide the wait window — bounded by the cap, so a perpetual
+            // repaint cannot wait forever.
+            const slid = Math.min(clock() + submitRetryWindowMs, cap);
+            if (slid > waitDeadline) {
+              waitDeadline = slid;
+              diag(`land-wait-extend pane=${paneId} idx=${waitIdx} deadline_ms=${Math.round(waitDeadline - start)} cap_ms=${Math.round(cap - start)}`);
+            }
+          }
         }
+        previous = stripped;
         waitIdx += 1;
       }
-    }
-
-    // Never observed the text → give up WITHOUT ever having touched the
-    // receiver: honest reason, escalation seam unchanged (7.2.1 step 5).
-    if (!hasLanded) {
-      const elapsedMs = clock() - start;
-      stderr(
-        `launch: submit not confirmed on ${paneId} within ${submitRetryWindowMs}ms after 0 Enters — the prompt text was never observed on screen; no Enter was sent — inspect the pane: if the text is visible in the input box, press Enter there manually; if it is gone, re-deliver the prompt manually\n`,
-      );
-      diag(
-        `give-up pane=${paneId} attempts=0 window_ms=${submitRetryWindowMs} box=unknown transport=false probe=unavailable elapsed_ms=${elapsedMs} budget_ms=${submitRetryWindowMs} reason=land-never-observed`,
-      );
-      try {
-        await options.onGiveUp?.(paneId, { box: "unknown", transport: false, probe: "unavailable" });
-      } catch {
-        // Escalation is best-effort: a failed notify degrades to the stderr
-        // diagnostics and the stall watchdog, never to a changed outcome.
+      if (!hasLanded) {
+        const elapsedMs = clock() - start;
+        const extended = branch === "born" && elapsedMs > submitRetryWindowMs;
+        stderr(
+          `launch: submit not confirmed on ${paneId} within ${submitRetryWindowMs}ms after 0 Enters — the prompt text was never observed on screen; no Enter was sent${extended ? ` (wait ran ${Math.round(elapsedMs)}ms — the window slid while the screen kept changing)` : ""} — inspect the pane: if the text is visible in the input box, press Enter there manually; if it is gone, re-deliver the prompt manually\n`,
+        );
+        diag(
+          `give-up pane=${paneId} attempts=0 window_ms=${submitRetryWindowMs} box=unknown transport=false probe=not-attempted elapsed_ms=${elapsedMs} budget_ms=${submitRetryWindowMs} reason=land-never-observed`,
+        );
+        try {
+          await options.onGiveUp?.(paneId, { box: "unknown", transport: false, probe: "not-attempted" });
+        } catch {
+          // Escalation is best-effort: a failed notify degrades to the stderr
+          // diagnostics and the stall watchdog, never to a changed outcome.
+        }
+        return;
       }
-      return;
     }
 
-    // Landed path (text observed at entry or adopted late): the wait above
-    // may already have spent part of the shared budget — the deadline is
-    // NEVER re-armed, only the initial observation window re-anchors.
+    // ---- the submit phase anchors at the landing --------------------------------
+    // No side effect ran during the wait above, so a late landing inherits a
+    // FULL window; from here on the ONE deadline spans the initial window and
+    // every resend and is never re-armed.
     const submitStart = clock();
+    const deadline = submitStart + submitRetryWindowMs;
+    const landwaitMs = submitStart - start;
     let attempt = 1;
-    if (submitStart >= deadline) {
-      // Text seen but no budget left to Enter: the honest give-up speaks
-      // from unknown and points at the pane (the text IS there).
-      const elapsedMs = clock() - start;
-      stderr(
-        `launch: submit not confirmed on ${paneId} within ${submitRetryWindowMs}ms after 0 Enters — budget exhausted right after the text was observed; inspect the pane and press Enter there manually only if the prompt is still visible in the input box\n`,
-      );
-      diag(
-        `give-up pane=${paneId} attempts=0 window_ms=${submitRetryWindowMs} box=unknown transport=false probe=unavailable elapsed_ms=${elapsedMs} budget_ms=${submitRetryWindowMs} reason=box-unknown`,
-      );
-      try {
-        await options.onGiveUp?.(paneId, { box: "unknown", transport: false, probe: "unavailable" });
-      } catch {
-        // Escalation is best-effort, never a changed outcome.
+
+    /**
+     * Verify the Enter path after one send-keys. The relay request and its
+     * read add no sleep to the existing submit cadence. A failed probe is
+     * deliberately a non-fatal submit failure: the caller's bounded Enter
+     * loop decides whether to try again. The probe is diagnostic only and
+     * self-guards on the submit deadline: neither the relay request nor its
+     * read may start at/past it — a skipped observation returns
+     * `unavailable`, never a stale result.  A request that never went out
+     * (dispatch ≠ sent) starts NO read, and a read that DID run feeds the
+     * box evidence directly — one observation, never discarded.
+     */
+    const probeEnter = async (
+      paneId2: string,
+      attemptNo: number,
+      phase: "initial" | "loop",
+    ): Promise<ProbeResult> => {
+      const marker = deliveryProbeMarker(prompt);
+      probeMarkers.add(marker);
+      if (clock() >= deadline) {
+        diag(`probe-skip pane=${paneId2} attempt=${attemptNo} phase=${phase} reason=deadline marker=${marker}`);
+        return probeUnobserved();
       }
-      return;
+      diag(`probe-send pane=${paneId2} attempt=${attemptNo} phase=${phase} marker=${marker}`);
+      let dispatch: DeliveryProbeDispatch = "unavailable";
+      if (client.sendProbe !== undefined) {
+        try {
+          dispatch = await client.sendProbe(paneId2, marker);
+        } catch {
+          dispatch = "failed";
+        }
+      }
+      if (clock() >= deadline) {
+        // The relay request started before the deadline but the budget is
+        // spent: the marker's visibility was never observed, and starting the
+        // read now would be a new side effect past the deadline.
+        diag(`probe-skip pane=${paneId2} attempt=${attemptNo} phase=${phase} reason=deadline marker=${marker}`);
+        return probeUnobserved();
+      }
+      if (dispatch !== "sent") {
+        diag(`probe-result pane=${paneId2} attempt=${attemptNo} phase=${phase} marker=${marker} dispatch=${dispatch} found=false len=0 tail=''`);
+        return { marker, dispatch, found: false };
+      }
+      const screen = await client.readPane(paneId2);
+      const found = screen.includes(marker);
+      const stripped = withoutDeliveryProbe(screen, [...probeMarkers], probeDialect);
+      evidence.box = boxOf(stripped);
+      diag(
+        `probe-result pane=${paneId2} attempt=${attemptNo} phase=${phase} marker=${marker} dispatch=sent found=${found} len=${screen.length} tail='${diagTail(screen)}'`,
+      );
+      return { marker, dispatch, found };
+    };
+
+    /** Submit-phase evidence triple from the LATEST Enter: transport (the
+     *  send-keys control call itself), box (derived from the probe-stripped
+     *  screen — observe reads and probe reads alike feed it), probe (relay
+     *  visibility, diagnostic only).  Every human-facing message is
+     *  generated from it — only box=held may claim the prompt still sits
+     *  in the composer. */
+    interface SubmitEvidence {
+      transport: boolean;
+      box: BoxState;
+      probe: ProbeResult;
     }
 
+    /** One cadence observation: read the screen, strip the probe overlay,
+     *  derive the box evidence, emit the read line, return the stripped
+     *  screen (the stall tracker consumes it). */
+    const observe = async (phase: "verify" | "loop", idx: number): Promise<string> => {
+      const latest = await client.readPane(paneId);
+      const stripped = withoutDeliveryProbe(latest, [...probeMarkers], probeDialect);
+      evidence.box = boxOf(stripped);
+      diag(
+        `read pane=${paneId} step=${phase} idx=${idx} len=${latest.length} box=${evidence.box} probe=${probeField(evidence.probe)} tail='${diagTail(latest)}'`,
+      );
+      return stripped;
+    };
+
+    /** Post-confirm re-verification: a submit-confirmed stands only
+     *  after ONE further observation, a poll apart, still shows the sent
+     *  text gone from the bottom edge.  A startup repaint that fooled one
+     *  read cannot fool two; a genuinely submitted round keeps the text
+     *  gone.  A re-verification that cannot run (budget spent) or that sees
+     *  the text back revokes the confirmation — the loop resumes. */
+    const confirmRecheck = async (attemptNo: number): Promise<boolean> => {
+      const now = clock();
+      if (now < deadline) {
+        await sleep(Math.min(pollMs, deadline - now));
+      }
+      if (clock() >= deadline) {
+        diag(`confirm-revoked pane=${paneId} attempt=${attemptNo} reason=budget`);
+        return false;
+      }
+      const latest = await client.readPane(paneId);
+      if (clock() >= deadline) {
+        // The re-verification read straddled the deadline: budget spent, so
+        // the observation updates the evidence but the confirm cannot stand.
+        const strippedLate = withoutDeliveryProbe(latest, [...probeMarkers], probeDialect);
+        evidence.box = boxOf(strippedLate);
+        diag(`confirm-revoked pane=${paneId} attempt=${attemptNo} reason=budget`);
+        return false;
+      }
+      const stripped = withoutDeliveryProbe(latest, [...probeMarkers], probeDialect);
+      const box = boxOf(stripped);
+      evidence.box = box;
+      diag(
+        `read pane=${paneId} step=recheck idx=0 len=${latest.length} box=${box} probe=${probeField(evidence.probe)} tail='${diagTail(latest)}'`,
+      );
+      if (box === "cleared") {
+        diag(`confirm-rechecked pane=${paneId} attempt=${attemptNo} box=cleared`);
+        return true;
+      }
+      diag(`confirm-revoked pane=${paneId} attempt=${attemptNo} box=${box}`);
+      return false;
+    };
+
+    // ---- phase 1: the informed initial Enter + observation window -------------
     diag(
       `submit pane=${paneId} phase=initial attempt=1 verify_ms=${submitTimeoutMs} retry_ms=${submitRetryMs} window_ms=${submitRetryWindowMs}`,
     );
@@ -798,24 +946,10 @@ export function createDelivery(options: DeliveryOptions): Delivery {
     diag(`enter pane=${paneId} attempt=1 phase=initial`);
     // The probe self-guards on the deadline: a first Enter that returns at/
     // past it starts no relay request and no read.
-    evidence.probe = await probeEnter(paneId, withText, attempt, "initial", deadline);
+    evidence.probe = await probeEnter(paneId, attempt, "initial");
 
-    /** One observation: read the screen, strip the probe overlay, derive
-     *  the box evidence against the with-text baseline, emit the read
-     *  line, decide confirmation — transport=true AND box=cleared, nothing
-     *  else. */
-    const observe = async (phase: "verify" | "loop", idx: number): Promise<boolean> => {
-      const latest = await client.readPane(paneId);
-      const stripped = withoutDeliveryProbe(latest, [...probeMarkers], probeDialect);
-      evidence.box = boxState(stripped, signature);
-      diag(
-        `read pane=${paneId} step=${phase} idx=${idx} len=${latest.length} box=${evidence.box} probe=${probeField(evidence.probe)} tail='${diagTail(latest)}'`,
-      );
-      return evidence.transport && evidence.box === "cleared";
-    };
-
-    // Phase 1: the initial observation window, capped by the shared
-    // deadline — never a budget of its own.
+    // The initial observation window is capped by the shared deadline —
+    // never a budget of its own.
     const initialEnd = Math.min(submitStart + submitTimeoutMs, deadline);
     let idx = 0;
     for (;;) {
@@ -823,23 +957,24 @@ export function createDelivery(options: DeliveryOptions): Delivery {
       if (now >= initialEnd) break;
       await sleep(Math.min(pollMs, initialEnd - now));
       if (clock() >= deadline) break; // budget spent: no new observation work
-      if (await observe("verify", idx)) {
+      await observe("verify", idx);
+      if (evidence.transport && evidence.box === "cleared") {
         diag(`submit-confirmed pane=${paneId} attempt=${attempt} phase=verify idx=${idx}`);
-        return;
+        if (await confirmRecheck(attempt)) return;
       }
       idx += 1;
     }
 
     // Loop entry: the evidence-based degradation note (only box=held may
     // say the prompt is still in the composer).
-    const entryElapsed = clock() - start;
+    const entryElapsed = clock() - submitStart;
     if (evidence.box === "held") {
       stderr(
         `launch: input box still holds the text on ${paneId} after ${entryElapsed}ms — bounded Enter resend loop (interval ${submitRetryMs}ms, total budget ${submitRetryWindowMs}ms)\n`,
       );
     } else if (evidence.box === "cleared") {
       stderr(
-        `launch: input box has released the text on ${paneId} but the initial Enter transport failed — do not press Enter blindly; continuing bounded verification (interval ${submitRetryMs}ms, total budget ${submitRetryWindowMs}ms)\n`,
+        `launch: input box has released the text on ${paneId} but the submit is unconfirmed (last Enter transport=${evidence.transport}) — do not press Enter blindly; continuing bounded verification (interval ${submitRetryMs}ms, total budget ${submitRetryWindowMs}ms)\n`,
       );
     } else {
       stderr(
@@ -854,29 +989,56 @@ export function createDelivery(options: DeliveryOptions): Delivery {
       if (evidence.box === "held") {
         return `launch: resending Enter (attempt ${attemptNo}) on ${paneId} — the prompt is still visible in the input box\n`;
       }
-      if (evidence.box === "cleared") {
-        return `launch: resending Enter (attempt ${attemptNo}) on ${paneId} — unconfirmed: the text has left the input box (last Enter transport failed)\n`;
-      }
       return `launch: resending Enter (attempt ${attemptNo}) on ${paneId} — unconfirmed: screen read unavailable\n`;
     };
 
-    // Phase 2: clocked resends inside the REMAINING budget.  Every sleep
-    // and side effect runs on the clock; at/past the deadline nothing new
-    // starts.
+    // ---- phase 2: clocked resends inside the REMAINING budget -----------------
+    // Every sleep and side effect runs on the clock; at/past the deadline
+    // nothing new starts.  box=cleared never resends (the text already left
+    // the box — a resend could hit a started round); a held screen frozen
+    // byte-identical across the stall streak gives up early.
+    const stallGiveupPolls = Math.max(
+      HELD_STALL_GIVEUP_POLLS,
+      Math.trunc((submitRetryWindowMs / pollMs) * 2 / 3),
+    );
     let lastEnterAt = submitStart;
     let step = 0;
+    let stallAnchor: string | undefined;
+    let stallScreens = 0;
+    let stalled = false;
     for (;;) {
       const now = clock();
       if (now >= deadline) break;
       await sleep(Math.min(pollMs, deadline - now));
       if (clock() >= deadline) break; // budget spent: no new reads, Enters, probes
       step += 1;
-      if (await observe("loop", step)) {
+      const stripped = await observe("loop", step);
+      if (evidence.box === "held") {
+        if (stripped === stallAnchor) {
+          stallScreens += 1;
+        } else {
+          stallAnchor = stripped;
+          stallScreens = 1;
+        }
+        if (stallScreens >= stallGiveupPolls) {
+          stalled = true;
+          stderr(
+            `launch: the screen on ${paneId} has not changed once across ${stallScreens} polls while holding the text — the receiver looks frozen; stopping the Enter loop early\n`,
+          );
+          diag(`held-stall pane=${paneId} polls=${stallScreens}`);
+          break;
+        }
+      } else {
+        stallAnchor = undefined;
+        stallScreens = 0;
+      }
+      if (evidence.transport && evidence.box === "cleared") {
         stderr(`launch: input box cleared on ${paneId} — submit confirmed (attempt ${attempt})\n`);
         diag(`submit-confirmed pane=${paneId} attempt=${attempt} phase=loop idx=${step}`);
-        return;
+        if (await confirmRecheck(attempt)) return;
+        continue;
       }
-      if (clock() - lastEnterAt >= submitRetryMs && clock() < deadline) {
+      if (clock() - lastEnterAt >= submitRetryMs && clock() < deadline && evidence.box !== "cleared") {
         attempt += 1;
         evidence.transport = await client.sendKeys(paneId, "Enter");
         if (!evidence.transport) {
@@ -889,7 +1051,7 @@ export function createDelivery(options: DeliveryOptions): Delivery {
         // from unknown/unavailable — never from the previous attempt's
         // held/observed view (the prompt may have committed in between).
         evidence.box = "unknown";
-        evidence.probe = await probeEnter(paneId, withText, attempt, "loop", deadline);
+        evidence.probe = await probeEnter(paneId, attempt, "loop");
         lastEnterAt = clock();
       }
     }
@@ -900,7 +1062,9 @@ export function createDelivery(options: DeliveryOptions): Delivery {
     const reason =
       evidence.box === "held" ? "box-held" : evidence.box === "cleared" ? "box-cleared-unconfirmed" : "box-unknown";
     const elapsedMs = clock() - start;
-    const notConfirmed = `launch: submit not confirmed on ${paneId} within ${submitRetryWindowMs}ms after ${attempt} Enters — `;
+    const notConfirmed = stalled
+      ? `launch: submit not confirmed on ${paneId} after ${attempt} Enters — `
+      : `launch: submit not confirmed on ${paneId} within ${submitRetryWindowMs}ms after ${attempt} Enters — `;
     if (evidence.box === "held") {
       stderr(`${notConfirmed}${giveUpGuidance("held")}\n`);
     } else if (evidence.box === "cleared") {
@@ -912,7 +1076,7 @@ export function createDelivery(options: DeliveryOptions): Delivery {
       stderr(`${notConfirmed}screen read unavailable; ${giveUpGuidance("unknown")}\n`);
     }
     diag(
-      `give-up pane=${paneId} attempts=${attempt} window_ms=${submitRetryWindowMs} box=${evidence.box} transport=${evidence.transport} probe=${probeField(evidence.probe)} elapsed_ms=${elapsedMs} budget_ms=${submitRetryWindowMs} reason=${reason}`,
+      `give-up pane=${paneId} attempts=${attempt} window_ms=${submitRetryWindowMs} box=${evidence.box} transport=${evidence.transport} probe=${probeField(evidence.probe)} elapsed_ms=${elapsedMs} budget_ms=${submitRetryWindowMs}${landwaitMs > 0 ? ` landwait_ms=${Math.round(landwaitMs)}` : ""} reason=${reason}`,
     );
     try {
       await options.onGiveUp?.(paneId, {
@@ -949,7 +1113,7 @@ export function createDelivery(options: DeliveryOptions): Delivery {
       }
       diag(`send-text pane=${input.paneId} branch=${input.branch} len=${sentText.length}`);
       const land = await confirmTextLanded(input.paneId, baseline, sentText);
-      await verifiedSubmit(input.paneId, land.screen, sentText, land.landed, baseline);
+      await verifiedSubmit(input.paneId, land.screen, sentText, land.landed, baseline, input.branch);
       return true;
     },
   };

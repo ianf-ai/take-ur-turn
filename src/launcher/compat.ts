@@ -382,9 +382,20 @@ async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
   }
   const invocation = await buildLegacyInvocation(entry.request, entry.invocation);
   let rendered: RenderedPaneCommand;
+  // The probe endpoint mixes the hub root into its digest: the same
+  // task id living in two independent hubs must never share a relay endpoint
+  // — the newer relay would steal it (or, on named pipes, split marker
+  // traffic into the wrong pane). A placeholder root (dry-run context) carries
+  // no instance; dry-run computes no endpoint at all.
   const probeEndpoint = dryRun()
     ? undefined
-    : deliveryProbeEndpoint(invocation.task_id, invocation.role, process.env, process.platform);
+    : deliveryProbeEndpoint(
+      invocation.task_id,
+      invocation.role,
+      process.env,
+      process.platform,
+      invocation.context.hubRoot.startsWith("<") ? undefined : invocation.context.hubRoot,
+    );
   try {
     rendered = renderInvocationPaneCommand(invocation, dialect, probeEndpoint);
   } catch (error) {

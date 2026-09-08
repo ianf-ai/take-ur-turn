@@ -13,7 +13,15 @@
  * Execution model: ONE async queue serializes all "compare + gate + act" — the
  * poll interval and agent events both only enqueue "run one compare"; requests
  * arriving in the same macrotask coalesce into a single run. Concurrent entry
- * points therefore cannot double-notify or double-launch.
+ * points therefore cannot double-notify or double-launch. The auto launcher
+ * child is the one deliberate exception: it runs on a per task+role
+ * chain OFF the queue once the launch marker is appended, so a wedged or slow
+ * launcher child cannot freeze every other task's compares; the child itself
+ * is bounded by a liveness backstop (runNodeCommand timeout → kill → failure
+ * path), and herdr control commands carry their own per-command timeout. The
+ * close-edge cleanup child (fired on the observed transition into
+ * `closed`) is the same kind of exception — detached from the queue, bounded
+ * by the same backstop, best-effort with one log line as its whole output.
  *
  * Auto-mode gate: waiting_for "agent:*" with
  * needs_attention false ALREADY fully encodes "launchable" — a task awaiting a
@@ -61,15 +69,16 @@ import {
   resolvePosixTargetPresence,
   type PlatformExecutionPlan,
 } from "./launcher/target-resolver.js";
-import { runInternalLaunch, runInternalLaunchInvocation, spawnDirect } from "./launcher/process.js";
+import { runInternalLaunch, runInternalLaunchInvocation, spawnDirect, DEFAULT_CHILD_TIMEOUT_MS } from "./launcher/process.js";
 import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
 import { HerdrClient } from "./launcher/herdr-client.js";
+import { HUB_FETCH_TIMEOUT_MS, HubSession, hubReadVia } from "./hub-client.js";
 import type { AgentCommand, AgentRoute, Cast, CheckoutRoute, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "./types.js";
 import {
   KNOWN_ROLES,
   defaultUserConfigDir,
   readWorkspaceConfigSnapshot,
-  resolveAgentRoute,
+  resolveAgentRouteFromSnapshot,
   resolveTabLabelTemplateFromSnapshot,
   type WorkspaceConfigSnapshot,
 } from "./workspace.js";
@@ -120,6 +129,11 @@ export interface StateAuto {
 export interface StateResponse {
   flow_mode: string;
   tasks: StateTask[];
+  /** Storage-degraded tasks (system-design 4.3): ids that failed to
+   *  fold. Optional — absent means none degraded (consumers treat absence as
+   *  healthy); present only when non-empty on a corruption-aware hub. Older hubs/fixtures
+   * without the key behave as "no degraded ids". */
+  degraded?: string[];
   /** Optional channel config; interpreted by createChannels. */
   notify?: unknown;
   /** Optional auto-enablement config; the launch whitelist. */
@@ -212,8 +226,27 @@ export interface NotifierDeps {
   launch(taskId: string, role: string, agent: string, args?: string[]): Promise<string>;
   /** Canonical launch seam: receives the same frozen invocation as the marker. */
   launchInvocation?(invocation: LaunchInvocation): Promise<string>;
+  /**
+   * Close-edge pane cleanup (system-design 4.4): reap `<task_id>.*`
+   * for a task the poll just observed entering `closed`. Best-effort — a
+   * rejection is logged as ONE line, never notified and never rethrown into
+   * the compare. Injectable for tests.
+   */
+  cleanupPanes(taskId: string): Promise<void>;
   /** Full task log used by auto launch de-duplication; injectable for tests. */
   readLog(taskId: string): Promise<ContextRecord[]>;
+  /**
+   * Incremental readLog: pull the records the wire contract of
+   * context.read's since_version returns for `sinceVersion` — INCLUSIVE
+   * (version ≥ sinceVersion), exactly what a real Hub answers; 0 means
+   * "everything" (the default wiring omits the field on the wire). The
+   * notifier passes cached.version + 1 once a cache exists:
+   * the inclusive wire parameter must be one PAST the cached maximum or
+   * every quiet round would re-fetch and re-read the last record. The
+   * notifier merges the reply into its per-task in-memory log cache and
+   * serves dedup/generation scans from the merged view. Injectable for tests.
+   */
+  readLogSince?(taskId: string, sinceVersion: number): Promise<{ versions: ContextRecord[] }>;
   /** Append the optimistic launch marker before calling the launcher. */
   markLaunched(taskId: string, role: string, baseVersion: number, via: LaunchVia, projection?: LaunchMarkerProjection): Promise<unknown>;
   channelsFor(notifyCfg: unknown): Channel[];
@@ -265,7 +298,19 @@ function stateUrlOf(url: string): string {
 }
 
 async function defaultFetchState(url: string): Promise<StateResponse> {
-  const res = await fetch(url);
+  // Every Hub fetch is bounded — a wedged/half-open hub
+  // connection fails diagnosably within the timeout instead of pinning the
+  // compare cycle indefinitely (poll failure handling keeps the snapshot).
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(HUB_FETCH_TIMEOUT_MS) });
+  } catch (e) {
+    const name = e instanceof Error ? e.name : "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new Error(`GET ${url} timed out after ${HUB_FETCH_TIMEOUT_MS}ms`);
+    }
+    throw e;
+  }
   if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`);
   return (await res.json()) as StateResponse;
 }
@@ -400,6 +445,9 @@ export async function spawnLaunch(
     { env, teeStderr: (chunk) => process.stderr.write(chunk) },
   );
   if (result.error !== undefined) throw result.error;
+  if (result.timedOut === true) {
+    throw new Error(`launch.sh ${taskId} ${role} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
+  }
   if (result.code !== 0) {
     const tail = result.stderr.trim();
     throw new Error(`launch.sh ${taskId} ${role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
@@ -417,11 +465,37 @@ export async function spawnLaunchInvocation(
     { env, teeStderr: (chunk) => process.stderr.write(chunk) },
   );
   if (result.error !== undefined) throw result.error;
+  if (result.timedOut === true) {
+    throw new Error(`launch.sh ${invocation.task_id} ${invocation.role} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
+  }
   if (result.code !== 0) {
     const tail = result.stderr.trim();
     throw new Error(`launch.sh ${invocation.task_id} ${invocation.role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
   }
   return result.stdout.trim();
+}
+
+/**
+ * Close-edge cleanup child (system-design 4.4): the same internal
+ * `launch --cleanup <task_id>` boundary `tut decide close` spawns
+ * synchronously — the notifier adds the consumer-side edge so a close that
+ * landed through ANY entrance (MCP decide, 4.1) still reaps the task's
+ * panes. Unlike the launch children there is no stderr tee: the daemon's
+ * contract for this path is ONE diagnostic line, carried by the thrown
+ * error's message (the child's stderr tail rides along).
+ */
+export async function spawnCleanupPanes(taskId: string): Promise<void> {
+  const result = await runInternalLaunch(["--cleanup", taskId]);
+  if (result.error !== undefined) {
+    throw new Error(`cannot run internal launcher: ${result.error.message}`);
+  }
+  if (result.timedOut === true) {
+    throw new Error(`launch --cleanup ${taskId} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
+  }
+  if (result.code !== 0) {
+    const tail = result.stderr.trim();
+    throw new Error(`launch --cleanup ${taskId} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
+  }
 }
 
 function defaultLog(line: string): void {
@@ -468,13 +542,25 @@ export interface RoutingMaps {
   roleToAgent: Map<string, string>;
 }
 
-/** Default routing loader — exported for the fixture-driven chain test. */
-export async function defaultLoadRouting(): Promise<RoutingMaps> {
+/**
+ * Default routing loader — exported for the fixture-driven chain test.
+ * ONE workspace snapshot per call feeds every role — the
+ * three-level chain reads (project + user workspace.json) happen once per
+ * poll, not once per role (0.6.0 resolved each role independently: 3 roles ×
+ * the same disk files every 5s). Optional root overrides keep tests hermetic.
+ */
+export async function defaultLoadRouting(
+  opts?: { projectRoot?: string; userConfigDir?: string },
+): Promise<RoutingMaps> {
   const labelToAgent = new Map<string, string>();
   const roleToAgent = new Map<string, string>();
+  const snapshot = await readWorkspaceConfigSnapshot({
+    ...(opts?.projectRoot !== undefined ? { projectRoot: opts.projectRoot } : {}),
+    ...(opts?.userConfigDir !== undefined ? { userConfigDir: opts.userConfigDir } : {}),
+  });
   for (const role of KNOWN_ROLES) {
-    const route = await resolveAgentRoute(role); // three-level chain from cwd; never throws
-    const agent = commandHead(route);
+    const resolved = await resolveAgentRouteFromSnapshot(role, undefined, snapshot); // never touches the filesystem again
+    const agent = commandHead(resolved.route);
     roleToAgent.set(role, agent);
     labelToAgent.set(agent, agent); // agent-named pane → identity
   }
@@ -568,6 +654,64 @@ function autoWhitelisted(auto: StateAuto | undefined, role: string): boolean {
   return Array.isArray(roles) && roles.includes(role);
 }
 
+/** One entry of the per-task log cache (see Notifier.logCache for the protocol). */
+interface LogCacheEntry {
+  /** Highest synced record version (0 = synced an empty log). */
+  version: number;
+  /** Merged records in audit order (ascending version; equal versions keep arrival order). */
+  records: ContextRecord[];
+  /** /state entry signature at the last successful sync; null when that pull ran without a /state entry. */
+  sig: string | null;
+}
+
+/**
+ * Fold-visible /state signature of a task entry: the
+ * fields /state re-derives from the record set every poll — status,
+ * waiting_for, needs_attention — plus updated_at (bumped by every
+ * store-mediated write). External damage that changes what the fold would
+ * produce (a same-version duplicate, a repair) changes this signature
+ * WITHOUT advancing /state's version field, which is exactly the signal the
+ * cache uses to order a full re-sync; a legit append changes it too, but
+ * appends advance the version, and the cache only falls back on a signature
+ * change at an UNCHANGED version. Tasks whose /state entry carries no
+ * version (older hubs / fixtures) never take the signature path.
+ */
+function stateTaskSig(task: StateTask): string {
+  return JSON.stringify([task.status, task.waiting_for, task.needs_attention, task.updated_at]);
+}
+
+/** Structural deep-equality of two records: identity for the
+ * merge — a record is "the same one" only when every field and the whole
+ * payload match. The wire carries no file names, so full-record equivalence
+ * is the strongest identity available; two DIFFERENT records sharing a
+ * version (VERSION_DUPLICATE shape) compare unequal and both stay. */
+function recordsEqual(a: ContextRecord, b: ContextRecord): boolean {
+  const av = a as unknown as Record<string, unknown>;
+  const bv = b as unknown as Record<string, unknown>;
+  const keys = new Set([...Object.keys(av), ...Object.keys(bv)]);
+  for (const key of keys) {
+    if (!jsonEquivalent(av[key], bv[key])) return false;
+  }
+  return true;
+}
+
+function jsonEquivalent(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || a === null || typeof b !== "object" || b === null) return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((item, i) => jsonEquivalent(item, b[i]));
+  }
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (!Object.hasOwn(b, key)) return false;
+    if (!jsonEquivalent((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) return false;
+  }
+  return true;
+}
+
 export class Notifier {
   private readonly stateUrl: string;
   private readonly intervalMs: number;
@@ -576,9 +720,49 @@ export class Notifier {
   private readonly eventPort: number;
   private readonly deps: NotifierDeps;
 
+  /**
+   * Resident Hub MCP session: connected lazily on the first
+   * incremental readLog and reused for every later one — one TCP connection
+   * and one MCP handshake for the notifier's lifetime instead of a fresh
+   * session per candidate per poll. Dropped (and reconnected on the next
+   * call) on any transport-level failure; closed in close().
+   */
+  private hubSession: HubSession | null = null;
+  /**
+   * Per-task merged task log: records ≤ version came from earlier
+   * pulls, records above arrive via readLogSince. Serves launchBlocked /
+   * latestRecordVersion / generation scans without re-pulling history.
+   * Entries are dropped when a task leaves tasks∪degraded (vanished/deleted),
+   * when /state reports a version BELOW the cached one (history rewound
+   * externally — the merge would otherwise keep phantom records forever), or
+   * when the task's /state-visible shape changed WITHOUT
+   * a version advance (same-version duplicate landed externally, a repair
+   * rewrote the fold): such records are unreachable through an incremental
+   * pull (their version is ≤ the cached max), so the entry is dropped and the
+   * next pull is a FULL re-sync — and, additionally, when a previously
+   * needs_attention task's attention CLEARED between polls: records that
+   * landed invisibly while the anomaly was set (no /state field changed) are
+   * recovered by that full re-sync exactly when the launch gate starts
+   * consulting the cache again. `sig` is the /state entry signature the last
+   * successful sync ran under (null when that pull had no /state entry at
+   * hand — e.g. the marker-race re-read); a null/stale sig never lets a
+   * quiet-round skip through, so the worst case is one extra full pull.
+   */
+  private logCache = new Map<string, LogCacheEntry>();
+
   private snapshot: Map<string, StateTask> | null = null;
   /** Tasks whose pending_approval entry edge has already been notified. */
   private pendingApprovalTasks = new Set<string>();
+  /** Degraded ids as of the last successful poll (system-design 4.3);
+   *  null before the first fetch. */
+  private lastDegraded: Set<string> | null = null;
+  /** Currently-degraded ids whose entering edge has already been alerted
+   *  (exactly-once per degraded stay; cleared on the recovery edge so a
+   *  later re-corruption alerts again). */
+  private degradedAlerted = new Set<string>();
+  /** Vanished ids whose disappearance edge has already been alerted
+   *  (cleared when the directory comes back). */
+  private vanishedAlerted = new Set<string>();
   private channels: Channel[] = createChannels(undefined);
   private consecutiveFailures = 0;
   /** Routing maps for the event reverse lookup; null until first load. */
@@ -628,6 +812,13 @@ export class Notifier {
    * already parked on it (the job could never start — the queue is busy).
    */
   private sweepBarriers = new Map<string, Promise<void>>();
+  /**
+   * Per task+role launcher-child chains (post-marker stage):
+   * each new round's child waits for the previous one, but the chain runs
+   * OFF the compare queue — a wedged launcher child can no longer freeze
+   * every compare; it drags at most its own task.
+   */
+  private launchChains = new Map<string, Promise<void>>();
 
   private server: Server | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -667,16 +858,158 @@ export class Notifier {
     this.paneReader = deps.readPane ?? defaultReadPane;
     const canonicalLaunch = deps.launchInvocation
       ?? (deps.launch === undefined ? (invocation: LaunchInvocation) => spawnLaunchInvocation(invocation) : undefined);
+    // Incremental readLog wiring: an explicitly injected readLog
+    // keeps the full-pull contract its tests rely on; otherwise the default
+    // resident-session incremental pull is installed (an injected
+    // readLogSince always wins over the default). The parameter is the wire
+    // contract verbatim — INCLUSIVE version ≥ sinceVersion; 0 means
+    // "everything", translated to an omitted field (the wire schema is
+    // since_version ≥ 1 or absent). fullLog supplies cached.version + 1 once
+    // a cache exists, so the inclusive contract still fetches
+    // strictly-new records.
+    const defaultReadLogSince = (taskId: string, sinceVersion: number): Promise<{ versions: ContextRecord[] }> =>
+      hubReadVia(
+        this.ensureHubSession(),
+        taskId,
+        sinceVersion > 0 ? sinceVersion : undefined,
+      ).then((res) => ({ versions: res.versions }));
+    const readLogSince =
+      deps.readLogSince !== undefined
+        ? deps.readLogSince
+        : deps.readLog === undefined
+          ? defaultReadLogSince
+          : undefined;
     this.deps = {
       fetchState: deps.fetchState ?? defaultFetchState,
       launch: deps.launch ?? spawnLaunch,
+      cleanupPanes: deps.cleanupPanes ?? spawnCleanupPanes,
       ...(canonicalLaunch !== undefined ? { launchInvocation: canonicalLaunch } : {}),
       readLog: deps.readLog ?? ((taskId) => readLaunchLog(options.url, taskId)),
+      ...(readLogSince !== undefined ? { readLogSince } : {}),
       markLaunched: deps.markLaunched ?? ((taskId, role, baseVersion, via, projection) => appendLaunchMarker(options.url, taskId, role, baseVersion, via, projection)),
       channelsFor: deps.channelsFor ?? createChannels,
       now: deps.now ?? (() => Date.now()),
       log: deps.log ?? defaultLog,
     };
+  }
+
+  /** The resident Hub session, connected on first use. */
+  private ensureHubSession(): HubSession {
+    this.hubSession ??= new HubSession(this.stateUrl.replace(/\/state$/u, ""), { clientName: "tut-notifier" });
+    return this.hubSession;
+  }
+
+  /**
+   * Full task log for dedup / base-version / generation scans, incremental
+   * when readLogSince is wired.
+   * Governed protocol, driven by the task's /state entry when the caller has
+   * one (the poll's candidate/generation scans always do):
+   *
+   *   - quiet round (cache covers entry.version AND the entry's fold-visible
+   *     signature matches the one the cache last synced under): the merged
+   *     records are served from memory — ZERO Hub log requests/responses, the
+   *     §4 "≤ bytes added since the previous round" gate reads 0 on a silent
+   *     poll. An entry without a version (older hub) can never
+   *     be proven covered, so it always pulls.
+   *   - otherwise: one context.read at since_version = cached.version + 1 —
+   *     the INCLUSIVE wire contract therefore fetches strictly-new versions
+   *     and never re-reads the cached tail. No cache yet → 0 =
+   *     full pull. The reply merges by record identity (deep equality), so
+   *     same-version DIFFERENT records all survive and fold in audit order;
+   *     a rewind or signature change has already dropped the
+   *     entry in reconcileLogCache, making the next pull a full re-sync.
+   *
+   * A failed pull throws with the cache untouched — callers already treat a
+   * read failure as "unreadable" and retry next poll.
+   */
+  private async fullLog(taskId: string, entry?: StateTask): Promise<ContextRecord[]> {
+    const incremental = this.deps.readLogSince;
+    if (incremental === undefined) return await this.deps.readLog(taskId);
+    const cached = this.logCache.get(taskId);
+    if (
+      cached !== undefined &&
+      entry !== undefined &&
+      entry.version !== undefined &&
+      cached.version >= entry.version &&
+      cached.sig !== null &&
+      cached.sig === stateTaskSig(entry)
+    ) {
+      return cached.records; // quiet round — /state already covers the cached history
+    }
+    // Exclusive lower bound → inclusive wire parameter: cached.version + 1.
+    // A dropped/stale cache (no entry, signature mismatch, rewind) starts at 0.
+    const lowerBound = cached?.version ?? 0;
+    const since = lowerBound > 0 ? lowerBound + 1 : 0;
+    const res = await incremental(taskId, since);
+    let merged: ContextRecord[];
+    let maxVersion = lowerBound;
+    if (cached === undefined) {
+      merged = [...res.versions];
+    } else {
+      merged = [...cached.records];
+      for (const record of res.versions) {
+        // Identity dedup only: a record already present verbatim
+        // is skipped; a DIFFERENT record at an already-cached version survives
+        // — the wire's same-version duplicates are distinct audit records and
+        // must all reach launchBlocked / the generation scans.
+        if (!merged.some((m) => recordsEqual(m, record))) merged.push(record);
+      }
+      merged.sort((a, b) => a.version - b.version); // stable: equal versions keep arrival order
+    }
+    for (const record of res.versions) maxVersion = Math.max(maxVersion, record.version);
+    this.logCache.set(taskId, { version: maxVersion, records: merged, sig: entry !== undefined ? stateTaskSig(entry) : cached?.sig ?? null });
+    return merged;
+  }
+
+  /**
+   * Log-cache housekeeping: entries for ids no longer known to
+   * /state are dropped (vanished/deleted — a later reappearance must not
+   * serve phantom history), a task whose /state version fell BELOW the
+   * cached version had its history rewound externally — drop it so the next
+   * pull starts from zero — and a task whose fold-visible
+   * /state signature changed at an UNCHANGED version had records land that
+   * an incremental pull can never reach (same-version duplicates, repairs):
+   * drop it too, forcing a full re-sync on the next pull. Version advances
+   * keep the entry (the delta is exactly what since_version fetches); entries
+   * without a /state version (older hubs) only take the vanished path.
+   *
+   * Attention-clearing edge: `prev` is the previous
+   * poll's snapshot. A task observed needs_attention=true last poll and false
+   * now had its anomaly resolved — and while attention was set, same-version
+   * records could land with NO /state-visible change at all (status,
+   * waiting_for, needs_attention already true, updated_at untouched by
+   * external writes): the signature rule cannot see them, and the resolving
+   * record (an ack) ADVANCES the version, so the incremental pull at
+   * cached.version + 1 fetches only the ack — the invisible records stay
+   * unreachable forever. Evicting on the clearing edge makes the next pull a
+   * FULL re-sync: whatever landed during the anomalous stay is recovered
+   * exactly when the launch gate starts consulting the cache again (a
+   * needs_attention task is gate-withheld, so the stale window is never
+   * acted on). The edge is rare (once per anomaly lifetime) and never fires
+   * for clean tasks — the quiet-round zero-request gate is untouched.
+   */
+  private reconcileLogCache(state: StateResponse, prev: ReadonlyMap<string, StateTask> | null): void {
+    if (this.logCache.size === 0) return;
+    const known = new Set<string>([...state.tasks.map((t) => t.task_id), ...(state.degraded ?? [])]);
+    for (const [taskId, entry] of this.logCache) {
+      if (!known.has(taskId)) {
+        this.logCache.delete(taskId);
+        continue;
+      }
+      const task = state.tasks.find((t) => t.task_id === taskId);
+      if (task?.version === undefined) continue;
+      if (entry.version > task.version) {
+        this.logCache.delete(taskId); // rewind
+        continue;
+      }
+      if (prev?.get(taskId)?.needs_attention === true && task.needs_attention === false) {
+        this.logCache.delete(taskId); // attention cleared — recover anything that landed invisibly while set
+        continue;
+      }
+      if (task.version === entry.version && entry.sig !== null && entry.sig !== stateTaskSig(task)) {
+        this.logCache.delete(taskId); // shape changed under the same version — full re-sync next pull
+      }
+    }
   }
 
   private log(line: string): void {
@@ -730,8 +1063,11 @@ export class Notifier {
     }
 
     const prev = this.snapshot;
+    const prevDegraded = this.lastDegraded;
     const now = this.deps.now();
     this.snapshot = new Map(state.tasks.map((t) => [t.task_id, t]));
+    this.lastDegraded = new Set(state.degraded ?? []);
+    this.reconcileLogCache(state, prev);
     // A task omitted from /state has left the observable workflow. Forget its
     // approval edge so a later reappearance can notify again.
     for (const taskId of this.pendingApprovalTasks) {
@@ -744,13 +1080,20 @@ export class Notifier {
     this.observeFlowMode(state.flow_mode, now);
 
     if (prev === null) {
-      // First successful fetch: baseline, no notifications.
+      // First successful fetch: baseline, no workflow notifications — but a
+      // task ALREADY degraded at startup is exactly the silent-loss shape the
+      // degraded listing exists to kill, so its entering edge alerts here (the notifier cannot
+      // know it was degraded before it started watching).
+      await this.diffDegraded(null, prevDegraded, this.lastDegraded, state);
       for (const t of state.tasks) {
         this.lastUpdatedAt.set(t.task_id, t.updated_at);
         this.lastProgressAt.set(t.task_id, now);
         if (t.status === "pending_approval") this.pendingApprovalTasks.add(t.task_id);
       }
-      this.log(`baseline: ${state.tasks.length} task(s), flow_mode=${state.flow_mode}`);
+      this.log(
+        `baseline: ${state.tasks.length} task(s), flow_mode=${state.flow_mode}` +
+          ((state.degraded?.length ?? 0) > 0 ? `, degraded=${state.degraded!.length}` : ""),
+      );
       // Decision lines on the baseline poll too — a task that is
       // ALREADY agent-waiting when the notifier (re)starts is exactly the
       // silent-door shape; its "no action, and why" must be visible.
@@ -758,11 +1101,37 @@ export class Notifier {
       return;
     }
 
-    // Per-poll decision lines precede this poll's acting — the line
-    // announces the launch (or the reason there will be none) first.
-    if (state.flow_mode === "auto") await this.logAutoDecisions(prev, state);
     try {
+      // Recovery bookkeeping runs FIRST so this poll knows which tasks just
+      // re-entered tasks[] from degraded / vanished — the recovery edge is a
+      // log line only (system-design 6.1), and that verdict must gate both the
+      // auto-decision lines and diffTask below.
+      const recoveredThisTick = await this.diffDegraded(prev, prevDegraded, this.lastDegraded, state);
+      // Per-poll decision lines precede this poll's acting — the line
+      // announces the launch (or the reason there will be none) first.
+      if (state.flow_mode === "auto") await this.logAutoDecisions(prev, state, recoveredThisTick);
       for (const after of state.tasks) {
+        // A task that just left degraded or came back from vanished is NOT a
+        // new task: prev has no entry for it (it was absent from tasks[]), so
+        // diffTask would fire waiting-for / approval notifications and even
+        // an auto launch off a first-sight `before === undefined`. The
+        // recovery tick records the recovery log line only; the NEXT tick
+        // diffs against this tick's snapshot entry, so genuine later state
+        // changes flow through the existing edges as usual. (Records cannot
+        // change while a task is degraded — append refuses until the storage
+        // chain folds — so nothing real is swallowed by one quiet poll.)
+        if (recoveredThisTick.has(after.task_id)) {
+          // Stall-clock restart: the watchdog kept
+          // the pre-degradation lastProgressAt — nothing could refresh it
+          // while the task was invisible (degraded or vanished). Running
+          // that stale clock into checkStalls below would fire "possibly
+          // stalled" on the very tick that must stay log-only. Restart from
+          // NOW; markProgress also clears stallNotified, so a genuine stall
+          // after recovery alerts again after one full fresh threshold.
+          this.lastUpdatedAt.set(after.task_id, after.updated_at);
+          this.markProgress(after.task_id, now);
+          continue;
+        }
         await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto);
       }
       this.checkStalls(state.tasks, now);
@@ -772,12 +1141,106 @@ export class Notifier {
     }
   }
 
+  /**
+   * Degraded / disappearance edges on the task-SET level (system-design
+   * 4.3 + 6.1). Storage corruption never silently vanishes a task again:
+   * entering `degraded` alerts exactly once per stay (re-corruption after a
+   * repair alerts again — the recovery edge cleared the bookkeeping), the
+   * recovery edge (back in tasks[]) is a log line only (no re-alert), and a
+   * task known from the previous snapshot that is absent from BOTH tasks and
+   * degraded now has vanished — its directory disappeared; that alerts once
+   * with copy clearly distinct from storage corruption (close does not apply:
+   * there is no log left to append to). prevTasks may be null (baseline —
+   * nothing known before, so only degraded entering edges fire).
+   *
+   * Returns the set of tasks that re-entered tasks[] THIS poll (left
+   * degraded, or reappeared after a vanished stay): their recovery edge is a
+   * log line only — compareAndAct suppresses their diffTask/auto-decision
+   * acting so a repaired task is never mistaken for a brand-new one.
+   */
+  private async diffDegraded(
+    prevTasks: ReadonlyMap<string, StateTask> | null,
+    prevDegraded: ReadonlySet<string> | null,
+    degradedNow: ReadonlySet<string>,
+    state: StateResponse,
+  ): Promise<Set<string>> {
+    const recoveredIntoTasks = new Set<string>();
+    // Rising: newly degraded (first sight included — baseline passes null prev).
+    for (const taskId of degradedNow) {
+      if (this.degradedAlerted.has(taskId)) continue;
+      this.degradedAlerted.add(taskId);
+      await this.sendAll({
+        title: `TUT ${taskId}: storage degraded`,
+        body:
+          `task ${taskId} failed to fold in /state — storage corruption (meta.json or record files). ` +
+          `Repair only through the supported entries: corrupt meta.json → tut repair-meta ${taskId} (rebuilds operation state, records untouched); ` +
+          `corrupt record → fetch the original bytes from an external snapshot and register via tut recover-record ${taskId} ` +
+          `(the corrupt original stays on disk byte-for-byte). decide close is unavailable until the storage chain parses again. ` +
+          `Never delete records (AGENTS.md invariant). Class-level diagnosis: tut doctor.`,
+        task_id: taskId,
+      });
+    }
+    // Falling: left degraded. Back in tasks[] = repaired — log line only.
+    for (const taskId of [...this.degradedAlerted]) {
+      if (degradedNow.has(taskId)) continue;
+      this.degradedAlerted.delete(taskId);
+      if (state.tasks.some((t) => t.task_id === taskId)) {
+        this.log(`[${taskId}] left degraded — storage repaired; back in tasks[]`);
+        recoveredIntoTasks.add(taskId);
+      }
+      // else: it vanished while degraded — the disappearance edge below reports it.
+    }
+    // Disappearance: known before (tasks or degraded), absent from both now.
+    const knownNow = new Set<string>([...state.tasks.map((t) => t.task_id), ...degradedNow]);
+    const knownBefore = new Set<string>([
+      ...(prevTasks?.keys() ?? []),
+      ...(prevDegraded ?? []),
+    ]);
+    // Anything present again clears its vanish bookkeeping FIRST — a restored
+    // directory re-arms the alert for a future disappearance.
+    for (const taskId of knownNow) {
+      if (this.vanishedAlerted.delete(taskId)) {
+        this.log(`[${taskId}] reappeared in /state (directory restored)`);
+        if (state.tasks.some((t) => t.task_id === taskId)) recoveredIntoTasks.add(taskId);
+      }
+    }
+    for (const taskId of knownBefore) {
+      if (knownNow.has(taskId)) continue;
+      if (this.vanishedAlerted.has(taskId)) continue;
+      this.vanishedAlerted.add(taskId);
+      await this.sendAll({
+        title: `TUT ${taskId}: task directory vanished`,
+        body:
+          `task ${taskId} was in the previous /state snapshot but is absent from both tasks and degraded now — ` +
+          `its directory disappeared (storage has no index; likely deleted or moved). ` +
+          `decide close does not apply — there is no log left to append to. Restore the directory from backup/git; ` +
+          `after restore it reappears in tasks[] (corrupt files inside → the storage-degraded path).`,
+        task_id: taskId,
+      });
+    }
+    return recoveredIntoTasks;
+  }
+
   private async diffTask(
     before: StateTask | undefined,
     after: StateTask,
     flowMode: string,
     auto: StateAuto | undefined,
   ): Promise<void> {
+    // Close-edge pane cleanup (system-design 4.4): `tut decide close`
+    // keeps its synchronous cleanup child, but the decision may land through
+    // ANY entrance (4.1: decide is callable from any MCP client) — this
+    // consumer-side edge covers them all. Transition-edge ONLY: `before` must
+    // exist and not be closed; a task already closed at baseline / first
+    // sight must NOT fire, or every restart would spawn one launcher child
+    // per historical closed task. Closed is absorbing (3.2), so the edge
+    // fires at most once per task per notifier run. Placed above the
+    // notification branches: the close itself stays notification-silent (the
+    // waiting_for → "none" early return below), and a rising needs_attention
+    // must not swallow the reap either.
+    if (before !== undefined && before.status !== "closed" && after.status === "closed") {
+      this.cleanupClosedTask(after.task_id);
+    }
     const pendingApprovalEntering = this.updatePendingApprovalEdge(after);
     // A task absent from the previous snapshot counts as waiting_for "none"
     // before, so brand-new tasks notify (absent → agent:* is a change) but a
@@ -804,14 +1267,21 @@ export class Notifier {
     }
 
     if (attentionRising) {
-      // Anomaly notification ONLY; suppresses the same-tick flow notification.
-      // Never contains warnings content — /state has none; the
-      // human runs `tut read` for the cause.
+      // Anomaly notification; suppresses the same-tick FLOW notification
+      // (the waiting_for edge below) but never the approval edge: a
+      // task entering pending_approval with needs_attention set in the same
+      // poll gets BOTH — the human must still receive the decide guidance,
+      // or the approval chain is lost until a restart. Never contains
+      // warnings content — /state has none; the human runs `tut read` for
+      // the cause.
       await this.sendAll({
         title: `TUT ${after.task_id}: needs attention`,
         body: `${after.title} — status: ${after.status}: run \`tut read ${after.task_id}\` for warnings`,
         task_id: after.task_id,
       });
+      if (pendingApprovalEntering) {
+        await this.notifyPendingApproval(after, flowMode);
+      }
       return;
     }
     if (pendingApprovalEntering) {
@@ -868,6 +1338,28 @@ export class Notifier {
       return;
     }
     await this.autoLaunch(after, role);
+  }
+
+  /**
+   * Hand the close-cleanup child OFF the compare queue, mirroring
+   * the auto-launch child's detachment: the compare returns
+   * immediately, so a wedged or slow cleanup child cannot block other
+   * tasks' diffs. Observability is exactly one log line either way — no
+   * desktop notification (the human closed the task themselves; this is
+   * housekeeping, not news) and no Hub writes (a cleanup record would
+   * re-trigger compares and notification loops). Failure is terminal for
+   * the panes — orphan recovery does not exist (4.4) — so the line carries
+   * the manual retry command.
+   */
+  private cleanupClosedTask(taskId: string): void {
+    void this.deps.cleanupPanes(taskId).then(
+      () => {
+        this.log(`[${taskId}] closed — pane cleanup done (launch --cleanup)`);
+      },
+      (e: unknown) => {
+        this.log(`[${taskId}] pane cleanup after close failed: ${(e as Error).message} — panes may remain; rerun: tut launch --cleanup ${taskId}`);
+      },
+    );
   }
 
   /** Track the pending_approval edge independently of waiting_for changes. */
@@ -928,7 +1420,11 @@ export class Notifier {
    * (local HTTP — the price of a truthful per-round 查重 result); withheld
    * candidates (gate or whitelist) are not read at all.
    */
-  private async logAutoDecisions(prev: ReadonlyMap<string, StateTask> | null, state: StateResponse): Promise<void> {
+  private async logAutoDecisions(
+    prev: ReadonlyMap<string, StateTask> | null,
+    state: StateResponse,
+    recoveredIntoTasks?: ReadonlySet<string>,
+  ): Promise<void> {
     for (const task of state.tasks) {
       if (!task.waiting_for.startsWith("agent:")) continue;
       const role = task.waiting_for.slice("agent:".length);
@@ -937,15 +1433,21 @@ export class Notifier {
       let dedup = gate !== null ? "n/a (gate withheld)" : "n/a (not whitelisted)";
       if (gate === null && whitelisted) {
         try {
-          const records = await this.deps.readLog(task.task_id);
+          const records = await this.fullLog(task.task_id, task);
           const blocked = launchBlocked(records, role);
           dedup = blocked.blocked ? `launched@v${blocked.noteVersion}` : "fresh";
         } catch (e) {
           dedup = `unreadable (${(e as Error).message})`;
         }
       }
+      // Recovery tick: the first tasks[] sight after a
+      // degraded / vanished stay suppresses flow edges below — the decision
+      // line must say so instead of announcing a launch that will not happen.
+      const recoveryEdge = recoveredIntoTasks?.has(task.task_id) === true;
       let action: string;
-      if (gate !== null) {
+      if (recoveryEdge) {
+        action = "none (recovery edge — first tasks[] sight after degraded/vanished; flow edges suppressed this poll)";
+      } else if (gate !== null) {
         action = `withheld (gate: ${gate})`;
       } else if (!whitelisted) {
         action = `withheld (role '${role}' not in launch whitelist)`;
@@ -961,7 +1463,14 @@ export class Notifier {
       } else if (dedup.startsWith("launched@")) {
         action = `none (already launched; ${dedup})`;
       } else {
-        action = `none this poll; an edge would re-read the log (dedup ${dedup})`;
+        // Edge-on-this-poll leftover: with an edge on THIS poll the
+        // action is not "none" — autoLaunch re-reads the log inside its own
+        // dedup stage and acts on that read, not on this poll's failed one.
+        const edge = prev !== null
+          && (prev.get(task.task_id)?.waiting_for ?? "none") !== task.waiting_for;
+        action = edge
+          ? `launch attempt this poll (dedup re-read inside autoLaunch; poll read ${dedup})`
+          : `none this poll; an edge would re-read the log (dedup ${dedup})`;
       }
       this.log(
         `[${task.task_id}] auto-decision: waiting_for=${task.waiting_for}` +
@@ -1018,7 +1527,7 @@ export class Notifier {
     await this.awaitSweepBarrier(task.task_id);
     let records: ContextRecord[];
     try {
-      records = await this.deps.readLog(task.task_id);
+      records = await this.fullLog(task.task_id, task);
     } catch (e) {
       await this.autoLaunchFailed(task, role, e);
       return;
@@ -1135,8 +1644,12 @@ export class Notifier {
       // A manual start-next or another notifier may have won the optimistic
       // append race. Re-read once: if its marker is now present, converge on
       // the same harmless skipped outcome instead of reporting a false error.
+      // Deliberately NO /state entry here: the poll's entry is
+      // stale by construction — the winner's marker landed after fetchState —
+      // so a coverage skip must not fire; the entry-less pull is always
+      // incremental since cached.version + 1 and therefore sees the marker.
       try {
-        const after = await this.deps.readLog(task.task_id);
+        const after = await this.fullLog(task.task_id);
         const afterBlocked = launchBlocked(after, role);
         if (afterBlocked.blocked) {
           await this.autoLaunchSkipped(task, role, afterBlocked.noteVersion);
@@ -1153,7 +1666,55 @@ export class Notifier {
     // let the marker slip past, the LAUNCH itself (the pane-reaping action)
     // still waits for the sweep.
     await this.awaitSweepBarrier(task.task_id);
+    // Post-marker stage: the launcher child runs OUTSIDE the
+    // drain queue.  Everything above (gate → dedup → marker) stays queued —
+    // a follow-up compare always observes the marker — but the child itself
+    // is handed off below, so a wedged or slow launcher can no longer freeze
+    // every other task's compares and notifications; a hung launch drags at
+    // most its own task, and the child liveness backstop (runNodeCommand)
+    // eventually settles it into the failure path.
+    this.spawnTrackedLaunch(task, role, agent, args, invocation, launchVersion);
+  }
+
+  /**
+   * Hand the launcher child to a per task+role chain that runs OFF the
+   * compare queue.  Round N+1's child waits for round N's — the
+   * queue used to provide this ordering by blocking; now only this task's
+   * chain waits.  The chain promise is registered synchronously so a
+   * same-key hand-off can never double-spawn.
+   */
+  private spawnTrackedLaunch(
+    task: StateTask,
+    role: string,
+    agent: string,
+    args: string[],
+    invocation: LaunchInvocation,
+    launchVersion: number | undefined,
+  ): void {
     const launchKey = this.workingWatchKey(task.task_id, role);
+    const previous = this.launchChains.get(launchKey);
+    const run = (async () => {
+      if (previous !== undefined) await previous.catch(() => undefined);
+      await this.runLaunchChild(launchKey, task, role, agent, args, invocation, launchVersion);
+    })();
+    this.launchChains.set(launchKey, run);
+    const reap = (): void => {
+      if (this.launchChains.get(launchKey) === run) this.launchChains.delete(launchKey);
+    };
+    run.then(reap, reap);
+  }
+
+  /** Await one launcher child and process its outcome (autoLaunch's former
+   *  post-marker tail, now detached from the compare queue). */
+  private async runLaunchChild(
+    launchKey: string,
+    task: StateTask,
+    role: string,
+    agent: string,
+    args: string[],
+    invocation: LaunchInvocation,
+    launchVersion: number | undefined,
+  ): Promise<void> {
     this.inFlightLaunches.set(launchKey, { task, role, agent, ...(launchVersion !== undefined ? { launchVersion } : {}) });
     try {
       const out = this.deps.launchInvocation !== undefined
@@ -1248,9 +1809,13 @@ export class Notifier {
     this.timers.add(timer);
   }
 
-  private async launchGenerationSuperseded(taskId: string, launchVersion: number): Promise<boolean | undefined> {
+  private async launchGenerationSuperseded(
+    taskId: string,
+    launchVersion: number,
+    entry?: StateTask,
+  ): Promise<boolean | undefined> {
     try {
-      const records = await this.deps.readLog(taskId);
+      const records = await this.fullLog(taskId, entry);
       return records.some(
         (record) => record.version > launchVersion && record.content_type !== "note",
       );
@@ -1275,7 +1840,7 @@ export class Notifier {
       // proves that the task has progressed beyond this launch generation.
       const launchVersion = watch.launchVersion;
       if (launchVersion === undefined || current.version === undefined || current.version <= launchVersion) continue;
-      const superseded = await this.launchGenerationSuperseded(watch.task.task_id, launchVersion);
+      const superseded = await this.launchGenerationSuperseded(watch.task.task_id, launchVersion, current);
       // A failed diagnostic read must not turn a still-valid watch into a
       // silent timeout. The timer remains armed and the next poll retries.
       if (superseded !== true) continue;
@@ -1375,7 +1940,12 @@ export class Notifier {
         this.earlyWorkingSignals.set(inFlight.key, evt);
         this.log(`[${taskId}] working signal arrived while ${inFlight.launch.role} launch was still completing`);
       } else if (this.workingEventMatchesCurrentTask(evt, taskId)) {
-        this.markProgress(taskId, this.deps.now());
+        // Stall-clock policy: an UNWATCHED working event no longer
+        // refreshes the stall watchdog — the realistic failure was herdr
+        // status flapping (working↔blocked oscillation with no hub progress)
+        // renewing the clock forever.  Only real progress renews: the first
+        // working after a launch (the watch-hit path above, or the in-flight
+        // path) and any updated_at/version advance (checkStalls).
         if (taskId !== evt.pane) {
           this.log(`working event pane '${evt.pane}' resolved to task ${taskId} (role-pane mapping)`);
         }
@@ -1704,14 +2274,14 @@ export class Notifier {
         }
         return;
       case "blocked": {
-        // An observed signal refreshes the stall timer too (judgment: a stuck
-        // agent is alive; a stall reminder right after this would be noise).
+        // No stall refresh: a blocked event is not progress — this
+        // stuck alert is the timely signal, and the stall watchdog stays the
+        // stallMs backstop instead of being renewed by status flapping.
         // blocked is an追加触发 immediate compare (system-design 6.1):
         // the stuck agent may have just published; a compare picks it up now.
         // The UNMATCHED degradation (log + notify) is rate-limited
         // per source — the immediate compare above is never suppressed.
         if (taskId !== null) {
-          this.markProgress(taskId, this.deps.now());
           void this.sendAll({
             title: `TUT ${taskId}: agent stuck`,
             body: `Agent ${evt.agent} appears blocked in pane ${evt.pane}${taskId !== evt.pane ? ` (task ${taskId})` : ""}`,
@@ -1779,6 +2349,10 @@ export class Notifier {
     if (immediate !== undefined && immediate.waiting_for !== wfAtEvent) return; // published in time
     const delayMs = Math.max(this.intervalMs, 2000);
     const timer = setTimeout(() => {
+      // Spent handles must not linger: this was the one timer that
+      // never removed itself from `timers` — every done-without-publish
+      // recheck leaked a handle for the process lifetime.
+      this.timers.delete(timer);
       void this.requestCompare()
         .then(() => {
           const later = this.snapshot?.get(taskId);
@@ -1947,7 +2521,12 @@ export class Notifier {
     const transport = evt.transport;
     const atomic = (box === "held" || box === "cleared" || box === "unknown") && typeof transport === "boolean";
     const probe =
-      evt.probe === "observed" || evt.probe === "failed" || evt.probe === "unavailable" ? evt.probe : undefined;
+      evt.probe === "observed" ||
+      evt.probe === "failed" ||
+      evt.probe === "unavailable" ||
+      evt.probe === "not-attempted"
+        ? evt.probe
+        : undefined;
     this.receiveEvent({
       event: evt.event,
       agent: evt.agent,
@@ -1977,12 +2556,19 @@ export class Notifier {
     this.timers.clear();
     this.workingWatches.clear();
     this.inFlightLaunches.clear();
+    this.launchChains.clear();
     this.earlyWorkingSignals.clear();
     this.earlyGiveUps.clear();
     this.unresolvedWorkingEvents.clear();
     this.pendingApprovalTasks.clear();
+    this.degradedAlerted.clear();
+    this.vanishedAlerted.clear();
     this.sweepBarriers.clear();
     this.unmatchedSources.clear();
+    this.logCache.clear();
+    const session = this.hubSession;
+    this.hubSession = null;
+    if (session !== null) await session.close().catch(() => undefined);
     const server = this.server;
     this.server = null;
     if (server !== null) {

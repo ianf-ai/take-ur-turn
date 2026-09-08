@@ -118,7 +118,10 @@ export async function resolveLaunchTargetWithSource(
   role: string,
   resolveOptions: ResolveOptions = {},
 ): Promise<LaunchTarget> {
-  const res = await fetch(new URL("/state", url), { headers: { Connection: "close" } });
+  const res = await fetch(new URL("/state", url), {
+    headers: { Connection: "close" },
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!res.ok) throw new Error(`GET ${url}/state → HTTP ${res.status}`);
   const state = (await res.json()) as { tasks?: Array<{ task_id: string; cast?: Cast; checkout?: CheckoutRoute }> };
   const entry = state.tasks?.find((t) => t.task_id === taskId);

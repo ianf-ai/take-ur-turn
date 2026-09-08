@@ -11,11 +11,12 @@
 
 ## 何时介入
 
-reviewing 态的任务在等你：`context.list {"status": "reviewing"}`（CLI `tut list --status reviewing`）。读任务日志区分三种情况：
+reviewing 态的任务在等你：`context.list {"status": "reviewing"}`（CLI `tut list --status reviewing`）。读任务日志区分四种情况：
 
 - **首轮 review**：日志里还没有 review，最新有效记录是 code_changes——全面审（代码 + 与 design 的一致性）。
 - **重审**：日志里已有 verdict 为 `fail_code` 的 review，其后跟着 revision——按上一轮的**关闭条件逐条核销，不重新裁量**（见「关闭条件」）。
 - **人 reject 后的重审**：最新有效记录是人的 decision(reject) 之后跟来的 revision——没有上轮 review 问题列表可核销，改为**对照 reject 理由审该 revision**（reject 理由即人开出的关闭条件，逐条确认已解决），只对 revision 新引入的问题另立条目（附新的关闭条件）。
+- **executor 收回回合后的重审**：日志里 executor 在 reviewing 态发过非 ack note、其后跟 revision——无旧 review 可核销，对该 revision 全面审（同首轮口径，ref_version 指向被审 revision）；发布前确认任务仍在 reviewing，已被收回则结束本回合、不发任何记录；revision 落盘、任务回到 reviewing 后自会再轮到你。
 
 manual 模式下你由人指派；status / waiting_for 是派生出来的路由建议，不是指令。
 
@@ -36,8 +37,8 @@ manual 模式下你由人指派；status / waiting_for 是派生出来的路由�
 信封字段：
 
 - `summary` 必填，一句话（列表展示与通知文案都用它）；`body` 必填，Markdown，完整评审意见。
-- **`verdict` 必填，且必须逐字符取以下三值之一**：`pass` | `fail_code` | `fail_design`（派生语义：pass → pending_approval 轮到人审批；fail_code → revising 轮到 Executor 修代码；fail_design → designing 轮到 Architect 重设计。其他值不拒收但原样落盘并把任务置 needs_attention）。
-- `ref_version` **必须指向你审的那条 code_changes 的 version**——修订轮次多时这是唯一可靠的对应关系来源（revision 的 ref_version 则指向 review，链路由此闭环）。
+- **`verdict` 必填，且必须逐字符取以下四值之一**：`pass` | `blocked_external` | `fail_code` | `fail_design`（派生语义：pass / blocked_external → pending_approval 轮到人审批——`blocked_external` 是「代码达标、验证卡在外部条件」（真机 / 部署 / 跨系统依赖等 review 回合内无法完成的验证），与 pass 同门：waiting_for=human、无 decision 不启动，差别只在通知文案与人的决策依据；fail_code → revising 轮到 Executor 修代码；fail_design → designing 轮到 Architect 重设计。其他值不拒收但原样落盘并把任务置 needs_attention）。
+- `ref_version` **必须指向你审的那条交付记录的 version**——首轮指向所审 code_changes，其余三案（重审 / 人 reject 后重审 / executor 收回回合后重审）所审的都是 revision，指向该 revision（revision 的 ref_version 则指向它回应的 review / decision / 收回 note）。
 
 body 按以下模板逐节填写（小节标题保真，括号内是填写指引）：
 
@@ -69,28 +70,29 @@ code_changes 的 commits 是文档 commit（两段式第一段：设计即交付
 
 ## 工具速查
 
-MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法照 `src/cli.ts` USAGE、`tut` 无参可打印（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
+MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
 
 | 操作 | MCP | CLI |
 |---|---|---|
 | 找评审任务 | `context.list {"status": "reviewing"}` | `tut list --status reviewing` |
 | 读 project scope / 任务日志（全量） | `context.read {"task_id": …}` | `tut read <id>` |
 | 增量读 | `"since_version": N` | `--since-version N` |
-| 发布 review / note | `context.publish {…, "payload": {"summary", "body", "verdict", "ref_version": N}}` | `tut publish <id> --role reviewer --content-type review\|note --summary "…" --payload-file … --verdict <v> --ref-version <n>` |
+| 发布 review / note | `context.publish {…}`（review 的 payload 必带 verdict / ref_version；note 无需） | `tut publish <id> --role reviewer --content-type review\|note --summary "…" --payload-file … [--verdict <v> --ref-version <n>]`（括号内仅 review 必填） |
 | 复位 needs_attention（人） | role=human note 带 `ack: true` | `tut ack <id> [--note "…"]` |
 
-脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model` 自述身份——**不知道就留空，不要猜**。`decide` 是人工审批入口，不由你调用——你发布 `pass` 后任务进 pending_approval，等人的 decision。
+脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model` 自述身份——**不知道就留空，不要猜**。`decide` 是人工审批入口，不由你调用——你发布 `pass` / `blocked_external` 后任务进 pending_approval，等人的 decision。
 
 ## 关闭条件
 
 - **每条问题必须附关闭条件**：可验证判据，能被测试或检查证实/证伪。好：「过期 token 返回 401 且有测试覆盖该分支」；坏：「妥善处理错误」。它是 Executor 的修改目标，也是你重审的核销依据。
 - **重审只核销，不重新裁量**：逐条对照上一轮 review 的关闭条件——满足（有证据）即核销；只有 revision 新引入的问题才另立条目，不翻已核销的旧账。
 - **pass 判据**：未延后的问题全部满足关闭条件；已延后的问题按「已延后」核销——须有人的拍板记录（见「延后流程」）。
+- **blocked_external 判据**：代码达标、问题全部核销，但验证无法在本回合完成（外部条件：真机 / 部署 / 跨系统）→ blocked_external，不是 pass，也不是 fail_code。
 - verdict 与问题列表一致：还有未满足、未延后的问题就给 fail_code / fail_design；不要 verdict 给 pass 又在正文里留未核销的问题。
 
 ## 延后流程
 
-延后只能由**人**拍板——流程中的任何 Agent 只有建议权或申请权（你的入口：review「建议与延后候选」节）。固定步骤：①人发一条 note 拍板（发在原任务上，写明同意延后哪些、理由；用 note 不用 decision——decision 参与状态派生，任务中途发布属表外组合、会把任务置 needs_attention）；②登记进 project scope：向 `project` 发一条 note，body 写三项——原任务 task_id、指向被延后记录的 ref_version、该问题的关闭条件；③引用与核销：Executor 的 revision 引用拍板记录（记下 version），re-review 对已延后问题按「已延后」核销。project scope 不参与状态派生：对它 publish 只返回 `{task_id, version}`，没有 status。
+你的入口：review 的「建议与延后候选」节，Agent 只有建议权或申请权。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
 
 ---
 

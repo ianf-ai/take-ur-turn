@@ -166,17 +166,69 @@ async function readPanes(client: BirthClient): Promise<BirthPaneList> {
   return normalizePaneRows(parseJson(result.stdout));
 }
 
-function tabIdByLabel(value: unknown, label: string): string | undefined {
+function tabIdsByLabel(value: unknown, label: string): string[] {
   const root = object(value);
   const result = resultObject(value);
   const rows = Array.isArray(root?.tabs) ? root.tabs : Array.isArray(result.tabs) ? result.tabs : [];
+  const ids: string[] = [];
   for (const row of rows) {
     const item = object(row);
     if (item?.label !== label) continue;
     const id = string(item.tab_id) ?? string(item.id);
-    if (id !== undefined) return id;
+    if (id !== undefined) ids.push(id);
   }
-  return undefined;
+  return ids;
+}
+
+/** agent_status values meaning a live session owns the pane (lifecycle vocabulary). */
+const LIVE_AGENT_STATUSES = new Set(["idle", "working", "blocked"]);
+
+/** `<task_id>.<role>` addressing keys — the label anatomy of every task work pane. */
+const TASK_ADDRESSING_LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9_-]+$/u;
+
+function isLiveTaskPane(pane: BirthPaneList["panes"][number]): boolean {
+  return typeof pane.label === "string"
+    && TASK_ADDRESSING_LABEL.test(pane.label)
+    && LIVE_AGENT_STATUSES.has(pane.agent_status ?? "");
+}
+
+/**
+ * Whether one labelled candidate tab qualifies for adoption after an
+ * unidentifiable tab create: only a pristine single EMPTY root does (no
+ * label — nothing was born or renamed into it), and never a tab carrying
+ * a live `<task_id>.` addressing label.  Default tab templates collide
+ * across tasks (`TUT executor`), so first-label-match recovery could adopt
+ * another task's tab — destroying its addressing key, injecting commands
+ * into it, and sweeping its panes.
+ */
+function recoverableTab(tabId: string, panes: BirthPaneList["panes"]): boolean {
+  const inTab = panes.filter((pane) => pane.tab_id === tabId);
+  if (inTab.length !== 1) return false; // not a pristine single-root tab
+  if ((inTab[0]?.label ?? "").length !== 0) return false; // root pane is not empty (used/renamed)
+  if (inTab[0]?.agent_status !== "idle") return false; // a shell/agent is still active in the root
+  return !inTab.some((pane) => isLiveTaskPane(pane)); // no live task pane anywhere in the tab
+}
+
+/** Tab-id recovery over tab list + pane list; undefined when nothing qualifies.
+ *  More than one qualifying candidate is ambiguity, not a pick — the caller
+ *  refuses adoption instead of guessing. */
+async function recoverTabId(
+  client: BirthClient,
+  workspaceId: string,
+  tabLabel: string,
+): Promise<{ tabId: string; rootId?: string } | { ambiguous: true } | undefined> {
+  const tabs = await command(client, ["tab", "list", "--workspace", workspaceId]);
+  if (!succeeded(tabs)) return undefined;
+  const matching = tabIdsByLabel(parseJson(tabs.stdout), tabLabel);
+  if (matching.length === 0) return undefined;
+  const listing = await readPanes(client);
+  if (!listing.usable) return undefined;
+  const qualified = matching.filter((tabId) => recoverableTab(tabId, listing.panes));
+  if (qualified.length === 0) return undefined;
+  if (qualified.length > 1) return { ambiguous: true };
+  const tabId = qualified[0]!;
+  const rootId = listing.panes.find((pane) => pane.tab_id === tabId)?.pane_id;
+  return rootId === undefined ? { tabId } : { tabId, rootId };
 }
 
 function envInt(environment: NodeJS.ProcessEnv | undefined, name: string, fallback: number): number {
@@ -189,7 +241,17 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
-/** Close all panes in a tab except the newly moved work pane. */
+/** Close all panes in a tab except the newly moved work pane.
+ *
+ *  The retry budget is deliberately INDEPENDENT of how many pane lists the
+ *  surrounding lifecycle happened to consume: Herdr's pane list can lag a
+ *  freshly created tab by a bounded number of polls, and the sweep — not
+ *  some incidental earlier list — is what must out-wait that lag.  A listing
+ *  that already shows ANY pane of the tab is not lag-blind for it: with no
+ *  leftovers such a view means genuinely clean, and the sweep stops early.
+ *  A listing that does not show the tab at all may simply lag behind the
+ *  create, so the sweep keeps polling within its budget instead of
+ *  concluding "clean" from a stale view. */
 export async function sweepTabRoots(
   client: BirthClient,
   tabId: string,
@@ -197,15 +259,17 @@ export async function sweepTabRoots(
   mode: "retry" | "sweep",
   environment?: NodeJS.ProcessEnv,
 ): Promise<void> {
-  const attempts = mode === "retry" ? Math.max(1, envInt(environment ?? process.env, "TUT_ROOT_SWEEP_RETRIES", 3)) : 1;
+  const attempts = mode === "retry" ? Math.max(1, envInt(environment ?? process.env, "TUT_ROOT_SWEEP_RETRIES", 8)) : 1;
   const waitMs = envInt(environment ?? process.env, "TUT_ROOT_SWEEP_RETRY_MS", 200);
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const listing = await readPanes(client);
+    const tabVisible = listing.panes.some((pane) => pane.tab_id === tabId);
     const leftovers = listing.panes.filter((pane) => pane.tab_id === tabId && pane.pane_id !== keepPaneId);
     if (leftovers.length > 0) {
       for (const pane of leftovers) await command(client, ["pane", "close", pane.pane_id]);
       return;
     }
+    if (tabVisible) return; // current view of the tab: nothing left to close
     if (attempt + 1 < attempts) await delay(waitMs);
   }
 }
@@ -265,9 +329,12 @@ export async function birthPane(options: BirthOptions): Promise<string | undefin
   // safe and intentional.
   const mayHaveCreatedTab = createOutcome === "success" || createOutcome === "signal" || createOutcome === "unknown";
   if (tabId === undefined && mayHaveCreatedTab) {
-    const tabs = await command(options.client, ["tab", "list", "--workspace", options.anchor.workspace_id]);
-    if (succeeded(tabs)) tabId = tabIdByLabel(parseJson(tabs.stdout), options.tabLabel);
-    if (tabId !== undefined) {
+    const recovered = await recoverTabId(options.client, options.anchor.workspace_id, options.tabLabel);
+    if (recovered !== undefined && "ambiguous" in recovered) {
+      err(options, `launch: multiple pristine tabs carry label '${options.tabLabel}' — cannot disambiguate, refusing adoption\n`);
+    } else if (recovered !== undefined) {
+      tabId = recovered.tabId;
+      rootId = recovered.rootId;
       const prefix = createOutcome === "success" ? "tab create output unparseable" : `tab create ${tabCreateExitDetail(create)}`;
       err(options, `launch: ${prefix} — tab id recovered via tab list ('${tabId}')\n`);
     }
@@ -308,6 +375,12 @@ export async function birthPane(options: BirthOptions): Promise<string | undefin
       "--cwd", options.birthCwd, "--label", options.tabLabel, "--no-focus",
     ]);
     if (succeeded(second)) tabId = tabIdFrom(parseJson(second.stdout)).tabId;
+    if (tabId === undefined) {
+      // Unparseable second-create output: same validated recovery as above —
+      // a colliding template label from another task is never adopted.
+      const recovered = await recoverTabId(options.client, options.anchor.workspace_id, options.tabLabel);
+      if (recovered !== undefined && !("ambiguous" in recovered)) tabId = recovered.tabId;
+    }
     if (tabId === undefined) {
       err(options, "launch: herdr tab create returned no tab id\n");
       return undefined;

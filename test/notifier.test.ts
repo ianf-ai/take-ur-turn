@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import http from "node:http";
 import net from "node:net";
 import type { AddressInfo } from "node:net";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -33,6 +33,9 @@ vi.mock("../src/channels.js", () => ({
 import { Notifier, runNotify, spawnLaunch, type StateResponse, type StateTask } from "../src/notifier.js";
 import { giveUpGuidance } from "../src/launcher/escalation.js";
 import { launchBlocked } from "../src/launch.js";
+import { derive } from "../src/state-machine.js";
+import { Store } from "../src/store.js";
+import { startServer } from "../src/server.js";
 import type { AgentRoute, ContextRecord } from "../src/types.js";
 import { HANDLERS, parseArgs } from "../src/cli.js";
 
@@ -63,9 +66,10 @@ function task(overrides: Partial<StateTask> & { task_id: string }): StateTask {
 
 function state(
   tasks: StateTask[],
-  opts?: { flow_mode?: string; notify?: unknown; auto?: StateResponse["auto"] },
+  opts?: { flow_mode?: string; notify?: unknown; auto?: StateResponse["auto"]; degraded?: string[] },
 ): StateResponse {
   const res: StateResponse = { flow_mode: opts?.flow_mode ?? "manual", tasks };
+  if (opts?.degraded !== undefined) res.degraded = opts.degraded;
   if (opts?.notify !== undefined) res.notify = opts.notify;
   if (opts?.auto !== undefined) res.auto = opts.auto;
   return res;
@@ -83,6 +87,10 @@ interface HarnessOpts {
   realLaunch?: boolean;
   launch?: (taskId: string, role: string, agent: string, args?: string[]) => Promise<string>;
   readLog?: (taskId: string) => Promise<ContextRecord[]>;
+  /** Incremental readLog injection: when set, the harness wires
+   *  readLogSince and the notifier's per-task log cache takes over — tests
+   *  observe the since_version protocol and the merge/eviction behavior. */
+  readLogSince?: (taskId: string, sinceVersion: number) => Promise<{ versions: ContextRecord[] }>;
   /** Agent the injected launch pre-check resolves (default "pi"). */
   agent?: string;
   /** Complete route the injected launch pre-check resolves. */
@@ -103,6 +111,8 @@ interface HarnessOpts {
   order?: string[];
   /** Artificial pane-list delay inside the done sweep, fake-timer ms (concurrency-barrier tests). */
   sweepDelayMs?: number;
+  /** Close-edge cleanup seam; default records into `cleanups`. */
+  cleanup?: (taskId: string) => Promise<void>;
 }
 
 const openNotifiers: Notifier[] = [];
@@ -117,6 +127,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   let nowMs = 0;
   const logs: string[] = [];
   const launches: { taskId: string; role: string; agent: string; args?: string[] }[] = [];
+  const cleanups: string[] = [];
   const sweptReads: string[] = [];
   let sweepLists = 0;
   let fetches = 0;
@@ -161,6 +172,13 @@ function makeHarness(opts: HarnessOpts = {}) {
           timestamp: U1,
           payload: { summary: "synthetic state version", body: "synthetic state version" },
         }));
+      }),
+      ...(opts.readLogSince !== undefined ? { readLogSince: opts.readLogSince } : {}),
+      // Close-edge cleanup: hermetic by default — the production
+      // default spawns the internal `launch --cleanup` child, which unit
+      // tests must never do.
+      cleanupPanes: opts.cleanup ?? (async (taskId: string) => {
+        cleanups.push(taskId);
       }),
       markLaunched: async (_taskId: string, _role: string, baseVersion: number, _via: "start-next" | "auto"): Promise<unknown> => {
         opts.order?.push("marker");
@@ -223,6 +241,7 @@ function makeHarness(opts: HarnessOpts = {}) {
     },
     logs,
     launches,
+    cleanups,
     sweptReads,
     sweepListCount: () => sweepLists,
     fetchCount: () => fetches,
@@ -350,6 +369,95 @@ describe("compare loop (poll /state)", () => {
     // [0] is the constructor's pre-baseline default (createChannels(undefined));
     // every poll afterwards rebuilds from that poll's notify value.
     expect(h.channelsSeen.slice(-2)).toEqual([cfgA, cfgB]);
+  });
+});
+
+// --- close-edge pane cleanup (system-design 4.4) --------------------------------------
+
+describe("close-edge pane cleanup", () => {
+  it("observed transition into closed fires launch --cleanup exactly once with the task id (covers the MCP decide path)", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // baseline: open task
+    expect(hz.cleanups).toEqual([]);
+
+    // The decision may have landed through any entrance (CLI decide, MCP
+    // context.decide, an older writer) — the consumer-side edge covers all.
+    hz.set(state([task({ task_id: "t1", status: "closed", waiting_for: "none", updated_at: U2 })]));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.cleanups).toEqual(["t1"]);
+    expect(hz.launches).toEqual([]); // cleanup is its own child boundary, not the launch seam
+    expect(h.sent).toEqual([]); // the close itself stays notification-silent (§3)
+
+    // closed is absorbing: further polls of the same closed task never re-fire.
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.cleanups).toEqual(["t1"]);
+    expect(hz.logs.filter((l) => l.includes("pane cleanup done"))).toHaveLength(1);
+  });
+
+  it("a task already closed at baseline fires nothing", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "old1", status: "closed", waiting_for: "none" })]));
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.cleanups).toEqual([]);
+    expect(hz.logs.some((l) => l.includes("pane cleanup"))).toBe(false);
+  });
+
+  it("a close that happened while the notifier was down arrives as first-sight and fires nothing (restart never replays historical closes)", async () => {
+    const down = makeHarness();
+    down.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer" })]));
+    await down.notifier.requestCompare();
+    await down.notifier.close(); // the notifier goes down
+
+    // ... the human closes via MCP while it is down; the replacement
+    // notifier's FIRST sight of the task is already the closed state.
+    const up = makeHarness();
+    up.set(state([task({ task_id: "t1", status: "closed", waiting_for: "none", updated_at: U3 })]));
+    await up.notifier.requestCompare();
+    await up.flush();
+    expect(up.cleanups).toEqual([]);
+  });
+
+  it("cleanup child failure: one stderr diagnostic with the retry hint, no desktop notification, other tasks' compares unaffected, polling continues", async () => {
+    const hz = makeHarness({
+      cleanup: async (taskId) => {
+        throw new Error(`launch --cleanup ${taskId} exited 1: herdr unreachable`);
+      },
+    });
+    hz.set(state([
+      task({ task_id: "t1", status: "pending_approval", waiting_for: "human" }),
+      task({ task_id: "t2", status: "designing", waiting_for: "agent:architect" }),
+    ]));
+    await hz.notifier.requestCompare();
+
+    // Same poll: t1 closes (cleanup child fails) while t2 hands off — the
+    // detached cleanup child must not block t2's compare/notification.
+    hz.set(state([
+      task({ task_id: "t1", status: "closed", waiting_for: "none", updated_at: U2 }),
+      task({ task_id: "t2", status: "implementing", waiting_for: "agent:executor", updated_at: U2 }),
+    ]));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+
+    const failures = hz.logs.filter((l) => l.includes("pane cleanup after close failed"));
+    expect(failures).toHaveLength(1); // exactly one diagnostic line
+    expect(failures[0]).toContain("[t1]");
+    expect(failures[0]).toContain("herdr unreachable");
+    expect(failures[0]).toContain("tut launch --cleanup t1"); // orphan recovery does not exist — the line says how to retry
+    expect(titlesMatching("cleanup")).toEqual([]); // no desktop notification for the failure
+    expect(titlesMatching("closed")).toEqual([]); // and the close itself stays silent
+    expect(titlesMatching("waiting for agent:executor")).toHaveLength(1); // t2's compare was not blocked
+
+    // The poll loop survived: a later transition still notifies.
+    hz.set(state([
+      task({ task_id: "t1", status: "closed", waiting_for: "none", updated_at: U3 }),
+      task({ task_id: "t2", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3 }),
+    ]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for agent:reviewer")).toHaveLength(1);
   });
 });
 
@@ -507,6 +615,20 @@ describe("needs_attention handling", () => {
     // Suppressed: no flow notification for the same transition.
     expect(titlesMatching("waiting for")).toHaveLength(0);
     expect(h.sent).toHaveLength(2); // anomaly via both channels, nothing else
+  });
+
+  it("same-tick pending_approval + needs_attention sends BOTH notifications — the approval edge is never swallowed", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare(); // baseline: designing / agent:architect
+    hz.set(state([task({ task_id: "t1", status: "pending_approval", waiting_for: "human", needs_attention: true, updated_at: U2 })]));
+    await hz.notifier.requestCompare();
+    // Both edges fire in one poll: the anomaly line AND the approval guidance.
+    expect(titlesMatching("needs attention")).toHaveLength(1);
+    // Exactly ONE approval notification (the same-tick FLOW notification stays
+    // suppressed — same title in manual mode, so distinguish by body).
+    expect(titlesMatching("waiting for human")).toHaveLength(1);
+    const approval = h.sent.find((s) => s.msg.title.includes("waiting for human"));
+    expect(approval?.msg.body).toContain("tut decide t1");
   });
 
   it("in auto mode an anomaly also means: no launch, notify human instead", async () => {
@@ -1092,6 +1214,11 @@ describe("auto-mode gate", () => {
       await hz.notifier.requestCompare(); // baseline: designing / agent:architect
       hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
       await hz.notifier.requestCompare();
+      // The launcher child runs OFF the compare queue: wait for
+      // the real dry-run child to finish and its notify to land.
+      await vi.waitFor(() => {
+        expect(hz.logs.some((l) => l.includes("launch.sh (t1, executor)"))).toBe(true);
+      });
       // launch.sh TUT_DRY_RUN output: the pre-check resolved executor →
       // agent 'pi' (passed as the 3rd arg); the prompt names the task id;
       // delivery is send-text + Enter (not pane run). Dry-run may open with
@@ -1103,7 +1230,9 @@ describe("auto-mode gate", () => {
       expect(sendText).toBeDefined();
       expect(sendText).toContain("(agent 'pi', label");
       expect(sendText).toContain("t1");
-      expect(titlesMatching("auto-launched executor")).toHaveLength(1);
+      await vi.waitFor(() => {
+        expect(titlesMatching("auto-launched executor")).toHaveLength(1);
+      });
     } finally {
       if (previous === undefined) delete process.env.TUT_DRY_RUN;
       else process.env.TUT_DRY_RUN = previous;
@@ -1377,6 +1506,9 @@ describe("auto-decision per-poll observability", () => {
     const line = hz.logs.find((l) => l.includes("[t1] auto-decision:"));
     expect(line).toBeDefined();
     expect(line).toContain("dedup=unreadable (hub read boom)");
+    // Edge-on-this-poll wording: this poll HAS the edge, so the action line
+    // must not claim "none" — the launch attempt (with its own re-read) runs.
+    expect(line).toContain("action=launch attempt this poll (dedup re-read inside autoLaunch");
     // acting proceeds as before: the launch path re-reads and fails loudly there
     expect(titlesMatching("auto launch failed")).toHaveLength(1);
   });
@@ -1616,16 +1748,139 @@ describe("stall watchdog", () => {
     expect(titlesMatching("possibly stalled")).toHaveLength(0);
   });
 
-  it("a working event refreshes the internal timer (signal-source observability)", async () => {
+  it("an unwatched working event no longer refreshes the stall timer (flapping hardening)", async () => {
     const hz = makeHarness({ stallMin: 30 });
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare();
     hz.at(25 * 60_000);
     await hz.notifier.requestCompare();
     hz.notifier.receiveEvent({ event: "working", agent: "codex", pane: "t1" });
-    hz.at(35 * 60_000); // 35 min since baseline but only 10 min since the signal
+    await hz.flush();
+    hz.at(35 * 60_000); // 35 min since baseline; the unwatched signal did NOT refresh
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
+  });
+
+  it("a blocked event no longer refreshes the stall timer (the stuck alert is timely, the watchdog stays the backstop)", async () => {
+    const hz = makeHarness({ stallMin: 30 });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.at(25 * 60_000);
+    hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "t1" });
+    await hz.flush();
+    expect(titlesMatching("agent stuck")).toHaveLength(1);
+    hz.at(35 * 60_000); // 35 min since baseline; blocked did NOT refresh
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
+  });
+
+  it("the first working after an auto launch still refreshes the stall timer (launch hand-off is progress)", async () => {
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], stallMin: 30 });
+    await hz.notifier.requestCompare(); // baseline
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // edge → auto launch
+    hz.at(10 * 60_000);
+    hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" }); // clears the working fuse → real progress
+    await hz.flush();
+    hz.at(39 * 60_000); // 29 min since the refresh → not yet
     await hz.notifier.requestCompare();
     expect(titlesMatching("possibly stalled")).toHaveLength(0);
+    hz.at(41 * 60_000); // 31 min since the refresh → fires
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
+  });
+});
+
+// --- launcher child liveness hardening ------------------------------------------------
+
+describe("launcher child liveness (post-marker stage off the compare queue)", () => {
+  it("a wedged launcher child no longer freezes the compare queue — other tasks keep notifying", async () => {
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      launch: () => new Promise(() => {}), // never settles — wedged child shape
+    });
+    await hz.notifier.requestCompare(); // baseline
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // edge → launch handed off; still "running"
+    expect(hz.fetchCount()).toBe(2);
+    // Another task needs attention while t1's launch is wedged — the compare
+    // queue must keep flowing (previously the whole notifier froze silently).
+    hz.set(state([
+      task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 }),
+      task({ task_id: "t2", status: "implementing", waiting_for: "agent:executor", needs_attention: true, updated_at: U2 }),
+    ], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("needs attention")).toHaveLength(1); // delivered despite the wedged launch
+    expect(hz.fetchCount()).toBe(3); // polls keep running
+  });
+
+  it("round N+1's launcher child waits for round N's on the same task+role chain (in-flight guard)", async () => {
+    const order: string[] = [];
+    const gates: Array<(out: string) => void> = [];
+    let records: ContextRecord[] = [];
+    const EXECUTOR_ONLY = { launch_roles: ["executor"] };
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      order,
+      readLog: async () => records,
+      launch: () => {
+        order.push("launch-start");
+        return new Promise<string>((resolve) => { gates.push(resolve); });
+      },
+    });
+    await hz.notifier.requestCompare(); // baseline: reviewing / agent:reviewer
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: EXECUTOR_ONLY }));
+    await hz.notifier.requestCompare(); // edge → round 1 launch starts (gated)
+    expect(gates).toHaveLength(1);
+    records = [{
+      version: 1,
+      task_id: "t1",
+      role: "human",
+      content_type: "note",
+      timestamp: U1,
+      payload: { summary: "launch: executor (base v0)", body: "launch", launch: { role: "executor", base_version: 0, via: "auto" } },
+    }];
+    // reviewer round in between (not whitelisted — no launch, no marker)
+    hz.set(state([task({ task_id: "t1", status: "reviewing", waiting_for: "agent:reviewer", version: 1, updated_at: U2 })], { flow_mode: "auto", auto: EXECUTOR_ONLY }));
+    await hz.notifier.requestCompare();
+    records = [
+      ...records,
+      {
+        version: 2,
+        task_id: "t1",
+        role: "reviewer",
+        content_type: "review",
+        timestamp: U2,
+        payload: { summary: "pass", body: "pass" },
+      },
+    ];
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2, updated_at: U3 })], { flow_mode: "auto", auto: EXECUTOR_ONLY }));
+    await hz.notifier.requestCompare(); // edge → round 2 passes dedup (v2 > marker v1)
+    await hz.flush();
+    // Round 2's child is parked behind round 1's on the same key: still ONE
+    // child running even though the queue handed both off.
+    expect(order.filter((m) => m === "launch-start")).toHaveLength(1);
+    gates[0]!("launched"); // round 1 settles → round 2 starts
+    await hz.flush();
+    expect(order.filter((m) => m === "launch-start")).toHaveLength(2);
+    gates[1]!("launched");
+    await hz.flush();
+    expect(titlesMatching("auto-launched executor")).toHaveLength(2);
+  });
+
+  it("the done-recheck timer removes itself once spent — the timers set returns to zero", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    const internals = hz.notifier as unknown as { timers: Set<ReturnType<typeof setTimeout>> };
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    await vi.advanceTimersByTimeAsync(5_001); // interval 5s recheck delay elapses
+    await hz.flush();
+    expect(titlesMatching("stopped without publishing")).toHaveLength(1);
+    expect(internals.timers.size).toBe(0); // the spent recheck handle was reclaimed
   });
 });
 
@@ -2241,7 +2496,7 @@ describe("event→task mapping (agent-keyed panes)", () => {
     expect(stuck?.msg.task_id).toBe("t1");
   });
 
-  it("working on a role pane refreshes the stall timer of the waiting task", async () => {
+  it("working on a role pane still resolves the task, but no longer refreshes its stall timer", async () => {
     const hz = makeHarness({ stallMin: 30, routing: ROUTING });
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare(); // baseline, label→role map loaded
@@ -2250,9 +2505,9 @@ describe("event→task mapping (agent-keyed panes)", () => {
     hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "pi" }); // bare agent-named pane → identity chain (legacy)
     await hz.flush();
     expect(hz.logs.some((l) => l.includes("resolved to task t1"))).toBe(true);
-    hz.at(35 * 60_000); // 35 min since baseline, only 10 min since the signal
+    hz.at(35 * 60_000); // mapping resolved, but the unwatched signal does not renew the clock
     await hz.notifier.requestCompare();
-    expect(titlesMatching("possibly stalled")).toHaveLength(0);
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
   });
 
   it("pane name colliding with a task_id AND an agent identity: 4.4 (task) wins over the identity chain", async () => {
@@ -2538,6 +2793,15 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
     expect(legacy.status).toBe(200);
     const garbage = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: 42, transport: "yes", probe: "maybe" });
     expect(garbage.status).toBe(200);
+    // the full four-value probe vocabulary passes ingest — not-attempted
+    // (land-never-observed: no probe ever ran) must not be erased into the
+    // legacy-omission shape, or the never-run/broken-relay distinction dies
+    // at the event boundary (a review follow-up made this explicit)
+    const receiveSpy = vi.spyOn(hz.notifier, "receiveEvent");
+    const notAttempted = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "unknown", transport: false, probe: "not-attempted" });
+    expect(notAttempted.status).toBe(200);
+    const received = receiveSpy.mock.calls.at(-1)?.[0] as { probe?: string };
+    expect(received.probe).toBe("not-attempted");
     // complete payloads still take their own branches:
     const completeHeld = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held", transport: true, probe: "failed" });
     expect(completeHeld.status).toBe(200);
@@ -2548,9 +2812,9 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
       .slice(sentBaseline)
       .filter((s) => s.name === "desktop" && s.msg.title === "TUT t1: prompt delivery gave up")
       .map((s) => s.msg.body);
-    expect(bodies).toHaveLength(8);
+    expect(bodies).toHaveLength(9);
     const conservativeBodies = bodies.filter((b) => b.includes(conservative));
-    expect(conservativeBodies).toHaveLength(6); // 4 half pairs + legacy + garbage
+    expect(conservativeBodies).toHaveLength(7); // 4 half pairs + legacy + garbage + not-attempted
     // No conservative alert may direct the manual-Enter action.
     expect(conservativeBodies.every((b) => !b.includes(giveUpGuidance("held")))).toBe(true);
     expect(bodies.filter((b) => b.includes(giveUpGuidance("held")))).toHaveLength(1);
@@ -2671,4 +2935,895 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
     },
     20_000,
   );
+});
+
+// --- degraded / disappearance edges (system-design 4.3 + 6.1) -----------------------
+
+describe("degraded / disappearance edges", () => {
+  it("entering degraded alerts exactly once per stay — repeated polls stay silent", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare(); // baseline: healthy
+    hz.set(state([], { degraded: ["t-corrupt"] }));
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-corrupt"] }));
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-corrupt"] }));
+    await hz.notifier.requestCompare();
+
+    expect(titlesMatching("storage degraded")).toEqual(["TUT t-corrupt: storage degraded"]);
+    const alert = h.sent.find((s) => s.msg.title.includes("storage degraded"))!.msg;
+    expect(alert.body).toContain("tut repair-meta t-corrupt");
+    expect(alert.body).toContain("tut recover-record t-corrupt");
+    expect(alert.body).toContain("decide close is unavailable");
+  });
+
+  it("a task already degraded at the FIRST fetch still alerts (baseline is no place for silence)", async () => {
+    const hz = makeHarness();
+    hz.set(state([], { degraded: ["t-born-broken"] }));
+    await hz.notifier.requestCompare(); // baseline fetch with degraded already set
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+  });
+
+  it("recovery edge: leaving degraded back into tasks[] logs a line and does not alert", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-fix", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-fix"] }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+
+    hz.set(state([task({ task_id: "t-fix", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1); // still exactly one
+    expect(hz.logs.some((l) => l.includes("[t-fix] left degraded"))).toBe(true);
+  });
+
+  it("re-corruption after a repair alerts AGAIN (the recovery edge re-armed the alert)", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-flap"] }));
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-flap", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-flap"] }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(2);
+  });
+
+  it("directory disappearance: a task known from the previous snapshot but absent from tasks AND degraded alerts once, with distinct copy", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-gone", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.set(state([])); // directory deleted: in neither tasks nor degraded
+    await hz.notifier.requestCompare();
+    hz.set(state([]));
+    await hz.notifier.requestCompare();
+
+    expect(titlesMatching("task directory vanished")).toEqual(["TUT t-gone: task directory vanished"]);
+    const alert = h.sent.find((s) => s.msg.title.includes("vanished"))!.msg;
+    expect(alert.body).toContain("decide close does not apply");
+    expect(alert.body).toContain("Restore the directory");
+    expect(titlesMatching("storage degraded")).toHaveLength(0); // distinct copy, never conflated
+  });
+
+  it("a task moving from tasks[] INTO degraded is corruption, not disappearance; a degraded task whose directory then vanishes IS disappearance", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-both", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-both"] })); // corrupt → degraded
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+    expect(titlesMatching("task directory vanished")).toHaveLength(0);
+
+    hz.set(state([])); // directory removed while degraded
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1); // no re-alert
+    expect(titlesMatching("task directory vanished")).toHaveLength(1); // the vanish edge fires once
+    expect(hz.logs.some((l) => l.includes("[t-both] reappeared") || l.includes("[t-both] left degraded"))).toBe(false);
+  });
+
+  it("restore after disappearance: the task reappears with a log line, no alert spam", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-back", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.set(state([]));
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-back", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();    hz.set(state([]));
+    await hz.notifier.requestCompare(); // vanish again — but the reappearance re-armed it
+    expect(titlesMatching("task directory vanished")).toHaveLength(2);
+    expect(hz.logs.some((l) => l.includes("[t-back] reappeared in /state"))).toBe(true);
+  });
+
+  it("recovery tick (P1-3): degraded→tasks[] is NOT a new task — recovery log only, no waiting-for notification; the next edge flows as usual", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare(); // baseline: healthy
+    hz.set(state([task({ task_id: "t-rec", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // first sight → waiting-for notification (existing new-task behavior)
+    const flowTitles = titlesMatching("waiting for").length;
+
+    hz.set(state([], { degraded: ["t-rec"] }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+
+    // RECOVERY TICK: back in tasks[] — only the recovery log line. Pre-fix,
+    // the absent prev entry made diffTask treat the task as brand new and
+    // fire a waiting-for notification (and, in auto mode, a launch).
+    hz.set(state([task({ task_id: "t-rec", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles); // no new flow notification
+    expect(titlesMatching("storage degraded")).toHaveLength(1); // no re-alert
+    expect(hz.logs.some((l) => l.includes("[t-rec] left degraded"))).toBe(true);
+
+    // NEXT TICK: a genuine state change still triggers the existing flow.
+    hz.set(state([task({ task_id: "t-rec", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U2 })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles + 1);
+  });
+
+  it("recovery tick (P1-3): vanished→tasks[] restore is log-only — no waiting-for notification; the next edge flows as usual", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare(); // baseline
+    hz.set(state([task({ task_id: "t-back2", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // first sight → waiting-for notification
+    const flowTitles = titlesMatching("waiting for").length;
+
+    hz.set(state([])); // directory vanished
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("task directory vanished")).toHaveLength(1);
+
+    // RESTORE TICK: back in tasks[] — only the reappearance log line.
+    hz.set(state([task({ task_id: "t-back2", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles); // no new flow notification
+    expect(hz.logs.some((l) => l.includes("[t-back2] reappeared in /state"))).toBe(true);
+
+    // NEXT TICK: normal flow resumes.
+    hz.set(state([task({ task_id: "t-back2", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U2 })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles + 1);
+  });
+
+  it("recovery tick into pending_approval (P1-3): no approval notification on the recovery tick; the reminder lands on the next poll instead", async () => {
+    const hz = makeHarness();
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t-appr", status: "pending_approval", waiting_for: "human" })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for human")).toHaveLength(1); // the pre-degradation announcement
+
+    hz.set(state([], { degraded: ["t-appr"] }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+
+    // RECOVERY TICK: suppressed — records cannot change while degraded, so
+    // this is the same pending_approval stay; recovery is a log line only.
+    hz.set(state([task({ task_id: "t-appr", status: "pending_approval", waiting_for: "human" })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for human")).toHaveLength(1);
+    expect(hz.logs.some((l) => l.includes("[t-appr] left degraded"))).toBe(true);
+
+    // NEXT POLL: the approval bookkeeping re-enters and delivers the decide
+    // guidance again — a redundant reminder one poll later is the accepted
+    // tradeoff (a notifier that restarted DURING degradation never announced
+    // this approval; silence there would lose the decide chain — that is the spirit of never swallowing the approval edge).
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for human")).toHaveLength(2);
+  });
+
+  it("auto recovery tick (P1-3): degraded→tasks[] launches nothing — no marker, no launch, honest decision line; the next edge launches as usual", async () => {
+    const order: string[] = [];
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor", "reviewer"], order });
+    await hz.notifier.requestCompare(); // baseline (auto): decision lines only
+    hz.set(state([task({ task_id: "t-auto", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // first sight → LAUNCH (existing new-task behavior)
+    expect(hz.launches).toHaveLength(1);
+
+    hz.set(state([], { flow_mode: "auto", auto: ALL_ROLES, degraded: ["t-auto"] }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+
+    // RECOVERY TICK: back in tasks[] waiting for an agent — pre-fix this
+    // would auto-launch (and append a launch marker) off a first-sight
+    // `before === undefined`; system-design 6.1 keeps the recovery edge quiet.
+    const markersBefore = order.filter((x) => x === "marker").length;
+    hz.set(state([task({ task_id: "t-auto", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toHaveLength(1); // still exactly the pre-degradation launch
+    expect(order.filter((x) => x === "marker")).toHaveLength(markersBefore); // no launch marker appended
+    expect(titlesMatching("auto-launched")).toHaveLength(1); // no new launch notification
+    expect(hz.logs.some((l) => l.includes("[t-auto] auto-decision") && l.includes("recovery edge"))).toBe(true);
+
+    // NEXT TICK: a genuine waiting_for edge launches through the existing flow.
+    hz.set(state([task({ task_id: "t-auto", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toHaveLength(2);
+    expect(hz.launches[1]).toMatchObject({ taskId: "t-auto", role: "reviewer" });
+  });
+
+  it("recovery-tick stall restart (P1-3 round 2): degraded past the stall threshold recovers with NO stalled alert — the timer restarts from the recovery tick", async () => {
+    const hz = makeHarness({ stallMin: 30 });
+    hz.at(0);
+    await hz.notifier.requestCompare(); // baseline
+    hz.set(state([task({ task_id: "t-rstall", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // first sight → waiting-for notification; stall clock starts at t=0
+    const flowTitles = titlesMatching("waiting for").length;
+
+    hz.set(state([], { degraded: ["t-rstall"] }));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+
+    // Stay degraded LONGER than the stall threshold: the watchdog cannot see
+    // the task (absent from tasks[]), so its bookkeeping keeps the
+    // pre-degradation clock. Pre-fix, the recovery tick ran that stale clock
+    // into checkStalls and fired "possibly stalled" on the quiet edge.
+    hz.at(31 * 60_000);
+    hz.set(state([task({ task_id: "t-rstall", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // RECOVERY TICK
+    expect(titlesMatching("possibly stalled")).toHaveLength(0);
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles); // quiet edge: no flow notification either
+    expect(hz.logs.some((l) => l.includes("[t-rstall] left degraded"))).toBe(true);
+
+    // The clock restarted FROM THE RECOVERY TICK: 29 min of silence since
+    // recovery is under the threshold — no alert yet.
+    hz.at(31 * 60_000 + 29 * 60_000);
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(0);
+    // A full fresh threshold with no progress alerts exactly once — the
+    // watchdog is alive again, measured from recovery, not from before.
+    hz.at(31 * 60_000 + 30 * 60_000);
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
+  });
+
+  it("recovery-tick stall restart (P1-3 round 2): vanished past the stall threshold reappears with NO stalled alert — timing restarts from the reappearance", async () => {
+    const hz = makeHarness({ stallMin: 30 });
+    hz.at(0);
+    await hz.notifier.requestCompare(); // baseline
+    hz.set(state([task({ task_id: "t-vstall", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // first sight → waiting-for notification
+    const flowTitles = titlesMatching("waiting for").length;
+
+    hz.set(state([])); // directory vanished
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("task directory vanished")).toHaveLength(1);
+
+    // Absent (neither tasks[] nor degraded) long past the threshold — no
+    // watchdog pass could see the task, so its clock stayed at t=0. The
+    // reappearance must be log-only: no stalled alert off the stale clock.
+    hz.at(45 * 60_000);
+    hz.set(state([task({ task_id: "t-vstall", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare(); // REAPPEARANCE TICK
+    expect(titlesMatching("possibly stalled")).toHaveLength(0);
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles);
+    expect(hz.logs.some((l) => l.includes("[t-vstall] reappeared in /state"))).toBe(true);
+
+    // Restart FROM THE REAPPEARANCE: exactly one alert after a full fresh
+    // threshold of silence.
+    hz.at(45 * 60_000 + 30 * 60_000);
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("possibly stalled")).toHaveLength(1);
+    // And the next genuine flow edge after recovery still notifies as usual.
+    hz.set(state([task({ task_id: "t-vstall", status: "reviewing", waiting_for: "agent:reviewer", updated_at: U2 })]));
+    await hz.notifier.requestCompare();
+    expect(titlesMatching("waiting for")).toHaveLength(flowTitles + 1);
+  });
+
+  it("degraded tasks produce no flow notifications or stall bookkeeping (absent from tasks[])", async () => {
+    const hz = makeHarness({ stallMin: 30 });
+    await hz.notifier.requestCompare();
+    hz.set(state([], { degraded: ["t-quiet"] }));
+    await hz.notifier.requestCompare();
+    await vi.advanceTimersByTimeAsync(31 * 60_000);
+    await hz.flush();
+    expect(titlesMatching("stalled")).toHaveLength(0);
+    expect(titlesMatching("waiting for")).toHaveLength(0);
+    expect(titlesMatching("storage degraded")).toHaveLength(1);
+  });
+
+  it("blocked_external reaches the same human approval door as pass (auto gate, four-tier verdict)", async () => {
+    // The review record in the task log carries verdict=blocked_external and NO
+    // human decision: derivation sends it to pending_approval / waiting human,
+    // the auto branch withholds (the human decision IS the external-verification
+    // gate), and the approval notification carries the decide guidance.
+    const reviewLog: ContextRecord[] = [
+      {
+        version: 1,
+        task_id: "t-blocked",
+        role: "executor",
+        content_type: "code_changes",
+        timestamp: U1,
+        payload: { summary: "implemented", body: "as designed" },
+      },
+      {
+        version: 2,
+        task_id: "t-blocked",
+        role: "reviewer",
+        content_type: "review",
+        timestamp: U2,
+        payload: { summary: "code fine, external verification pending", body: "real-machine run needed", verdict: "blocked_external", ref_version: 1 },
+      },
+    ];
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], readLog: async () => reviewLog });
+    await hz.notifier.requestCompare();
+    hz.set(
+      state([task({ task_id: "t-blocked", status: "pending_approval", waiting_for: "human", version: 2, updated_at: U2 })], {
+        flow_mode: "auto",
+        auto: ALL_ROLES,
+      }),
+    );
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toEqual([]); // withheld: no decision, exactly like pass
+    expect(titlesMatching("human decision needed")).toHaveLength(1);
+
+    // Human reject writes the remedial path into the decision: revising → executor launches.
+    reviewLog.push({
+      version: 3,
+      task_id: "t-blocked",
+      role: "human",
+      content_type: "decision",
+      timestamp: U3,
+      payload: { summary: "reject: run the external verification first", body: "reject", decision: "reject" },
+    });
+    hz.set(
+      state([task({ task_id: "t-blocked", status: "revising", waiting_for: "agent:executor", version: 3, updated_at: U3 })], {
+        flow_mode: "auto",
+        auto: ALL_ROLES,
+      }),
+    );
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toEqual([{ taskId: "t-blocked", role: "executor", agent: "pi" }]);
+  });
+});
+
+describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, identity merge)", () => {
+  const note = (taskId: string, version: number): ContextRecord => ({
+    version,
+    task_id: taskId,
+    role: "human",
+    content_type: "note",
+    timestamp: U1,
+    payload: { summary: `n${version}`, body: "b" },
+  });
+  const marker = (taskId: string, version: number, baseVersion: number): ContextRecord => ({
+    version,
+    task_id: taskId,
+    role: "human",
+    content_type: "note",
+    timestamp: U1,
+    payload: { summary: `launch: executor (base v${baseVersion})`, body: "launch", launch: { role: "executor", base_version: baseVersion, via: "auto" } },
+  });
+  const decision = (taskId: string, version: number, decisionValue: "approve" | "reject" | "close"): ContextRecord => ({
+    version,
+    task_id: taskId,
+    role: "human",
+    content_type: "decision",
+    timestamp: U1,
+    payload: { summary: `decision ${decisionValue}`, body: "b", decision: decisionValue },
+  });
+  /** Fake hub with the REAL wire semantics: since_version is INCLUSIVE (≥). */
+  const inclusiveHub = (tail: () => ContextRecord[]) => {
+    const calls: number[] = [];
+    return {
+      calls,
+      readLogSince: async (_taskId: string, since: number): Promise<{ versions: ContextRecord[] }> => {
+        calls.push(since);
+        return { versions: tail().filter((r) => r.version >= since) };
+      },
+    };
+  };
+  const logCacheOf = (notifier: Notifier): Map<string, { version: number; records: ContextRecord[]; sig: string | null }> =>
+    (notifier as unknown as { logCache: Map<string, { version: number; records: ContextRecord[]; sig: string | null }> }).logCache;
+
+  it("P1-1: the cursor is EXCLUSIVE against the inclusive wire — quiet rounds pull nothing, a new version pulls since=cached+1", async () => {
+    let tail: ContextRecord[] = [note("t1", 1), note("t1", 2), marker("t1", 3, 2)];
+    const hub = inclusiveHub(() => tail);
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      readLogSince: hub.readLogSince,
+      readLog: async () => {
+        throw new Error("readLog must not be called when readLogSince is wired");
+      },
+    });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // baseline: one FULL pull
+    expect(hub.calls).toEqual([0]);
+
+    // Quiet rounds — /state version covered by the cache: ZERO log pulls (P1-2),
+    // and the dedup verdict still comes from the merged cache.
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    hz.at(10_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0]); // nothing re-requested, let alone v3 re-read
+    const lines = hz.logs.filter((l) => l.includes("auto-decision"));
+    expect(lines).toHaveLength(3);
+    for (const line of lines) expect(line).toContain("dedup=launched@v3");
+
+    // A record lands: /state version 4 > cached 3 → ONE pull at since = 3 + 1 = 4
+    // (the inclusive wire parameter is one PAST the cached maximum — the old
+    // protocol passed 3 and re-fetched v3 every round).
+    tail = [...tail, note("t1", 4)];
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 4 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(15_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0, 4]); // cached.version + 1, not 3
+    expect(logCacheOf(hz.notifier).get("t1")?.version).toBe(4);
+  });
+
+  it("P1-3: same-version DIFFERENT records survive the merge — identity dedup, not version dedup", async () => {
+    // Reproduction shape from the review: v1 decision(close) cached; an
+    // external same-version duplicate lands; the /state signature changes at
+    // an UNCHANGED version → full re-sync returns BOTH v1 records. The merged
+    // log must keep the two distinct audit records (the old merge replaced
+    // by version and kept only the last one).
+    let tail: ContextRecord[] = [decision("t1", 1, "close")];
+    const hub = inclusiveHub(() => tail);
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], readLogSince: hub.readLogSince });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1, needs_attention: false })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0]);
+
+    // External duplicate v1 decision(approve): version stays 1, but the fold
+    // now warns (VERSION_DUPLICATE) → needs_attention flips → signature
+    // changed at an unchanged version → reconcile DROPS the cache (the
+    // gate-withheld task pulls nothing this poll — the drop is the point).
+    tail = [decision("t1", 1, "close"), decision("t1", 1, "approve")];
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1, needs_attention: true })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0]); // gate withheld — but the cache is gone already
+    expect(logCacheOf(hz.notifier).has("t1")).toBe(false); // dropped by reconcile
+
+    // The human acks the anomaly (v2 note ack — warnings clear, the task is a
+    // launch candidate again): the next pull is a FULL re-sync that returns
+    // BOTH v1 records; the merge must keep the two distinct audit records
+    // (the old merge replaced by version and kept only the last one).
+    tail = [decision("t1", 1, "close"), decision("t1", 1, "approve"), {
+      version: 2,
+      task_id: "t1",
+      role: "human",
+      content_type: "note",
+      timestamp: U1,
+      payload: { summary: "ack", body: "handled", ack: true },
+    }];
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2, needs_attention: false })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(10_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0, 0]); // dropped → full pull again
+
+    const merged = logCacheOf(hz.notifier).get("t1")?.records ?? [];
+    expect(merged).toHaveLength(3); // BOTH v1 records kept, plus the ack
+    expect(merged.map((r) => (r.payload as { decision?: string }).decision ?? "ack")).toEqual(["close", "approve", "ack"]);
+    expect(merged.filter((r) => r.version === 1)).toHaveLength(2); // the two distinct v1 audit records
+    // Fold equivalence with a one-shot full read (same records, same order):
+    const folded = derive("t1", merged);
+    // The pre-ack pair warned as a duplicate (the anomaly the ack cleared):
+    expect(derive("t1", merged.slice(0, 2))?.warnings).toContainEqual({ version: 1, code: "VERSION_DUPLICATE" });
+    expect(folded).toEqual(derive("t1", tail));
+    expect(folded?.status).toBe("closed"); // close folds first, approve hits CLOSED_ABSORB — NOT designing
+    expect(folded?.needs_attention).toBe(false); // the v2 ack cleared the anomaly — the clean /state shape was honest
+  });
+
+  it("P1-3 (marker combo): duplicate-version markers and non-markers both reach launchBlocked", async () => {
+    // Two files share version 3 — one a launch marker, one an ordinary note.
+    // The incremental reply carries both; the merge must keep both so the
+    // dedup scan sees the marker (a version-keyed merge would drop one).
+    let tail: ContextRecord[] = [note("t2", 1), note("t2", 2)];
+    const hub = inclusiveHub(() => tail);
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], readLogSince: hub.readLogSince });
+    hz.set(state([task({ task_id: "t2", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0]);
+
+    tail = [...tail, marker("t2", 3, 2), note("t2", 3)]; // same version, different payloads
+    hz.set(state([task({ task_id: "t2", status: "implementing", waiting_for: "agent:executor", version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0, 3]); // delta pull at cached+1
+    const merged = logCacheOf(hz.notifier).get("t2")?.records ?? [];
+    expect(merged).toHaveLength(4); // v1, v2, and BOTH v3 records
+    expect(launchBlocked(merged, "executor")).toEqual({ blocked: true, noteVersion: 3 });
+    // Order swapped — the marker must win regardless of which duplicate the
+    // reply lists second (audit order within a version follows arrival).
+    const reordered = [merged[0]!, merged[1]!, merged[3]!, merged[2]!];
+    expect(launchBlocked(reordered, "executor")).toEqual({ blocked: true, noteVersion: 3 });
+    expect(derive("t2", merged)?.warnings).toContainEqual({ version: 3, code: "VERSION_DUPLICATE" });
+    expect(hz.logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v3");
+  });
+
+  it("P1-3 round 2: a marker landing while needs_attention is ALREADY set is recovered on the attention-clearing edge", async () => {
+    // Reproduction shape from review round 2: the cache must be synced UNDER
+    // the attention-set entry for the poison to persist — that happens through
+    // the UNGATED fullLog caller (launchGenerationSuperseded reads watched
+    // tasks regardless of needs_attention; the auto-gate decision line
+    // withholds and never pulls while attention is set). The poison step below
+    // calls fullLog with the attention-set /state entry exactly as that caller
+    // does; everything else runs through real polls.
+    const secondNote = (taskId: string, version: number): ContextRecord => ({
+      version,
+      task_id: taskId,
+      role: "reviewer",
+      content_type: "note",
+      timestamp: U1,
+      payload: { summary: `other ${version}`, body: "b" },
+    });
+    const ack = (taskId: string, version: number): ContextRecord => ({
+      version,
+      task_id: taskId,
+      role: "human",
+      content_type: "note",
+      timestamp: U2,
+      payload: { summary: "ack", body: "handled", ack: true },
+    });
+    let tail: ContextRecord[] = [note("t7", 1), secondNote("t7", 1)]; // VERSION_DUPLICATE → needs_attention=true
+    const hub = inclusiveHub(() => tail);
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], readLogSince: hub.readLogSince });
+    const anomalous = () =>
+      state([task({ task_id: "t7", status: "implementing", waiting_for: "agent:executor", version: 1, needs_attention: true, updated_at: U1 })], { flow_mode: "auto", auto: ALL_ROLES });
+
+    // Poll 1 observes the anomalous task (gate withholds); the ungated scan
+    // syncs the cache under the attention-set entry.
+    hz.set(anomalous());
+    await hz.notifier.requestCompare();
+    await (hz.notifier as unknown as { fullLog(t: string, e?: StateTask): Promise<ContextRecord[]> }).fullLog("t7", anomalous().tasks[0]!);
+    expect(hub.calls).toEqual([0]);
+    const poisoned = logCacheOf(hz.notifier).get("t7")!;
+
+    // An external same-version launch marker lands: /state shows NOTHING new
+    // (status / waiting_for / needs_attention / updated_at all unchanged) —
+    // the poll keeps the cache and pulls nothing.
+    tail = [...tail, marker("t7", 1, 0)];
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0]);
+    expect(logCacheOf(hz.notifier).get("t7")).toBe(poisoned); // survived — the marker is invisible to /state
+
+    // The ack lands (v2): attention clears. The clearing edge evicts the
+    // cache; the next pull is a FULL re-sync. (The old protocol pulled
+    // since=2 here — only the ack — and the v1 marker stayed lost forever,
+    // leaving launchBlocked wrongly fresh.)
+    tail = [...tail, ack("t7", 2)];
+    hz.set(state([task({ task_id: "t7", status: "implementing", waiting_for: "agent:executor", version: 2, needs_attention: false, updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(10_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0, 0]); // full re-sync, not since=2
+
+    const merged = logCacheOf(hz.notifier).get("t7")?.records ?? [];
+    expect(merged).toHaveLength(4); // both v1 notes AND the invisible v1 marker, plus the ack
+    expect(launchBlocked(merged, "executor")).toEqual({ blocked: true, noteVersion: 1 });
+    expect(derive("t7", merged)).toEqual(derive("t7", tail)); // one-shot full-read equivalence
+    expect(derive("t7", merged)?.needs_attention).toBe(false); // the ack cleared the anomaly — the clean /state shape was honest
+    const line = hz.logs.filter((l) => l.includes("auto-decision")).pop()!;
+    expect(line).toContain("dedup=launched@v1"); // the recovered marker blocks the relaunch
+    // Quiet again — clean and covered: no pull at all.
+    hz.at(15_000);
+    await hz.notifier.requestCompare();
+    expect(hub.calls).toEqual([0, 0]);
+    expect(hz.logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v1");
+  });
+
+  it("P1-2: a fold-visible /state change at an UNCHANGED version drops the cache for a full re-sync; a rewind evicts too", async () => {
+    const sinceValues: number[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      readLogSince: async (_taskId, since) => {
+        sinceValues.push(since);
+        return { versions: since === 0 ? [note("t3", 1), note("t3", 2)] : [] };
+      },
+    });
+    const t3 = (over: Partial<StateTask>) =>
+      state([task({ task_id: "t3", status: "implementing", waiting_for: "agent:executor", version: 2, ...over })], { flow_mode: "auto", auto: ALL_ROLES });
+    hz.set(t3({}));
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0]);
+    // Quiet: version covered, signature unchanged → no pull at all.
+    hz.set(t3({}));
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0]);
+    // Signature change at the SAME version (external duplicate → needs_attention
+    // rises): reconcile drops the entry even though the gate withholds the
+    // pull this poll — an incremental since=cached+1 could never reach a
+    // record at/below the cached maximum.
+    hz.set(t3({ needs_attention: true }));
+    hz.at(10_000);
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0]); // gate withheld — nothing pulled
+    expect((hz.notifier as unknown as { logCache: Map<string, unknown> }).logCache.has("t3")).toBe(false);
+    // An ack lands (v3, clean again — candidate): the pull is a FULL re-sync.
+    hz.set(t3({ version: 3 }));
+    hz.at(15_000);
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0, 0]);
+    // Rewind — /state version 1 < cached 3 → drop, next pull starts from zero.
+    hz.set(t3({ version: 1 }));
+    hz.at(20_000);
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0, 0, 0]); // rewind evicted the phantom history
+  });
+
+  it("a task leaving tasks∪degraded drops its cache — reappearance pulls since=0 again", async () => {
+    const sinceValues: number[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      readLogSince: async (_taskId, since) => {
+        sinceValues.push(since);
+        return { versions: since === 0 ? [note("t4", 1), note("t4", 2)] : [] };
+      },
+    });
+    hz.set(state([task({ task_id: "t4", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0]);
+    // Task vanishes from /state (directory deleted, say) — cache must go.
+    hz.set(state([], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    // Reappears — nothing cached anymore, full pull.
+    hz.set(state([task({ task_id: "t4", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(10_000);
+    await hz.notifier.requestCompare();
+    expect(sinceValues).toEqual([0, 0]); // vanish evicted the entry
+  });
+
+  it("a failed pull keeps the cache — the retry merges the missed delta onto the survivors", async () => {
+    let fail = false;
+    let tail: ContextRecord[] = [note("t5", 1)];
+    const pulls: number[] = [];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      readLogSince: async (_taskId, since) => {
+        pulls.push(since);
+        if (fail) throw new Error("hub down");
+        return { versions: tail.filter((r) => r.version >= since) };
+      },
+    });
+    hz.set(state([task({ task_id: "t5", status: "implementing", waiting_for: "agent:executor", version: 1 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // full pull v1, cache warm
+    expect(pulls).toEqual([0]);
+    // v2 lands (a marker); the delta pull FAILS — the cache must keep v1 intact.
+    fail = true;
+    tail = [...tail, marker("t5", 2, 1)];
+    hz.set(state([task({ task_id: "t5", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    hz.at(5_000);
+    await hz.notifier.requestCompare();
+    const failedLine = hz.logs.filter((l) => l.includes("auto-decision")).pop()!;
+    expect(failedLine).toContain("dedup=unreadable");
+    expect(logCacheOf(hz.notifier).get("t5")?.version).toBe(1); // survived the failure
+    fail = false;
+    hz.at(10_000);
+    await hz.notifier.requestCompare(); // retry: since = 1 + 1 = 2, delta only
+    expect(pulls).toEqual([0, 2, 2]);
+    const recoveredLine = hz.logs.filter((l) => l.includes("auto-decision")).pop()!;
+    expect(recoveredLine).toContain("dedup=launched@v2"); // v1 survived + v2 merged on top
+    // Quiet again — no pull at all.
+    hz.at(15_000);
+    await hz.notifier.requestCompare();
+    expect(pulls).toEqual([0, 2, 2]);
+    expect(hz.logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v2");
+  });
+
+  it("autoLaunch consumes the merged log — the launch dedup gate sees historical markers", async () => {
+    // Waiting_for EDGE fires on this poll (reviewing → implementing hand-off),
+    // and the merged cache already holds a launch marker at the task's base:
+    // the launch must be SKIPPED as already launched, not re-fired.
+    let tail: ContextRecord[] = [note("t6", 1), marker("t6", 2, 1)];
+    const hz = makeHarness({
+      flowMode: "auto",
+      autoRoles: ["executor"],
+      readLogSince: async (_taskId, since) => ({ versions: tail.filter((r) => r.version >= since) }),
+    });
+    hz.set(state([task({ task_id: "t6", status: "reviewing", waiting_for: "agent:reviewer", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare(); // baseline warms the cache (v1+v2)
+    hz.set(state([task({ task_id: "t6", status: "implementing", waiting_for: "agent:executor", version: 2 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toEqual([]); // marker at v2 blocks the relaunch
+    expect(hz.logs.some((l) => l.includes("auto launch skipped (already launched)"))).toBe(true);
+  });
+});
+
+describe("governed readLog against a REAL hub (integration: real Store, real MCP, real /state)", () => {
+  // No readLog/readLogSince injection here: the notifier runs its DEFAULT
+  // wiring — resident HubSession + context.read since_version — against a
+  // real startServer with a real Store. This pins the inclusive wire
+  // contract end-to-end: cached.version + 1 must be exactly the parameter
+  // that yields "only the new record" on a real Hub, and quiet rounds must
+  // issue ZERO MCP log requests (the §4 gate's 0-byte steady state).
+  it("quiet rounds issue zero MCP log requests; a landed record pulls exactly the delta and the marker blocks relaunch", async () => {
+    const tmpReal = mkdtempSync(path.join(os.tmpdir(), "tut-notifier-real-"));
+    const root = path.join(tmpReal, ".context-hub");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      path.join(root, "config.json"),
+      JSON.stringify({ flow_mode: "auto", auto: { launch_roles: ["executor"] } }) + "\n",
+      "utf8",
+    );
+    const running = await startServer({ root, port: 0 });
+    let mcpPosts = 0;
+    running.server.on("request", (req) => {
+      if (req.url === "/mcp" && req.method === "POST") mcpPosts += 1;
+    });
+    const logs: string[] = [];
+    try {
+      const writer = new Store(root); // external writer (separate instance — exercises token invalidation too)
+      await writer.createTask({ title: "Governed Real", description: "d", creator: "t", role: "human", flow: "direct" });
+      const notifier = new Notifier(
+        { url: running.url, interval: 5, eventPort: 3998, stallTimeoutMin: 30 },
+        {
+          launch: async () => "launched",
+          markLaunched: async () => ({ version: 1 }),
+          resolveTarget: async () => "pi",
+          loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
+          listPanes: async () => [],
+          listAnchorPanes: async () => [],
+          readPane: async () => "",
+          now: () => 0,
+          log: (line: string) => logs.push(line),
+        },
+      );
+      openNotifiers.push(notifier);
+
+      // Baseline: full pull through the real MCP session — dedup verdict fresh.
+      await notifier.requestCompare();
+      let line = logs.filter((l) => l.includes("auto-decision")).pop()!;
+      expect(line).toContain("dedup=fresh");
+      expect(line).toContain("waiting_for=agent:executor"); // direct flow, gate passed
+      const postsAfterBaseline = mcpPosts;
+
+      // A launch marker lands (v1). Next poll: ONE delta pull — the real
+      // Store's inclusive since_version=1 returns exactly v1, the merged log
+      // sees the marker, dedup flips to launched@v1.
+      await writer.append("governed-real", {
+        role: "human",
+        content_type: "note",
+        payload: {
+          summary: "launch: executor (base v0)",
+          body: "Recorded launch of executor via auto at task log base version 0.",
+          launch: { role: "executor", base_version: 0, via: "auto" },
+        },
+      });
+      await notifier.requestCompare();
+      line = logs.filter((l) => l.includes("auto-decision")).pop()!;
+      expect(line).toContain("dedup=launched@v1"); // cached.version(0) + 1 = 1 → only v1 came back
+      const postsAfterDelta = mcpPosts;
+      expect(postsAfterDelta).toBeGreaterThan(postsAfterBaseline); // the delta pull happened
+
+      // Quiet rounds — /state version covered by the cache: ZERO further MCP
+      // requests (not even an empty since_version round-trip).
+      await notifier.requestCompare();
+      await notifier.requestCompare();
+      expect(mcpPosts).toBe(postsAfterDelta);
+      line = logs.filter((l) => l.includes("auto-decision")).pop()!;
+      expect(line).toContain("dedup=launched@v1"); // served from the merged cache
+      await notifier.close();
+    } finally {
+      await running.close().catch(() => undefined);
+      rmSync(tmpReal, { recursive: true, force: true });
+    }
+  });
+
+  it("review round 2: a marker that landed invisibly while needs_attention was set is recovered on the attention-clearing edge", async () => {
+    const tmpReal = mkdtempSync(path.join(os.tmpdir(), "tut-notifier-real2-"));
+    const root = path.join(tmpReal, ".context-hub");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      path.join(root, "config.json"),
+      JSON.stringify({ flow_mode: "auto", auto: { launch_roles: ["executor"] } }) + "\n",
+      "utf8",
+    );
+    const running = await startServer({ root, port: 0 });
+    let mcpPosts = 0;
+    running.server.on("request", (req) => {
+      if (req.url === "/mcp" && req.method === "POST") mcpPosts += 1;
+    });
+    const logs: string[] = [];
+    const taskDir = path.join(root, "tasks", "gov-clear");
+    /** Externally land a record file under a LEGAL alias name (same version, different name). */
+    const externalAlias = (fileName: string, version: number, payload: Record<string, unknown>): void => {
+      const record = {
+        version,
+        task_id: "gov-clear",
+        role: "human",
+        content_type: "note",
+        timestamp: new Date().toISOString(),
+        payload,
+      };
+      writeFileSync(path.join(taskDir, fileName), JSON.stringify(record, null, 2) + "\n", "utf8");
+    };
+    try {
+      const writer = new Store(root);
+      await writer.createTask({ title: "Gov Clear", description: "d", creator: "t", role: "human", flow: "direct" });
+      const notifier = new Notifier(
+        { url: running.url, interval: 5, eventPort: 3997, stallTimeoutMin: 30 },
+        {
+          launch: async () => "launched",
+          markLaunched: async () => ({ version: 1 }),
+          resolveTarget: async () => "pi",
+          loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
+          listPanes: async () => [],
+          listAnchorPanes: async () => [],
+          readPane: async () => "",
+          now: () => 0,
+          log: (l: string) => logs.push(l),
+        },
+      );
+      openNotifiers.push(notifier);
+      const fullLogOf = (entry: unknown) =>
+        (notifier as unknown as { fullLog(t: string, e?: unknown): Promise<ContextRecord[]> }).fullLog("gov-clear", entry);
+      const cacheOf = () =>
+        (notifier as unknown as { logCache: Map<string, { records: ContextRecord[] }> }).logCache.get("gov-clear")?.records ?? [];
+
+      // Warm: v1 executor marker (dedup=launched@v1).
+      await notifier.requestCompare();
+      await writer.append("gov-clear", {
+        role: "human",
+        content_type: "note",
+        payload: {
+          summary: "launch: executor (base v0)",
+          body: "Recorded launch of executor via auto at task log base version 0.",
+          launch: { role: "executor", base_version: 0, via: "auto" },
+        },
+      });
+      await notifier.requestCompare();
+      expect(logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v1");
+
+      // Anomaly: v2 note via the store + an EXTERNAL alias v2 note →
+      // VERSION_DUPLICATE → needs_attention=true. The gated decision line
+      // withholds; the poison sync below mirrors the UNGATED generation-scan
+      // caller (launchGenerationSuperseded), which reads watched tasks
+      // regardless of needs_attention — exactly the review's repro shape.
+      await writer.append("gov-clear", { role: "human", content_type: "note", payload: { summary: "first at v2", body: "b" } });
+      externalAlias("v2.foreign.json", 2, { summary: "alias at v2", body: "b" });
+      await notifier.requestCompare(); // gate withholds — attention set
+      const stateNow = (await (await fetch(`${running.url}/state`)).json()) as {
+        tasks: Array<{ task_id: string; needs_attention: boolean; version: number }>;
+      };
+      const anomalousEntry = stateNow.tasks.find((t) => t.task_id === "gov-clear")!;
+      expect(anomalousEntry.needs_attention).toBe(true); // the real fold sees the duplicate
+      await fullLogOf(anomalousEntry); // the ungated caller's pull — cache now synced under the attention-set entry
+      const postsAfterPoison = mcpPosts;
+
+      // The invisible marker: a THIRD v2 file (legal alias) — /state shows
+      // nothing new. A poll must issue ZERO MCP log requests (covered skip).
+      externalAlias("v02.mark.json", 2, {
+        summary: "launch: executor (base v2)",
+        body: "Recorded launch of executor via auto at task log base version 2.",
+        launch: { role: "executor", base_version: 2, via: "auto" },
+      });
+      await notifier.requestCompare();
+      expect(mcpPosts).toBe(postsAfterPoison); // invisible to /state, skipped
+
+      // The ack (v3, via the store) clears the anomaly. The clearing edge
+      // evicts; the next pull is a FULL re-sync through the real MCP session.
+      await writer.append("gov-clear", {
+        role: "human",
+        content_type: "note",
+        payload: { summary: "ack", body: "Anomalies handled.", ack: true },
+      });
+      await notifier.requestCompare();
+      expect(mcpPosts).toBeGreaterThan(postsAfterPoison); // the full re-sync pulled
+
+      const merged = cacheOf();
+      expect(merged.filter((r) => r.version === 2)).toHaveLength(3); // BOTH v2 notes AND the invisible v2 marker recovered
+      const oneShot = (await writer.readTask("gov-clear")).versions; // full read straight off the store
+      expect(merged.sort((a, b) => a.version - b.version)).toEqual(oneShot.sort((a, b) => a.version - b.version));
+      expect(launchBlocked(merged, "executor")).toEqual({ blocked: true, noteVersion: 2 }); // the recovered marker wins
+      expect(logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v2");
+      // And the recovered view is quiet again.
+      const postsAfterResync = mcpPosts;
+      await notifier.requestCompare();
+      expect(mcpPosts).toBe(postsAfterResync);
+      await notifier.close();
+    } finally {
+      await running.close().catch(() => undefined);
+      rmSync(tmpReal, { recursive: true, force: true });
+    }
+  });
 });

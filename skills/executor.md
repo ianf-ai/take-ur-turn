@@ -17,7 +17,7 @@ flow 建任务时选定（create 的 `--flow` / MCP `flow` 字段，缺省 `full
 从任务列表找等你动手的任务：`context.list {"status": "implementing"}` / `{"status": "revising"}`（CLI `tut list --status implementing` / `--status revising`）。
 
 - **implementing**：design 已发布，等你实现并交付 code_changes。
-- **revising**：两条进入路径——review verdict 为 `fail_code`（等你按 review 修改并交付 revision），或人在 pending_approval 拍了 `decide(reject)`（reject 理由就是你的修改清单，同样交付 revision）。
+- **revising**：三条进入路径——review verdict 为 `fail_code`（等你按 review 修改并交付 revision）；人在 pending_approval 拍了 `decide(reject)`（reject 理由就是你的修改清单，同样交付 revision）；或你自己在 reviewing 态发了非 ack note 收回回合（自报交付问题、补材料、先行修改——收回后照常以 revision 交付，见「中途补充（note）」）。
 
 status / waiting_for 是派生出来的路由建议，不是指令——被指派的任务不在这两个状态时，先读任务日志弄清进行到哪，再决定动作。
 
@@ -32,11 +32,11 @@ status / waiting_for 是派生出来的路由建议，不是指令——被指�
 第 2 层注意项目级约束与不变量（如「零运行时依赖」）——违反约束的实现会被 review 打回。第 3 层按所处阶段定重点：
 
 - **implementing**：精读 design 的「对实现的要求」（验收口径、边界条件、必须跑的测试）——那是你的验收清单。
-- **revising**：先分清进入路径——日志里最新一条有效记录是 verdict 为 `fail_code` 的 review（精读其**问题列表与每条的关闭条件**，以及其后可能存在的人的延后拍板 note），还是人的 decision(reject)（精读该记录 body——**reject 理由就是修改清单**）。两种路径 revision 都要逐条回应它们。
+- **revising**：先分清进入路径——日志里最新一条影响状态折叠的记录（排除 ack note 与表外记录）是 verdict 为 `fail_code` 的 review（精读其**问题列表与每条的关闭条件**，以及其后可能存在的人的延后拍板 note）、人的 decision(reject)（精读该记录 body——**reject 理由就是修改清单**），还是你自己在 reviewing 态发的非 ack note（自报问题即修改清单）。三种路径 revision 都要逐条回应它们。
 
 增量读取：read 返回的 versions 数组每条带 version，之后用 `"since_version": N`（CLI `--since-version N`）只取新记录。
 
-**expected_version 的正确用法**（两种通道通用）：值 = 你看到的任务当前版本——read 到最新记录 version 是 N 就带 N；上一次 publish 返回 version 4，下一次就带 4。带对了能抓住并发写入：别人先写了一手，你的发布会报版本冲突（MCP 返回 isError；CLI 非零退出码、stderr 首行是 VERSION_CONFLICT）——重读日志再发。不带也能写（跳过校验），但带上是更好的习惯。
+**expected_version 的正确用法**（两种通道通用）：值 = 你看到的任务当前版本——read 到最新记录 version 是 N 就带 N。带对了能抓住并发写入：别人先写了一手，你的发布会报版本冲突（MCP 返回 isError；CLI 非零退出码、stderr 首行是 VERSION_CONFLICT）——重读日志再发。不带也能写（跳过校验），但带上是更好的习惯。
 
 ## 发布 code_changes（implementing 阶段的交付）
 
@@ -65,18 +65,18 @@ context.publish {"task_id": "<id>", "role": "executor", "content_type": "code_ch
 tut publish <id> --role executor --content-type code_changes --summary "…" --payload-file changes.md --commits a1b2c3d --expected-version 2
 ```
 
-code_changes 落盘后任务派生为 reviewing，轮到 Reviewer。
+code_changes 落盘后任务派生为 reviewing，轮到 Reviewer（solo 例外：直接进 pending_approval 由人拍板，见「流程选择指引」）。
 
 ## 发布 revision（revising 阶段的交付）
 
-`ref_version` **必须指向你回应的那条记录的 version**——它是问题清单的定位锚点：fail_code 进入时指向那条 review，人 reject 进入时指向那条 decision 记录（修订轮次多时这是唯一可靠的对应关系来源）。
+`ref_version` **必须指向你回应的那条记录的 version**——它是问题清单的定位锚点：fail_code 进入时指向那条 review，人 reject 进入时指向那条 decision 记录，note 收回进入时指向你自己那条收回 note（修订轮次多时这是唯一可靠的对应关系来源）。
 
 body 按以下模板逐节填写（小节标题保真，括号内是填写指引）：
 
 ```markdown
 ## 对 review 的逐条回应
-（针对 ref_version 指向的 review 或 decision(reject)——人 reject 进入时把 reject 理由当作
- 问题列表，逐条回应的姿势完全相同；每条说明属于哪种：
+（针对 ref_version 指向的 review、decision(reject) 或收回 note——人 reject 进入时把 reject 理由当作
+ 问题列表、note 收回进入时把自报问题当作问题列表，逐条回应的姿势完全相同；每条说明属于哪种：
  满足关闭条件——给出证据（测试、commit）；
  申请延后——引用人的拍板记录（见「延后流程」，没有拍板就不算延后，只能修或反驳）；
  反驳——给出理由）
@@ -98,11 +98,11 @@ revision 落盘后任务回到 reviewing，等 Reviewer 重审。
 
 ## 中途补充（note）
 
-实现中发现设计缺口、风险、要给 Reviewer 的提示：发 note，不改变派生状态——`context.publish {"task_id": "<id>", "role": "executor", "content_type": "note", "payload": {"summary": "…", "body": "…"}}`（CLI 同构：`--summary` + `--body` / `--payload-file`）。
+实现中发现设计缺口、风险、要给 Reviewer 的提示：发 note。默认不改变派生状态；**唯一例外**：`reviewing` 态下你的 note（role=executor、非 ack）会把任务收回 `revising`——评审等待期开口（自报交付问题、补材料、先行修改）即收回回合，收回后照常以 revision 交付（无需改代码时 revision 说明即可）；closed 吸收态与 ack note 不转态。`context.publish {"task_id": "<id>", "role": "executor", "content_type": "note", "payload": {"summary": "…", "body": "…"}}`（CLI 同构：`--summary` + `--body` / `--payload-file`）。
 
 ## 工具速查
 
-MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法照 `src/cli.ts` USAGE、`tut` 无参可打印（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
+MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
 
 | 操作 | MCP | CLI |
 |---|---|---|
@@ -110,7 +110,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 | 读 project scope / 任务日志 / 增量 | `context.read {"task_id": …, "since_version": N}` | `tut read <id> [--since-version N]` |
 | 发布 code_changes / revision / note | `context.publish {…}` | `tut publish <id> --role executor --content-type <t> --summary "…" (--body <text>\|--payload-file <md>) [--commits <a,b>] [--ref-version <n>] [--expected-version <n>]` |
 
-脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model`（MCP 同名顶层字段）自述身份，供追溯——**不知道就留空，不要猜**，自报字段宁可空、不可错。`decide` 是人工审批入口，不由你调用；`status` 是给人看的一次性总览快照（--json 供脚本），持续提醒由 `tut notify` 负责。
+脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model`（MCP 同名顶层字段）自述身份，供追溯——**不知道就留空，不要猜**，自报字段宁可空、不可错。`decide` 是人工审批入口，不由你调用。
 
 ## 关闭条件
 
@@ -119,7 +119,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 
 ## 延后流程
 
-延后只能由**人**拍板——流程中的任何 Agent 只有建议权或申请权（你的入口：revision 的逐条回应里对某条标注「申请延后」）。固定步骤：①人发一条 note 拍板（发在原任务上，写明同意延后哪些、理由；用 note 不用 decision——decision 参与状态派生，任务中途发布属表外组合、会把任务置 needs_attention）；②登记进 project scope：向 `project` 发一条 note，body 写三项——原任务 task_id、指向被延后记录的 ref_version、该问题的关闭条件（延后由此进入跨任务记忆，不随原任务关闭而丢失）；③引用与核销：你的 revision 引用拍板记录（记下它的 version），re-review 对已延后问题按「已延后」核销。project scope 不参与状态派生：对它 publish 只返回 `{task_id, version}`，没有 status。
+你的入口：revision 的逐条回应里标「申请延后」，Agent 只有建议权或申请权。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
 
 ---
 
