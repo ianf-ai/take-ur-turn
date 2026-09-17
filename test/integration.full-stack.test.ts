@@ -567,7 +567,7 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
       // prompt names the task. Dry-run may open with provisioning
       // preview/skip lines — assert on the send-text line, independent of
       // line order.
-      const launchLines = stack.err().split("\n").filter((l) => l.includes(`launch.sh (${id}, executor)`));
+      const launchLines = stack.err().split("\n").filter((l) => l.includes(`tut launch (${id}, executor)`));
       expect(launchLines.length).toBeGreaterThan(0);
       const sendText = launchLines.find((l) => l.includes("DRY-RUN: herdr pane send-text"));
       expect(sendText).toBeDefined();
@@ -609,7 +609,7 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
       expect(gated.body).toContain("status: pending_approval");
       expect(gated.body).toContain("auto launch withheld");
       // No launch happened at all — no launcher log line, no auto-launched post.
-      expect(stack.err().includes("launch.sh (")).toBe(false);
+      expect(stack.err().includes("tut launch (")).toBe(false);
       expect(stack.posts.filter((p) => p.title.includes("auto-launched"))).toHaveLength(0);
     },
     15_000,
@@ -617,7 +617,7 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
 
   // --- 6. start-next via the CLI ------------------------------------------------------------
 
-  it("start-next spawns launch.sh (TUT_DRY_RUN) naming the routed pane and the task", async () => {
+  it("start-next spawns tut launch (TUT_DRY_RUN) naming the routed pane and the task", async () => {
     const baseUrl = await startHubOnly();
     const id = await createTask(baseUrl, "Start Next Integration");
     await publish(baseUrl, id, "architect", "design", { summary: "design", body: "the design" }); // → agent:executor

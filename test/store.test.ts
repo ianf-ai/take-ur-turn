@@ -1494,3 +1494,32 @@ describe("post-write degradation and close boundaries", () => {
     expect(recordFiles(root, task_id).sort()).toEqual(["recovery.jsonl", "v001.design.json", "v001.design.json.recovered", "v002.decision.json"].sort());
   });
 });
+
+
+describe("task ID dot hygiene", () => {
+  it("normalizes dotted titles and rejects repair-created dotted IDs", async () => {
+    const { store, root } = newStore();
+    const created = await store.createTask({ title: "new.task", description: "d", creator: "human", role: "architect" });
+    expect(created.task_id).toBe("new-task");
+    mkdirSync(taskDir(root, "new.task"));
+    await expectCode(store.repairMeta("new.task", {}), ErrorCode.VALIDATION_ERROR);
+    expect(existsSync(path.join(taskDir(root, "new.task"), "meta.json"))).toBe(false);
+  });
+
+  it("reads, lists, derives and appends to a historical dotted task without rewriting records", async () => {
+    const { store, root } = newStore();
+    const created = await store.createTask({ title: "seed", description: "d", creator: "human", role: "architect" });
+    const id = "old.task";
+    mkdirSync(taskDir(root, id));
+    writeFileSync(path.join(taskDir(root, id), "meta.json"), JSON.stringify({ ...readMeta(root, created.task_id), task_id: id }));
+    writeRecordDirect(root, id, directDesignRecord(id));
+    const recordPath = path.join(taskDir(root, id), "v001.design.json");
+    const original = readFileSync(recordPath);
+    expect(await store.readTask(id)).toMatchObject({ task_id: id, status: "implementing" });
+    expect((await store.listTasks()).some((task) => task.task_id === id)).toBe(true);
+    expect((await store.snapshotTasks()).tasks).toContainEqual(expect.objectContaining({ task_id: id, status: "implementing" }));
+    await store.append(id, { role: "executor", content_type: "code_changes", payload: validPayload() });
+    expect(await store.readTask(id)).toMatchObject({ task_id: id, status: "reviewing" });
+    expect(readFileSync(recordPath)).toEqual(original);
+  });
+});

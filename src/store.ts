@@ -277,17 +277,19 @@ function requireValidCheckout(value: unknown): CheckoutRoute | undefined {
 }
 
 /**
- * Legal task_id on disk: the same domain slugify produces (lowercase
- * alphanumerics plus "." / "_" / "-", starting alphanumeric; "project" passes,
- * which is correct). Blocking anything else at every public entry point stops
+ * New/rebuilt IDs exclude dots, the task/role label separator. Retain the
+ * historical on-disk alphabet for reading and appending existing tasks.
+ * Both patterns accept "project" and block separators at public entry points:
  * path traversal — "../evil" / "../../outside" must never reach path.join
  * against the store root (blocks path traversal).
  */
-const TASK_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+const TASK_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+// Historical dotted IDs remain readable/appendable; never use this for new IDs.
+export const LEGACY_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
-function requireValidTaskId(taskId: string): void {
-  if (!TASK_ID_PATTERN.test(taskId)) {
-    throw new StoreError(ErrorCode.VALIDATION_ERROR, `task_id must match ${TASK_ID_PATTERN.source}: ${taskId}`);
+function requireValidTaskId(taskId: string, pattern = LEGACY_TASK_ID_PATTERN): void {
+  if (!pattern.test(taskId)) {
+    throw new StoreError(ErrorCode.VALIDATION_ERROR, `task_id must match ${pattern.source}: ${taskId}`);
   }
 }
 
@@ -608,6 +610,7 @@ export class Store {
 
     return this.enqueue(null, async () => {
       const taskId = await this.uniqueSlug(slugify(title));
+      requireValidTaskId(taskId, TASK_ID_PATTERN);
       const taskDir = this.taskDir(taskId);
       await mkdir(taskDir, { recursive: true });
       const now = new Date().toISOString();
@@ -865,7 +868,7 @@ export class Store {
    */
   async repairMeta(taskId: string, input: RepairMetaInput): Promise<RepairMetaResult> {
     requireNonEmptyString(taskId, "task_id");
-    requireValidTaskId(taskId);
+    requireValidTaskId(taskId, TASK_ID_PATTERN);
     const title = input?.title !== undefined ? requireNonEmptyString(input.title, "title") : undefined;
     const description = input?.description !== undefined ? requireNonEmptyString(input.description, "description") : undefined;
     const creator = input?.creator !== undefined ? requireNonEmptyString(input.creator, "creator") : undefined;
@@ -1167,7 +1170,7 @@ export class Store {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const taskId = entry.name;
-      if (!TASK_ID_PATTERN.test(taskId)) continue; // foreign dir names never resolve to a task path
+      if (!LEGACY_TASK_ID_PATTERN.test(taskId)) continue; // foreign dir names never resolve to a task path
       let meta: TaskMeta | null = null;
       let metaOk = true;
       try {

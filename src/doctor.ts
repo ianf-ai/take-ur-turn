@@ -82,6 +82,7 @@ import {
   resolveAgentRouteWithSource,
 } from "./workspace.js";
 import {
+  LEGACY_TASK_ID_PATTERN,
   recordFileVersion,
   StoreError,
   validateMetaArtifact,
@@ -1089,7 +1090,7 @@ async function checkStorage(ctx: DoctorContext, hub: HubOutcome): Promise<Doctor
   for (const name of taskDirNames.sort()) {
     // Same task-id domain the store enforces; anything else is invisible to
     // the hub by construction — surfacing it is exactly doctor's job.
-    if (!/^[a-z0-9][a-z0-9._-]*$/u.test(name)) {
+    if (!LEGACY_TASK_ID_PATTERN.test(name)) {
       statuses.push("warn");
       check.details.push(`tasks/${name}: foreign directory name — the hub ignores it entirely`);
       continue;

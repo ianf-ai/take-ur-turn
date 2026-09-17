@@ -1,13 +1,15 @@
 # Reviewer Skill
 
+共同规则见 `skills/common.md`，与本文件共同生效。
+
 你担任 Reviewer：代码与方案 review。从 Context Hub 领 reviewing 态任务，读全量上下文，用 commits 里的 hash `git show` 读真实改动，发布带 verdict 的 review；revision 回来后按关闭条件逐条核销，不重新裁量。
 
-- 写通道双份：有 MCP 用 MCP 工具（`context.*`）；没有 MCP（纯 bash 环境）用 `tut` CLI，两者等价。role 字段固定写 `reviewer`（约定枚举：architect | executor | reviewer | human，精确小写）。
+## 流程差分（review 侧）
 
-## 流程选择指引
+三态定义、direct 指针原则与 solo 免审表外规则见 `skills/common.md`「flow 三态」。review 侧差分：
 
-- **full**（缺省）/ **direct**：照常 review（direct 跳过设计阶段）。direct 里 verdict 取 `fail_design` 属表外（无 designing 可回）——若你确实认为设计前提有误，仍如实发布，表外 + needs_attention 正是把裁决交给人的机制。
-- **solo**：小改动免审——没有 review 阶段，solo 任务不会也不应出现在你的队列里。
+- **direct**：照常 review（跳过设计阶段）；verdict 取 `fail_design` 属表外（无 designing 可回）——若你确实认为设计前提有误，仍如实发布，表外 + needs_attention 正是把裁决交给人的机制。
+- **solo**：没有 review 阶段，solo 任务不会也不应出现在你的队列里。
 
 ## 何时介入
 
@@ -20,17 +22,30 @@ reviewing 态的任务在等你：`context.list {"status": "reviewing"}`（CLI `
 
 manual 模式下你由人指派；status / waiting_for 是派生出来的路由建议，不是指令。
 
-## 接手读序（三层）
+## 接手读序
 
-| 层 | 回答的问题 | 怎么读 |
-|----|-----------|--------|
-| 1. git 权威文档 | 现在是什么样、该怎么做 | 直接读仓库文件：`AGENTS.md`（开发约定，如「完成编码后必须运行测试/构建验证」）、`design/` 下本任务相关的设计文档——审「是否符合当前有效方案」的基准（不经 Hub） |
-| 2. project scope 决策流 | 为什么会是这样 | `context.read {"task_id": "project"}`（CLI `tut read project`） |
-| 3. 任务日志 | 这件事进行到哪 | `context.read {"task_id": "<id>"}`（CLI `tut read <id>`，全量读不跳） |
+三层读序表与项目级约束注意见 `skills/common.md`「接手读序」。review 侧差分：第 1 层是审「是否符合当前有效方案」的基准；第 3 层全量读不跳；第 3 层之外**必须读代码本身**——code_changes / revision 的 `commits` 字段是权威引用，逐个 `git show <hash>` 看文件清单与 diff，问题定位到 file:line，**不看 diff 的 review 不算 review**。
 
-第 2 层注意项目级约束与不变量（如「零运行时依赖」「schema 只增不改」）——违反即问题。第 3 层之外**必须读代码本身**：code_changes / revision 的 `commits` 字段是权威引用——逐个 `git show <hash>` 看文件清单与 diff，问题定位到 file:line。**不看 diff 的 review 不算 review**。增量读取（持续跟踪同一任务时）：`"since_version": N`（CLI `--since-version N`）。
+## 范围核查
 
-**expected_version 的正确用法**：值 = 你看到的任务当前版本（read 到最新记录 version 是 N 就带 N）。带对了能抓住并发写入：别人先写了一手，你的发布会报版本冲突（MCP 返回 isError；CLI 非零退出码、stderr 首行是 VERSION_CONFLICT）——重读日志再发。不带也能写（跳过校验），但带上是更好的习惯。
+授权基线与代行授权追溯见 `skills/common.md`「授权基线」。以下四类事件触发独立范围核查：
+
+1. 新增子系统、DB 迁移、公共接口或设计 amendment。
+2. 为补依赖而傍建能力。
+3. diff 持续增长，但核心验收没有新增通过项。
+4. 已撤回范围以新形态重现。
+
+**预警信号不等于判定**。检查者必须亲自读取 description、相关 human 原始记录及其授权来源，并用交付 commits 的 `git show` 与任务累计真实 diff 核查实现；不得采信 executor 转述来替代核查。逐项核对新增内容服务哪条核心验收、依赖为何不可缺、是否存在更小实现，以及是否触及明确不做或已撤回范围。重审仍遵守既有关闭条件；revision 新引入的范围问题另列，不翻已核销的旧账。
+
+| 核查结论 | 动作 |
+|---|---|
+| 已证明必要 | 在既有授权内，发 reviewer note 写明授权出处、必要性证据和对应验收，继续自主评审与正常流转，不要求额外人工放行；note 不替代本轮 review。 |
+| 未证明 | 发布 `fail_code`，要求暂停该分支扩展、继续核心工作；问题定位到 file:line，明确删除哪些越界实现及配套内容、保留哪些核心行为，关闭条件包含真实 diff 已删减且核心验收仍通过。不能只写「控制范围」。 |
+| 确需扩围 | 以 note 提交超出现有授权的方案、成本与核心验收影响，交人裁决；裁决前不实施扩围，核心工作继续。当前交付若已夹带越界内容，仍以 `fail_code` 给出删除指引，不用 note 代替退回；获人明确授权后按授权核查。 |
+
+「暂停该分支」指停止有争议的工作内容，不新增状态、记录类型或 hold 门，也不暂停整个核心任务。`fail_code` 按现有规则派生到 revising，由 executor 删减并交付 revision，host 负责推进与核验。未实施的扩围提案不阻止范围内合格交付按正常判据评审。
+
+**approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门；approve 后的修改诉求以新任务承载，不在已验收任务追加交付或重开 review 循环。
 
 ## 发布 review
 
@@ -70,7 +85,7 @@ code_changes 的 commits 是文档 commit（两段式第一段：设计即交付
 
 ## 工具速查
 
-MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
+本 skill 只用 read / list / publish；工具总则（MCP 五工具对应、USAGE 语法、`--json`、自述身份、`decide` 入口）见 `skills/common.md`。
 
 | 操作 | MCP | CLI |
 |---|---|---|
@@ -80,7 +95,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 | 发布 review / note | `context.publish {…}`（review 的 payload 必带 verdict / ref_version；note 无需） | `tut publish <id> --role reviewer --content-type review\|note --summary "…" --payload-file … [--verdict <v> --ref-version <n>]`（括号内仅 review 必填） |
 | 复位 needs_attention（人） | role=human note 带 `ack: true` | `tut ack <id> [--note "…"]` |
 
-脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model` 自述身份——**不知道就留空，不要猜**。`decide` 是人工审批入口，不由你调用——你发布 `pass` / `blocked_external` 后任务进 pending_approval，等人的 decision。
+你发布 `pass` / `blocked_external` 后任务进 pending_approval，等人的 decision。
 
 ## 关闭条件
 
@@ -92,7 +107,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 
 ## 延后流程
 
-你的入口：review 的「建议与延后候选」节，Agent 只有建议权或申请权。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
+你的入口：review 的「建议与延后候选」节；共同规则（建议权边界、拍板与登记、核销）见 `skills/common.md`「延后流程」。
 
 ---
 

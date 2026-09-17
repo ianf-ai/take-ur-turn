@@ -446,11 +446,11 @@ export async function spawnLaunch(
   );
   if (result.error !== undefined) throw result.error;
   if (result.timedOut === true) {
-    throw new Error(`launch.sh ${taskId} ${role} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
+    throw new Error(`tut launch ${taskId} ${role} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
   }
   if (result.code !== 0) {
     const tail = result.stderr.trim();
-    throw new Error(`launch.sh ${taskId} ${role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
+    throw new Error(`tut launch ${taskId} ${role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
   }
   return result.stdout.trim();
 }
@@ -466,11 +466,11 @@ export async function spawnLaunchInvocation(
   );
   if (result.error !== undefined) throw result.error;
   if (result.timedOut === true) {
-    throw new Error(`launch.sh ${invocation.task_id} ${invocation.role} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
+    throw new Error(`tut launch ${invocation.task_id} ${invocation.role} exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`);
   }
   if (result.code !== 0) {
     const tail = result.stderr.trim();
-    throw new Error(`launch.sh ${invocation.task_id} ${invocation.role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
+    throw new Error(`tut launch ${invocation.task_id} ${invocation.role} exited ${result.code ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}`);
   }
   return result.stdout.trim();
 }
@@ -1726,7 +1726,7 @@ export class Notifier {
       // Dry-run output is often multi-line (provisioning preview + delivery
       // preview); log EVERY line so the pane log shows the full launch preview.
       for (const line of out.trim().split("\n")) {
-        this.log(`launch.sh (${task.task_id}, ${role})${line ? ` → ${line}` : ""}`);
+        this.log(`tut launch (${task.task_id}, ${role})${line ? ` → ${line}` : ""}`);
       }
       // A delivery give-up that landed while this launch was in flight has
       // already escalated this round's fate through the channels; arming the
@@ -1744,7 +1744,7 @@ export class Notifier {
       );
       await this.sendAll({
         title: `TUT ${task.task_id}: auto-launched ${role}`,
-        body: `${task.title} — status: ${task.status}; launch succeeded for ${role} via launch.sh (pane: ${task.task_id}.${role}); waiting for the agent's working signal`,
+        body: `${task.title} — status: ${task.status}; launch succeeded for ${role} via tut launch (pane: ${task.task_id}.${role}); waiting for the agent's working signal`,
         task_id: task.task_id,
       });
       // A real launcher can still be awaiting its final verification while
@@ -1779,7 +1779,7 @@ export class Notifier {
     this.log(`launch failed for ${task.task_id} (${role}): ${message}`);
     await this.sendAll({
       title: `TUT ${task.task_id}: auto launch failed`,
-      body: `${task.title} — launch.sh ${role} failed: ${message}; intervene manually`,
+      body: `${task.title} — tut launch ${role} failed: ${message}; intervene manually`,
       task_id: task.task_id,
     });
   }
@@ -2034,7 +2034,7 @@ export class Notifier {
     this.log(`[${watch.task.task_id}] launch working timeout for ${watch.role} after ${seconds}s; no working signal observed`);
     await this.sendAll({
       title: `TUT ${watch.task.task_id}: launch succeeded but no working signal`,
-      body: `${watch.task.title} — ${watch.role} was launched via launch.sh, but no working signal arrived within ${seconds}s; intervene manually`,
+      body: `${watch.task.title} — ${watch.role} was launched via tut launch, but no working signal arrived within ${seconds}s; intervene manually`,
       task_id: watch.task.task_id,
     });
     // Keep the key in the method signature so a future repeated-watch policy

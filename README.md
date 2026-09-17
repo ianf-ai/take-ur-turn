@@ -100,11 +100,11 @@ Acceptance: the flag reaches the Hub call; both flag forms tested." \
 tut start-next <task_id>   # manual: start the first round (auto mode: the Notifier starts it per its whitelist)
 ```
 
-`create` takes the workflow (`--flow full|direct|solo`) and the per-task lineup as real flags. Cast values may be legacy bare names (`--cast executor=pi`) or parameterized, ordered commands (`--cast 'executor=codex --model gpt-5.6 --sandbox workspace-write --search'`); repeat `--cast` for multiple parameterized roles. The legacy comma form (`--cast executor=pi,reviewer=codex`) remains compatible. The requirement and its acceptance criteria live in `title` + `description`, where agents pick them up via `context.read`.
+`create` takes the workflow (`--flow full|direct|solo`) and the per-task lineup as real flags. Cast values may be legacy bare names (`--cast executor=pi`) or parameterized, ordered commands (`--cast 'executor=codex --model <executor-model> --sandbox workspace-write --search'`); repeat `--cast` for multiple parameterized roles. The legacy comma form (`--cast executor=pi,reviewer=codex`) remains compatible. The requirement and its acceptance criteria live in `title` + `description`, where agents pick them up via `context.read`.
 
 From there, agents push the task forward by reading and writing the Hub through MCP tools from their own panes; `tut status` shows the overview, the Notifier notifies you when an approval is due, and you make the call with `tut decide <task_id> --decision approve --by <your-name>`.
 
-The Notifier's side channels (instant blocked alerts, done cross-checks) rely on Herdr forwarding each pane's agent state changes to `scripts/on-agent-event.sh` — a one-time environment setup (a Herdr plugin); see the wiring instructions in section 7.2 of [design/system-design.md](design/system-design.md).
+The Notifier's side channels (instant blocked alerts, done cross-checks) rely on Herdr forwarding each pane's agent state changes to `scripts/on-agent-event.sh` — a one-time environment setup (a Herdr plugin); see [Herdr event hookup](#herdr-event-hookup).
 
 ## Host Mode: Drive It from a Conversation
 
@@ -149,6 +149,36 @@ Once configured, the agent sees 5 tools: `context.create` / `context.publish` / 
 **CLIs without MCP-over-HTTP support**: use the equivalent CLI channel — the `tut create / publish / read / list / decide` subcommands map one-to-one onto the MCP tools, so an agent can simply call them from the shell (the per-role "tool cheat sheets" in the skills — an MCP | CLI mapping — are made for exactly these CLIs; the two channels can be mixed; on the same task, each role using its own channel is fully compatible).
 
 **Environments with no way to configure MCP** (e.g. sandbox restrictions in some sessions): fall back to the CLI channel as above.
+
+### Herdr event hookup
+
+The Notifier's blocked / done / working event channel requires a one-time Herdr plugin installation. Create `~/.config/herdr/plugins/tut-notify/` and add `herdr-plugin.toml`:
+
+```toml
+id = "tut.notify"
+name = "TUT agent events"
+version = "0.2.0"
+min_herdr_version = "0.7.0"
+description = "Forward agent status changes to TUT herdr-hook.mjs"
+platforms = ["macos", "linux", "windows"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["<ABSOLUTE_NODE>", "<ABSOLUTE_PACKAGE>/scripts/herdr-hook.mjs"]
+```
+
+Replace `<ABSOLUTE_NODE>` with the absolute Node executable path and `<ABSOLUTE_PACKAGE>` with the installed TUT package root. Herdr does not expand shell syntax: use absolute paths without tildes or shebangs. Windows also invokes Node directly; escape backslashes in TOML paths or use forward slashes.
+
+Activate the plugin:
+
+```bash
+herdr plugin link ~/.config/herdr/plugins/tut-notify
+herdr plugin list
+```
+
+The list should show `tut.notify` enabled. Start the Hub and Notifier, run an Agent round in a pane, and check the notify pane log for an event entry.
+
+With `tut notify --event-port <p>`, set `TUT_EVENT_PORT_URL=http://127.0.0.1:<p>/agent-event` in the environment inherited by the Herdr plugin and launcher. Without this setting, producers send to port 3002.
 
 ## Command Overview
 
@@ -236,7 +266,7 @@ File shape (only what you want to change needs to be present; entries may carry 
 ```
 
 Parameterized workspace entries use an ordered `args` array, for example
-`"executor": { "agent": "codex", "args": ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] }`.
+`"executor": { "agent": "codex", "args": ["--model", "<executor-model>", "--sandbox", "workspace-write", "--search"] }`.
 TUT preserves the legacy bare-string cast shape and does not interpret shell
 quotes, variables, operators, redirects, or globs inside command values. Only
 the command head is checked with `command -v`; the complete argv reaches the
@@ -262,7 +292,7 @@ launcher. Codex receives TUT's update suppression after user args (`-c check_for
 | env `TUT_PROJECT_ROOT` | workspace-chain L1 root override: pins the project whose `.context-hub/workspace.json` the launcher reads (default: the anchor pane's cwd) | auto-detected |
 | env `TUT_USER_CONFIG_DIR` | workspace-chain L2 directory override (default `~/.config/tut`) | auto-detected |
 
-There is also one piece of one-time environment setup: the Herdr event-wiring plugin (see the wiring note at the end of [Quick Start](#quick-start)).
+There is also one piece of one-time environment setup: the Herdr event-wiring plugin (see [Herdr event hookup](#herdr-event-hookup)).
 
 ## Development
 
@@ -280,7 +310,7 @@ Behavioral instructions for the agent roles live in [skills/](skills/) (architec
 ## Documentation
 
 - [design/system-design.md](design/system-design.md) — **System design (currently authoritative)**: architecture, state derivation rules, MCP tool schemas, module contracts, technology choices
-- [design/context-design.md](design/context-design.md) — **Context design**: what goes in (scope / record types / payload envelope and body templates) and how it is managed
+- [design/context-design.md](design/context-design.md) — **Context design**: what goes in (scope / record types / body content requirements) and how it is managed
 
 Design docs and skills are currently Chinese-language; code, CLI output, and commit conventions are English.
 

@@ -9,7 +9,7 @@ TUT（Take Ur Turn）：多 coding agent 协作系统。核心是 Context Hub—
 当前有效方案是 [design/system-design.md](design/system-design.md)（系统设计文档），开发以它为准。开发前必读：
 
 - `design/system-design.md` — 架构、状态派生规则、MCP 工具 schema、代码结构
-- `design/context-design.md` — 上下文放什么、怎么管理（scope、记录类型、payload 信封与 body 模板）
+- `design/context-design.md` — 上下文放什么、怎么管理（scope、记录类型、正文内容要求）
 
 ## 技术栈
 
@@ -53,6 +53,10 @@ take-ur-turn/
 | Architect | 需求分析、技术方案、架构决策 | Codex CLI (GPT) |
 | Executor | 编码实现、按 review 反馈修改 | Pi (GLM) |
 | Reviewer | 代码与方案 Review | Codex CLI (GPT) |
-| Host（驱动者） | 主会话驱动：环境检查、任务发起、轮次推进、审批点汇报、异常处置——驱动不代工 | 任一主会话 Agent（ZCode / codex 等）；担任时加载 `skills/host.md` |
+| Host（驱动者） | 主会话驱动：环境检查、任务发起与范围冻结、轮次推进、审批点汇报、异常处置与纠偏落实——驱动不代工 | 任一主会话 Agent（ZCode / codex 等）；担任时加载 `skills/host.md` |
+
+**approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门；approve 后的修改诉求以新任务承载。
+
+授权基线为建任务 description 与 role=human 的记录；worker 记录只是提案，批准局部修订不等于扩大整体授权。人可授权任一 agent 代行机械操作，但代行的授权必须可回溯到人的原话，role=human 标签不能替代人的授权证据。
 
 各 Agent 通过 Context Hub 的 MCP 工具发布/读取上下文，不依赖手工维护的中转文件（传统 design.md / review.md 转交模式）。

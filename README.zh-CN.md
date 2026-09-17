@@ -100,11 +100,11 @@ tut create --title "mode 子命令补 --url flag" \
 tut start-next <task_id>   # manual：投首轮（auto 模式：Notifier 按白名单自动投递）
 ```
 
-`create` 的流程（`--flow full|direct|solo`）与任务级阵容是真旗子。cast 既支持旧的裸名（`--cast executor=pi`），也支持带有序参数的命令（`--cast 'executor=codex --model gpt-5.6 --sandbox workspace-write --search'`）；多个带参 role 可重复 `--cast`。旧逗号简写（`--cast executor=pi,reviewer=codex`）继续兼容。需求与验收口径写在 `title` + `description` 里，Agent 经 `context.read` 自取。
+`create` 的流程（`--flow full|direct|solo`）与任务级阵容是真旗子。cast 既支持旧的裸名（`--cast executor=pi`），也支持带有序参数的命令（`--cast 'executor=codex --model <executor-model> --sandbox workspace-write --search'`）；多个带参 role 可重复 `--cast`。旧逗号简写（`--cast executor=pi,reviewer=codex`）继续兼容。需求与验收口径写在 `title` + `description` 里，Agent 经 `context.read` 自取。
 
 之后 Agent 在各自 pane 里经 MCP 工具读写 Hub 推进任务；`tut status` 看总览，该人审批时 Notifier 会通知你，`tut decide <task_id> --decision approve --by <你的名字>` 拍板。
 
-Notifier 的辅通道（blocked 即时告警、done 交叉验证）依赖 Herdr 把 pane 内 Agent 的状态变化投给 `scripts/on-agent-event.sh`——这是一次性的环境配置（Herdr 插件），见 [design/system-design.md](design/system-design.md) 7.2 节的接线说明。
+Notifier 的辅通道（blocked 即时告警、done 交叉验证）依赖 Herdr 把 pane 内 Agent 的状态变化投给 `scripts/on-agent-event.sh`——这是一次性的环境配置（Herdr 插件），见 [Herdr 事件接线](#herdr-事件接线)。
 
 ## 会话驱动（Host 模式）
 
@@ -148,6 +148,36 @@ url = "http://127.0.0.1:3001/mcp"
 **不支持 MCP over HTTP 的 CLI**：走等价的 CLI 通道——`tut create / publish / read / list / decide` 子命令与 MCP 工具一一对应，Agent 经 shell 调用即可（skills 里各角色的「工具速查」表（MCP | CLI 对照）就是为这类 CLI 准备的；两类通道可混用，同一任务里各角色各走各的通道完全兼容）。
 
 **无 MCP 配置能力的环境**（如某些会话的沙箱限制）：同上走 CLI 通道兜底。
+
+### Herdr 事件接线
+
+Notifier 的 blocked / done / working 辅通道需要一次性安装 Herdr 插件。创建 `~/.config/herdr/plugins/tut-notify/` 并写入 `herdr-plugin.toml`：
+
+```toml
+id = "tut.notify"
+name = "TUT agent events"
+version = "0.2.0"
+min_herdr_version = "0.7.0"
+description = "Forward agent status changes to TUT herdr-hook.mjs"
+platforms = ["macos", "linux", "windows"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["<ABSOLUTE_NODE>", "<ABSOLUTE_PACKAGE>/scripts/herdr-hook.mjs"]
+```
+
+将 `<ABSOLUTE_NODE>` 换成 Node 可执行文件的绝对路径，将 `<ABSOLUTE_PACKAGE>` 换成 TUT 安装包根目录。Herdr 不做 shell 展开，不使用波浪号或 shebang；Windows 同样直接调用 Node，TOML 路径中的反斜杠须转义（也可使用正斜杠）。
+
+激活插件：
+
+```bash
+herdr plugin link ~/.config/herdr/plugins/tut-notify
+herdr plugin list
+```
+
+列表应显示 `tut.notify` enabled。启动 Hub 与 Notifier 后，在 pane 内运行一回合 Agent，检查 notify pane 日志是否出现事件行。
+
+若使用 `tut notify --event-port <p>`，须在 Herdr 插件与启动器继承的环境中设置 `TUT_EVENT_PORT_URL=http://127.0.0.1:<p>/agent-event`；未设置时生产者向默认端口 3002 投递。
 
 ## 命令速览
 
@@ -235,7 +265,7 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 ```
 
 带参 workspace 条目使用有序 `args` 数组，例如：
-`"executor": { "agent": "codex", "args": ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] }`。
+`"executor": { "agent": "codex", "args": ["--model", "<executor-model>", "--sandbox", "workspace-write", "--search"] }`。
 旧的裸字符串 cast 形状保持不变；TUT 不解释命令值中的 shell 引号、变量、运算符、重定向或 glob。只有命令首词进入 `command -v` 检查，完整 argv 才交给 launcher。Codex 在用户参数之后追加 `-c check_for_update_on_startup=false`，pi 在命令前加 `env PI_SKIP_VERSION_CHECK=1`；`TUT_SUPPRESS_AGENT_UPDATE=0` 可关闭这些附加项。
 
 `naming.tab_label` 渲染**tab** 标签（人读侧）：占位符 `{role}` / `{task}` / `{agent}`，未知占位符原样保留，默认 `TUT {role}`。**pane** 标签是机器寻址键、不可模板化：轮次 pane 恒为 `<task_id>.<role>`（事件反查直接命中）。双字段各司其职。
@@ -258,7 +288,7 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 | env `TUT_PROJECT_ROOT` | 工作区链 L1 根覆盖：指定启动器读哪个项目的 `.context-hub/workspace.json`（缺省取锚点 pane 的 cwd） | 自动解析 |
 | env `TUT_USER_CONFIG_DIR` | 工作区链 L2 目录覆盖（缺省 `~/.config/tut`） | 自动解析 |
 
-另有一次性环境态配置：Herdr 事件接线插件（见[快速上手](#快速上手)末段的接线说明）。
+另有一次性环境态配置：Herdr 事件接线插件（见 [Herdr 事件接线](#herdr-事件接线)）。
 
 ## 开发
 
@@ -276,7 +306,7 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 ## 文档
 
 - [design/system-design.md](design/system-design.md) — **系统设计（当前有效）**：架构、状态派生规则、MCP 工具 schema、模块契约、技术选型
-- [design/context-design.md](design/context-design.md) — **上下文设计**：放什么（scope / 记录类型 / payload 信封与 body 模板）、怎么管理
+- [design/context-design.md](design/context-design.md) — **上下文设计**：放什么（scope / 记录类型 / 正文内容要求）、怎么管理
 
 ## 故障排查与已知限制
 

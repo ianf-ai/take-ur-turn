@@ -1,16 +1,8 @@
 # Executor Skill
 
-你担任 Executor：编码实现、按 review 反馈修改。从 Context Hub 领任务——implementing 阶段交付 code_changes，revising 阶段交付 revision。代码进 git，过程记录进 Hub：**改动清单与 diff 不写进记录**，用 commits 字段引用 commit，读者自己 `git show`。提交纪律：`git add` 精确点名本次交付的文件，不用 `-A`／全家桶。
+共同规则见 `skills/common.md`，与本文件共同生效。
 
-- 写通道双份：有 MCP 用 MCP 工具（`context.*`）；没有 MCP（纯 bash 环境）用 `tut` CLI，两者等价。role 字段固定写 `executor`（约定枚举：architect | executor | reviewer | human，精确小写）。
-
-## 流程选择指引
-
-flow 建任务时选定（create 的 `--flow` / MCP `flow` 字段，缺省 `full`），落库后不可变：
-
-- **full**（缺省）：design → 实现 → review → 人审批的完整四阶段。
-- **direct**：repo 已有现成设计，任务从 implementing 开始，日志里的 design 记录只是参考（不转态）。**description 即指针**：direct 单的设计指针在任务 description（如「按 design/X.md 第 N 单元…」），接单即按指针读文档开工，无需等 design 记录、也不必自发发参考 design note。
-- **solo**：小改动免审——code_changes 直接进 pending_approval 由人拍板；被打回（reject）时回到 implementing 重做，重做后仍发 code_changes——solo 里没有 revising，revision 记录属表外。
+你担任 Executor：编码实现、按 review 反馈修改。从 Context Hub 领任务——implementing 阶段交付 code_changes，revising 阶段交付 revision。信封选择纪律：code_changes 只在 implementing 态作首轮交付；full／direct 的修订轮发 revision（`ref_version` 指向进入修订的那条记录），solo 无 review 环、修复轮仍在 implementing 态交付 code_changes；任务 approve／close 之后不再发任何交付类记录，进展汇报改用 note。代码进 git，过程记录进 Hub：**改动清单与 diff 不写进记录**，用 commits 字段引用 commit，读者自己 `git show`。提交纪律：`git add` 精确点名本次交付的文件，不用 `-A`／全家桶。
 
 ## 何时介入
 
@@ -21,22 +13,12 @@ flow 建任务时选定（create 的 `--flow` / MCP `flow` 字段，缺省 `full
 
 status / waiting_for 是派生出来的路由建议，不是指令——被指派的任务不在这两个状态时，先读任务日志弄清进行到哪，再决定动作。
 
-## 接手读序（三层）
+## 接手读序
 
-| 层 | 回答的问题 | 怎么读 |
-|----|-----------|--------|
-| 1. git 权威文档 | 现在是什么样、该怎么做 | 直接读仓库文件：`AGENTS.md`（开发约定，含「完成编码后必须运行测试/构建验证」的硬规则）、`design/` 下本任务依赖的设计文档（不经 Hub） |
-| 2. project scope 决策流 | 为什么会是这样 | `context.read {"task_id": "project"}`（CLI `tut read project`） |
-| 3. 任务日志 | 这件事进行到哪 | `context.read {"task_id": "<id>"}`（CLI `tut read <id>`） |
-
-第 2 层注意项目级约束与不变量（如「零运行时依赖」）——违反约束的实现会被 review 打回。第 3 层按所处阶段定重点：
+三层读序表与项目级约束注意见 `skills/common.md`「接手读序」；第 3 层按所处阶段定重点：
 
 - **implementing**：精读 design 的「对实现的要求」（验收口径、边界条件、必须跑的测试）——那是你的验收清单。
 - **revising**：先分清进入路径——日志里最新一条影响状态折叠的记录（排除 ack note 与表外记录）是 verdict 为 `fail_code` 的 review（精读其**问题列表与每条的关闭条件**，以及其后可能存在的人的延后拍板 note）、人的 decision(reject)（精读该记录 body——**reject 理由就是修改清单**），还是你自己在 reviewing 态发的非 ack note（自报问题即修改清单）。三种路径 revision 都要逐条回应它们。
-
-增量读取：read 返回的 versions 数组每条带 version，之后用 `"since_version": N`（CLI `--since-version N`）只取新记录。
-
-**expected_version 的正确用法**（两种通道通用）：值 = 你看到的任务当前版本——read 到最新记录 version 是 N 就带 N。带对了能抓住并发写入：别人先写了一手，你的发布会报版本冲突（MCP 返回 isError；CLI 非零退出码、stderr 首行是 VERSION_CONFLICT）——重读日志再发。不带也能写（跳过校验），但带上是更好的习惯。
 
 ## 发布 code_changes（implementing 阶段的交付）
 
@@ -65,7 +47,7 @@ context.publish {"task_id": "<id>", "role": "executor", "content_type": "code_ch
 tut publish <id> --role executor --content-type code_changes --summary "…" --payload-file changes.md --commits a1b2c3d --expected-version 2
 ```
 
-code_changes 落盘后任务派生为 reviewing，轮到 Reviewer（solo 例外：直接进 pending_approval 由人拍板，见「流程选择指引」）。
+code_changes 落盘后任务派生为 reviewing，轮到 Reviewer（solo 例外：直接进 pending_approval 由人拍板，见 `skills/common.md`「flow 三态」）。
 
 ## 发布 revision（revising 阶段的交付）
 
@@ -102,15 +84,13 @@ revision 落盘后任务回到 reviewing，等 Reviewer 重审。
 
 ## 工具速查
 
-MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
+本 skill 只用 read / list / publish；工具总则（MCP 五工具对应、USAGE 语法、`--json`、自述身份、`decide` 入口）见 `skills/common.md`。
 
 | 操作 | MCP | CLI |
 |---|---|---|
 | 找实现任务 | `context.list {"status": "implementing\|revising"}` | `tut list --status implementing` / `--status revising` |
 | 读 project scope / 任务日志 / 增量 | `context.read {"task_id": …, "since_version": N}` | `tut read <id> [--since-version N]` |
 | 发布 code_changes / revision / note | `context.publish {…}` | `tut publish <id> --role executor --content-type <t> --summary "…" (--body <text>\|--payload-file <md>) [--commits <a,b>] [--ref-version <n>] [--expected-version <n>]` |
-
-脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model`（MCP 同名顶层字段）自述身份，供追溯——**不知道就留空，不要猜**，自报字段宁可空、不可错。`decide` 是人工审批入口，不由你调用。
 
 ## 关闭条件
 
@@ -119,7 +99,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 
 ## 延后流程
 
-你的入口：revision 的逐条回应里标「申请延后」，Agent 只有建议权或申请权。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
+你的入口：revision 的逐条回应里标「申请延后」；共同规则（建议权边界、拍板与登记、核销）见 `skills/common.md`「延后流程」。
 
 ---
 

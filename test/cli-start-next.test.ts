@@ -200,7 +200,7 @@ describe("start-next no-arg default (handler, /state stubbed)", () => {
     expect(out).toContain("DRY-RUN"); // real launch.sh honored the passthrough env
     expect(out).toContain("(agent 'pi', label 't-unique.executor')"); // fresh round pane (4.4)
     expect(out).toContain("t-unique");
-    expect(out).toContain("launched executor for t-unique via launch.sh");
+    expect(out).toContain("launched executor for t-unique via tut launch");
     expect(out).not.toContain("[!!]"); // clean task: no attention marker
     // The auto-selected id flows into the launch-note guard path verbatim.
     expect(vi.mocked(hubPublish)).toHaveBeenCalledWith("http://hub.test", {
@@ -514,7 +514,7 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
     expect(code).toBe(0);
     expect(io.err()).toContain("--fresh — force-closing panes labeled 't-fresh.executor'");
     expect(io.err()).not.toContain("same-role continuation"); // the flag bypassed the seat
-    expect(io.out()).toContain("start-next: launched executor for t-fresh via launch.sh");
+    expect(io.out()).toContain("start-next: launched executor for t-fresh via tut launch");
     // Pane policy ≠ dedup policy: the launch marker was appended as usual.
     expect(vi.mocked(hubPublish)).toHaveBeenCalledWith("http://hub.test", {
       task_id: "t-fresh",
