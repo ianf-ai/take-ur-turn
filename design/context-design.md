@@ -104,58 +104,19 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 
 **cast 不进信封**：任务级点将（role → agent route）是 TaskMeta 字段，随 create 落库、随 read/list/state 暴露——它是路由参数不是记录内容，信封 schema 零改动（见主设计 4.1/6.2）。裸 agent 仍是字符串；带参命令使用 `{agent,args}`，args 按顺序保留。
 
-### 2.4 body 模板（由 skill 教给 Agent，不进 schema）
+### 2.4 正文内容与模板边界
 
-**design**
-```markdown
-## 背景与目标
-## 选定方案及理由
-## 被否决的方案
-（考虑过但放弃的选项，以及放弃的原因）    ← 原始痛点点名要保的东西
-## 对实现的要求
-（验收口径、边界条件、必须跑的测试）
-## 风险与开放问题
-```
+body 是完整的 Markdown 叙述，不由 Server 校验小节标题或写作顺序。各类型的内容要求如下；可执行的写作模板与交付步骤由 `skills/` 独立维护。
 
-**code_changes**
-```markdown
-## 实现概述
-## 关键决策与偏差
-（与 design 不一致的地方及原因）
-## 验证结果
-（测试/构建输出摘要——必须真实跑过）
-## 遗留问题
+| 类型 | 正文承载的内容 |
+|------|----------------|
+| design | 背景与目标、选定及否决方案的理由、验收要求、风险与开放问题 |
+| code_changes | 实现概述、关键决策及偏差、真实验证结果、遗留问题；代码以 commits 引用 |
+| review | 总体评价、问题定位与严重度、可验证的关闭条件、建议与延后候选 |
+| revision | 对所引用问题的逐条回应及证据、改动说明、真实验证结果 |
+| note / decision | 补充上下文或决定理由（decision 正文一到三句）；note 无固定正文结构 |
 
-（改动清单与 diff 不写在这里——commits 字段引用 commit，读者用 `git show` 查看；
- 需要在正文里讨论某段代码时，按需摘录关键 hunk 作为说明的一部分）
-```
-
-**review**
-```markdown
-## 总体评价
-## 问题列表
-（按严重度排列，定位到 file:line，给出建议修法；
- 每条附**关闭条件**——怎样算修好的可验证判据，如「过期 token 返回 401 且有测试覆盖」。
- 下一轮 review 按关闭条件逐条核销，不重新裁量）
-## 建议与延后候选
-（pass 判据：未延后的问题全部满足关闭条件。
- 认为可以延后的问题在这里列出——Reviewer 只有建议权，延后由人拍板）
-```
-
-**revision**
-```markdown
-## 对 review 的逐条回应
-（针对 ref_version 指向的 review，每条说明属于哪种：
- 满足关闭条件——给出证据（测试、commit）；
- 申请延后——引用人的拍板记录；
- 反驳——给出理由）
-## 改动说明
-## 验证结果
-```
-
-**note**：无模板。**decision**：body 写决定理由，一到三句。
-
-**延后问题的流程**：延后有两个发起入口——Reviewer 在 review 的「延后候选」中提出，或 Executor 在 revision 中申请。无论哪个入口，**延后由人拍板**：人发一条 note 写明同意延后哪些问题、理由。拍板用 note 而非 decision——decision 参与状态派生，任务中途（如 reviewing 态）发布属于表外组合、会置 needs_attention；拍板 note（role=human）在任何状态都安全——note 的转态例外只认 `reviewing` 态的 role=executor（主设计 3.1），与人的拍板无涉。revision 引用该拍板记录，re-review 按「已延后」核销。拍板的人（或委托的任一 Agent）随即将延后问题以一条 note 登记进 project scope（带原任务、ref_version、关闭条件），成为跨任务记忆，不随任务关闭而丢失——将来哪个任务把它捡起来，不用考古。
+**延后问题的记忆归属**：Reviewer 的延后建议与 Executor 的延后申请均不是批准。有效延后须有人的授权 note，记录问题、理由；使用 note 而非参与状态派生的 decision。revision 以拍板记录为证据，project scope 的延后登记保留原任务、ref_version 与关闭条件，由人或明确受托的 Agent 发布，保证任务关闭后仍可检索。状态折叠规则归主设计第 3 节。
 
 ### 2.5 链路回溯：ref_version
 
@@ -163,15 +124,9 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 - revision `ref_version` → 它回应的 review
 - 修订轮次多时，这是唯一可靠的对应关系来源
 
-### 2.6 上下文获取路径（写进 skill）
+### 2.6 上下文可达性
 
-任务 description 随 context.read / `tut read` 返回（加法修订）——direct/solo 流程里任务要求不经 design 记录承载，读日志即见需求。
-
-Agent 接手工作时的读序，三层各答一个问题：
-
-1. 读 git 权威文档（AGENTS.md、design/）——「现在是什么样、该怎么做」
-2. 读 project scope 决策流——「为什么」
-3. 读任务日志——「进行到哪」
+三层上下文各有独立事实源（1.1）：git 文件承载当前有效的设计与约定，project scope 承载跨任务决策流，任务日志承载任务要求与过程。任务 description 随 context.read / `tut read` 返回，direct/solo 的要求无需重复写成 design 记录即可被下一角色读取。接单读序与读取操作由各角色 skill 承载。
 
 ## 3. 管理方式：怎么管理
 

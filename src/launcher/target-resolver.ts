@@ -109,6 +109,14 @@ const POSIX_WHICH_MISSING_HINT =
 /** A hung where.exe/which or a dead-UNC stat must return failure, not stall
  * the launch loop. */
 const DEFAULT_PROBE_TIMEOUT_MS = 8000;
+/** Total Windows PATH walk, including candidate discovery and all resumes. */
+const DEFAULT_PROBE_WALK_TIMEOUT_MS = 24_000;
+
+function probeWalkTimeoutMs(environment: NodeJS.ProcessEnv): number {
+  const raw = environment.TUT_PROBE_WALK_TIMEOUT_MS;
+  if (raw === undefined || !/^\d+$/u.test(raw)) return DEFAULT_PROBE_WALK_TIMEOUT_MS;
+  return Math.min(Math.max(Number(raw), 250), 60_000);
+}
 const PROBE_TIMEOUT_MIN_MS = 250;
 const PROBE_TIMEOUT_MAX_MS = 60_000;
 
@@ -145,7 +153,7 @@ async function withFsProbeBudget<T>(
         timer = setTimeout(() => {
           controller.abort();
           reject(new Error(`filesystem probe timed out after ${budgetMs}ms and was aborted`));
-        }, budgetMs);
+        }, Math.ceil(budgetMs));
       }),
     ]);
   } finally {
@@ -474,8 +482,8 @@ const FACT_PROBE_CHUNK_SIZE = 128;
  * the verdict, dead UNC or not, are never probed at all.
  *
  * The budget is per child (matching TUT_PROBE_TIMEOUT_MS semantics for
- * where/which probes): a resume child gets a fresh budget, so N dead
- * directories cost N budgets — each bounded, each kernel-cleaned by
+ * where/which probes), clipped to the shared walk deadline. Dead directories
+ * cannot accumulate unlimited budgets; every child is kernel-cleaned by
  * SIGKILL, never the main process's threadpool (Node fs has no
  * AbortSignal/cancellable stat; a pure Promise.race saves only the caller,
  * not the threadpool request).
@@ -495,6 +503,7 @@ class StreamingWindowsFactTable {
     private readonly candidates: readonly string[],
     private readonly budgetMs: number,
     private readonly spawnChild: (argv: readonly string[]) => FactProbeChild,
+    private readonly deadline: number,
   ) {}
 
   /** Facts for one (walk-resolved) candidate; starts or resumes a probing
@@ -504,7 +513,7 @@ class StreamingWindowsFactTable {
       const known = this.facts.get(candidate);
       if (known !== undefined) return known;
       if (this.child === undefined) {
-        if (this.disposed || this.nextStart >= this.candidates.length) return undefined;
+        if (this.disposed || performance.now() >= this.deadline || this.nextStart >= this.candidates.length) return undefined;
         this.startChild();
       }
       await new Promise<void>((resolve) => {
@@ -540,7 +549,7 @@ class StreamingWindowsFactTable {
     this.childBase = base;
     this.childArgv = argv;
     this.childRows = 0;
-    this.childTimer = setTimeout(() => this.expireChild(handle), this.budgetMs);
+    this.childTimer = setTimeout(() => this.expireChild(handle), Math.ceil(Math.min(this.budgetMs, Math.max(1, this.deadline - performance.now()))));
     handle.onLine((line) => this.onRow(handle, line));
     handle.onEnd((outcome) => this.endChild(handle, outcome));
   }
@@ -729,10 +738,10 @@ export function enumeratePathCandidates(agent: string, environment: NodeJS.Proce
  * CreateProcess resolution still finds System32\where.exe with an empty
  * PATH, covering the one case self-enumeration cannot).
  */
-async function defaultWindowsCandidates(agent: string, environment: NodeJS.ProcessEnv): Promise<string[]> {
+async function defaultWindowsCandidates(agent: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<string[]> {
   const enumerated = enumeratePathCandidates(agent, environment);
   if (enumerated.length > 0) return enumerated;
-  const probe = await probeExecutable("where.exe", [agent]);
+  const probe = await probeExecutable("where.exe", [agent], { timeoutMs });
   if (probe.error !== undefined) {
     throw new AgentTargetError(
       agent,
@@ -776,10 +785,24 @@ export async function resolveWindowsExecutableTarget(
 ): Promise<ResolvedAgentTarget> {
   const environment = deps.environment ?? process.env;
   const fsProbeBudgetMs = probeTimeoutMs(environment);
+  const walkBudgetMs = probeWalkTimeoutMs(environment);
+  const deadline = performance.now() + walkBudgetMs;
+  const remaining = (): number => {
+    const ms = deadline - performance.now();
+    if (ms <= 0) throw new AgentTargetError(routeAgent,
+      `PATH walk timed out after ${walkBudgetMs}ms`, WINDOWS_NATIVE_HINT);
+    return Math.min(fsProbeBudgetMs, ms);
+  };
   const nodeExecutable = deps.nodeExecutable ?? process.execPath;
-  const listCandidates = deps.candidates ?? ((agent: string) => defaultWindowsCandidates(agent, environment));
+  const listCandidates = deps.candidates ?? ((agent: string) => defaultWindowsCandidates(agent, environment, remaining()));
 
-  const candidates = await listCandidates(routeAgent);
+  let candidates: string[];
+  try {
+    candidates = await withFsProbeBudget(() => listCandidates(routeAgent), remaining());
+  } catch (error) {
+    throw new AgentTargetError(routeAgent, `candidate discovery failed: ${(error as Error).message}`, WINDOWS_NATIVE_HINT);
+  }
+  remaining();
 
   // Production default (neither stat nor readHeader injected): serve every
   // candidate's facts from a streaming session backed by killable children
@@ -792,7 +815,7 @@ export async function resolveWindowsExecutableTarget(
   // instead run per-candidate adapters under the signal+race budget of
   // withFsProbeBudget.
   const factTable = deps.stat === undefined && deps.readHeader === undefined && candidates.length > 0
-    ? new StreamingWindowsFactTable(candidates, fsProbeBudgetMs, deps.factProbe ?? spawnFactProbeDefault)
+    ? new StreamingWindowsFactTable(candidates, fsProbeBudgetMs, deps.factProbe ?? spawnFactProbeDefault, deadline)
     : undefined;
   const stat = deps.stat ?? (factTable !== undefined
     ? statFromFacts(factTable)
@@ -803,6 +826,7 @@ export async function resolveWindowsExecutableTarget(
   let sawEvidence = false; // some candidate existed (or errored beyond ENOENT)
   try {
     for (const raw of candidates) {
+      remaining();
       let candidate: string;
       try {
         candidate = path.win32.resolve(raw);
@@ -814,7 +838,7 @@ export async function resolveWindowsExecutableTarget(
       let entry: Stats;
       try {
         // Bounded: a dead-UNC candidate stat cannot stall the walk.
-        entry = await withFsProbeBudget((signal) => stat(candidate, signal), fsProbeBudgetMs);
+        entry = await withFsProbeBudget((signal) => stat(candidate, signal), remaining());
       } catch (error) {
         if (isENOENT(error)) {
           // The candidate never existed — not an untrusted result, and not a
@@ -827,6 +851,7 @@ export async function resolveWindowsExecutableTarget(
         );
         continue;
       }
+      remaining();
       sawEvidence = true;
       if (!isRegularFile(entry)) {
         rejected.push(`resolves to a non-file target ('${candidate}')`);
@@ -865,13 +890,14 @@ export async function resolveWindowsExecutableTarget(
         // later candidates.
         let header: Buffer;
         try {
-          header = await withFsProbeBudget((signal) => readHeader(candidate, 2, signal), fsProbeBudgetMs);
+          header = await withFsProbeBudget((signal) => readHeader(candidate, 2, signal), remaining());
         } catch (error) {
           rejected.push(
             `header read failed for '${candidate}' (${error instanceof Error ? error.message : String(error)})`,
           );
           continue;
         }
+        remaining();
         if (header.length >= 2 && header[0] === 0x4d && header[1] === 0x5a) {
           return { kind: "native", executable: candidate, prefix_args: [], source_path: candidate };
         }
@@ -888,6 +914,7 @@ export async function resolveWindowsExecutableTarget(
       );
     }
 
+    remaining();
     if (!sawEvidence) {
       throw new AgentTargetError(
         routeAgent,

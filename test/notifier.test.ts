@@ -688,7 +688,7 @@ describe("auto-mode gate", () => {
     expect(titlesMatching("auto launch failed")).toHaveLength(1);
   });
 
-  it("launches via launch.sh for an agent:* hand-off and notifies 'auto-launched'", async () => {
+  it("launches via tut launch for an agent:* hand-off and notifies 'auto-launched'", async () => {
     const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"] });
     await hz.notifier.requestCompare();
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", updated_at: U2 })], { flow_mode: "auto", auto: ALL_ROLES }));
@@ -1217,14 +1217,14 @@ describe("auto-mode gate", () => {
       // The launcher child runs OFF the compare queue: wait for
       // the real dry-run child to finish and its notify to land.
       await vi.waitFor(() => {
-        expect(hz.logs.some((l) => l.includes("launch.sh (t1, executor)"))).toBe(true);
+        expect(hz.logs.some((l) => l.includes("tut launch (t1, executor)"))).toBe(true);
       });
       // launch.sh TUT_DRY_RUN output: the pre-check resolved executor →
       // agent 'pi' (passed as the 3rd arg); the prompt names the task id;
       // delivery is send-text + Enter (not pane run). Dry-run may open with
       // provisioning preview/skip lines when no live pane matches the agent —
       // assert on the send-text line, independent of line order.
-      const launchLines = hz.logs.filter((l) => l.includes("launch.sh (t1, executor)"));
+      const launchLines = hz.logs.filter((l) => l.includes("tut launch (t1, executor)"));
       expect(launchLines.length).toBeGreaterThan(0);
       const sendText = launchLines.find((l) => l.includes("DRY-RUN: herdr pane send-text"));
       expect(sendText).toBeDefined();

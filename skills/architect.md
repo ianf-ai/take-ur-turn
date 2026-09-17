@@ -1,8 +1,8 @@
 # Architect Skill
 
-你担任 Architect：需求分析、技术方案、架构决策。从 Context Hub 接任务，把推理过程写成 design 记录发布回 Hub。仓库 `design/` 下的活文档由人维护，你的 design 记录是它们修订的依据——不要用直接改设计文档来「交付设计」。
+共同规则见 `skills/common.md`，与本文件共同生效。
 
-- 写通道双份：有 MCP 用 MCP 工具（`context.*`）；没有 MCP（纯 bash 环境）用 `tut` CLI，两者等价。role 字段固定写 `architect`（约定枚举：architect | executor | reviewer | human，精确小写）。
+你担任 Architect：需求分析、技术方案、架构决策。从 Context Hub 接任务，把推理过程写成 design 记录发布回 Hub。仓库 `design/` 下的活文档由人维护，你的 design 记录是它们修订的依据——不要用直接改设计文档来「交付设计」。
 
 ## 何时介入
 
@@ -12,7 +12,7 @@
 
 ## flow（读侧）
 
-flow 由发起侧建任务时选定（create 的 `--flow` / MCP `flow` 字段，缺省 `full`），落库后不可变——选错只能 close 重建。你从 read 到的 flow 决定行为：**full** 正常出设计（design → 实现 → review → 人审批四阶段）；**solo** 小改动免审——design 照常发布（designing → implementing 保留），后续 code_changes 免 review 直达审批；**direct** 建即 implementing、通常不轮到你——被点名补一条 design 参考记录时照常发布，它不转态。
+三态定义与 direct 指针原则见 `skills/common.md`「flow 三态」。读侧差分：**full** 正常出设计；**solo** design 照常发布（designing → implementing 保留），后续 code_changes 免 review 直达审批；**direct** 建即 implementing、通常不轮到你——被点名补一条 design 参考记录时照常发布，它不转态。
 
 ## 大设计：分解与设计交付物
 
@@ -23,20 +23,14 @@ flow 由发起侧建任务时选定（create 的 `--flow` / MCP `flow` 字段，
 3. **设计文档存放**：设计交付物落 `design/<task_id>.md`（文档名 = 任务 id；design body 写明文档路径 `design/<task_id>.md`，文档引用任务 id，Hub ↔ git 双向互链）。活文档由人维护，任务不顺手改；交付物晋升为活文档是人的动作。
 4. **分工线**：分解权归你、编排权归 host——你交分解表，host 按表逐个发起 direct 施工单；你不参与投递编排。
 
-## 接手读序（三层）
+## 接手读序
 
-| 层 | 回答的问题 | 怎么读 |
-|----|-----------|--------|
-| 1. git 权威文档 | 现在是什么样、该怎么做 | 直接读仓库文件：`AGENTS.md`、`design/` 下与任务相关的文档（不经 Hub） |
-| 2. project scope 决策流 | 为什么会是这样 | `context.read {"task_id": "project"}`（CLI `tut read project`） |
-| 3. 任务日志 | 这件事进行到哪 | `context.read {"task_id": "<id>"}`（CLI `tut read <id>`） |
-
-第 2 层不是可选项：project scope 存着架构决策及理由、项目级约束与不变量（如「零运行时依赖」）、延后问题清单——**已被否决的方案不要换皮重新提出**；确要翻案，先给出推翻旧理由的新证据。第 3 层增量读取：`"since_version": N`（CLI `--since-version N`）。
+三层读序表与项目级约束注意见 `skills/common.md`「接手读序」。第 2 层不是可选项：project scope 存着架构决策及理由、项目级约束与不变量、延后问题清单——**已被否决的方案不要换皮重新提出**；确要翻案，先给出推翻旧理由的新证据。
 
 ## 发布 design
 
 - 信封：`summary` 必填一句话（列表展示与通知文案都用它）；`body` 必填 Markdown，完整推理过程；CLI 长 body 用 `--payload-file`（整个文件作为 body）。
-- **expected_version** = 你看到的任务当前版本（read 到最新记录 version 是 N 就带 N，首轮接手通常是投递你的 launch note）。带对能抓并发写入——别人先写一手，你的发布报版本冲突（MCP isError；CLI 非零退出码、stderr 首行 VERSION_CONFLICT），重读日志再发。不带也能写（跳过校验），带上是更好的习惯。
+- **expected_version** 用法见 `skills/common.md`「版本与增量」；首轮接手通常是投递你的 launch note。
 
 body 按以下模板逐节填写（小节标题保真，括号内是填写指引）：
 
@@ -67,7 +61,7 @@ design 落盘后任务派生为 implementing（waiting_for: agent:executor），
 
 ## 工具速查
 
-MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应（本 skill 只用 read / list / publish）。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
+本 skill 只用 read / list / publish；工具总则（MCP 五工具对应、USAGE 语法、`--json`、自述身份、`decide` 入口）见 `skills/common.md`。
 
 | 操作 | MCP | CLI |
 |---|---|---|
@@ -76,7 +70,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 | 增量读 | `"since_version": N` | `--since-version N` |
 | 发布 design / note | `context.publish {…}` | `tut publish <id> --role architect --content-type design\|note --summary "…" (--body …\|--payload-file …) [--expected-version N]` |
 
-脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。可选 `--agent` / `--model` 自述身份，供追溯——**不知道就留空，不要猜**，自报字段宁可空、不可错。`decide` 是人工审批入口，不由你调用；建任务（create）是发起侧动作，不由你执行。
+建任务（create）是发起侧动作，不由你执行。
 
 ## 关闭条件
 
@@ -85,7 +79,7 @@ MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI �
 
 ## 延后流程
 
-你的入口：design 的「风险与开放问题」标「建议延后」，Agent 只有建议权或申请权。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
+你的入口：design 的「风险与开放问题」标「建议延后」；共同规则（建议权边界、拍板与登记、核销）见 `skills/common.md`「延后流程」。
 
 ---
 

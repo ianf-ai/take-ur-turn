@@ -366,6 +366,38 @@ describe("Windows filesystem probe budget (dead-UNC stat/header cannot stall the
    * a dead UNC share. */
   const never = <T>(): Promise<T> => new Promise<T>(() => {});
 
+  it.each(["stat", "stream"])("caps a long slow PATH walk through the %s adapter and stops further probes", async (adapter) => {
+    const candidates = Array.from({ length: 20 }, (_, i) => `C:\\slow${i}\\pi.exe`);
+    const kills = vi.fn();
+    const starts = vi.fn();
+    const signals: AbortSignal[] = [];
+    const started = performance.now();
+    const error = await resolveWindowsExecutableTarget("pi", {
+      candidates: cands(...candidates),
+      environment: { TUT_PROBE_TIMEOUT_MS: "250", TUT_PROBE_WALK_TIMEOUT_MS: "600" },
+      ...(adapter === "stat" ? {
+        stat: async (_candidate: string, signal?: AbortSignal) => {
+          starts();
+          if (signal) signals.push(signal);
+          return never<Stats>();
+        },
+      } : {
+        factProbe: () => {
+          starts();
+          return { kill: kills, onLine() {}, onEnd() {} };
+        },
+      }),
+    }).catch((e: unknown) => e);
+    const elapsed = performance.now() - started;
+    expect(error).toBeInstanceOf(AgentTargetError);
+    expect((error as Error).message).toContain("PATH walk timed out after 600ms");
+    expect(elapsed).toBeGreaterThanOrEqual(590);
+    expect(elapsed).toBeLessThan(1500); // 20 directories would otherwise take 5 seconds.
+    expect(starts.mock.calls.length).toBeLessThanOrEqual(3);
+    if (adapter === "stream") expect(kills.mock.calls.length).toBe(starts.mock.calls.length);
+    else expect(signals.every((signal) => signal.aborted)).toBe(true);
+  });
+
   it("times a never-resolving stat out per candidate and keeps walking to a later good candidate", async () => {
     const started = Date.now();
     const result = await resolveWindowsExecutableTarget("pi", {

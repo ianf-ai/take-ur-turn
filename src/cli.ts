@@ -1651,7 +1651,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
     process.stderr.write("tut: relaunch with --force once the pane is fixed\n");
     return 1;
   }
-  process.stdout.write(`start-next: launched ${role} for ${taskId} via launch.sh\n`);
+  process.stdout.write(`start-next: launched ${role} for ${taskId} via tut launch\n`);
   return 0;
 }
 

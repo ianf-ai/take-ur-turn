@@ -66,13 +66,15 @@ export interface RunNodeCommandOptions extends DirectSpawnOptions {
 
 /**
  * Default child timeout: generous by design — it must sit above
- * every legitimate launcher phase budget summed up (submit retry window 30s,
- * gate ~15s, land ~5s, plus birth/observe/cleanup spawns) so healthy
- * launches are never killed.  A wedged child (ancestor sent SIGSTOP, a
+ * the default launcher phase budgets summed up:
+ * gate 15s + land 5s + born late-land 60s + submit 30s = 110s.
+ * The 180s default leaves 70s for birth/control spawns and escalation;
+ * custom phase overrides remain subject to this finite backstop.
+ * A wedged child (ancestor sent SIGSTOP, a
  * dependency path hangs) becomes a failure return instead of a pending
  * promise that freezes its caller forever.
  */
-export const DEFAULT_CHILD_TIMEOUT_MS = 120_000;
+export const DEFAULT_CHILD_TIMEOUT_MS = 180_000;
 
 /** Run a direct child and collect its stdio without turning spawn errors into throws. */
 export function runNodeCommand(

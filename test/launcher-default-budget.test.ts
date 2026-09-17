@@ -71,7 +71,7 @@ function invocation() {
 describe("production default launcher budget through the Notifier boundary", () => {
   it("spawnLaunchInvocation translates the default-budget kill into the budget-exceeded throw", async () => {
     await expect(spawnLaunchInvocation(invocation())).rejects.toThrow(
-      `launch.sh budget-unit executor exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`,
+      `tut launch budget-unit executor exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`,
     );
   });
 
