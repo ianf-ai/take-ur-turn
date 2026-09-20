@@ -5,7 +5,7 @@
  *   POST   /mcp   → stateless Streamable HTTP (per-request McpServer + transport,
  *                   destroyed on response close — verified idiom)
  *   GET|DELETE /mcp → 405 + Allow: POST (stateless mode has no SSE stream / session)
- *   GET    /state → frozen shape for the Notifier (system-design 4.3)
+ *   GET|HEAD /state → frozen shape for the Notifier (system-design 4.3)
  *                   + optional top-level `notify` key echoing config.json's notify
  *                   field (additive revision, absent by default)
  *                   + optional top-level `auto` key echoing the validated auto
@@ -33,6 +33,8 @@
  * response, never a process crash.
  */
 
+import path from "node:path";
+import { canonicalRoot } from "./rig-discovery.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   StreamableHTTPServerTransport,
@@ -137,6 +139,7 @@ function parseRepairMetaBody(parsed: unknown): { task_id: string; input: RepairM
 
 export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
   const { store, root } = deps;
+  const hubRoot = canonicalRoot(path.dirname(path.resolve(root)));
   const transports = new Set<StreamableHTTPServerTransport>();
 
   async function handleState(res: ServerResponse): Promise<void> {
@@ -173,6 +176,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     // their previous snapshot to detect disappearance.
     const auto = autoSectionOf(config);
     sendJson(res, 200, {
+      hub_root: hubRoot,
       flow_mode: flowMode,
       tasks,
       ...(snapshot.degraded.length > 0 ? { degraded: snapshot.degraded } : {}),
@@ -340,8 +344,8 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
           await handleState(res);
           return;
         }
-        res.writeHead(405, { Allow: "GET", "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "method not allowed: use GET /state" }));
+        res.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "method not allowed: use GET or HEAD /state" }));
         return;
       }
 

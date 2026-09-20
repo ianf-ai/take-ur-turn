@@ -113,9 +113,10 @@ function toAppendInput(r: ContextRecord): AppendInput {
   return input;
 }
 
-/** Compare a landed record with its fixture source, ignoring the store-generated timestamp. */
-function stripTimestamp(r: ContextRecord): Omit<ContextRecord, "timestamp"> {
-  const { timestamp: _timestamp, ...rest } = r;
+/** Compare a landed record with its fixture source, ignoring the store-generated timestamp
+ * and the store-stamped `tut_version` build provenance — neither is part of the derive contract. */
+function stripTimestamp(r: ContextRecord): Omit<ContextRecord, "timestamp" | "tut_version"> {
+  const { timestamp: _timestamp, tut_version: _tutVersion, ...rest } = r;
   return rest;
 }
 

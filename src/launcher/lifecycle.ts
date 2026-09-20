@@ -9,6 +9,7 @@
  * execution context.
  */
 
+import { rigLabel, unscopedLabel } from "../rig.js";
 import type { LaunchInvocation } from "../types.js";
 import type { HerdrPane } from "./herdr-client.js";
 
@@ -52,7 +53,7 @@ export interface RoundLifecycleResult {
 }
 
 export interface RoundLifecycleOptions extends LifecycleWriters {
-  invocation: Pick<LaunchInvocation, "task_id" | "role" | "fresh" | "naming">;
+  invocation: Pick<LaunchInvocation, "task_id" | "role" | "fresh" | "naming"> & { context?: { hubRoot: string } };
   client: LifecycleClient;
   /** Defaults to the product's executor/reviewer continuity set. */
   continuityRoles?: ReadonlySet<string> | string;
@@ -64,6 +65,7 @@ export interface RoundLifecycleOptions extends LifecycleWriters {
 }
 
 export interface CleanupOptions extends LifecycleWriters {
+  hubRoot?: string;
   task_id: string;
   client: LifecycleClient;
   dryRun?: boolean;
@@ -147,6 +149,7 @@ export function planReap(
     mode?: "reap" | "force";
     onlyRole?: string;
     skipLabel?: string;
+    hubRoot?: string;
   },
 ): ReapPlan {
   const mode = options.mode ?? "reap";
@@ -156,14 +159,14 @@ export function planReap(
   const prefix = `${options.task_id}.`;
 
   for (const pane of panes) {
-    const label = pane.label;
+    const label = options.hubRoot === undefined ? pane.label : unscopedLabel(pane.label ?? "", options.hubRoot);
     if (label === undefined || !label.startsWith(prefix)) continue;
     if (options.onlyRole !== undefined && label !== taskPaneLabel(options.task_id, options.onlyRole)) continue;
     if (mode === "force") {
       close.push(pane);
       continue;
     }
-    if (options.skipLabel !== undefined && label === options.skipLabel) continue;
+    if (options.skipLabel !== undefined && pane.label === options.skipLabel) continue;
     if (pane.agent_status === "working") {
       working.push(pane);
       continue;
@@ -272,7 +275,8 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
   const taskId = options.invocation.task_id;
   const role = options.invocation.role;
   const paneLabel = options.invocation.naming.pane_label;
-  const expectedLabel = taskPaneLabel(taskId, role);
+  const hubRoot = options.invocation.context?.hubRoot;
+  const expectedLabel = hubRoot === undefined ? taskPaneLabel(taskId, role) : rigLabel(taskPaneLabel(taskId, role), hubRoot);
   if (paneLabel !== expectedLabel) {
     const reason = `pane label '${paneLabel}' does not match addressing key '${expectedLabel}'`;
     write(options.stderr, (text) => process.stderr.write(text), `launch: ${reason}\n`);
@@ -292,6 +296,7 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
   let snapshotDirty = false;
   const listFresh = async (): Promise<PaneListSnapshot> => {
     snapshot = await list(options.client);
+    if (hubRoot !== undefined) snapshot.panes = snapshot.panes.filter(p => p.label !== undefined && unscopedLabel(p.label, hubRoot) !== undefined);
     snapshotDirty = false;
     return snapshot;
   };
@@ -353,7 +358,7 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
       return { kind: "failed", reason };
     }
     await closePlannedAndMark(
-      planReap(forced.panes, { task_id: taskId, continuityRoles: continuity, mode: "force", onlyRole: role }),
+      planReap(forced.panes, { task_id: taskId, continuityRoles: continuity, mode: "force", onlyRole: role, ...(hubRoot === undefined ? {} : { hubRoot }) }),
     );
   }
 
@@ -365,6 +370,7 @@ export async function runRoundLifecycle(options: RoundLifecycleOptions): Promise
   }
   const reapOptions = {
     task_id: taskId,
+    ...(hubRoot === undefined ? {} : { hubRoot }),
     continuityRoles: continuity,
     ...(options.invocation.fresh ? { skipLabel: paneLabel } : {}),
   };
@@ -408,6 +414,7 @@ export async function cleanupTaskPanes(options: CleanupOptions): Promise<void> {
   }
   const plan = planReap(snapshot.panes, {
     task_id: options.task_id,
+    ...(options.hubRoot === undefined ? {} : { hubRoot: options.hubRoot }),
     continuityRoles: new Set(),
     mode: "force",
   });

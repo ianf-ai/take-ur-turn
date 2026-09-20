@@ -13,6 +13,9 @@
  * DEFAULT_HUB_URL applied in the handler). No deps.
  */
 
+import { discoverHub, probeNotifier, notifierMatches, resolveNotifierPort, probeHub, resolveRigRoot, resolveCliHubUrl, resolveUpHub } from "./rig-discovery.js";
+import { acquireRigStartLock } from "./rig-lock.js";
+import { rigLabel, rigEnvironment, unscopedLabel } from "./rig.js";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -275,10 +278,11 @@ Usage:
       run 'tut skill host'; worker-role skills are supplied automatically
       by the launcher.
 
---url selects the Hub for any command that talks to one (default
-${DEFAULT_HUB_URL}). Running several hubs side by side? Pass --url
-explicitly on every call — a --url-less command always speaks to the
-default port, which may be the wrong hub.
+--url selects a Hub belonging to this workspace (verified via /state.hub_root).
+Without --url, try TUT_HUB_URL or ${DEFAULT_HUB_URL}, then discover this
+workspace's hub on local ports 3001–3199. Run tut up to start a missing rig;
+up automatically selects a free hub/notifier pair. An explicit foreign
+--url is rejected; use the matching workspace or correct the URL.
 `;
 
 // --- parsed shapes (frozen — handlers consume these) -------------------------
@@ -510,7 +514,7 @@ function parseNotify(args: readonly string[]): ParsedArgs {
   const workingTimeoutSec = workingValues[0];
   return {
     command: "notify",
-    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
+    url: strFlag(t, "url") ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
     interval: flagValue(intFlag(t, "interval")) ?? 5,
     eventPort: flagValue(eventPort) ?? DEFAULT_EVENT_PORT,
     stallTimeoutMin: flagValue(intFlag(t, "stall-timeout")) ?? 30,
@@ -527,7 +531,7 @@ function parseMode(args: readonly string[]): ParsedArgs {
   if (mode !== "manual" && mode !== "auto") {
     return { command: "usage", error: `mode must be manual or auto, got: ${mode ?? "(missing)"}` };
   }
-  return { command: "mode", mode, url: strFlag(t, "url") ?? DEFAULT_HUB_URL };
+  return { command: "mode", mode, url: strFlag(t, "url") ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL };
 }
 
 function parseConfig(args: readonly string[]): ParsedArgs {
@@ -564,7 +568,7 @@ function parseStartNext(args: readonly string[]): ParsedArgs {
   return {
     command: "start-next",
     ...(taskId !== undefined ? { task_id: taskId } : {}),
-    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
+    url: strFlag(t, "url") ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
     force: t.bools.has("force"),
     fresh: t.bools.has("fresh"),
   };
@@ -581,7 +585,7 @@ function parseWatch(args: readonly string[]): ParsedArgs {
   return {
     command: "watch",
     ...(taskId !== undefined ? { task_id: taskId } : {}),
-    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
+    url: strFlag(t, "url") ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
     interval: flagValue(intFlag(t, "interval")) ?? 5,
   };
 }
@@ -892,7 +896,7 @@ function parseDoctor(args: readonly string[]): ParsedArgs {
   return {
     command: "doctor",
     root: strFlag(t, "root") ?? ".context-hub",
-    url: strFlag(t, "url") ?? DEFAULT_HUB_URL,
+    url: strFlag(t, "url") ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
     json: t.bools.has("json"),
   };
 }
@@ -944,7 +948,7 @@ function parseRepairMeta(args: readonly string[]): ParsedArgs {
     ...(flow !== undefined ? { flow } : {}),
     ...(cast !== undefined ? { cast } : {}),
     ...(checkout !== undefined ? { checkout } : {}),
-    url: url ?? DEFAULT_HUB_URL,
+    url: url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
   };
 }
 
@@ -976,7 +980,7 @@ function parseRecoverRecord(args: readonly string[]): ParsedArgs {
     recordFile,
     from: from.value,
     ...(source !== undefined ? { source } : {}),
-    url: url ?? DEFAULT_HUB_URL,
+    url: url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
   };
 }
 
@@ -1605,7 +1609,7 @@ async function runStartNext(parsed: Extract<ParsedArgs, { command: "start-next" 
       route,
       route_source: resolved.source,
       context: executionContext,
-      naming: { tab_label: tabLabel, pane_label: `${taskId}.${role}` },
+      naming: { tab_label: tabLabel, pane_label: rigLabel(`${taskId}.${role}`, executionContext.hubRoot) },
       prompt: `轮到你了（role: ${role}）：请用 Context Hub 读取任务 ${taskId} 的完整上下文（context.read），按你的 role skill（${skillPath}）开始本轮工作，完成后发布相应记录（context.publish）。`,
       ...(plan.platform === "posix"
         ? { posix_direct: plan.posix_direct }
@@ -1809,7 +1813,7 @@ async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Pr
       );
     }
     printJson(
-      await hubCreate(parsed.url ?? DEFAULT_HUB_URL, {
+      await hubCreate(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, {
         title: parsed.title,
         description: parsed.description,
         creator: parsed.creator,
@@ -1821,7 +1825,7 @@ async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Pr
     );
     return 0;
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1837,7 +1841,7 @@ async function runPublish(parsed: Extract<ParsedArgs, { command: "publish" }>): 
     }
   }
   try {
-    const result = await hubPublish(parsed.url ?? DEFAULT_HUB_URL, {
+    const result = await hubPublish(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, {
       task_id: parsed.task_id,
       role: parsed.role,
       content_type: parsed.content_type,
@@ -1855,7 +1859,7 @@ async function runPublish(parsed: Extract<ParsedArgs, { command: "publish" }>): 
     printJson(result);
     return 0;
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1904,12 +1908,12 @@ function renderRead(result: HubReadResult): string {
 
 async function runRead(parsed: Extract<ParsedArgs, { command: "read" }>): Promise<number> {
   try {
-    const result = await hubRead(parsed.url ?? DEFAULT_HUB_URL, parsed.task_id, parsed.sinceVersion);
+    const result = await hubRead(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, parsed.task_id, parsed.sinceVersion);
     if (parsed.json) printJson(result);
     else process.stdout.write(renderRead(result));
     return 0;
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -1935,12 +1939,12 @@ function renderList(result: HubListResult): string {
 
 async function runList(parsed: Extract<ParsedArgs, { command: "list" }>): Promise<number> {
   try {
-    const result = await hubList(parsed.url ?? DEFAULT_HUB_URL, parsed.status);
+    const result = await hubList(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, parsed.status);
     if (parsed.json) printJson(result);
     else process.stdout.write(renderList(result));
     return 0;
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -2002,12 +2006,12 @@ function renderStatus(result: HubListResult): string {
 
 async function runStatus(parsed: Extract<ParsedArgs, { command: "status" }>): Promise<number> {
   try {
-    const result = await hubList(parsed.url ?? DEFAULT_HUB_URL);
+    const result = await hubList(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
     if (parsed.json) printJson({ tasks: statusSnapshot(result) });
     else process.stdout.write(renderStatus(result));
     return 0;
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -2015,8 +2019,16 @@ async function runStatus(parsed: Extract<ParsedArgs, { command: "status" }>): Pr
  *  from the SAME DoctorReport; runDoctor's robustness contract is that it
  *  never rejects (a bad input becomes that check's failure item), so the
  *  exit code is purely report.ok. Warnings do not flip it. */
-async function runDoctor(parsed: Extract<ParsedArgs, { command: "doctor" }>): Promise<number> {
-  const report = await runDoctorChecks({ root: parsed.root, url: parsed.url });
+async function runDoctor(parsed: Extract<ParsedArgs, { command: "doctor" }>, identityError?: unknown): Promise<number> {
+  const report = await runDoctorChecks({
+    root: parsed.root, url: parsed.url,
+    // Keep offline diagnostics available without reading an unverified Hub.
+    ...(identityError === undefined ? {} : { fetchImpl: (async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (new URL(url).pathname === "/state") throw identityError;
+      return fetch(input, init);
+    }) as typeof fetch }),
+  });
   if (parsed.json) printJson(report);
   else process.stdout.write(`${renderDoctorReport(report)}\n`);
   return report.ok ? 0 : 1;
@@ -2025,14 +2037,14 @@ async function runDoctor(parsed: Extract<ParsedArgs, { command: "doctor" }>): Pr
 async function runDecide(parsed: Extract<ParsedArgs, { command: "decide" }>): Promise<number> {
   let result: unknown;
   try {
-    result = await hubDecide(parsed.url ?? DEFAULT_HUB_URL, {
+    result = await hubDecide(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, {
       task_id: parsed.task_id,
       decision: parsed.decision,
       by: parsed.by,
       ...(parsed.reason !== undefined ? { reason: parsed.reason } : {}),
     });
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
   printJson(result);
   // decide(close) hooks the fresh-session lifecycle: reap the task's round
@@ -2079,7 +2091,7 @@ function ackSummary(note: string | undefined): string {
 async function runAck(parsed: Extract<ParsedArgs, { command: "ack" }>): Promise<number> {
   try {
     printJson(
-      await hubPublish(parsed.url ?? DEFAULT_HUB_URL, {
+      await hubPublish(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, {
         task_id: parsed.task_id,
         role: "human",
         content_type: "note",
@@ -2088,7 +2100,7 @@ async function runAck(parsed: Extract<ParsedArgs, { command: "ack" }>): Promise<
     );
     return 0;
   } catch (e) {
-    return failWith(e, parsed.url ?? DEFAULT_HUB_URL);
+    return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   }
 }
 
@@ -2342,8 +2354,6 @@ function eventPortUrl(port: number): string {
  * NOT agent names, so agent-keyed lookup never hits them.
  */
 const SYS_TAB_LABEL = "tut-sys";
-const SYS_HUB_PANE_LABEL = "tut-hub";
-const SYS_NOTIFY_PANE_LABEL = "tut-notify";
 
 /**
  * How long tut up waits for a freshly provisioned hub to answer /state.
@@ -2391,20 +2401,11 @@ async function pollUntil(check: () => Promise<boolean>, timeoutMs: number, inter
 }
 
 /**
- * GET <hub>/state and shape-check the answer: only a 2xx whose
- * JSON body carries `flow_mode` AND `tasks` counts as this system's hub —
- * anything else (refused, 404, alien JSON) means provisioning.
+ * A serving Hub must prove it belongs to the selected root. Recheck after
+ * provisioning so a port race cannot turn a foreign service into success.
  */
-async function hubHealthy(baseUrl: string): Promise<boolean> {
-  try {
-    const res = await fetch(new URL("/state", baseUrl), cliFetchInit({ headers: { Connection: "close" } }));
-    if (!res.ok) return false;
-    const body: unknown = await res.json();
-    if (body === null || typeof body !== "object") return false;
-    return "flow_mode" in body && "tasks" in body;
-  } catch {
-    return false;
-  }
+async function hubHealthy(baseUrl: string, root: string): Promise<boolean> {
+  return (await probeHub(baseUrl))?.root === root;
 }
 
 /**
@@ -2413,7 +2414,8 @@ async function hubHealthy(baseUrl: string): Promise<boolean> {
  * Tightened: a bare 405 from an unrelated service on the port no longer counts
  * as "notifier present" — provisioning proceeds instead of silently skipping.
  */
-export async function notifyHealthy(url: string = UP_EVENT_URL): Promise<boolean> {
+export async function notifyHealthy(url: string = UP_EVENT_URL, root?: string, hubUrl?: string): Promise<boolean> {
+  if (root !== undefined && hubUrl !== undefined) return notifierMatches(await probeNotifier(url), root, hubUrl);
   try {
     const res = await fetch(url, cliFetchInit());
     if (res.status !== 405) return false;
@@ -2424,23 +2426,20 @@ export async function notifyHealthy(url: string = UP_EVENT_URL): Promise<boolean
   }
 }
 
-/**
- * Seed hint: does the project scope carry an invariants seed? The marker is
- * the literal 不变量 in any record's summary or body. Returns false when the
- * project scope does not exist yet (fresh hub — definitely unseeded) and null
- * when the read fails otherwise (unknown — the hint stays silent, never nags
- * on a transient MCP failure).
+/** Distinguish a normal empty scope from records missing an invariants seed.
+ * Read failures stay unknown, never masquerading as an empty scope.
  */
-async function projectInvariantsSeeded(url: string): Promise<boolean | null> {
+async function projectInvariantsState(url: string): Promise<"empty" | "seeded" | "unseeded" | "unknown"> {
   let versions: HubReadResult["versions"];
   try {
     versions = (await hubRead(url, "project")).versions;
   } catch (e) {
-    return e instanceof HubError && e.code === "TASK_NOT_FOUND" ? false : null;
+    return e instanceof HubError && e.code === "TASK_NOT_FOUND" ? "empty" : "unknown";
   }
+  if (versions.length === 0) return "empty";
   return versions.some(
     (r) => r.payload.summary.includes(INVARIANTS_MARKER) || r.payload.body.includes(INVARIANTS_MARKER),
-  );
+  ) ? "seeded" : "unseeded";
 }
 
 /** Marker for an invariants seed note in the project scope (seed-hint check). */
@@ -2480,9 +2479,9 @@ export async function herdrPaneList(): Promise<{ panes: HerdrPane[] } | { error:
 }
 
 /** `herdr pane split` off the current pane (no-focus, same window) → new pane id. */
-async function herdrSplit(cwd: string): Promise<string | { error: string }> {
+async function herdrSplit(cwd: string, environment: Readonly<Record<string, string>> = {}): Promise<string | { error: string }> {
   try {
-    return (await herdrClient.paneSplit({ current: true, direction: "right", noFocus: true, cwd })).paneId;
+    return (await herdrClient.paneSplit({ current: true, direction: "right", noFocus: true, cwd, env: environment })).paneId;
   } catch (error) {
     return { error: (error as Error).message };
   }
@@ -2494,9 +2493,9 @@ async function herdrSplit(cwd: string): Promise<string | { error: string }> {
  * pane id is optional in the return: a shape drift that omits it only costs
  * the cosmetic cleanup close, not the provisioning itself.
  */
-async function herdrTabCreate(cwd: string): Promise<{ tabId: string; rootPaneId?: string } | { error: string }> {
+async function herdrTabCreate(cwd: string, workspaceId?: string): Promise<{ tabId: string; rootPaneId?: string } | { error: string }> {
   try {
-    return await herdrClient.tabCreate({ label: SYS_TAB_LABEL, noFocus: true, cwd });
+    return await herdrClient.tabCreate({ label: SYS_TAB_LABEL, noFocus: true, cwd, ...(workspaceId !== undefined ? { workspaceId } : {}) });
   } catch (error) {
     return { error: (error as Error).message };
   }
@@ -2565,10 +2564,10 @@ async function reportedPaneId(label: string, fallback: string): Promise<string> 
  *     memoized for step 2; the known-occupied reuse shape (moved port down,
  *     live default-port notifier, labelled tut-notify pane) refuses up
  *     front — exit 1 without touching any pane;
- * 1. hub: /state shape-check → skip, or provision and WAIT for /state to turn
+ * 1. hub: /state root handshake → skip, or provision and WAIT for /state to turn
  *    healthy (spawn success ≠ serving);
- * 1b. seed hint: hub reachable → project scope read; no invariants note →
- *     print the exact publish command (reads only — dry-run included);
+ * 1b. project hint: empty scope → one startup explanation; existing records
+ *     without an invariants seed → publish hint (reads only, dry-run included);
  * 2. notify: /agent-event 405+Allow:POST probe (pre-flighted) → skip, or
  *     provision and WAIT for the event port to answer (pane run into an
  *     occupied pane is a silent no-op — spawn success ≠ listening, the
@@ -2601,17 +2600,20 @@ function printActivationHint(): void {
 
 async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<number> {
   const dryRun = parsed.dryRun;
-  const cwd = process.cwd();
+  const cwd = resolveRigRoot();
+  process.stdout.write(`up: expected host relay label: ${rigLabel("tut-host", cwd)} (host_pane_label)\n`);
   const self = upCliSelf();
+  const SYS_HUB_PANE_LABEL = rigLabel("tut-hub", cwd);
+  const SYS_NOTIFY_PANE_LABEL = rigLabel("tut-notify", cwd);
 
   // --url selects the hub to provision. up provisions a LOCAL hub — the
   // host must be loopback and the port explicit (serve needs a concrete port
   // to bind). Validated before any probe, spawn, or pane read.
-  const hubUrl = parsed.url ?? DEFAULT_HUB_URL;
+  let hubUrl = parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL;
   let hubPort: number;
   try {
     const u = new URL(hubUrl);
-    const loopback = u.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(u.hostname);
+    const loopback = u.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]", "::1"].includes(u.hostname);
     if (!loopback || u.port.length === 0) throw new Error("not a loopback http URL with an explicit port");
     hubPort = Number(u.port);
   } catch {
@@ -2621,8 +2623,8 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
 
   // --event-port moves the notifier's event listener; probe, provisioning,
   // and the rendered notify command all use this one value.
-  const eventPort = parsed.eventPort ?? DEFAULT_EVENT_PORT;
-  const eventUrl = eventPortUrl(eventPort);
+  let eventPort = parsed.eventPort ?? DEFAULT_EVENT_PORT;
+  let eventUrl = eventPortUrl(eventPort);
 
   // Port-conflict pre-check: the hub and the notifier's event
   // listener cannot share a port — serve would bind it and the provisioned
@@ -2656,300 +2658,368 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
     return 1;
   }
 
-  // Workspace-lineup hint (a PROMPT, never a write — configs are human
-  // declarations, the same discipline as the invariants seed hint): both
-  // the project-level and user-level workspace configs missing → the
-  // built-in defaults are in effect; print the migration pointer once.
-  if (
-    !existsSync(path.join(cwd, ".context-hub", "workspace.json")) &&
-    !existsSync(path.join(defaultUserConfigDir(), "workspace.json"))
-  ) {
-    const seed = fileURLToPath(new URL("../scripts/workspace.json", import.meta.url));
-    process.stdout.write(
-      "up: no workspace lineup config found — using built-in defaults (architect=codex, executor=pi, reviewer=codex)\n",
-    );
-    process.stdout.write(
-      "up:   to customize: tut assign <role> <agent>   (the light path — e.g. tut assign executor pi; rewrites one seat)\n",
-    );
-    process.stdout.write(
-      `up:   full control: cp ${seed} ${path.join(cwd, ".context-hub", "workspace.json")}   (project-level; or ${path.join(defaultUserConfigDir(), "workspace.json")} for all projects)\n`,
-    );
-  }
-
-  // A non-default --url must reach the provisioned panes too — serve binds
-  // the parsed port, notify polls it (byte-identical commands when the default
-  // is used, so existing provisioning output is unchanged).
-  //
-  // The service commands are PaneCommands now, rendered by the same dialect
-  // renderer the agent panes use: POSIX output keeps the legacy `cd … &&
-  // node …` bytes exactly; PowerShell dialects never see `&&`; cmd picks the
-  // safe direct form or the encoded pane-runner.  The dialect resolves
-  // BEFORE any probe so a bad TUT_PANE_SHELL fails the whole up run.
-  let dialect: ShellDialect;
+  let releaseLock: (() => void) | undefined;
   try {
-    dialect = resolvePaneShellDialect(process.env);
-  } catch (error) {
-    process.stderr.write(`tut: up: ${(error as Error).message}\n`);
-    return 1;
-  }
-  // Windows carries the absolute node.exe the cmd/PowerShell forms quote;
-  // POSIX keeps the bare PATH-resolved `node` word of the legacy bytes.
-  const nodeWord = process.platform === "win32" ? process.execPath : "node";
-  const renderServiceCommand = (args: readonly string[], env: Readonly<Record<string, string>> = {}): string =>
-    renderPaneCommand({
-      cwd,
-      executable: nodeWord,
-      args: [...args],
-      env,
-      dialect,
-      purpose: "service",
-    } as PaneCommand).command_text;
-  let serveCmd: string;
-  let notifyCmd: string;
-  try {
-    serveCmd = renderServiceCommand([self, "serve", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--port", String(hubPort)])]);
-    // Full-chain pass-through: a non-default event port rides the
-    // rendered notify command explicitly (the provisioned notifier cannot
-    // drift back to the default), and TUT_EVENT_PORT_URL is exported into the
-    // pane so every launcher the notifier spawns (auto mode) escalates
-    // give-up events to the port that notifier actually listens on. Defaults
-    // stay byte-identical to the legacy command (no flag, no env prefix).
-    notifyCmd =
-      eventPort === DEFAULT_EVENT_PORT
-        ? renderServiceCommand([self, "notify", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--url", hubUrl])])
-        : renderServiceCommand(
-            [self, "notify", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--url", hubUrl]), "--event-port", String(eventPort)],
-            { TUT_EVENT_PORT_URL: eventUrl },
-          );
-  } catch (error) {
-    process.stderr.write(`tut: up: cannot render the service pane command: ${(error as Error).message}\n`);
-    return 1;
-  }
-  const manual: string[] = [];
-
-  // Herdr usability + the role-step pane snapshot in one read.
-  const listing = await herdrPaneList();
-  const panes = "panes" in listing ? listing.panes : null;
-  const herdrError = "error" in listing ? listing.error : "";
-
-  // Event-port pre-flight: both event-port probes run
-  // BEFORE any provisioning and their results are memoized for step 2 — no
-  // URL is probed twice. The known-occupied shape refuses up front: a moved
-  // event port that is down while the default-port notifier is still alive
-  // AND a labelled tut-notify pane exists. provisionSysPane would take that
-  // pane for dead and `pane run` into it — but a pane still hosting the
-  // running notifier cannot start a second process; herdr reports ok and up
-  // would print "notify running" over a dead provisioning (false success).
-  // Refuse WITHOUT touching any pane (fail fast, before even the hub step):
-  // non-zero exit + actionable stop-first remedy. A target that already
-  // answers never reaches this refusal; the shapes the pre-flight cannot
-  // see (occupant on a non-default port) are caught by step 2's probe gate.
-  const oldNotifierAlive = eventPort !== DEFAULT_EVENT_PORT && (await notifyHealthy(UP_EVENT_URL));
-  const targetListening = await notifyHealthy(eventUrl);
-  if (oldNotifierAlive && !targetListening) {
-    const occupied = panes?.find((p) => p.label === SYS_NOTIFY_PANE_LABEL);
-    if (occupied !== undefined) {
-      process.stderr.write(
-        `tut: up: cannot start the notifier on ${eventUrl} — another notifier is still listening on ${UP_EVENT_URL} and the ${SYS_NOTIFY_PANE_LABEL} pane (${occupied.pane_id}) is the reuse candidate; pane run into a still-occupied pane cannot start a second process. Stop the old pane first (herdr pane close ${occupied.pane_id}), or drop --event-port to keep the existing notifier, then rerun tut up\n`,
-      );
+    if (!dryRun && parsed.url === undefined) releaseLock = acquireRigStartLock(cwd);
+    try {
+      let selected = await resolveUpHub(hubUrl, parsed.url !== undefined, cwd, parsed.eventPort);
+      if (parsed.url === undefined) {
+        const own = await discoverHub(cwd);
+        if (own) {
+          selected = { url: own, eventPort: await resolveNotifierPort(own, cwd, parsed.eventPort, Number(new URL(own).port) + 1) };
+          process.stdout.write(`up: ownership check found hub for workspace ${cwd} at ${own}; reusing existing rig\n`);
+        }
+      }
+      hubUrl = selected.url;
+      hubPort = Number(new URL(hubUrl).port);
+      eventPort = selected.eventPort;
+      eventUrl = eventPortUrl(eventPort);
+      if (hubPort === eventPort) {
+        throw new Error(`hub port and notifier event port are both ${eventPort}; choose a different --event-port and rerun tut up`);
+      }
+    } catch (error) {
+      process.stderr.write(`tut: up: ${(error as Error).message}\n`);
       return 1;
     }
-  }
 
-  // C-layout sys-tab state, shared across the two provisioning steps: the
-  // discovered/created tut-sys tab plus its anchor pane (the move --target).
-  // Discovery rides the same pane-list snapshot — a labelled sys pane carries
-  // its tab_id, so no `herdr tab list` (unobserved shape) is ever needed.
-  let sysTab: { tabId: string; anchorPane?: string; rootPaneId?: string; fresh: boolean } | null = null;
-  if (panes !== null) {
-    const anchor =
-      panes.find((p) => p.label === SYS_HUB_PANE_LABEL) ?? panes.find((p) => p.label === SYS_NOTIFY_PANE_LABEL);
-    if (anchor !== undefined && anchor.tab_id !== undefined) {
-      sysTab = { tabId: anchor.tab_id, anchorPane: anchor.pane_id, fresh: false };
+    // Workspace-lineup hint (a PROMPT, never a write — configs are human
+    // declarations, the same discipline as the invariants seed hint): both
+    // the project-level and user-level workspace configs missing → the
+    // built-in defaults are in effect; print the migration pointer once.
+    if (
+      !existsSync(path.join(cwd, ".context-hub", "workspace.json")) &&
+      !existsSync(path.join(defaultUserConfigDir(), "workspace.json"))
+    ) {
+      const seed = fileURLToPath(new URL("../scripts/workspace.json", import.meta.url));
+      process.stdout.write(
+        "up: no workspace lineup config found — using built-in defaults (architect=codex, executor=pi, reviewer=codex)\n",
+      );
+      process.stdout.write(
+        "up:   to customize: tut assign <role> <agent>   (the light path — e.g. tut assign executor pi; rewrites one seat)\n",
+      );
+      process.stdout.write(
+        `up:   full control: cp ${seed} ${path.join(cwd, ".context-hub", "workspace.json")}   (project-level; or ${path.join(defaultUserConfigDir(), "workspace.json")} for all projects)\n`,
+      );
     }
-  }
 
-  /**
-   * Provision one system pane (hub/notify) into the tut-sys tab. Ladder:
-   * labelled pane in the snapshot = dead pane → rerun in place (no split, no
-   * tab work); otherwise split → ensure the tab → move (--split down
-   * --ratio 0.5, even halves) → close the tab's empty root (only when we
-   * created the tab this run) → rename → run. Returns the running pane id,
-   * or null with the failure already printed.
-   *
-   * The label⇒dead assumption is guarded, not blind: a snapshot cannot tell
-   * an occupied pane from a dead one. For notify, the up pre-flight refuses
-   * the known-occupied shape outright and the post-run event-port probe
-   * gates the success report — a `pane run` that lands in a live foreground
-   * process is swallowed while herdr still reports ok.
-   */
-  const provisionSysPane = async (
-    label: string,
-    name: string,
-    cmd: string,
-  ): Promise<{ paneId: string; reused: boolean } | null> => {
-    const dead = panes?.find((p) => p.label === label);
-    if (dead !== undefined) {
-      if (dryRun) {
-        process.stdout.write(`up: [dry-run] would reuse pane ${dead.pane_id} (label ${label}) and run: ${cmd}\n`);
+    // The selected endpoints must reach both provisioned panes: serve binds
+    // the parsed port, notify polls it, and descendants inherit the rig.
+    //
+    // The service commands are PaneCommands now, rendered by the same dialect
+    // renderer the agent panes use: POSIX exports one-shot assignments;
+    // PowerShell and cmd carry the environment in a runner payload. The dialect resolves
+    // BEFORE any probe so a bad TUT_PANE_SHELL fails the whole up run.
+    let dialect: ShellDialect;
+    try {
+      dialect = resolvePaneShellDialect(process.env);
+    } catch (error) {
+      process.stderr.write(`tut: up: ${(error as Error).message}\n`);
+      return 1;
+    }
+    // Windows carries the absolute node.exe the cmd/PowerShell forms quote;
+    // POSIX keeps the bare PATH-resolved `node` word of the legacy bytes.
+    const nodeWord = process.platform === "win32" ? process.execPath : "node";
+    const renderServiceCommand = (args: readonly string[], env: Readonly<Record<string, string>> = {}): string =>
+      renderPaneCommand({
+        cwd,
+        executable: nodeWord,
+        args: [...args],
+        env: { ...rigEnvironment(cwd, hubUrl, eventUrl), ...env },
+        dialect,
+        purpose: "service",
+      } as PaneCommand).command_text;
+    let serveCmd: string;
+    let notifyCmd: string;
+    try {
+      serveCmd = renderServiceCommand([self, "serve", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--port", String(hubPort)])]);
+      // Full-chain pass-through: a non-default event port rides the
+      // rendered notify command explicitly (the provisioned notifier cannot
+      // drift back to the default), and TUT_EVENT_PORT_URL is exported into the
+      // pane so every launcher the notifier spawns (auto mode) escalates
+      // give-up events to the port that notifier actually listens on. Defaults
+      // use the same explicit rig environment (only the redundant flag is omitted).
+      notifyCmd =
+        eventPort === DEFAULT_EVENT_PORT
+          ? renderServiceCommand([self, "notify", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--url", hubUrl])])
+          : renderServiceCommand(
+              [self, "notify", ...(hubPort === DEFAULT_HUB_PORT ? [] : ["--url", hubUrl]), "--event-port", String(eventPort)],
+              { TUT_EVENT_PORT_URL: eventUrl },
+            );
+    } catch (error) {
+      process.stderr.write(`tut: up: cannot render the service pane command: ${(error as Error).message}\n`);
+      return 1;
+    }
+    const manual: string[] = [];
+
+    // Herdr usability + the role-step pane snapshot in one read.
+    const listing = await herdrPaneList();
+    const panes = "panes" in listing ? listing.panes : null;
+    const herdrError = "error" in listing ? listing.error : "";
+
+    // Event-port pre-flight: both event-port probes run
+    // BEFORE any provisioning and their results are memoized for step 2 — no
+    // URL is probed twice. The known-occupied shape refuses up front: a moved
+    // event port that is down while the default-port notifier is still alive
+    // AND a labelled tut-notify pane exists. provisionSysPane would take that
+    // pane for dead and `pane run` into it — but a pane still hosting the
+    // running notifier cannot start a second process; herdr reports ok and up
+    // would print "notify running" over a dead provisioning (false success).
+    // Refuse WITHOUT touching any pane (fail fast, before even the hub step):
+    // non-zero exit + actionable stop-first remedy. A target that already
+    // answers never reaches this refusal; the shapes the pre-flight cannot
+    // see (occupant on a non-default port) are caught by step 2's probe gate.
+    const oldNotifierAlive = eventPort !== DEFAULT_EVENT_PORT && (await notifyHealthy(UP_EVENT_URL, cwd, hubUrl));
+    const targetListening = await notifyHealthy(eventUrl, cwd, hubUrl);
+    if (oldNotifierAlive && !targetListening) {
+      const occupied = panes?.find((p) => p.label === SYS_NOTIFY_PANE_LABEL);
+      if (occupied !== undefined) {
+        process.stderr.write(
+          `tut: up: cannot start the notifier on ${eventUrl} — another notifier is still listening on ${UP_EVENT_URL} and the ${SYS_NOTIFY_PANE_LABEL} pane (${occupied.pane_id}) is the reuse candidate; pane run into a still-occupied pane cannot start a second process. Stop the old pane first (herdr pane close ${occupied.pane_id}), or drop --event-port to keep the existing notifier, then rerun tut up\n`,
+        );
+        return 1;
+      }
+    }
+
+    // C-layout sys-tab state, shared across the two provisioning steps: the
+    // discovered/created tut-sys tab plus its anchor pane (the move --target).
+    // Discovery rides the same pane-list snapshot — a labelled sys pane carries
+    // its tab_id, so no `herdr tab list` (unobserved shape) is ever needed.
+    let sysTab: { tabId: string; anchorPane?: string; rootPaneId?: string; fresh: boolean } | null = null;
+    if (panes !== null) {
+      const anchor =
+        panes.find((p) => p.label === SYS_HUB_PANE_LABEL) ?? panes.find((p) => p.label === SYS_NOTIFY_PANE_LABEL);
+      if (anchor !== undefined && anchor.tab_id !== undefined) {
+        sysTab = { tabId: anchor.tab_id, anchorPane: anchor.pane_id, fresh: false };
+      }
+    }
+
+    /**
+     * Provision one system pane (hub/notify) into the tut-sys tab. Ladder:
+     * labelled pane in the snapshot = dead pane → rerun in place (no split, no
+     * tab work); otherwise split → ensure the tab → move (--split down
+     * --ratio 0.5, even halves) → close the tab's empty root (only when we
+     * created the tab this run) → rename → run. Returns the running pane id,
+     * or null with the failure already printed.
+     *
+     * The label⇒dead assumption is guarded, not blind: a snapshot cannot tell
+     * an occupied pane from a dead one. For notify, the up pre-flight refuses
+     * the known-occupied shape outright and the post-run event-port probe
+     * gates the success report — a `pane run` that lands in a live foreground
+     * process is swallowed while herdr still reports ok.
+     */
+    const provisionSysPane = async (
+      label: string,
+      name: string,
+      cmd: string,
+    ): Promise<{ paneId: string; reused: boolean } | null> => {
+      const dead = panes?.find((p) => p.label === label);
+      if (dead !== undefined) {
+        if (dryRun) {
+          process.stdout.write(`up: [dry-run] would reuse pane ${dead.pane_id} (label ${label}) and run: ${cmd}\n`);
+          return { paneId: dead.pane_id, reused: true };
+        }
+        if (!(await herdrOk(["pane", "run", dead.pane_id, cmd]))) {
+          process.stderr.write(`tut: up: could not start ${name} in pane ${dead.pane_id}\n`);
+          return null;
+        }
         return { paneId: dead.pane_id, reused: true };
       }
-      if (!(await herdrOk(["pane", "run", dead.pane_id, cmd]))) {
-        process.stderr.write(`tut: up: could not start ${name} in pane ${dead.pane_id}\n`);
+      if (dryRun) {
+        const freshTab = sysTab === null;
+        const tabId = sysTab === null ? "<new-tab>" : sysTab.tabId;
+        process.stdout.write(`up: [dry-run] would provision the ${label} pane into tab ${SYS_TAB_LABEL}:\n`);
+        process.stdout.write(`up: [dry-run]   pane split --current --direction right --no-focus --cwd ${cwd}\n`);
+        if (freshTab) {
+          process.stdout.write(`up: [dry-run]   tab create --label ${SYS_TAB_LABEL} --no-focus --cwd ${cwd}\n`);
+        }
+        const move = `up: [dry-run]   pane move <new-pane> --tab ${tabId} --split down --ratio 0.5 --no-focus`;
+        process.stdout.write(
+          sysTab?.anchorPane !== undefined ? `${move} --target-pane ${sysTab.anchorPane}\n` : `${move}\n`,
+        );
+        if (freshTab) {
+          process.stdout.write(`up: [dry-run]   pane close <root-pane>   (tab create ships an empty root pane)\n`);
+        }
+        process.stdout.write(`up: [dry-run]   pane rename <new-pane> ${label}\n`);
+        process.stdout.write(`up: [dry-run]   pane run <new-pane> ${cmd}\n`);
+        // Plan-level state so the notify plan targets the (planned) hub pane
+        // and omits its own tab create/close lines.
+        if (sysTab === null) {
+          sysTab = { tabId, ...(label === SYS_HUB_PANE_LABEL ? { anchorPane: "<tut-hub-pane>" } : {}), fresh: true };
+        } else if (sysTab.anchorPane === undefined && label === SYS_HUB_PANE_LABEL) {
+          sysTab.anchorPane = "<tut-hub-pane>";
+        }
+        return { paneId: "<new-pane>", reused: false };
+      }
+      const pane = await herdrSplit(cwd, rigEnvironment(cwd, hubUrl, eventUrl));
+      if (typeof pane !== "string") {
+        process.stderr.write(`tut: up: ${pane.error}\n`);
+        printHerdrAnchorHint();
         return null;
       }
-      return { paneId: dead.pane_id, reused: true };
-    }
-    if (dryRun) {
-      const freshTab = sysTab === null;
-      const tabId = sysTab === null ? "<new-tab>" : sysTab.tabId;
-      process.stdout.write(`up: [dry-run] would provision the ${label} pane into tab ${SYS_TAB_LABEL}:\n`);
-      process.stdout.write(`up: [dry-run]   pane split --current --direction right --no-focus --cwd ${cwd}\n`);
-      if (freshTab) {
-        process.stdout.write(`up: [dry-run]   tab create --label ${SYS_TAB_LABEL} --no-focus --cwd ${cwd}\n`);
-      }
-      const move = `up: [dry-run]   pane move <new-pane> --tab ${tabId} --split down --ratio 0.5 --no-focus`;
-      process.stdout.write(
-        sysTab?.anchorPane !== undefined ? `${move} --target-pane ${sysTab.anchorPane}\n` : `${move}\n`,
-      );
-      if (freshTab) {
-        process.stdout.write(`up: [dry-run]   pane close <root-pane>   (tab create ships an empty root pane)\n`);
-      }
-      process.stdout.write(`up: [dry-run]   pane rename <new-pane> ${label}\n`);
-      process.stdout.write(`up: [dry-run]   pane run <new-pane> ${cmd}\n`);
-      // Plan-level state so the notify plan targets the (planned) hub pane
-      // and omits its own tab create/close lines.
       if (sysTab === null) {
-        sysTab = { tabId, ...(label === SYS_HUB_PANE_LABEL ? { anchorPane: "<tut-hub-pane>" } : {}), fresh: true };
-      } else if (sysTab.anchorPane === undefined && label === SYS_HUB_PANE_LABEL) {
-        sysTab.anchorPane = "<tut-hub-pane>";
+        const anchorWorkspace = panes?.find((p) => p.pane_id === (process.env.HERDR_PANE_ID ?? "").trim())?.workspace_id?.trim() || undefined;
+        if (anchorWorkspace === undefined) {
+          process.stderr.write("tut: up: tut-sys workspace pinning unavailable (HERDR_PANE_ID missing or unresolved); tab creation falls back to the focused workspace\n");
+        }
+        const tab = await herdrTabCreate(cwd, anchorWorkspace);
+        if ("error" in tab) {
+          process.stderr.write(`tut: up: ${tab.error}\n`);
+          return null;
+        }
+        sysTab = { tabId: tab.tabId, ...(tab.rootPaneId !== undefined ? { rootPaneId: tab.rootPaneId } : {}), fresh: true };
       }
-      return { paneId: "<new-pane>", reused: false };
-    }
-    const pane = await herdrSplit(cwd);
-    if (typeof pane !== "string") {
-      process.stderr.write(`tut: up: ${pane.error}\n`);
-      printHerdrAnchorHint();
-      return null;
-    }
-    if (sysTab === null) {
-      const tab = await herdrTabCreate(cwd);
-      if ("error" in tab) {
-        process.stderr.write(`tut: up: ${tab.error}\n`);
+      const moveArgs = ["pane", "move", pane, "--tab", sysTab.tabId, "--split", "down", "--ratio", "0.5", "--no-focus"];
+      if (sysTab.anchorPane !== undefined) moveArgs.push("--target-pane", sysTab.anchorPane);
+      if (!(await herdrOk(moveArgs))) {
+        process.stderr.write(
+          `tut: up: could not move pane ${pane} into tab ${SYS_TAB_LABEL} — orphan pane left in the current tab; clean up manually: herdr pane close ${pane}\n`,
+        );
+        printHerdrAnchorHint();
         return null;
       }
-      sysTab = { tabId: tab.tabId, ...(tab.rootPaneId !== undefined ? { rootPaneId: tab.rootPaneId } : {}), fresh: true };
-    }
-    const moveArgs = ["pane", "move", pane, "--tab", sysTab.tabId, "--split", "down", "--ratio", "0.5", "--no-focus"];
-    if (sysTab.anchorPane !== undefined) moveArgs.push("--target-pane", sysTab.anchorPane);
-    if (!(await herdrOk(moveArgs))) {
-      process.stderr.write(
-        `tut: up: could not move pane ${pane} into tab ${SYS_TAB_LABEL} — orphan pane left in the current tab; clean up manually: herdr pane close ${pane}\n`,
-      );
-      printHerdrAnchorHint();
-      return null;
-    }
-    sysTab.anchorPane = pane; // the next sys pane splits THIS pane (--ratio 0.5 → even halves)
-    if (sysTab.fresh && sysTab.rootPaneId !== undefined) {
-      // Empty-root cleanup, only for a tab created this run. Non-fatal: a
-      // leftover empty pane is cosmetic (herdr's stderr is forwarded by herdrOk).
-      await herdrOk(["pane", "close", sysTab.rootPaneId]);
-      sysTab.fresh = false;
-    }
-    if (!(await herdrOk(["pane", "rename", pane, label]))) {
-      process.stderr.write(`tut: up: could not label pane ${pane} as ${label} — rediscovery depends on it\n`);
-      return null;
-    }
-    if (!(await herdrOk(["pane", "run", pane, cmd]))) {
-      process.stderr.write(`tut: up: could not start ${name} in pane ${pane}\n`);
-      return null;
-    }
-    return { paneId: pane, reused: false };
-  };
-
-  // Step 1 — hub.
-  let hubUp = false;
-  if (await hubHealthy(hubUrl)) {
-    hubUp = true;
-    process.stdout.write(`up: hub already running (${hubUrl}/state)\n`);
-  } else if (panes === null) {
-    manual.push(serveCmd);
-  } else {
-    const provisioned = await provisionSysPane(SYS_HUB_PANE_LABEL, "serve", serveCmd);
-    if (provisioned === null) return 1;
-    if (!dryRun) {
-      const startedAt = Date.now();
-      const waitMs = hubWaitMs();
-      if (!(await pollUntil(() => hubHealthy(hubUrl), waitMs, UP_POLL_INTERVAL_MS))) {
-        process.stderr.write(
-          `tut: up: serve pane ${provisioned.paneId} started but ${hubUrl}/state stayed unhealthy for ${waitMs}ms — check the pane\n`,
-        );
-        return 1;
+      sysTab.anchorPane = pane; // the next sys pane splits THIS pane (--ratio 0.5 → even halves)
+      if (sysTab.fresh && sysTab.rootPaneId !== undefined) {
+        // Empty-root cleanup, only for a tab created this run. Non-fatal: a
+        // leftover empty pane is cosmetic (herdr's stderr is forwarded by herdrOk).
+        await herdrOk(["pane", "close", sysTab.rootPaneId]);
+        sysTab.fresh = false;
       }
+      if (!(await herdrOk(["pane", "rename", pane, label]))) {
+        process.stderr.write(`tut: up: could not label pane ${pane} as ${label} — rediscovery depends on it\n`);
+        return null;
+      }
+      if (!(await herdrOk(["pane", "run", pane, cmd]))) {
+        process.stderr.write(`tut: up: could not start ${name} in pane ${pane}\n`);
+        return null;
+      }
+      return { paneId: pane, reused: false };
+    };
+
+    // Step 1 — hub.
+    let hubUp = false;
+    if (await hubHealthy(hubUrl, cwd)) {
       hubUp = true;
-      process.stdout.write(
-        `up: hub serving on ${hubUrl} (pane ${await reportedPaneId(SYS_HUB_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""}, waited ${Date.now() - startedAt}ms)\n`,
+      process.stdout.write(`up: hub already running (${hubUrl}/state)\n`);
+    } else if (panes === null) {
+      manual.push(serveCmd);
+    } else {
+      const provisioned = await provisionSysPane(SYS_HUB_PANE_LABEL, "serve", serveCmd);
+      if (provisioned === null) return 1;
+      if (!dryRun) {
+        const startedAt = Date.now();
+        const waitMs = hubWaitMs();
+        if (!(await pollUntil(() => hubHealthy(hubUrl, cwd), waitMs, UP_POLL_INTERVAL_MS))) {
+          process.stderr.write(
+            `tut: up: serve pane ${provisioned.paneId} started but ${hubUrl}/state stayed unhealthy for ${waitMs}ms — check the pane\n`,
+          );
+          return 1;
+        }
+        hubUp = true;
+        process.stdout.write(
+          `up: hub serving on ${hubUrl} (pane ${await reportedPaneId(SYS_HUB_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""}, waited ${Date.now() - startedAt}ms)\n`,
+        );
+      }
+    }
+
+    // Step 1b — seed hint (hub reachable only; the read is allowed in dry-run).
+    if (hubUp) {
+      const projectState = await projectInvariantsState(hubUrl);
+      if (projectState === "empty" && !targetListening) {
+        // The existing notifier probe bounds this explanation to startup.
+        // Repeated up calls during subsequent rounds stay silent, including
+        // across CLI processes; no synthetic project record is needed.
+        process.stdout.write("up: project scope is empty — this is normal; executors can start from the task description.\n");
+      } else if (projectState === "unseeded") {
+        printInvariantsHint(hubUrl);
+      }
+    }
+
+    // Step 2 — notifier. The probes already ran in the pre-flight (memoized):
+    // the double-notifier warning rides oldNotifierAlive, the skip rides
+    // targetListening. Fresh-pane provisioning may continue past the warning
+    // — the stale notifier is the user's to stop; up never kills panes it does
+    // not own (the reuse-on-top-of-it shape was refused up front instead).
+    if (oldNotifierAlive && panes?.some((p) => p.label === SYS_NOTIFY_PANE_LABEL)) {
+      process.stderr.write(
+        `tut: up: another notifier is already listening on ${UP_EVENT_URL} — provisioning ${eventUrl} would leave two notifiers running; stop the old pane (label ${SYS_NOTIFY_PANE_LABEL}) or drop --event-port to reuse it\n`,
       );
     }
-  }
-
-  // Step 1b — seed hint (hub reachable only; the read is allowed in dry-run).
-  if (hubUp && (await projectInvariantsSeeded(hubUrl)) === false) {
-    printInvariantsHint(hubUrl);
-  }
-
-  // Step 2 — notifier. The probes already ran in the pre-flight (memoized):
-  // the double-notifier warning rides oldNotifierAlive, the skip rides
-  // targetListening. Fresh-pane provisioning may continue past the warning
-  // — the stale notifier is the user's to stop; up never kills panes it does
-  // not own (the reuse-on-top-of-it shape was refused up front instead).
-  if (oldNotifierAlive) {
-    process.stderr.write(
-      `tut: up: another notifier is already listening on ${UP_EVENT_URL} — provisioning ${eventUrl} would leave two notifiers running; stop the old pane (label ${SYS_NOTIFY_PANE_LABEL}) or drop --event-port to reuse it\n`,
-    );
-  }
-  if (targetListening) {
-    process.stdout.write(`up: notify already listening (${eventUrl})\n`);
-  } else if (panes === null) {
-    manual.push(notifyCmd);
-  } else {
-    const provisioned = await provisionSysPane(SYS_NOTIFY_PANE_LABEL, "notify", notifyCmd);
-    if (provisioned === null) return 1;
-    if (!dryRun) {
-      // Occupancy gate: spawn ok ≠ listening. A pane run
-      // into a pane still hosting a live foreground process is swallowed
-      // while herdr reports ok, so the success report waits for the event
-      // port to actually answer — the same discipline as the hub's /state
-      // wait. On timeout up fails loud instead of printing "notify running"
-      // over a dead provisioning.
-      const waitMs = notifyWaitMs();
-      if (!(await pollUntil(() => notifyHealthy(eventUrl), waitMs, UP_POLL_INTERVAL_MS))) {
-        process.stderr.write(
-          `tut: up: notify pane ${provisioned.paneId} ran but ${eventUrl} never answered — the pane may still be occupied by a live process (pane run cannot start a second one); stop it (herdr pane close ${provisioned.paneId} or exit the process in the pane) and rerun tut up\n`,
+    if (targetListening) {
+      process.stdout.write(`up: notify already listening (${eventUrl})\n`);
+    } else if (panes === null) {
+      manual.push(notifyCmd);
+    } else {
+      const provisioned = await provisionSysPane(SYS_NOTIFY_PANE_LABEL, "notify", notifyCmd);
+      if (provisioned === null) return 1;
+      if (!dryRun) {
+        // Occupancy gate: spawn ok ≠ listening. A pane run
+        // into a pane still hosting a live foreground process is swallowed
+        // while herdr reports ok, so the success report waits for the event
+        // port to actually answer — the same discipline as the hub's /state
+        // wait. On timeout up fails loud instead of printing "notify running"
+        // over a dead provisioning.
+        const waitMs = notifyWaitMs();
+        if (!(await pollUntil(() => notifyHealthy(eventUrl, cwd, hubUrl), waitMs, UP_POLL_INTERVAL_MS))) {
+          process.stderr.write(
+            `tut: up: notify pane ${provisioned.paneId} ran but ${eventUrl} never answered — the pane may still be occupied by a live process (pane run cannot start a second one); stop it (herdr pane close ${provisioned.paneId} or exit the process in the pane) and rerun tut up\n`,
+          );
+          return 1;
+        }
+        process.stdout.write(
+          `up: notify running (pane ${await reportedPaneId(SYS_NOTIFY_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""})\n`,
         );
+      }
+    }
+
+    // Degradation: no usable Herdr → manual commands for whatever is down,
+    // idempotent exit 0 — never a hidden background process.
+    if (panes === null) {
+      process.stdout.write(`up: herdr unusable (${herdrError}) — panes cannot be managed; start manually:\n`);
+      for (const cmd of manual) process.stdout.write(`up:   ${cmd}\n`);
+      process.stdout.write("up: agent panes are on-demand — launchers raise them at hand-off\n");
+      printActivationHint();
+      return 0;
+    }
+    // No role-pane provisioning here — panes are agent-keyed and
+    // raised on demand by the launcher at hand-off time. up is the power
+    // switch (hub + notify).
+    // Re-read before the success report: concurrent up can pass service
+    // probes through another invocation's winner while leaving duplicate
+    // labelled panes behind. Inside the lock window, this read-only check
+    // deliberately exits 1 on any error, including listing failure, even
+    // though provisioning succeeded. Rerunning up is idempotent.
+    if (!dryRun) {
+      const finalListing = await herdrPaneList();
+      if ("error" in finalListing) {
+        process.stderr.write(`tut: up: cannot verify final pane label uniqueness: ${finalListing.error}\n`);
         return 1;
       }
-      process.stdout.write(
-        `up: notify running (pane ${await reportedPaneId(SYS_NOTIFY_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""})\n`,
-      );
+      const labels = new Map<string, string[]>();
+      for (const pane of finalListing.panes) {
+        if (pane.label === undefined) continue;
+        const label = unscopedLabel(pane.label, cwd);
+        if (label === undefined || !/^(?:tut-(?:hub|notify)|.+\.(?:architect|executor|reviewer))$/.test(label)) continue;
+        const ids = labels.get(pane.label) ?? [];
+        ids.push(pane.pane_id);
+        labels.set(pane.label, ids);
+      }
+      const duplicates = [...labels].filter(([, ids]) => ids.length > 1);
+      if (duplicates.length > 0) {
+        for (const [label, ids] of duplicates) {
+          process.stderr.write(`tut: up: duplicate pane label ${label}: ${ids.join(", ")} — inspect and close the redundant panes, then rerun tut up\n`);
+        }
+        return 1;
+      }
     }
-  }
-
-  // Degradation: no usable Herdr → manual commands for whatever is down,
-  // idempotent exit 0 — never a hidden background process.
-  if (panes === null) {
-    process.stdout.write(`up: herdr unusable (${herdrError}) — panes cannot be managed; start manually:\n`);
-    for (const cmd of manual) process.stdout.write(`up:   ${cmd}\n`);
     process.stdout.write("up: agent panes are on-demand — launchers raise them at hand-off\n");
     printActivationHint();
     return 0;
+  } catch (error) {
+    process.stderr.write(`tut: up: ${(error as Error).message}\n`);
+    return 1;
+  } finally {
+    releaseLock?.();
   }
-  // No role-pane provisioning here — panes are agent-keyed and
-  // raised on demand by the launcher at hand-off time. up is the power
-  // switch (hub + notify).
-  process.stdout.write("up: agent panes are on-demand — launchers raise them at hand-off\n");
-  printActivationHint();
-  return 0;
 }
 
 export const HANDLERS = {
@@ -2998,6 +3068,24 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     if (parsed.error !== undefined) process.stderr.write(`tut: ${parsed.error}\n`);
     process.stderr.write(USAGE);
     return 1;
+  }
+  // Resolve before any Hub-consuming handler (including mutations) runs.
+  const hubCommands = new Set(["notify", "mode", "start-next", "watch", "create", "publish", "read", "list", "status", "doctor", "repair-meta", "recover-record", "decide", "ack"]);
+  if (hubCommands.has(parsed.command)) {
+    const target = parsed as { url?: string; eventPort?: number };
+    try {
+      const requested = target.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL;
+      target.url = await resolveCliHubUrl(requested, argv.some(arg => arg === "--url" || arg.startsWith("--url=")));
+      if (parsed.command === "notify" && !argv.some(arg => arg === "--event-port" || arg.startsWith("--event-port="))) {
+        target.eventPort = await resolveNotifierPort(target.url, resolveRigRoot(), undefined, target.url === requested ? DEFAULT_EVENT_PORT : Number(new URL(target.url).port) + 1);
+      }
+    } catch (error) {
+      if (parsed.command === "doctor") {
+        process.stderr.write(`tut: ${(error as Error).message}\n`);
+        return runDoctor(parsed, error);
+      }
+      return failWith(error, target.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
+    }
   }
   switch (parsed.command) {
     case "serve": return HANDLERS.serve(parsed);

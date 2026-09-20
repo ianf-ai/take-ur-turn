@@ -1,3 +1,4 @@
+import { scopedFixture, agentFixture } from "./rig-fixtures.js";
 // Fresh-session launcher coverage:
 // birth anchoring (tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail),
 // lifecycle hooks (three-branch round hand-off: same-role continuation /
@@ -36,8 +37,8 @@ afterAll(() => {
   rmSync(EMPTY_L2, { recursive: true, force: true });
 });
 
-const HUB_PANE = { pane_id: "w11:p2", label: "tut-hub", workspace_id: "w11", cwd: "/repo", tab_id: "w11:t2", agent_status: "idle" };
-const NOTIFY_PANE = { pane_id: "w11:p4", label: "tut-notify", workspace_id: "w11", cwd: "/repo", tab_id: "w11:t3", agent_status: "idle" };
+const HUB_PANE = { pane_id: "w11:p2", label: scopedFixture("tut-hub", "/repo"), workspace_id: "w11", cwd: "/repo", tab_id: "w11:t2", agent_status: "idle" };
+const NOTIFY_PANE = { pane_id: "w11:p4", label: scopedFixture("tut-notify", "/repo"), workspace_id: "w11", cwd: "/repo", tab_id: "w11:t3", agent_status: "idle" };
 
 // Screen timelines for the closed-loop delivery (7.2.1): the born branch
 // consumes 6 reads (base + 2 boot empties + the FOUR-sample quiescence run
@@ -89,7 +90,7 @@ const expectProbeRelayRun = (lines: string[], pane: string, target: { executable
     args: string[];
     env: Record<string, string>;
   };
-  expect(payload).toEqual({ protocol_version: 1, cwd: "/repo", ...target, purpose: "agent" });
+  expect(payload).toEqual({ protocol_version: 1, cwd: "/repo", ...target, env: { ...target.env, TUT_HUB_ROOT: "/repo", TUT_HUB_URL: "http://127.0.0.1:1", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" }, purpose: "agent" });
 };
 
 /** Env with the fixture herdr first on PATH; panes/fixtures parameterized.
@@ -99,6 +100,7 @@ const env = (panes: unknown[], extra: Record<string, string> = {}, dryRun = fals
   ...process.env,
   PATH: `${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
   TUT_HERDR_PANES: JSON.stringify(panes),
+  TUT_HUB_ROOT: "/repo",
   TUT_HUB_URL: "http://127.0.0.1:1", // deterministic: hub down → file chain + stderr note
   TUT_PROJECT_ROOT: CHAIN_ROOT,
   TUT_USER_CONFIG_DIR: EMPTY_L2,
@@ -158,7 +160,7 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
     });
     expect(r.code).toBe(0);
     expect(r.lines).toContain("tab create --workspace w11 --cwd /repo --label TUT executor --no-focus");
-    expect(r.lines).toContain("pane rename FIX:root1 t1.executor"); // pane label: fixed addressing key
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo")); // pane label: fixed addressing key
     // The foreign workspace/cwd must not leak into the birth.
     expect(r.lines.some((l) => l.includes("wP") || l.includes("/other/project"))).toBe(false);
   });
@@ -196,8 +198,8 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
   });
 
   it("live no-anchor exits before reaping stale task panes or delivering continuation", async () => {
-    const stale = { pane_id: "wP:stale", label: "t1.architect", workspace_id: "wP", cwd: "/other/project", agent_status: "done" };
-    const continuation = { pane_id: "wP:continuation", label: "t1.executor", workspace_id: "wP", cwd: "/other/project", agent_status: "idle" };
+    const stale = { pane_id: "wP:stale", label: scopedFixture("t1.architect", "/repo"), workspace_id: "wP", cwd: "/other/project", agent_status: "done" };
+    const continuation = { pane_id: "wP:continuation", label: scopedFixture("t1.executor", "/repo"), workspace_id: "wP", cwd: "/other/project", agent_status: "idle" };
     const r = await runLogged(["t1", "executor", "pi"], [stale, continuation]);
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("no anchor pane found");
@@ -215,21 +217,22 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
         ...process.env,
         PATH: `${bin}:${NODE_DIR}:/usr/bin:/bin`,
         TUT_DRY_RUN: "1",
-        TUT_HUB_URL: "http://127.0.0.1:1",
+        TUT_HUB_ROOT: "/repo",
+  TUT_HUB_URL: "http://127.0.0.1:1",
         TUT_PROJECT_ROOT: CHAIN_ROOT, // hermetic chain even without herdr
         TUT_USER_CONFIG_DIR: EMPTY_L2,
       };
       const { stdout } = await runLaunch(LAUNCH_SH, ["t2", "reviewer", "pi"], { env: noHerdr });
       expect(stdout).toContain("DRY-RUN: birth: herdr tab create --workspace <workspace> --cwd <cwd> --label TUT reviewer --no-focus");
-      expect(stdout).toContain("DRY-RUN: birth: herdr pane rename <root> t2.reviewer"); // pane label fixed
-      expect(stdout).toContain("(agent 'pi', label 't2.reviewer')");
+      expect(stdout).toContain(scopedFixture("DRY-RUN: birth: herdr pane rename <root> t2.reviewer", "<hub-root>")); // pane label fixed
+      expect(stdout).toContain(scopedFixture("(agent 'pi', label 't2.reviewer')", "<hub-root>"));
       // Closed-loop preview: land-confirm + verified-submit lines with
       // their knobs, both for the born branch.  The plan is CONDITIONAL:
       // Enter/probe only on land; land-timeout is an observe-only wait
       // ending in an attempts=0 give-up — never "submit anyway".
-      expect(stdout).toContain("DRY-RUN: text-land check <label:t2.reviewer> (timeout 5000ms; prompt-fragment match, NEW instance vs pre-send baseline; prompt carries a per-delivery nonce suffix for attribution)");
-      expect(stdout).toContain("DRY-RUN: on land: herdr pane send-keys <label:t2.reviewer> Enter");
-      expect(stdout).toContain("DRY-RUN: on land: submit verify <label:t2.reviewer> (ONE monotonic budget: 30000ms total from the first Enter; initial observation ≤ min(3000ms, budget) by transport+box-cleared; bounded Enter resend loop — interval 1500ms within the remaining budget, probe diagnostic-only; exhaustion → evidence-based manual-fallback note, still exit 0)");
+      expect(stdout).toContain(scopedFixture("DRY-RUN: text-land check <label:t2.reviewer> (timeout 5000ms; prompt-fragment match, NEW instance vs pre-send baseline; prompt carries a per-delivery nonce suffix for attribution)", "<hub-root>"));
+      expect(stdout).toContain(scopedFixture("DRY-RUN: on land: herdr pane send-keys <label:t2.reviewer> Enter", "<hub-root>"));
+      expect(stdout).toContain(scopedFixture("DRY-RUN: on land: submit verify <label:t2.reviewer> (ONE monotonic budget: 30000ms total from the first Enter; initial observation ≤ min(3000ms, budget) by transport+box-cleared; bounded Enter resend loop — interval 1500ms within the remaining budget, probe diagnostic-only; exhaustion → evidence-based manual-fallback note, still exit 0)", "<hub-root>"));
       expect(stdout).toContain("DRY-RUN: on land-timeout: NO Enter, NO probe — observe-only wait for a late landing (same new-instance rule) within the remaining 30000ms budget; exhausted without the text → give-up reason=land-never-observed (attempts=0) + escalation");
     } finally {
       rmSync(bin, { recursive: true, force: true });
@@ -243,8 +246,8 @@ describe("round hand-off: role change births fresh (narrowed reap)", () => {
   it("architect (idle, non-continuity) reaped (original behavior); the LIVE executor seat is KEPT (narrowing); prompt goes ONLY to the new pane", async () => {
     const panes = [
       HUB_PANE,
-      { pane_id: "w11:p5", label: "t1.architect", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
-      { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p5", label: scopedFixture("t1.architect", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
       // A bare agent-name pane (the task's architect agent) — with the
       // kickoff namespace retired, TUT mechanisms never touch these.
       { pane_id: "w11:p8", label: "pi", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
@@ -259,7 +262,7 @@ describe("round hand-off: role change births fresh (narrowed reap)", () => {
     expect(r.lines).not.toContain("pane close w11:p8"); // bare agent pane — out of scope
     // The fresh birth happened for the new role, adopt-root complete.
     expect(r.lines).toContain("tab create --workspace w11 --cwd /repo --label TUT reviewer --no-focus");
-    expect(r.lines).toContain("pane rename FIX:root1 t1.reviewer");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.reviewer", "/repo"));
     // The prompt went ONLY to the newborn pane — never the surviving seat.
     const sends = r.lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"));
     expect(sends).toHaveLength(1);
@@ -270,7 +273,7 @@ describe("round hand-off: role change births fresh (narrowed reap)", () => {
   it("prefix hygiene: a task_id that prefixes another task's id does NOT match its panes (and never continues into them)", async () => {
     const panes = [
       HUB_PANE,
-      { pane_id: "w11:p9", label: "t1-long.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p9", label: scopedFixture("t1-long.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
     ];
     const r = await runLogged(["t1", "executor", "pi"], panes, {
             TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
@@ -286,7 +289,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
   it("idle executor seat (revision scene): no reap, no birth, no gate — closed-loop delivery straight in", async () => {
     const r = await runLogged(["t1", "executor", "pi"], [
       HUB_PANE,
-      { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
     ], { TUT_HERDR_READ_SCRIPT: CONT_SCREENS });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("same-role continuation — delivering to existing pane w11:p6");
@@ -312,7 +315,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
   it("idle reviewer seat likewise (re-review scene)", async () => {
     const r = await runLogged(["t1", "reviewer", "pi"], [
       HUB_PANE,
-      { pane_id: "w11:p3", label: "t1.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p3", label: scopedFixture("t1.reviewer", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
     ], { TUT_HERDR_READ_SCRIPT: CONT_SCREENS });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("same-role continuation — delivering to existing pane w11:p3");
@@ -324,7 +327,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
     for (const status of ["working", "blocked"]) {
       const r = await runLogged(["t1", "executor", "pi"], [
         HUB_PANE,
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: status },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: status },
       ], { TUT_HERDR_READ_SCRIPT: CONT_SCREENS });
       expect(r.code).toBe(0);
       expect(r.stderr).toContain("same-role continuation — delivering to existing pane w11:p6");
@@ -338,7 +341,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
       ["t1", "executor", "pi"],
       [
         HUB_PANE,
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
       ],
       {},
       true,
@@ -360,14 +363,14 @@ describe("narrowed reap (birth branch): continuity seats survive, corpses and no
       ["t1", "reviewer", "pi"],
       [
         HUB_PANE,
-        { pane_id: "w11:p5", label: "t1.architect", workspace_id: "w11", cwd: "/repo", agent_status: "working" },
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "done" }, // turn-complete, process alive — protected
-        { pane_id: "w11:p7", label: "t1.reviewer", workspace_id: "w11", cwd: "/repo" }, // agent_status missing = dead
+        { pane_id: "w11:p5", label: scopedFixture("t1.architect", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "working" },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "done" }, // turn-complete, process alive — protected
+        { pane_id: "w11:p7", label: scopedFixture("t1.reviewer", "/repo"), workspace_id: "w11", cwd: "/repo" }, // agent_status missing = dead
       ],
       { TUT_HERDR_READ_SCRIPT: BORN_SCREENS },
     );
     expect(r.code).toBe(0);
-    expect(r.stderr).toContain("pane 't1.architect' (w11:p5) still working"); // the original working-skip semantics survive
+    expect(r.stderr).toContain(scopedFixture("pane 't1.architect' (w11:p5) still working", "/repo")); // the original working-skip semantics survive
     expect(r.lines).not.toContain("pane close w11:p5");
     expect(r.lines).not.toContain("pane close w11:p6"); // done = turn-complete seat, continuity protects it
     expect(r.lines).toContain("pane close w11:p7"); // missing-field corpse likewise
@@ -379,8 +382,8 @@ describe("narrowed reap (birth branch): continuity seats survive, corpses and no
       ["t1", "reviewer", "pi"],
       [
         HUB_PANE,
-        { pane_id: "w11:p5", label: "t1.architect", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w11:p5", label: scopedFixture("t1.architect", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
       ],
       { TUT_CONTINUITY_ROLES: "", TUT_HERDR_READ_SCRIPT: BORN_SCREENS },
     );
@@ -397,18 +400,18 @@ describe("--fresh (explicit outside perspective) + addressing-key guard", () => 
       ["--fresh", "t1", "executor", "pi"],
       [
         HUB_PANE,
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
-        { pane_id: "w11:p9", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "working" },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w11:p9", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "working" },
       ],
       { TUT_HERDR_READ_SCRIPT: BORN_SCREENS },
     );
     expect(r.code).toBe(0);
-    expect(r.stderr).toContain("--fresh — force-closing panes labeled 't1.executor'");
+    expect(r.stderr).toContain(scopedFixture("--fresh — force-closing panes labeled 't1.executor'", "/repo"));
     expect(r.stderr).not.toContain("same-role continuation"); // fresh bypasses continuation by design
     expect(r.lines).toContain("pane close w11:p6"); // idle seat
     expect(r.lines).toContain("pane close w11:p9"); // working seat — the explicit choice authorizes it
     expect(r.lines).toContain("tab create --workspace w11 --cwd /repo --label TUT executor --no-focus");
-    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expect(r.lines.some((l) => l.startsWith("pane read"))).toBe(true); // readiness gate — born pane
     const sends = r.lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"));
     expect(sends).toHaveLength(1);
@@ -433,7 +436,7 @@ describe("--fresh (explicit outside perspective) + addressing-key guard", () => 
       ["t1", "executor", "pi"],
       [
         HUB_PANE,
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "working" },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "working" },
       ],
       { TUT_CONTINUITY_ROLES: "" },
     );
@@ -452,8 +455,8 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
   it("closes this task's round panes even when working (live continuity seats included — the task is closed); bare agent panes are never touched; exit 0", async () => {
     const panes = [
       HUB_PANE,
-      { pane_id: "w11:p5", label: "t9.executor", workspace_id: "w11", cwd: "/repo", agent_status: "working" },
-      { pane_id: "w11:p6", label: "t9.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" }, // live continuity seat
+      { pane_id: "w11:p5", label: scopedFixture("t9.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "working" },
+      { pane_id: "w11:p6", label: scopedFixture("t9.reviewer", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" }, // live continuity seat
       { pane_id: "w11:p8", label: "pi", workspace_id: "w11", cwd: "/repo", agent_status: "idle" }, // bare agent pane
     ];
     const r = await runLogged(["--cleanup", "t9"], panes);
@@ -467,17 +470,17 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
   it("a pane close failure is a warning, not a failure (decide must succeed regardless)", async () => {
     const panes = [
       HUB_PANE,
-      { pane_id: "w11:p5", label: "t9.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p5", label: scopedFixture("t9.reviewer", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
     ];
     const r = await runLogged(["--cleanup", "t9"], panes, { TUT_HERDR_FAIL: "pane:close" });
     expect(r.code).toBe(0);
-    expect(r.stderr).toContain("pane close w11:p5 (label 't9.reviewer') failed — continuing");
+    expect(r.stderr).toContain(scopedFixture("pane close w11:p5 (label 't9.reviewer') failed — continuing", "/repo"));
   });
 
   it("a pane-list rejection warns with an action and still exits 0 without claiming full cleanup", async () => {
     const r = await runLogged(["--cleanup", "t9"], [
       HUB_PANE,
-      { pane_id: "w11:p5", label: "t9.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p5", label: scopedFixture("t9.reviewer", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
     ], { TUT_HERDR_FAIL: "pane:list" });
     expect(r.code).toBe(0);
     expect(r.lines).toEqual(["pane list"]);
@@ -491,7 +494,7 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
   it("an unusable non-JSON pane list warns with the parse reason and still exits 0", async () => {
     const r = await runLogged(["--cleanup", "t9"], [
       HUB_PANE,
-      { pane_id: "w11:p5", label: "t9.reviewer", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+      { pane_id: "w11:p5", label: scopedFixture("t9.reviewer", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
     ], { TUT_HERDR_PANES_RAW: "not json\n" });
     expect(r.code).toBe(0);
     expect(r.lines).toEqual(["pane list"]);
@@ -505,7 +508,7 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
       HUB_PANE,
       NOTIFY_PANE,
       { pane_id: "w11:p1", label: "", workspace_id: "w11", cwd: "/repo", agent_status: "idle" }, // human's
-      { pane_id: "w11:p7", label: "t8.executor", workspace_id: "w11", cwd: "/repo", agent_status: "idle" }, // another task
+      { pane_id: "w11:p7", label: scopedFixture("t8.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" }, // another task
     ];
     const r = await runLogged(["--cleanup", "t9"], panes);
     expect(r.code).toBe(0);
@@ -529,7 +532,7 @@ describe("self-update suppression: the agent run command disables startup update
     });
     expect(r.code).toBe(0);
     expectProbeRelayRun(r.lines, "FIX:root1", { executable: "codex", args: ["-c", "check_for_update_on_startup=false"], env: {} });
-    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expectDelivered(r.lines, "FIX:root1");
   });
 
@@ -592,7 +595,7 @@ describe("self-update suppression: the agent run command disables startup update
   it("dry-run preview shows the suppressed run command", async () => {
     const r = await runLogged(["t1", "executor", "codex"], [HUB_PANE], {}, true);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("DRY-RUN: birth: herdr pane run <root> cd -- '/repo' && 'codex' '-c' 'check_for_update_on_startup=false'");
+    expect(r.stdout).toContain(agentFixture("DRY-RUN: birth: herdr pane run <root> cd -- '/repo' && 'codex' '-c' 'check_for_update_on_startup=false'", "/repo", "http://127.0.0.1:1"));
   });
 });
 
@@ -618,10 +621,10 @@ describe("adopt-root fallback: anchored split sequence when root adoption fails"
     expect(r.stderr).toContain("falling back to the anchored split sequence");
     expect(r.lines).toContain("tab create --workspace w11 --cwd /repo --label TUT executor --no-focus");
     expect(r.lines).toContain("pane close FIX:root1"); // failed adoption root removed
-    expect(r.lines).toContain("pane split w11:p2 --direction right --no-focus --cwd /repo"); // anchored split
+    expect(r.lines).toContain("pane split w11:p2 --direction right --no-focus --cwd /repo" + " --env TUT_HUB_ROOT=/repo --env TUT_HUB_URL=http://127.0.0.1:1 --env TUT_EVENT_PORT_URL=http://127.0.0.1:1/agent-event"); // anchored split
     expect(r.lines).toContain("pane move FIX:p1 --tab FIX:t1 --split down");
     // the fallback tab's stray panes are swept — FIX:root1 matches again (idempotent close, same target)
-    expect(r.lines).toContain("pane rename FIX:p1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:p1 t1.executor", "/repo"));
     expectProbeRelayRun(r.lines, "FIX:p1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:p1");
   });
@@ -630,7 +633,7 @@ describe("adopt-root fallback: anchored split sequence when root adoption fails"
     const r = await runLogged(["t1", "executor", "pi"], [HUB_PANE], { TUT_HERDR_FAIL: "tab:create" });
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("herdr tab create returned no tab id");
-    expect(r.lines).toContain("pane split w11:p2 --direction right --no-focus --cwd /repo"); // anchored anyway
+    expect(r.lines).toContain("pane split w11:p2 --direction right --no-focus --cwd /repo" + " --env TUT_HUB_ROOT=/repo --env TUT_HUB_URL=http://127.0.0.1:1 --env TUT_EVENT_PORT_URL=http://127.0.0.1:1/agent-event"); // anchored anyway
   });
 });
 
@@ -655,7 +658,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     expect(r.stderr).toContain("tab id recovered via tab list ('FIX:t1')");
     // Root discovery fell to channel 2 (pane list by tab_id) and the birth
     // sequence completed on the recovered tab's root pane.
-    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:root1");
   });
@@ -680,7 +683,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     // and reclaim the pristine single-root tab instead.
     const r = await runLogged(["t1", "executor", "pi"], [
       HUB_PANE,
-      { pane_id: "FIX:fx1", label: "other-task.executor", workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "working" },
+      { pane_id: "FIX:fx1", label: scopedFixture("other-task.executor", "/repo"), workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "working" },
       { pane_id: "FIX:root1", label: "", workspace_id: "w11", cwd: "/repo", tab_id: "FIX:t1", agent_status: "idle" },
     ], {
       TUT_HERDR_TAB_CREATE_RAW: "created a tab",
@@ -693,7 +696,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     expect(r.code).toBe(0);
     expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
     expect(r.stderr).toContain("tab id recovered via tab list ('FIX:t1')");
-    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expect(r.lines.some((l) => l.startsWith("pane rename FIX:fx1"))).toBe(false); // the foreign pane is untouched
     expect(r.lines.some((l) => l.startsWith("pane close FIX:fx1"))).toBe(false);
     expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
@@ -703,7 +706,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
   it("only a foreign LIVE tab matches → recovery refuses, never adopts (no second create either)", async () => {
     const r = await runLogged(["t1", "executor", "pi"], [
       HUB_PANE,
-      { pane_id: "FIX:fx1", label: "other-task.executor", workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "working" },
+      { pane_id: "FIX:fx1", label: scopedFixture("other-task.executor", "/repo"), workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "working" },
     ], {
       TUT_HERDR_TAB_CREATE_RAW: "created a tab",
       TUT_HERDR_TABS: JSON.stringify([{ label: "TUT executor", tab_id: "FIX:t9" }]),
@@ -721,7 +724,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     // pristine (unlabeled) root qualifies as “root 为空”.
     const r = await runLogged(["t1", "executor", "pi"], [
       HUB_PANE,
-      { pane_id: "FIX:fx1", label: "other-task.executor", workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "done" },
+      { pane_id: "FIX:fx1", label: scopedFixture("other-task.executor", "/repo"), workspace_id: "w11", cwd: "/other", tab_id: "FIX:t9", agent_status: "done" },
     ], {
       TUT_HERDR_TAB_CREATE_RAW: "created a tab",
       TUT_HERDR_TABS: JSON.stringify([{ label: "TUT executor", tab_id: "FIX:t9" }]),
@@ -781,7 +784,7 @@ describe("tab create signal termination: recover or refuse, never blindly duplic
     expect(r.code).toBe(0);
     expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
     expect(r.lines).toContain("tab list --workspace w11");
-    expect(r.lines).toContain("pane rename FIX:root1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:root1");
     expect(r.stderr).toContain("signal SIGTERM");
@@ -831,9 +834,9 @@ describe("fallback root cleanup survives pane-list lag (bounded retry + post-run
     const listsBeforeClose = r.lines.slice(0, closeIdx).filter((l) => l === "pane list").length;
     expect(listsBeforeClose).toBeGreaterThanOrEqual(5);
     // The fallback sequence itself completed.
-    expect(r.lines).toContain("pane split w11:p2 --direction right --no-focus --cwd /repo");
+    expect(r.lines).toContain("pane split w11:p2 --direction right --no-focus --cwd /repo" + " --env TUT_HUB_ROOT=/repo --env TUT_HUB_URL=http://127.0.0.1:1 --env TUT_EVENT_PORT_URL=http://127.0.0.1:1/agent-event");
     expect(r.lines).toContain("pane move FIX:p1 --tab FIX:t2 --split down");
-    expect(r.lines).toContain("pane rename FIX:p1 t1.executor");
+    expect(r.lines).toContain(scopedFixture("pane rename FIX:p1 t1.executor", "/repo"));
     expectDelivered(r.lines, "FIX:p1");
   });
 });

@@ -1,3 +1,9 @@
+// This suite isolates doctor rendering; endpoint identity is covered separately.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveCliHubUrl: async (url: string) => url,
+}));
+
 // tut doctor CLI wiring (0.7.0). The doctor module itself is
 // exercised in test/doctor.test.ts through its own seams (fetchImpl /
 // resolveTarget) against real temp-dir fixtures; these tests cover only the

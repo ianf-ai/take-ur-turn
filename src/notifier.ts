@@ -47,6 +47,8 @@
  * flood the notify log.
  */
 
+import { canonicalRoot, resolveRigRoot } from "./rig-discovery.js";
+import { rigLabel, rigEnvironment, unscopedLabel } from "./rig.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createChannels, type Channel, type Notification } from "./channels.js";
@@ -71,6 +73,7 @@ import {
 } from "./launcher/target-resolver.js";
 import { runInternalLaunch, runInternalLaunchInvocation, spawnDirect, DEFAULT_CHILD_TIMEOUT_MS } from "./launcher/process.js";
 import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
+import { relayHostStatus, type HostStatusReport } from "./host-status-relay.js";
 import { HerdrClient } from "./launcher/herdr-client.js";
 import { HUB_FETCH_TIMEOUT_MS, HubSession, hubReadVia } from "./hub-client.js";
 import type { AgentCommand, AgentRoute, Cast, CheckoutRoute, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "./types.js";
@@ -233,6 +236,8 @@ export interface NotifierDeps {
    * the compare. Injectable for tests.
    */
   cleanupPanes(taskId: string): Promise<void>;
+  /** One best-effort host report per observed approval/attention edge. */
+  relayHostStatus?(report: HostStatusReport, notify: unknown): Promise<void>;
   /** Full task log used by auto launch de-duplication; injectable for tests. */
   readLog(taskId: string): Promise<ContextRecord[]>;
   /**
@@ -401,6 +406,8 @@ async function buildAutoInvocation(
 ): Promise<LaunchInvocation> {
   const normalized: AgentCommand = { agent: commandHead(route), args: commandArgs(route) };
   const plan = preResolvedPlan ?? await planForPlatform(normalized, environment);
+  const agentPlan = plan.platform === "posix" ? plan.posix_direct : plan.effective_agent;
+  agentPlan.env = { ...agentPlan.env, ...rigEnvironment(context.hubRoot, hubUrl, environment.TUT_EVENT_PORT_URL || "http://127.0.0.1:3002/agent-event") };
   const template = resolveTabLabelTemplateFromSnapshot(workspaceSnapshot);
   const skillPath = fileURLToPath(new URL(`../skills/${role}.md`, import.meta.url));
   const request: LaunchRequest = {
@@ -419,7 +426,7 @@ async function buildAutoInvocation(
     context,
     naming: {
       tab_label: renderTabLabel(template, role, task.task_id, normalized.agent),
-      pane_label: `${task.task_id}.${role}`,
+      pane_label: rigLabel(`${task.task_id}.${role}`, context.hubRoot),
     },
     prompt: `轮到你了（role: ${role}）：请用 Context Hub 读取任务 ${task.task_id} 的完整上下文（context.read），按你的 role skill（${skillPath}）开始本轮工作，完成后发布相应记录（context.publish）。`,
     ...(plan.platform === "posix"
@@ -484,8 +491,8 @@ export async function spawnLaunchInvocation(
  * contract for this path is ONE diagnostic line, carried by the thrown
  * error's message (the child's stderr tail rides along).
  */
-export async function spawnCleanupPanes(taskId: string): Promise<void> {
-  const result = await runInternalLaunch(["--cleanup", taskId]);
+export async function spawnCleanupPanes(taskId: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const result = await runInternalLaunch(["--cleanup", taskId], { env });
   if (result.error !== undefined) {
     throw new Error(`cannot run internal launcher: ${result.error.message}`);
   }
@@ -718,6 +725,7 @@ export class Notifier {
   private readonly stallMs: number;
   private readonly workingTimeoutMs: number;
   private readonly eventPort: number;
+  private readonly rigRoot = resolveRigRoot();
   private readonly deps: NotifierDeps;
 
   /**
@@ -882,7 +890,8 @@ export class Notifier {
     this.deps = {
       fetchState: deps.fetchState ?? defaultFetchState,
       launch: deps.launch ?? spawnLaunch,
-      cleanupPanes: deps.cleanupPanes ?? spawnCleanupPanes,
+      cleanupPanes: deps.cleanupPanes ?? ((taskId) => spawnCleanupPanes(taskId, { ...process.env, TUT_HUB_ROOT: this.rigRoot })),
+      relayHostStatus: deps.relayHostStatus ?? relayHostStatus,
       ...(canonicalLaunch !== undefined ? { launchInvocation: canonicalLaunch } : {}),
       readLog: deps.readLog ?? ((taskId) => readLaunchLog(options.url, taskId)),
       ...(readLogSince !== undefined ? { readLogSince } : {}),
@@ -1132,7 +1141,7 @@ export class Notifier {
           this.markProgress(after.task_id, now);
           continue;
         }
-        await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto);
+        await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto, state.notify);
       }
       this.checkStalls(state.tasks, now);
     } catch (e) {
@@ -1226,6 +1235,7 @@ export class Notifier {
     after: StateTask,
     flowMode: string,
     auto: StateAuto | undefined,
+    notify: unknown,
   ): Promise<void> {
     // Close-edge pane cleanup (system-design 4.4): `tut decide close`
     // keeps its synchronous cleanup child, but the decision may land through
@@ -1248,6 +1258,10 @@ export class Notifier {
     const beforeWf = before?.waiting_for ?? "none";
     const wfChanged = beforeWf !== after.waiting_for;
     const attentionRising = after.needs_attention && before?.needs_attention !== true;
+    // Reuse the existing edge bookkeeping. Detach I/O just like cleanup:
+    // failure is logged once and never retried by subsequent quiet polls.
+    if (pendingApprovalEntering) this.reportHostStatus(after, "pending_approval", notify);
+    if (attentionRising) this.reportHostStatus(after, "needs_attention", notify);
 
     // Merge log (log-only, no behavior change): version jumped
     // by more than 1 → intermediate rounds landed between polls and were never
@@ -1338,6 +1352,13 @@ export class Notifier {
       return;
     }
     await this.autoLaunch(after, role);
+  }
+
+  private reportHostStatus(task: StateTask, status: HostStatusReport["status"], notify: unknown): void {
+    const report = { task_id: task.task_id, status, waiting_for: task.waiting_for };
+    void Promise.resolve().then(() => this.deps.relayHostStatus!(report, notify)).catch((e: unknown) => {
+      this.log(`[${task.task_id}] host status relay failed: ${(e as Error).message}`);
+    });
   }
 
   /**
@@ -1551,7 +1572,7 @@ export class Notifier {
     // planning the route.  Both are frozen at this planner boundary, so
     // naming, routing and birth cannot drift if focus, files, or environment
     // changes after this point.
-    const environment = { ...process.env };
+    const environment = { ...process.env, ...rigEnvironment(this.rigRoot, this.stateUrl.replace(/\/state$/, ""), `http://127.0.0.1:${this.eventPort}/agent-event`) };
     let executionContext: ExecutionContext;
     try {
       executionContext = await resolveExecutionContext({
@@ -1859,7 +1880,7 @@ export class Notifier {
   }
 
   private roundRoleFromPane(taskId: string, pane: string): string | undefined {
-    const label = pane.trim();
+    const label = unscopedLabel(pane.trim(), this.rigRoot) ?? pane.trim();
     const prefix = `${taskId}.`;
     if (!label.startsWith(prefix)) return undefined;
     const role = label.slice(prefix.length).split(".", 1)[0];
@@ -1875,7 +1896,7 @@ export class Notifier {
       if (paneRole !== undefined && watch.role !== paneRole) continue;
       // A prefix can still resolve a legacy/suffixed pane to the task, but a
       // working watch may only be cleared by the exact current round key.
-      if (paneRole !== undefined && evt.pane.trim() !== `${taskId}.${watch.role}`) continue;
+      if (paneRole !== undefined && (unscopedLabel(evt.pane.trim(), this.rigRoot) ?? evt.pane.trim()) !== `${taskId}.${watch.role}`) continue;
       if (watch.launchVersion !== undefined && task?.version !== undefined && task.version > watch.launchVersion) {
         const superseded = await this.launchGenerationSuperseded(taskId, watch.launchVersion);
         // Notes advance task.version without changing the launch generation;
@@ -1902,7 +1923,7 @@ export class Notifier {
       if (launch.task.task_id !== taskId) continue;
       if (task?.waiting_for !== `agent:${launch.role}`) continue;
       if (paneRole !== undefined && launch.role !== paneRole) continue;
-      if (paneRole !== undefined && evt.pane.trim() !== `${taskId}.${launch.role}`) continue;
+      if (paneRole !== undefined && (unscopedLabel(evt.pane.trim(), this.rigRoot) ?? evt.pane.trim()) !== `${taskId}.${launch.role}`) continue;
       if (launch.launchVersion !== undefined && task?.version !== undefined && task.version > launch.launchVersion) {
         const superseded = await this.launchGenerationSuperseded(taskId, launch.launchVersion);
         if (superseded !== false) continue;
@@ -1920,7 +1941,7 @@ export class Notifier {
     const currentRole = task.waiting_for.slice("agent:".length);
     const paneRole = this.roundRoleFromPane(taskId, evt.pane);
     if (paneRole !== undefined) {
-      return paneRole === currentRole && evt.pane.trim() === `${taskId}.${currentRole}`;
+      return paneRole === currentRole && (unscopedLabel(evt.pane.trim(), this.rigRoot) ?? evt.pane.trim()) === `${taskId}.${currentRole}`;
     }
     // Bare task-id panes and agent-named panes are the legacy/identity paths;
     // resolveEventTask already validated the task/agent relationship before
@@ -2137,7 +2158,7 @@ export class Notifier {
   private resolveEventTask(pane: string): string | null {
     const snap = this.snapshot;
     if (snap === null) return null;
-    const label = pane.trim();
+    const label = unscopedLabel(pane.trim(), this.rigRoot) ?? pane.trim();
     if (snap.has(label)) return label; // (a) 4.4: work pane named after its task
     // (a½) round pane <task_id>.<role>. Slugs do not contain dots, but walk
     // every dot from the right so a legacy label with an extra suffix still
@@ -2259,6 +2280,7 @@ export class Notifier {
 
   /** Handles a validated event; safe to call from the HTTP handler directly. */
   receiveEvent(evt: AgentEvent): void {
+    if (/\.(architect|executor|reviewer)-[a-f0-9]{8}$/.test(evt.pane.trim()) && unscopedLabel(evt.pane.trim(), this.rigRoot) === undefined) return;
     const taskId = this.resolveEventTask(evt.pane);
     switch (evt.event) {
       case "working":
@@ -2415,7 +2437,7 @@ export class Notifier {
     // Prefix match is exact at the namespace boundary: task slugs carry no
     // dots (slug alphabet [a-z0-9-]), so `${taskId}.` cannot span into a
     // longer task's namespace (t1. never matches t1-long.*).
-    const scoped = panes.filter((p) => p.label.startsWith(`${taskId}.`));
+    const scoped = panes.filter((p) => (unscopedLabel(p.label, this.rigRoot) ?? "").startsWith(`${taskId}.`));
     if (scoped.length === 0) {
       this.log(`[${taskId}] done sweep: no round panes left to snapshot`);
       return;
@@ -2481,7 +2503,7 @@ export class Notifier {
     }
     if (req.method !== "POST") {
       res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "method not allowed: use POST /agent-event" }));
+      res.end(JSON.stringify({ error: "method not allowed: use POST /agent-event", hub_root: canonicalRoot(this.rigRoot), hub_url: this.stateUrl.replace(/\/state$/, "") }));
       return;
     }
     const raw = await readBody(req, EVENT_BODY_LIMIT);

@@ -97,6 +97,18 @@ describe("createTask", () => {
     expect(meta.title).toBe("Auth Refactor!");
   });
 
+  it("allocates a suffixed slug when a regular file occupies the title slug", async () => {
+    const { store, root } = newStore();
+    mkdirSync(path.join(root, "tasks"), { recursive: true });
+    const occupied = taskDir(root, "foo");
+    writeFileSync(occupied, "preserve occupied entry");
+    const created = await store.createTask({ title: "Foo", description: "d", creator: "human", role: "executor" });
+    expect(created.task_id).toMatch(/^foo-[a-z0-9]+$/);
+    expect((await store.readTask(created.task_id)).title).toBe("Foo");
+    expect(existsSync(path.join(taskDir(root, created.task_id), "meta.json"))).toBe(true);
+    expect(readFileSync(occupied, "utf8")).toBe("preserve occupied entry");
+  });
+
   it("gives a short suffix on slug collision", async () => {
     const { store, root } = newStore();
     const first = await store.createTask({ title: "Auth Refactor", description: "d", creator: "alice", role: "agent:architect" });
@@ -167,6 +179,35 @@ describe("append", () => {
     const record = readRecordFile(root, task_id, "v001.design.json");
     expect("agent" in record).toBe(false);
     expect("model" in record).toBe(false);
+  });
+
+  it("stamps tut_version from package.json on every appended record; readTask returns it", async () => {
+    const { store, root } = newStore();
+    const { task_id } = await store.createTask({ title: "Auth Refactor", description: "d", creator: "alice", role: "agent:architect" });
+
+    await store.append(task_id, { role: "agent:architect", content_type: "design", payload: validPayload() });
+
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    const record = readRecordFile(root, task_id, "v001.design.json");
+    expect(record.tut_version).toBe(manifest.version);
+    const read = await store.readTask(task_id);
+    expect(read.versions[0]?.tut_version).toBe(manifest.version);
+  });
+
+  it("old records without tut_version stay compatible: read and derive ignore its absence; the next append still stamps it", async () => {
+    const { store, root } = newStore();
+    const { task_id } = await store.createTask({ title: "Auth Refactor", description: "d", creator: "alice", role: "agent:architect" });
+    // Pre-tut_version shape landed directly on disk (writeRecordDirect bypasses append).
+    writeRecordDirect(root, task_id, directDesignRecord(task_id));
+
+    const read = await store.readTask(task_id);
+    expect(read.status).toBe("implementing"); // the old-shape record still folds
+    expect("tut_version" in read.versions[0]!).toBe(false);
+
+    await store.append(task_id, { role: "agent:executor", content_type: "code_changes", payload: validPayload() });
+    const record = readRecordFile(root, task_id, "v002.code_changes.json");
+    expect(typeof record.tut_version).toBe("string");
+    expect(record.tut_version?.length ?? 0).toBeGreaterThan(0);
   });
 
   it("expected_version: 0 passes for the first publish, current version passes afterwards", async () => {
@@ -1124,6 +1165,47 @@ describe("structural artifact validation", () => {
 });
 
 describe("repairMeta (A-class, system-design 4.3)", () => {
+  const frozenDescription = ["要改变的行为", "验收场景", "明确不做", "必要依赖及理由"]
+    .map((heading) => `## ${heading}\nScope text`).join("\n\n");
+
+  it("directs healthy frozen scope changes to a new task too", async () => {
+    const { store } = newStore();
+    const { task_id } = await store.createTask({ title: "Healthy frozen", description: frozenDescription, creator: "human", role: "human" });
+    await expect(store.repairMeta(task_id, { description: "new scope" })).rejects.toThrow("create a new task");
+    await expect(store.repairMeta(task_id, { description: frozenDescription })).rejects.toThrow("nothing to repair");
+  });
+
+  it.each(["replacement", undefined, frozenDescription])("protects a surviving frozen description during repair (%s)", async (replacement) => {
+    const { store, root } = newStore();
+    const { task_id } = await store.createTask({ title: "Frozen scope", description: frozenDescription, creator: "human", role: "human" });
+    const metaPath = path.join(taskDir(root, task_id), "meta.json");
+    const damaged = JSON.parse(readFileSync(metaPath, "utf8"));
+    damaged.version = -1;
+    const bytes = JSON.stringify(damaged);
+    writeFileSync(metaPath, bytes);
+    if (replacement === "replacement") {
+      await expect(store.repairMeta(task_id, { description: replacement })).rejects.toMatchObject({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: expect.stringContaining("create a new task"),
+      });
+      expect(readFileSync(metaPath, "utf8")).toBe(bytes);
+    } else {
+      await store.repairMeta(task_id, replacement === undefined ? {} : { description: replacement });
+      expect((await store.readTask(task_id)).description).toBe(frozenDescription);
+    }
+  });
+
+  it.each(["legacy prose", "## 要改变的行为\nOnly one heading"])("keeps legacy description repair writable (%s)", async (description) => {
+    const { store, root } = newStore();
+    const { task_id } = await store.createTask({ title: "Legacy scope", description, creator: "human", role: "human" });
+    const metaPath = path.join(taskDir(root, task_id), "meta.json");
+    const damaged = JSON.parse(readFileSync(metaPath, "utf8"));
+    damaged.version = -1;
+    writeFileSync(metaPath, JSON.stringify(damaged));
+    await store.repairMeta(task_id, { description: "repaired legacy scope" });
+    expect((await store.readTask(task_id)).description).toBe("repaired legacy scope");
+  });
+
   it("rebuilds a corrupt meta: version = max on-disk record version (server-computed), caller fields honored", async () => {
     const { store, root } = newStore();
     const { task_id } = await store.createTask({ title: "Original", description: "orig", creator: "alice", role: "agent:architect" });
@@ -1497,13 +1579,38 @@ describe("post-write degradation and close boundaries", () => {
 
 
 describe("task ID dot hygiene", () => {
-  it("normalizes dotted titles and rejects repair-created dotted IDs", async () => {
+  it("rejects a dotted file as a repair target without changing its bytes", async () => {
+    const { store, root } = newStore();
+    mkdirSync(path.join(root, "tasks"), { recursive: true });
+    const target = taskDir(root, "legacy.task");
+    writeFileSync(target, "preserve me");
+    await expectCode(store.repairMeta("legacy.task", {}), ErrorCode.VALIDATION_ERROR);
+    expect(readFileSync(target, "utf8")).toBe("preserve me");
+  });
+
+  it("normalizes dotted titles and rejects missing dotted IDs", async () => {
     const { store, root } = newStore();
     const created = await store.createTask({ title: "new.task", description: "d", creator: "human", role: "architect" });
     expect(created.task_id).toBe("new-task");
-    mkdirSync(taskDir(root, "new.task"));
     await expectCode(store.repairMeta("new.task", {}), ErrorCode.VALIDATION_ERROR);
     expect(existsSync(path.join(taskDir(root, "new.task"), "meta.json"))).toBe(false);
+  });
+
+  it.each(["missing", "corrupt"])("rebuilds %s meta in an existing dotted directory without changing records", async (damage) => {
+    const { store, root } = newStore();
+    const id = "legacy.task";
+    mkdirSync(taskDir(root, id), { recursive: true });
+    writeRecordDirect(root, id, directDesignRecord(id));
+    const recordPath = path.join(taskDir(root, id), "v001.design.json");
+    const original = readFileSync(recordPath);
+    if (damage === "corrupt") writeFileSync(path.join(taskDir(root, id), "meta.json"), "{bad");
+    expect(await store.repairMeta(id, { title: "Recovered" })).toMatchObject({ task_id: id, version: 1 });
+    expect(await store.readTask(id)).toMatchObject({ title: "Recovered", status: "implementing" });
+    expect((await store.snapshotTasks()).degraded).not.toContain(id);
+    expect(readFileSync(recordPath)).toEqual(original);
+    await expectCode(store.repairMeta(id, {}), ErrorCode.VALIDATION_ERROR);
+    await expectCode(store.repairMeta("../legacy.task", {}), ErrorCode.VALIDATION_ERROR);
+    await expectCode(store.repairMeta("missing-task", {}), ErrorCode.TASK_NOT_FOUND);
   });
 
   it("reads, lists, derives and appends to a historical dotted task without rewriting records", async () => {

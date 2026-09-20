@@ -1,3 +1,4 @@
+import { agentFixture } from "./rig-fixtures.js";
 /**
  * Integration verification — exercises the full acceptance criteria end to end.
  *
@@ -215,6 +216,7 @@ async function startStack(): Promise<Stack> {
     "utf8",
   );
   const running: RunningServer = await startServer({ root, port: 0 });
+  setEnv("TUT_HUB_ROOT", tmp);
   cleanups.push(() => running.close());
   return { baseUrl: running.url, sink, posts: sink.posts, err: io.err, out: io.out };
 }
@@ -237,6 +239,7 @@ async function startHubOnly(): Promise<string> {
   cleanups.push(() => rmSync(tmp, { recursive: true, force: true }));
   setEnv("TUT_PROJECT_ROOT", tmp);
   const running = await startServer({ root: path.join(tmp, ".context-hub"), port: 0 });
+  setEnv("TUT_HUB_ROOT", tmp);
   cleanups.push(() => running.close());
   return running.url;
 }
@@ -689,6 +692,7 @@ describe("--url real chain (context commands against an ephemeral-port hub)", ()
     const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-urlchain-"));
     const root = path.join(tmp, ".context-hub");
     const running: RunningServer = await startServer({ root, port: 0 });
+    setEnv("TUT_HUB_ROOT", tmp);
     const baseUrl = running.url;
     let outText = "";
     const out = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
@@ -758,7 +762,7 @@ describe("cast routing end-to-end", () => {
       try {
         await main(["start-next", castId, "--url", baseUrl]);
         expect(io.out()).toContain("(agent 'codex', label"); // cast routed the round to codex
-        expect(io.out()).toContain("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search'");
+        expect(io.out()).toContain(agentFixture("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search'", "<hub-root>", baseUrl));
 
         // Regression (zero migration): a no-cast task routes through the
         // default chain (executor → pi via DEFAULT_ROLES).

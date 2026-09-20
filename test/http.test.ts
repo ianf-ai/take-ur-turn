@@ -71,8 +71,8 @@ describe("GET /state (frozen shape)", () => {
 
     expect(body.flow_mode).toBe("manual");
     // Frozen top-level shape (plus the two additive optional keys):
-    // with no notify/auto configured, exactly flow_mode + tasks.
-    expect(Object.keys(body).sort()).toEqual(["flow_mode", "tasks"]);
+    // with no notify/auto configured, flow_mode + tasks + owning hub_root.
+    expect(Object.keys(body).sort()).toEqual(["flow_mode", "hub_root", "tasks"]);
     expect(Array.isArray(body.tasks)).toBe(true);
     expect(body.tasks).toHaveLength(1);
 
@@ -104,6 +104,32 @@ describe("GET /state (frozen shape)", () => {
     const body = (await res.json()) as { tasks: { task_id: string }[] };
 
     expect(body.tasks.map((t) => t.task_id)).not.toContain("project");
+  });
+
+  it("never exposes record tut_version (store-added field stays out of the /state shape)", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const text = JSON.stringify(await res.json());
+
+    expect(text).not.toContain("tut_version");
+  });
+
+  it("HEAD /state runs the same state build: 200, JSON content-type, no body", async () => {
+    const res = await fetch(`${baseUrl}/state`, { method: "HEAD" });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.text()).toBe("");
+  });
+
+  it("POST /state → 405 with Allow: GET, HEAD", async () => {
+    const res = await fetch(`${baseUrl}/state`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("GET, HEAD");
   });
 
   it("exposes parameterized cast argv unchanged on the HTTP state seam", async () => {

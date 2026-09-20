@@ -154,7 +154,10 @@ function fold(status: Status, record: ContextRecord, flow: Flow): { status: Stat
       if (flow === "solo") {
         return { status, warning: "OUT_OF_TABLE" };
       }
-      return status === "revising"
+      // full: fail_design → designing → design → implementing also accepts
+      // revision: the envelope discipline requires a revision, not a second-round code_changes.
+      // The table consumes only the current state/flow, not prior history.
+      return status === "revising" || (flow === "full" && status === "implementing")
         ? { status: "reviewing", warning: null }
         : { status, warning: "OUT_OF_TABLE" };
     case "decision": {

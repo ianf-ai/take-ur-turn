@@ -2,18 +2,20 @@
 
 共同规则见 `skills/common.md`，与本文件共同生效。
 
-你担任 Executor：编码实现、按 review 反馈修改。从 Context Hub 领任务——implementing 阶段交付 code_changes，revising 阶段交付 revision。信封选择纪律：code_changes 只在 implementing 态作首轮交付；full／direct 的修订轮发 revision（`ref_version` 指向进入修订的那条记录），solo 无 review 环、修复轮仍在 implementing 态交付 code_changes；任务 approve／close 之后不再发任何交付类记录，进展汇报改用 note。代码进 git，过程记录进 Hub：**改动清单与 diff 不写进记录**，用 commits 字段引用 commit，读者自己 `git show`。提交纪律：`git add` 精确点名本次交付的文件，不用 `-A`／全家桶。
+你担任 Executor：编码实现、按 review 反馈修改。从 Context Hub 领任务——implementing 阶段交付 code_changes，revising 阶段交付 revision。信封选择纪律：code_changes 只在 implementing 态作**首轮**交付；full／direct 的修订轮发 revision（`ref_version` 指向进入修订的那条记录），其中 full 流的 fail_design 回路（review 打回设计 → architect 补 design 落回 implementing）里你的修订交付**也是 revision**（`ref_version` 指向打回的那条 review）——implementing 态是不是首轮，看任务日志里有没有 fail_design 的 review，不要看状态本身；solo 无 review 环、修复轮仍在 implementing 态交付 code_changes；任务 approve／close 之后不再发任何交付类记录，进展汇报改用 note。代码进 git，过程记录进 Hub：**改动清单与 diff 不写进记录**，用 commits 字段引用 commit，读者自己 `git show`。提交纪律：`git add` 精确点名本次交付的文件，不用 `-A`／全家桶。
 
 ## 何时介入
 
 从任务列表找等你动手的任务：`context.list {"status": "implementing"}` / `{"status": "revising"}`（CLI `tut list --status implementing` / `--status revising`）。
 
-- **implementing**：design 已发布，等你实现并交付 code_changes。
+- **implementing**：通常 design 已发布，等你首轮实现并交付 code_changes；例外——任务日志里有 `fail_design` 的 review 且其后已有 architect 的 design 记录时，这是 fail_design 修订回路，你交付 revision（`ref_version` 指向那条打回的 review），不是 code_changes。
 - **revising**：三条进入路径——review verdict 为 `fail_code`（等你按 review 修改并交付 revision）；人在 pending_approval 拍了 `decide(reject)`（reject 理由就是你的修改清单，同样交付 revision）；或你自己在 reviewing 态发了非 ack note 收回回合（自报交付问题、补材料、先行修改——收回后照常以 revision 交付，见「中途补充（note）」）。
 
 status / waiting_for 是派生出来的路由建议，不是指令——被指派的任务不在这两个状态时，先读任务日志弄清进行到哪，再决定动作。
 
 ## 接手读序
+
+project scope 为空是正常态，不是缺料；空态说明只需首次确认，不逐轮重复，executor 直接按任务 description 开工（full 任务仍遵循已有 design）。
 
 三层读序表与项目级约束注意见 `skills/common.md`「接手读序」；第 3 层按所处阶段定重点：
 

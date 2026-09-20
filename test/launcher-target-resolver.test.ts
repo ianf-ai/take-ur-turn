@@ -1,3 +1,11 @@
+// Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveCliHubUrl: async (url: string) => url,
+}));
+
+import { agentFixture } from "./rig-fixtures.js";
+import { rigLabel } from "../src/rig.js";
 /**
  * Platform target resolution (launcher port design §3) — the unit-3 seam.
  *
@@ -35,6 +43,7 @@ import {
   enumeratePathCandidates,
   planForPlatform,
   probeExecutable,
+  probeWalkTimeoutMs,
   resolvePlatformExecutionPlan,
   resolvePosixTargetPresence,
   resolveWindowsExecutableTarget,
@@ -356,6 +365,24 @@ describe("probe subprocess timeout (a hung where/which cannot stall the loop)", 
     const probe = await probeExecutable(process.execPath, ["-e", "process.exit(0)"],);
     expect(probe.code).toBe(0);
     expect(probe.error).toBeUndefined();
+  });
+});
+
+describe("probe walk timeout clamp (TUT_PROBE_WALK_TIMEOUT_MS reuses the probe budget bounds)", () => {
+  it("defaults to 24s on unset and garbage values", () => {
+    expect(probeWalkTimeoutMs({})).toBe(24_000);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "abc" })).toBe(24_000);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "-1" })).toBe(24_000);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "1.5" })).toBe(24_000);
+  });
+
+  it("clamps to the shared probe budget bounds [250ms, 60s] with behavior unchanged", () => {
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "0" })).toBe(250);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "249" })).toBe(250);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "250" })).toBe(250);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "60000" })).toBe(60_000);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "120000" })).toBe(60_000);
+    expect(probeWalkTimeoutMs({ TUT_PROBE_WALK_TIMEOUT_MS: "600" })).toBe(600);
   });
 });
 
@@ -683,6 +710,18 @@ describe("streaming fact-probe isolation (a stalled candidate cannot sink its ba
     expect((error as UnsupportedWindowsShimError).shimPath).toBe(shim);
   });
 
+  it("reports the walk deadline and actual wait when it clips a child budget", async () => {
+    const dead = "C:\\dead\\pi.exe";
+    const error = await resolveWindowsExecutableTarget("pi", {
+      environment: { TUT_PROBE_TIMEOUT_MS: "8000", TUT_PROBE_WALK_TIMEOUT_MS: "250" },
+      candidates: cands(dead),
+      factProbe: scriptedFactProbe([], {}),
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AgentTargetError);
+    expect((error as Error).message).toMatch(/walk deadline after waiting \d+ms/u);
+    expect((error as Error).message).not.toContain("after 8000ms");
+  });
+
   it("an all-stalled list converges to the actionable all-untrusted error with the timeout evidence", async () => {
     const dead = "\\\\dead-server\\share\\pi.exe";
     const error = await resolveWindowsExecutableTarget("pi", {
@@ -902,7 +941,7 @@ function windowsPlan(): LaunchInvocation {
       context: { kind: "shared" },
       source: "anchor",
     },
-    naming: { tab_label: "TUT executor", pane_label: "t-win.executor" },
+    naming: { tab_label: "TUT executor", pane_label: rigLabel("t-win.executor", "C:\\work\\project") },
     prompt: "round",
     resolved_target: target,
     effective_agent: effective,
@@ -997,7 +1036,7 @@ describe("compat boundary with a Windows platform plan", () => {
         cwd: "C:\\work\\project",
         executable: "C:\\pi\\pi.exe",
         args: ["--model", "glm"],
-        env: { PI_SKIP_VERSION_CHECK: "1" },
+        env: { PI_SKIP_VERSION_CHECK: "1", TUT_HUB_ROOT: "C:\\work\\project", TUT_HUB_URL: "http://127.0.0.1:3001", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" },
         purpose: "agent",
       });
       // Dry-run preview makes no mutation: discovery pane list only.
@@ -1103,7 +1142,7 @@ describe("compat boundary with a Windows platform plan", () => {
         cwd: "<cwd>", // dry-run placeholder anchor — honest preview
         executable: "pi",
         args: ["--model", "glm"],
-        env: { PI_SKIP_VERSION_CHECK: "1" },
+        env: { PI_SKIP_VERSION_CHECK: "1", TUT_HUB_ROOT: "<hub-root>", TUT_HUB_URL: "http://127.0.0.1:1", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" },
         purpose: "agent",
       });
     } finally {
@@ -1233,7 +1272,7 @@ describe("start-next Windows target pre-check (before the marker)", () => {
       // The real chain: the enumerated extensionless candidate C:\pi + suppression env,
       // rendered by the platform-default dialect (posix here) from the placeholder anchor.
       expect(childOut).toContain(
-        "pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'C:\\pi'",
+        agentFixture("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'C:\\pi'", "<hub-root>", "http://hub.test"),
       );
       // Read-only discovery (pane list) is legal; NO mutation command anywhere.
       const herdrLines = (existsSync(herdrLog) ? readFileSync(herdrLog, "utf8") : "")

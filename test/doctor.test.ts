@@ -1,3 +1,5 @@
+import * as rig from "../src/rig.js";
+import { HerdrClient } from "../src/launcher/herdr-client.js";
 // tut doctor (0.7.0) — report-only environment & assembly self-check.
 // Module-stage discipline: the doctor module is exercised through runDoctor
 // with injected seams (fetchImpl / resolveTarget) against real temp-dir
@@ -6,7 +8,7 @@
 // commands) is a separate CLI-side task; the HTTP endpoints themselves are
 // tested in http.test.ts.
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { vi, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -1076,5 +1078,34 @@ describe("tut doctor manifest shape warnings (schema-invalid lines)", () => {
     const text = storage.details.join("\n");
     expect(text).toContain("recovered (digest chain verifies)");
     expect(text).toContain("1 line(s) skipped (unparseable or wrong shape)");
+  });
+});
+
+
+describe("rig hash collision diagnosis", () => {
+  it("reports distinct roots sharing a live system-label suffix", async () => {
+    const hash = vi.spyOn(rig, "rigHash").mockReturnValue("deadbeef");
+    const list = vi.spyOn(HerdrClient.prototype, "paneList").mockResolvedValue({ panes: [
+      { pane_id: "a", label: "tut-hub-deadbeef", cwd: "/rig-one" },
+      { pane_id: "b", label: "tut-notify-deadbeef", cwd: "/rig-two" },
+    ] });
+    try {
+      const report = await runDoctor(baseOptions(healthyRoot()));
+      expect(check(report, "paths").status).toBe("fail");
+      expect(check(report, "paths").details.join("\n")).toContain("rigHash collision deadbeef: /rig-one <-> /rig-two");
+      expect(report.ok).toBe(false);
+    } finally { hash.mockRestore(); list.mockRestore(); }
+  });
+
+  it("does not mistake two services or task checkout paths for a collision", async () => {
+    const hash = vi.spyOn(rig, "rigHash").mockReturnValue("deadbeef");
+    const list = vi.spyOn(HerdrClient.prototype, "paneList").mockResolvedValue({ panes: [
+      { pane_id: "a", label: "tut-hub-deadbeef", cwd: "/rig-one" },
+      { pane_id: "b", label: "tut-notify-deadbeef", cwd: "/rig-one" },
+      { pane_id: "c", label: "task.executor-deadbeef", cwd: "/checkout" },
+    ] });
+    try {
+      expect(check(await runDoctor(baseOptions(healthyRoot())), "paths").status).toBe("ok");
+    } finally { hash.mockRestore(); list.mockRestore(); }
   });
 });

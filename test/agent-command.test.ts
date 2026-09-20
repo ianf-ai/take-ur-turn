@@ -1,3 +1,4 @@
+import { agentFixture } from "./rig-fixtures.js";
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -192,12 +193,12 @@ describe("launcher argv boundary", () => {
 
   it("passes ordered args and appends codex suppression after user -c", async () => {
     const result = await run(LAUNCHER, ["route-launch", "executor", "codex", "--model", "gpt-5.6", "--sandbox", "workspace-write", "--search", "-c", "check_for_update_on_startup=true"], { env: env() });
-    expect(result.stdout).toContain("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'");
+    expect(result.stdout).toContain(agentFixture("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'", "<hub-root>", "http://127.0.0.1:1"));
   });
 
   it("supports a legacy raw command string and pi suppression", async () => {
     const result = await run(LAUNCHER, ["route-launch", "executor", "pi --model fast --search"], { env: env() });
-    expect(result.stdout).toContain("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi' '--model' 'fast' '--search'");
+    expect(result.stdout).toContain(agentFixture("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi' '--model' 'fast' '--search'", "<hub-root>", "http://127.0.0.1:1"));
   });
 
   it("rejects injection tokens before pane birth", async () => {

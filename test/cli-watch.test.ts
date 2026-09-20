@@ -1,3 +1,9 @@
+// Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveCliHubUrl: async (url: string) => url,
+}));
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // tut watch (three-state exit codes + start-next-aligned task selection) —

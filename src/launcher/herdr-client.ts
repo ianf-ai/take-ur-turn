@@ -7,6 +7,7 @@
  * verbatim is the final command passed to `pane run`.
  */
 
+import { paneEnvArgs } from "../rig.js";
 import type { ChildProcess } from "node:child_process";
 import { spawnDirect, type DirectSpawn, type DirectSpawnOptions } from "./process.js";
 
@@ -120,6 +121,7 @@ export interface TabCreateOptions {
 }
 
 export interface PaneSplitOptions {
+  env?: Readonly<Record<string, string>>;
   /** Split this pane; when absent, `current: true` emits --current. */
   paneId?: string;
   current?: boolean;
@@ -466,6 +468,7 @@ export class HerdrClient {
     if (direction !== undefined) args.push("--direction", direction);
     if (options.noFocus === true) args.push("--no-focus");
     if (cwd !== undefined) args.push("--cwd", cwd);
+    args.push(...paneEnvArgs(options.env ?? {}));
     const { value } = await this.jsonCommand("herdr pane split", args);
     const paneIdResult = paneIdFrom(value);
     if (paneIdResult === undefined) {

@@ -58,8 +58,11 @@ describe("combination: create with a worktree path → legacy positional launch 
   it("births the pane at the task's checkout root, not the anchor cwd", { timeout: 30000 }, async () => {
     expect(existsSync(DIST_CLI)).toBe(true); // npm run build first — the launcher tests drive the built CLI
 
-    // Real hub on an ephemeral port.
-    const hubRoot = tempRoot("tut-combo-hub-");
+    // Real hub on an ephemeral port. startServer's root is the .context-hub
+    // DATA dir — /state.hub_root reports its parent (the workspace root), so
+    // build the two-level shape a real `tut serve` sits in.
+    const workspace = tempRoot("tut-combo-hub-");
+    const hubRoot = path.join(workspace, ".context-hub");
     const server: RunningServer = await startServer({ root: hubRoot, port: 0 });
 
     // A REAL worktree directory (prepared by the caller — TUT never runs git).
@@ -108,6 +111,7 @@ describe("combination: create with a worktree path → legacy positional launch 
             TUT_HERDR_LOG: log,
             TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
             TUT_HUB_URL: server.url,
+            TUT_HUB_ROOT: workspace,
             TUT_PROJECT_ROOT: CHAIN_ROOT,
             TUT_USER_CONFIG_DIR: EMPTY_L2,
             TUT_READY_POLL_MS: "20",
@@ -236,6 +240,34 @@ describe("legacy door: /state metadata failure modes", () => {
     }
   });
 
+  it.each([false, true])("refuses a missing cast agent before mutations (existing pane: %s)", async (existingPane) => {
+    const hub = await stubHub((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ tasks: [{ task_id: "cast-task", cast: { executor: "no-such-cast-agent-x" } }] }));
+    });
+    const log = path.join(tempRoot("tut-cast-refusal-"), "herdr.log");
+    try {
+      const env = launchEnv(hub.url, log);
+      if (existingPane) {
+        const panes = JSON.parse(env.TUT_HERDR_PANES!);
+        panes.push({ pane_id: "w1:p2", label: "cast-task.executor", workspace_id: "w1", cwd: ANCHOR_CWD, agent_status: "idle" });
+        env.TUT_HERDR_PANES = JSON.stringify(panes);
+      }
+      const error = await runLaunch(process.execPath, [DIST_CLI, "launch", "cast-task", "executor"], { env })
+        .catch((error: unknown) => error) as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain("no-such-cast-agent-x");
+      expect(error.message).toContain("tut assign");
+      expect(error.message).toContain("correct the task cast");
+      const lines = existsSync(log) ? readFileSync(log, "utf8").split("\n") : [];
+      for (const prefix of MUTATION_PREFIXES) {
+        expect(lines.some((line) => line.startsWith(prefix))).toBe(false);
+      }
+    } finally {
+      await hub.close();
+    }
+  });
+
   it("refuses a 200 /state that does not know the task: non-zero exit, zero Herdr mutations", { timeout: 30000 }, async () => {
     const hub = await stubHub((_req, res) => {
       res.setHeader("content-type", "application/json");
@@ -251,6 +283,36 @@ describe("legacy door: /state metadata failure modes", () => {
       ).rejects.toThrow(/not found in hub state/u);
       // Non-zero + refusal before ANY tab/pane mutation (the implementation
       // refuses before even the discovery pane list).
+      const lines = existsSync(log)
+        ? readFileSync(log, "utf8").split("\n").filter((line) => line.length > 0)
+        : [];
+      for (const prefix of MUTATION_PREFIXES) {
+        expect(lines.some((line) => line.startsWith(prefix))).toBe(false);
+      }
+    } finally {
+      await hub.close().catch(() => undefined);
+      rmSync(log, { force: true });
+    }
+  });
+
+  it("refuses a hub owned by another workspace: non-zero exit, ownership named, zero Herdr mutations", { timeout: 30000 }, async () => {
+    const hub = await stubHub((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      // A 200 that knows the task but serves a foreign hub_root (hub-root
+      // handshake): production injects TUT_HUB_ROOT into worker panes; its
+      // absence here makes the child resolve the repo root — foreign.
+      res.end(JSON.stringify({ hub_root: "/srv/foreign-workspace", tasks: [{ task_id: "foreign-task" }] }));
+    });
+    const log = path.join(os.tmpdir(), `tut-combo-foreign-${process.pid}-${Math.random().toString(36).slice(2)}.log`);
+    rmSync(log, { force: true });
+    try {
+      const error = await runLaunch(process.execPath, [DIST_CLI, "launch", "foreign-task", "executor"], {
+        env: launchEnv(hub.url, log),
+      }).catch((error: unknown) => error) as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain("hub ownership mismatch");
+      expect(error.message).toContain("/srv/foreign-workspace");
+      expect(error.message).toContain(process.cwd());
       const lines = existsSync(log)
         ? readFileSync(log, "utf8").split("\n").filter((line) => line.length > 0)
         : [];

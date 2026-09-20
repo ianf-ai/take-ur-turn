@@ -1,3 +1,4 @@
+import { rigLabel } from "../src/rig.js";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -43,7 +44,7 @@ function invocation(): LaunchInvocation {
       context: { kind: "shared" },
       source: "anchor",
     },
-    naming: { tab_label: "TUT executor unit-1", pane_label: "unit-1.executor" },
+    naming: { tab_label: "TUT executor unit-1", pane_label: rigLabel("unit-1.executor", "/work/project") },
     prompt: "round prompt",
     posix_direct: {
       executable: "pi",

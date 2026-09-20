@@ -1,3 +1,9 @@
+// Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveUpHub: async (url: string, _explicit: boolean, _root: string, eventPort?: number) => ({ url, eventPort: eventPort ?? 3002 }),
+}));
+
 // Platform-edge acceptance:
 //  - space-path provisioning e2e: `tut up` in a project directory whose path
 //    contains a space provisions BOTH system panes (serve + notify) with
@@ -121,12 +127,12 @@ describe("space-path provisioning e2e (up → serve → notify)", () => {
       const logged = readLog(logPath);
       if (url.includes(":3001/state")) {
         return logged.includes(" serve")
-          ? Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }))
+          ? Promise.resolve(responseJson({ hub_root: project, flow_mode: "manual", tasks: [] }))
           : refused();
       }
       if (url.includes(":3002/agent-event")) {
         return logged.includes(" notify")
-          ? Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }))
+          ? Promise.resolve(new Response(JSON.stringify({ hub_root: project, hub_url: "http://127.0.0.1:3001" }), { status: 405, headers: { Allow: "POST" } }))
           : refused();
       }
       return refused();
@@ -139,8 +145,8 @@ describe("space-path provisioning e2e (up → serve → notify)", () => {
       // THE assertion set: both pane-run lines quote the space-carrying cwd
       // and cli path as single words — the renderer's on-demand sq, with the
       // legacy `cd <cwd> && node <cli> …` shape otherwise intact.
-      expect(logLines(logPath)).toContain(`pane run FIX:p1 cd '${project}' && node '${self}' serve`);
-      expect(logLines(logPath)).toContain(`pane run FIX:p2 cd '${project}' && node '${self}' notify`);
+      expect(logLines(logPath)).toContain(`pane run FIX:p1 cd '${project}' && TUT_HUB_ROOT='${project}' TUT_HUB_URL=http://127.0.0.1:3001 TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event node '${self}' serve`);
+      expect(logLines(logPath)).toContain(`pane run FIX:p2 cd '${project}' && TUT_HUB_ROOT='${project}' TUT_HUB_URL=http://127.0.0.1:3001 TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event node '${self}' notify`);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001");
       expect(io.out()).toContain("up: notify running");
     } finally {

@@ -1,3 +1,10 @@
+// Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveCliHubUrl: async (url: string) => url,
+  resolveNotifierPort: async () => 3002,
+}));
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -1326,7 +1333,7 @@ describe("default URL/port convergence", () => {
   });
 
   it("USAGE teaches the multi-hub --url discipline and documents up --event-port", () => {
-    expect(USAGE).toContain("Running several hubs side by side? Pass --url");
+    expect(USAGE).toContain("verified via /state.hub_root");
     expect(USAGE).toContain("tut up [--url <u>] [--event-port <p>] [--dry-run]");
   });
 });

@@ -18,3 +18,8 @@
  * so rendered-command assertions are unaffected too.
  */
 process.env.TUT_EVENT_PORT_URL = "http://127.0.0.1:1/agent-event";
+
+// workers inherit rig endpoints. Keep a live parent rig out of fixture
+// defaults; individual routing tests set their own explicit environment.
+delete process.env.TUT_HUB_URL;
+delete process.env.TUT_HUB_ROOT;

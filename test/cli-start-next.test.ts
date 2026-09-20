@@ -1,3 +1,10 @@
+// Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveCliHubUrl: async (url: string) => url,
+}));
+
+import { scopedFixture, agentFixture } from "./rig-fixtures.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -198,7 +205,7 @@ describe("start-next no-arg default (handler, /state stubbed)", () => {
     expect(code).toBe(0);
     const out = io.out();
     expect(out).toContain("DRY-RUN"); // real launch.sh honored the passthrough env
-    expect(out).toContain("(agent 'pi', label 't-unique.executor')"); // fresh round pane (4.4)
+    expect(out).toContain(scopedFixture("(agent 'pi', label 't-unique.executor')", "<hub-root>")); // fresh round pane (4.4)
     expect(out).toContain("t-unique");
     expect(out).toContain("launched executor for t-unique via tut launch");
     expect(out).not.toContain("[!!]"); // clean task: no attention marker
@@ -377,7 +384,7 @@ describe("first round after tut create (doorbell, real launch.sh under TUT_DRY_R
     const out = io.out();
     expect(out).toContain("DRY-RUN"); // real launch.sh honored the passthrough env
     // Round hand-off form from round one: launch.sh receives <task_id> architect
-    expect(out).toContain("(agent 'pi', label 'kick-one.architect')"); // pane label = <task_id>.<role> (4.4)
+    expect(out).toContain(scopedFixture("(agent 'pi', label 'kick-one.architect')", "<hub-root>")); // pane label = <task_id>.<role> (4.4)
     // The tab label renders the REAL task_id (no kickoff "new" literal anywhere).
     expect(out).toContain("--label TUT kick-one architect --no-focus");
     expect(out).not.toContain("TUT new");
@@ -464,8 +471,8 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
       const prev = process.env.TUT_DRY_RUN;
       delete process.env.TUT_DRY_RUN;
       process.env.TUT_HERDR_PANES = JSON.stringify([
-        { pane_id: "w1:p0", label: "tut-hub", workspace_id: "w1", cwd: "/repo", agent_status: "idle" },
-        { pane_id: "w1:p1", label: "t-fresh.executor", workspace_id: "w1", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w1:p0", label: scopedFixture("tut-hub", process.cwd()), workspace_id: "w1", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w1:p1", label: scopedFixture("t-fresh.executor", "/repo"), workspace_id: "w1", cwd: "/repo", agent_status: "idle" },
       ]);
       // The fixture herdr's closes-are-effective semantics live in the LOG
       // (its per-invocation shared state) — without it a closed pane
@@ -512,7 +519,7 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
     });
 
     expect(code).toBe(0);
-    expect(io.err()).toContain("--fresh — force-closing panes labeled 't-fresh.executor'");
+    expect(io.err()).toContain(scopedFixture("--fresh — force-closing panes labeled 't-fresh.executor'", "/repo"));
     expect(io.err()).not.toContain("same-role continuation"); // the flag bypassed the seat
     expect(io.out()).toContain("start-next: launched executor for t-fresh via tut launch");
     // Pane policy ≠ dedup policy: the launch marker was appended as usual.
@@ -548,7 +555,7 @@ describe("tut decide (close spawns launch.sh --cleanup; approve does not)", () =
     const code = await withFixtureHerdr(() =>
       withDryRun(async () => {
         process.env.TUT_HERDR_PANES = JSON.stringify([
-          { pane_id: "w1:p1", label: "t-gone.executor", workspace_id: "w1", cwd: "/repo", agent_status: "working" },
+          { pane_id: "w1:p1", label: scopedFixture("t-gone.executor", process.cwd()), workspace_id: "w1", cwd: "/repo", agent_status: "working" },
         ]);
         return main(["decide", "t-gone", "--decision", "close", "--by", "host", "--url", "http://hub.test"]);
       }),
@@ -558,7 +565,7 @@ describe("tut decide (close spawns launch.sh --cleanup; approve does not)", () =
     expect(io.out()).toContain('"status":"closed"'); // the decision result is printed
     // The cleanup hook ran the REAL launcher in dry-run: the task's round
     // pane is reaped UNCONDITIONALLY (working included — the task is closed).
-    expect(io.out()).toContain("DRY-RUN: cleanup: herdr pane close w1:p1 (label 't-gone.executor')");
+    expect(io.out()).toContain(scopedFixture("DRY-RUN: cleanup: herdr pane close w1:p1 (label 't-gone.executor')", process.cwd()));
   });
 
   it("decide approve → no cleanup spawn (the task may still be consulted)", async () => {
@@ -625,6 +632,9 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
 
     expect(code).toBe(1);
     expect(io.err()).toContain("agent 'no-such-cli-x' (routed for executor on t-pre) is not on PATH");
+    expect(io.err()).toContain("tut assign");
+    expect(io.err()).toContain("correct the task cast");
+    expect(io.err()).toContain("no default fallback");
     expect(vi.mocked(hubPublish)).not.toHaveBeenCalled(); // 无痕: no launch marker
     expect(io.out()).not.toContain("DRY-RUN");
   });
@@ -697,7 +707,7 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
     const code = await withFixtureHerdr(() => withDryRun(() => main(["start-next", "t-snapshot", "--url", "http://hub.test"])));
 
     expect(code).toBe(0);
-    expect(io.out()).toContain("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
+    expect(io.out()).toContain(agentFixture("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'", "<hub-root>", "http://hub.test"));
     expect(vi.mocked(hubPublish)).toHaveBeenCalledWith("http://hub.test", {
       task_id: "t-snapshot",
       role: "human",
@@ -722,7 +732,7 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
 
     expect(code).toBe(0);
     expect(io.out()).toContain(
-      "pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'",
+      agentFixture("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'", "<hub-root>", "http://hub.test"),
     );
     expect(vi.mocked(hubPublish)).toHaveBeenCalledTimes(1);
   });
