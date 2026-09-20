@@ -95,9 +95,9 @@ const WINDOWS_SHIM_EXTENSIONS = new Set([".cmd", ".bat", ".ps1", ".sh"]);
 const NODE_ENTRY_EXTENSIONS = new Set([".js", ".mjs", ".cjs"]);
 const NATIVE_EXTENSIONS = new Set([".exe", ".com"]);
 const WINDOWS_NATIVE_HINT =
-  "install the native executable, or point the workspace/task cast at a direct Node entry route (node + script) with node.exe on PATH";
+  "install the native executable, or point the workspace/task cast at a direct Node entry route (node + script) with node.exe on PATH; use tut assign for the workspace lineup (task cast takes precedence; correct cast in a new task, no default fallback)";
 const POSIX_PRESENCE_HINT =
-  "install it, or fix the task cast / workspace lineup";
+  "install it, or correct the task cast when creating a new task; use tut assign to change the workspace lineup (task cast takes precedence; launch refused, no default fallback)";
 const POSIX_WHICH_MISSING_HINT =
   "install which (e.g. `apt-get install which` / `apk add which`), or run TUT from an environment that provides it — the PATH presence preflight needs the which binary";
 
@@ -112,13 +112,17 @@ const DEFAULT_PROBE_TIMEOUT_MS = 8000;
 /** Total Windows PATH walk, including candidate discovery and all resumes. */
 const DEFAULT_PROBE_WALK_TIMEOUT_MS = 24_000;
 
-function probeWalkTimeoutMs(environment: NodeJS.ProcessEnv): number {
-  const raw = environment.TUT_PROBE_WALK_TIMEOUT_MS;
-  if (raw === undefined || !/^\d+$/u.test(raw)) return DEFAULT_PROBE_WALK_TIMEOUT_MS;
-  return Math.min(Math.max(Number(raw), 250), 60_000);
-}
 const PROBE_TIMEOUT_MIN_MS = 250;
 const PROBE_TIMEOUT_MAX_MS = 60_000;
+
+/** Total Windows PATH walk budget (system-design 7.2): bounded by the same
+ * [PROBE_TIMEOUT_MIN_MS, PROBE_TIMEOUT_MAX_MS] window as TUT_PROBE_TIMEOUT_MS,
+ * garbage falls back to the default. */
+export function probeWalkTimeoutMs(environment: NodeJS.ProcessEnv): number {
+  const raw = environment.TUT_PROBE_WALK_TIMEOUT_MS;
+  if (raw === undefined || !/^\d+$/u.test(raw)) return DEFAULT_PROBE_WALK_TIMEOUT_MS;
+  return Math.min(Math.max(Number(raw), PROBE_TIMEOUT_MIN_MS), PROBE_TIMEOUT_MAX_MS);
+}
 
 /** Test/ops knob: bounded [250ms, 60s], garbage falls back to the default. */
 function probeTimeoutMs(environment: NodeJS.ProcessEnv = process.env): number {
@@ -549,7 +553,11 @@ class StreamingWindowsFactTable {
     this.childBase = base;
     this.childArgv = argv;
     this.childRows = 0;
-    this.childTimer = setTimeout(() => this.expireChild(handle), Math.ceil(Math.min(this.budgetMs, Math.max(1, this.deadline - performance.now()))));
+    const startedAt = performance.now();
+    const remainingMs = this.deadline - startedAt;
+    const clippedByWalk = remainingMs < this.budgetMs;
+    this.childTimer = setTimeout(() => this.expireChild(handle, startedAt, clippedByWalk),
+      Math.ceil(Math.min(this.budgetMs, Math.max(1, remainingMs))));
     handle.onLine((line) => this.onRow(handle, line));
     handle.onEnd((outcome) => this.endChild(handle, outcome));
   }
@@ -579,7 +587,7 @@ class StreamingWindowsFactTable {
   /** Budget expiry: the line stream stopped mid-candidate.  Keep every row
    * already received, mark the stalled candidate and its directory-mates as
    * bounded unavailability, and set the resume point past them. */
-  private expireChild(handle: FactProbeChild): void {
+  private expireChild(handle: FactProbeChild, startedAt: number, clippedByWalk: boolean): void {
     if (handle !== this.child) return;
     this.childTimer = undefined;
     try {
@@ -587,14 +595,17 @@ class StreamingWindowsFactTable {
     } catch {
       // already gone — nothing left to stop
     }
+    const timeoutMessage = clippedByWalk
+      ? `candidate fs probe reached walk deadline after waiting ${Math.round(performance.now() - startedAt)}ms`
+      : `candidate fs probe timed out after ${this.budgetMs}ms`;
     const stalled = this.childBase + this.childRows;
     const end = this.childBase + this.childArgv.length;
     const stalledCandidate = stalled < end ? this.candidates[stalled] : undefined;
     if (stalledCandidate !== undefined) {
-      this.markIndex(stalled, `candidate fs probe timed out after ${this.budgetMs}ms and was killed`);
+      this.markIndex(stalled, `${timeoutMessage} and was killed`);
       const stalledDir = path.win32.dirname(stalledCandidate);
       const skipMessage =
-        `candidate fs probe timed out after ${this.budgetMs}ms (directory '${stalledDir}' unresponsive; ` +
+        `${timeoutMessage} (directory '${stalledDir}' unresponsive; ` +
         "same-directory candidates marked unavailable without further probes)";
       let next = stalled + 1;
       while (next < end) {
@@ -787,10 +798,11 @@ export async function resolveWindowsExecutableTarget(
   const fsProbeBudgetMs = probeTimeoutMs(environment);
   const walkBudgetMs = probeWalkTimeoutMs(environment);
   const deadline = performance.now() + walkBudgetMs;
+  const rejected: string[] = [];
   const remaining = (): number => {
     const ms = deadline - performance.now();
     if (ms <= 0) throw new AgentTargetError(routeAgent,
-      `PATH walk timed out after ${walkBudgetMs}ms`, WINDOWS_NATIVE_HINT);
+      `PATH walk timed out after ${walkBudgetMs}ms${rejected.length > 0 ? `; ${rejected.join("; ")}` : ""}`, WINDOWS_NATIVE_HINT);
     return Math.min(fsProbeBudgetMs, ms);
   };
   const nodeExecutable = deps.nodeExecutable ?? process.execPath;
@@ -822,7 +834,6 @@ export async function resolveWindowsExecutableTarget(
     : (candidate: string) => fsStatPromises(candidate));
   const readHeader = deps.readHeader ?? (factTable !== undefined ? readHeaderFromFacts(factTable) : readHeaderDefault);
 
-  const rejected: string[] = [];
   let sawEvidence = false; // some candidate existed (or errored beyond ENOENT)
   try {
     for (const raw of candidates) {

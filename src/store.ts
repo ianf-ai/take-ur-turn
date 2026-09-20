@@ -1,7 +1,8 @@
-import { appendFile, link, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { type Dirent } from "node:fs";
+import { appendFile, link, lstat, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { type Dirent, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ErrorCode,
   PROJECT_TASK_ID,
@@ -37,6 +38,33 @@ export class StoreError extends Error {
     this.name = "StoreError";
     this.code = code;
   }
+}
+
+/**
+ * package.json version of the running build, stamped as `tut_version` onto
+ * every record this store appends (system-design 4.2 — one write door, both
+ * serve and CLI land here). Resolved lazily, once per process, relative to
+ * the compiled module (dist/../package.json; repo root under vitest).
+ * Undefined (field omitted) when the manifest is missing or unreadable —
+ * an honest gap, never a fabricated value. Dev-branch caveat: one manifest
+ * version covers uncommitted changes, so it approximates the build identity.
+ */
+let buildTutVersion: string | undefined;
+let buildTutVersionResolved = false;
+function tutVersionOfBuild(): string | undefined {
+  if (!buildTutVersionResolved) {
+    buildTutVersionResolved = true;
+    try {
+      const manifestPath = fileURLToPath(new URL("../package.json", import.meta.url));
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { version?: unknown };
+      if (typeof manifest.version === "string" && manifest.version.length > 0) {
+        buildTutVersion = manifest.version;
+      }
+    } catch {
+      // manifest not found / unreadable → omit the field, never block the append
+    }
+  }
+  return buildTutVersion;
 }
 
 export interface CreateTaskInput {
@@ -277,8 +305,8 @@ function requireValidCheckout(value: unknown): CheckoutRoute | undefined {
 }
 
 /**
- * New/rebuilt IDs exclude dots, the task/role label separator. Retain the
- * historical on-disk alphabet for reading and appending existing tasks.
+ * New IDs exclude dots, the task/role label separator. Retain the historical
+ * on-disk alphabet for reading, appending and repairing existing tasks.
  * Both patterns accept "project" and block separators at public entry points:
  * path traversal — "../evil" / "../../outside" must never reach path.join
  * against the store root (blocks path traversal).
@@ -706,6 +734,8 @@ export class Store {
       };
       if (input.agent !== undefined) record.agent = input.agent;
       if (input.model !== undefined) record.model = input.model;
+      const tutVersion = tutVersionOfBuild();
+      if (tutVersion !== undefined) record.tut_version = tutVersion;
 
       // PRE-WRITE fold: fold the on-disk sequence and derive the
       // post-append state BEFORE any byte lands. A corrupt existing record
@@ -868,7 +898,12 @@ export class Store {
    */
   async repairMeta(taskId: string, input: RepairMetaInput): Promise<RepairMetaResult> {
     requireNonEmptyString(taskId, "task_id");
-    requireValidTaskId(taskId, TASK_ID_PATTERN);
+    // Validate path safety before inspecting disk; only an existing legacy
+    // directory may opt out of the new-ID pattern.
+    requireValidTaskId(taskId, LEGACY_TASK_ID_PATTERN);
+    const pattern = taskId.includes(".") && await this.dirExists(this.taskDir(taskId))
+      ? LEGACY_TASK_ID_PATTERN : TASK_ID_PATTERN;
+    requireValidTaskId(taskId, pattern);
     const title = input?.title !== undefined ? requireNonEmptyString(input.title, "title") : undefined;
     const description = input?.description !== undefined ? requireNonEmptyString(input.description, "description") : undefined;
     const creator = input?.creator !== undefined ? requireNonEmptyString(input.creator, "creator") : undefined;
@@ -897,10 +932,28 @@ export class Store {
         if (e instanceof StoreError && e.code === ErrorCode.VALIDATION_ERROR) broken = true;
         else throw e;
       }
+      // Structural damage must not open a write door into a surviving frozen scope.
+      let originalDescription: unknown;
+      try {
+        const raw: unknown = JSON.parse(await readFile(this.metaPath(taskId), "utf8"));
+        if (raw !== null && typeof raw === "object" && "description" in raw) {
+          originalDescription = raw.description;
+        }
+      } catch (error) {
+        if (!(error instanceof SyntaxError) && !isErrnoException(error, "ENOENT")) throw error;
+      }
+      const frozen = typeof originalDescription === "string" &&
+        ["要改变的行为", "验收场景", "明确不做", "必要依赖及理由"].every(
+          (heading) => originalDescription.split(/\r?\n/u).some((line) => line.trimEnd() === `## ${heading}`),
+        );
+      if (frozen && description !== undefined && description !== originalDescription) {
+        throw new StoreError(ErrorCode.VALIDATION_ERROR,
+          "description has a frozen four-section scope — create a new task for scope changes (范围变更请新建任务)");
+      }
       if (!broken && readable !== null) {
         throw new StoreError(ErrorCode.VALIDATION_ERROR, `meta.json of ${taskId} is readable — nothing to repair`);
       }
-      broken = true; // readMeta null (missing meta.json in an existing dir) is damage too
+      const repairedDescription = frozen ? originalDescription as string : description;
 
       const now = new Date().toISOString();
       const version = await this.maxOnDiskRecordVersion(taskId); // server-computed, never caller input
@@ -911,7 +964,7 @@ export class Store {
       const meta: TaskMeta = {
         task_id: taskId,
         title: isProject ? PROJECT_TASK_ID : (title ?? taskId),
-        ...(description !== undefined ? { description } : {}),
+        ...(repairedDescription !== undefined ? { description: repairedDescription } : {}),
         ...(creator !== undefined ? { creator } : {}),
         ...(isProject ? {} : { flow: flow ?? "full" }),
         ...(cast !== undefined ? { cast } : {}),
@@ -1239,16 +1292,27 @@ export class Store {
     await mkdir(this.tasksDir(), { recursive: true });
     let candidate = base;
     if (candidate === PROJECT_TASK_ID) candidate = `${base}-${shortSuffix()}`;
-    while (await this.dirExists(path.join(this.tasksDir(), candidate))) {
+    while (await this.entryExists(path.join(this.tasksDir(), candidate))) {
       candidate = `${base}-${shortSuffix()}`;
     }
     return candidate;
   }
 
+  // Slug allocation must avoid every occupied entry, including dangling links.
+  // Repair eligibility separately requires an actual directory.
+  private async entryExists(p: string): Promise<boolean> {
+    try {
+      await lstat(p);
+      return true;
+    } catch (e) {
+      if (isErrnoException(e, "ENOENT")) return false;
+      throw e;
+    }
+  }
+
   private async dirExists(p: string): Promise<boolean> {
     try {
-      await stat(p);
-      return true;
+      return (await stat(p)).isDirectory();
     } catch (e) {
       if (isErrnoException(e, "ENOENT")) return false;
       throw e;

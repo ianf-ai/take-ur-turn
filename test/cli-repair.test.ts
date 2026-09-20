@@ -208,10 +208,12 @@ describe("repair-meta / recover-record handlers (real hub)", () => {
     });
     running = await startServer({ root, port: 0 });
     baseUrl = running.url;
+    process.env.TUT_HUB_ROOT = tmp;
     io = captureIo();
   });
 
   afterEach(async () => {
+    delete process.env.TUT_HUB_ROOT;
     io.restore();
     await running.close().catch(() => undefined);
     rmSync(tmp, { recursive: true, force: true });

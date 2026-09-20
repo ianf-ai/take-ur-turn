@@ -41,6 +41,10 @@ flow 由发起侧建任务时选定（create 的 `--flow` / MCP `flow` 字段，
 
 **授权基线 = 建任务 description + role=human 的记录**。worker 的 design、交付、review 或 note 只是提案，不能自行扩围；符合设计文档不等于属于当前任务。批准局部修订不等于扩大整体授权。代人行操作的授权必须可回溯到人的原话（会话原文或 Hub 记录位置）；role=human 标签本身不替代人的授权证据。
 
+## approve 语义
+
+**approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门。
+
 ## 延后流程
 
 Agent 只有建议权或申请权，延后入口随角色（见各角色 skill）。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。

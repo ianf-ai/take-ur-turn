@@ -213,6 +213,78 @@ describe("derive: unit properties beyond the fixtures", () => {
   });
 });
 
+describe("revision after fail_design rework", () => {
+  function record(version: number, content_type: string, payload: Partial<ContextRecord["payload"]> = {}): ContextRecord {
+    return {
+      version,
+      task_id: "design-rework",
+      role: content_type === "design" ? "architect" : content_type === "review" ? "reviewer" : "executor",
+      content_type,
+      timestamp: "2026-09-19T00:00:00Z",
+      payload: { summary: content_type, body: "Design rework regression", ...payload },
+    };
+  }
+
+  const reviewing: DerivedState = {
+    status: "reviewing",
+    waiting_for: "agent:reviewer",
+    needs_attention: false,
+    warnings: [],
+  };
+
+  it("replays the full fail_design loop through revision without warnings", () => {
+    const records = [
+      record(1, "design"),
+      record(2, "code_changes"),
+      record(3, "review", { verdict: "fail_design" }),
+      record(4, "design"),
+      record(5, "revision", { ref_version: 3 }),
+    ];
+    expect(derive("design-rework", [], "full")?.status).toBe("designing");
+    expect(derive("design-rework", records.slice(0, 3), "full")?.status).toBe("designing");
+    expect(derive("design-rework", records.slice(0, 4), "full")?.status).toBe("implementing");
+    expect(derive("design-rework", records, "full")).toStrictEqual(reviewing);
+  });
+
+  it("accepts full implementing revision without fail_design history or ref_version", () => {
+    expect(derive("design-rework", [record(1, "design"), record(2, "revision")], "full"))
+      .toStrictEqual(reviewing);
+    expect(foldOntoCursor({ status: "implementing", prevVersion: 0, warnings: [] }, [record(1, "revision")], "full"))
+      .toStrictEqual({ ...reviewing, prevVersion: 1 });
+  });
+
+  it("keeps direct implementing revision out of table", () => {
+    expect(derive("design-rework", [record(1, "revision")], "direct")).toStrictEqual({
+      status: "implementing",
+      waiting_for: "human",
+      needs_attention: true,
+      warnings: [{ version: 1, code: "OUT_OF_TABLE" }],
+    });
+  });
+
+  it.each(["designing", "reviewing", "pending_approval", "approved"] as const)(
+    "keeps full revision out of table in %s (only revising and implementing accept it)", (status) => {
+      expect(foldOntoCursor({ status, prevVersion: 0, warnings: [] }, [record(1, "revision")], "full"))
+        .toStrictEqual({ status, prevVersion: 1, waiting_for: "human", needs_attention: true,
+          warnings: [{ version: 1, code: "OUT_OF_TABLE" }] });
+    },
+  );
+
+  it.each(["designing", "implementing", "reviewing", "revising", "pending_approval", "approved"] as const)(
+    "keeps solo revision out of table in %s", (status) => {
+      expect(foldOntoCursor({ status, prevVersion: 0, warnings: [] }, [record(1, "revision")], "solo"))
+        .toStrictEqual({ status, prevVersion: 1, waiting_for: "human", needs_attention: true,
+          warnings: [{ version: 1, code: "OUT_OF_TABLE" }] });
+    },
+  );
+
+  it("preserves closed absorption for solo revision", () => {
+    expect(foldOntoCursor({ status: "closed", prevVersion: 0, warnings: [] }, [record(1, "revision")], "solo"))
+      .toStrictEqual({ status: "closed", prevVersion: 1, waiting_for: "human", needs_attention: true,
+        warnings: [{ version: 1, code: "CLOSED_ABSORB" }] });
+  });
+});
+
 describe("foldOntoCursor: incremental fold", () => {
   // foldOntoCursor is the store's cache-carrying fold — its contract is
   // EXACT equivalence with folding the whole sequence at once, at every

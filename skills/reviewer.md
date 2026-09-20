@@ -17,6 +17,7 @@ reviewing 态的任务在等你：`context.list {"status": "reviewing"}`（CLI `
 
 - **首轮 review**：日志里还没有 review，最新有效记录是 code_changes——全面审（代码 + 与 design 的一致性）。
 - **重审**：日志里已有 verdict 为 `fail_code` 的 review，其后跟着 revision——按上一轮的**关闭条件逐条核销，不重新裁量**（见「关闭条件」）。
+- **fail_design 回路后的重审**：日志里有 verdict 为 `fail_design` 的 review，其后依次跟着 architect 的 design 与 executor 的 revision（任务经 designing 回到 implementing）——按打回 review 的关闭条件逐条核销该 revision（口径同 fail_code 重审），并确认 revision 回应了 architect 修订设计的裁决。
 - **人 reject 后的重审**：最新有效记录是人的 decision(reject) 之后跟来的 revision——没有上轮 review 问题列表可核销，改为**对照 reject 理由审该 revision**（reject 理由即人开出的关闭条件，逐条确认已解决），只对 revision 新引入的问题另立条目（附新的关闭条件）。
 - **executor 收回回合后的重审**：日志里 executor 在 reviewing 态发过非 ack note、其后跟 revision——无旧 review 可核销，对该 revision 全面审（同首轮口径，ref_version 指向被审 revision）；发布前确认任务仍在 reviewing，已被收回则结束本回合、不发任何记录；revision 落盘、任务回到 reviewing 后自会再轮到你。
 
@@ -45,7 +46,13 @@ manual 模式下你由人指派；status / waiting_for 是派生出来的路由�
 
 「暂停该分支」指停止有争议的工作内容，不新增状态、记录类型或 hold 门，也不暂停整个核心任务。`fail_code` 按现有规则派生到 revising，由 executor 删减并交付 revision，host 负责推进与核验。未实施的扩围提案不阻止范围内合格交付按正常判据评审。
 
-**approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门；approve 后的修改诉求以新任务承载，不在已验收任务追加交付或重开 review 循环。
+approve 后的修改诉求以新任务承载，不在已验收任务追加交付或重开 review 循环。
+
+### 规范符合度
+
+对照 `AGENTS.md` 硬规则与 `project` scope 规范记录，核查适用于本次交付的已入册规范；引用规则位置、规范记录版本及适用范围，结合真实 diff 给出证据。违反硬规则使用 `fail_code`，问题定位到 file:line，并附可验证的关闭条件。风格类问题使用不阻塞的 reviewer `note`，不列入必须核销的问题列表，不以其阻止 `pass`；note 不替代本轮 review。
+
+未入册标准不构成评审维度，不能把口头偏好或外部打回中新出现的标准追认为既有硬规则；交 host 按「打回学习闭环」呈现给人并办理入册。规范记录不自行扩大任务授权；需要新增范围时按「范围核查」交人裁决。重审仍按既有关闭条件核销，只对 revision 新引入的问题另立条目，不因新入册标准翻已核销的旧账。
 
 ## 发布 review
 
@@ -53,7 +60,7 @@ manual 模式下你由人指派；status / waiting_for 是派生出来的路由�
 
 - `summary` 必填，一句话（列表展示与通知文案都用它）；`body` 必填，Markdown，完整评审意见。
 - **`verdict` 必填，且必须逐字符取以下四值之一**：`pass` | `blocked_external` | `fail_code` | `fail_design`（派生语义：pass / blocked_external → pending_approval 轮到人审批——`blocked_external` 是「代码达标、验证卡在外部条件」（真机 / 部署 / 跨系统依赖等 review 回合内无法完成的验证），与 pass 同门：waiting_for=human、无 decision 不启动，差别只在通知文案与人的决策依据；fail_code → revising 轮到 Executor 修代码；fail_design → designing 轮到 Architect 重设计。其他值不拒收但原样落盘并把任务置 needs_attention）。
-- `ref_version` **必须指向你审的那条交付记录的 version**——首轮指向所审 code_changes，其余三案（重审 / 人 reject 后重审 / executor 收回回合后重审）所审的都是 revision，指向该 revision（revision 的 ref_version 则指向它回应的 review / decision / 收回 note）。
+- `ref_version` **必须指向你审的那条交付记录的 version**——首轮指向所审 code_changes，其余各案（重审 / fail_design 回路后重审 / 人 reject 后重审 / executor 收回回合后重审）所审的都是 revision，指向该 revision（revision 的 ref_version 则指向它回应的 review / decision / 收回 note）。
 
 body 按以下模板逐节填写（小节标题保真，括号内是填写指引）：
 

@@ -59,6 +59,9 @@
  * by the runner's guard. runDoctor never rejects; the report always renders.
  */
 
+import { realpathSync } from "node:fs";
+import { HerdrClient } from "./launcher/herdr-client.js";
+import { rigHash } from "./rig.js";
 import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -1164,7 +1167,7 @@ function pathHazards(p: string, platform: NodeJS.Platform): string[] {
   return hazards;
 }
 
-function checkPaths(ctx: DoctorContext): DoctorCheck {
+async function checkPaths(ctx: DoctorContext): Promise<DoctorCheck> {
   const check: DoctorCheck = {
     name: "paths",
     title: "path safety & probe endpoints",
@@ -1218,7 +1221,32 @@ function checkPaths(ctx: DoctorContext): DoctorCheck {
     check.details.push(`delivery probe endpoint cannot be derived: ${(e as Error).message}`);
   }
   check.status = worst(statuses);
-  check.summary = check.status === "fail" ? "path/probe-endpoint hazards — see details" : "path safety prechecks passed";
+  // Only system panes carry the rig root as cwd; task checkouts can differ.
+  try {
+    const { panes } = await new HerdrClient({ env: ctx.env, platform: ctx.platform }).paneList();
+    const rootsByHash = new Map<string, Set<string>>();
+    for (const pane of panes) {
+      const match = /^tut-(?:hub|notify)-([a-f0-9]{8})$/.exec(pane.label ?? "");
+      if (!match || !pane.cwd || !path.isAbsolute(pane.cwd)) continue;
+      let root = path.resolve(pane.cwd);
+      try { root = realpathSync(root); } catch { /* report the visible path */ }
+      const suffix = match[1]!;
+      if (rigHash(root) !== suffix) continue;
+      const roots = rootsByHash.get(suffix) ?? new Set<string>();
+      roots.add(root);
+      rootsByHash.set(suffix, roots);
+    }
+    for (const [hash, roots] of rootsByHash) {
+      if (roots.size < 2) continue;
+      check.status = "fail";
+      check.details.push(`rigHash collision ${hash}: ${[...roots].join(" <-> ")}`);
+      check.fix = "relocate one colliding rig root and restart its services; inspect existing pane labels before reuse";
+    }
+    check.details.push("rig label scan completed (system panes with root cwd evidence)");
+  } catch (error) {
+    check.details.push(`rig collision scan unavailable: ${(error as Error).message}`);
+  }
+  check.summary = check.status === "fail" ? "path/probe-endpoint or rig identity hazards — see details" : "path safety prechecks passed";
   return check;
 }
 

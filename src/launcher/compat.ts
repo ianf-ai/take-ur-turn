@@ -7,6 +7,8 @@
  * a .sh file.
  */
 
+import { rigLabel, rigEnvironment } from "../rig.js";
+import { canonicalRoot, resolveRigRoot } from "../rig-discovery.js";
 import {
   buildLaunchInvocation,
   explicitRouteFromValues,
@@ -116,7 +118,7 @@ export function createDeliveryClient(
  *
   POSIX keeps the bare executable, Windows plans carry their resolved
   absolute target; both render through the same dialect renderer. */
-function renderInvocationPaneCommand(
+export function renderInvocationPaneCommand(
   invocation: LaunchInvocation,
   dialect: ShellDialect,
   probeEndpoint?: string,
@@ -133,7 +135,7 @@ function renderInvocationPaneCommand(
     cwd: birthCwdOf(invocation.context),
     executable: plan.executable,
     args: plan.args,
-    env: plan.env,
+    env: { ...plan.env, ...rigEnvironment(invocation.context.hubRoot, invocation.hub_url, plan.env.TUT_EVENT_PORT_URL || process.env.TUT_EVENT_PORT_URL || "http://127.0.0.1:3002/agent-event") },
     dialect,
     purpose: "agent",
   };
@@ -204,9 +206,10 @@ interface TaskLaunchMetadata {
 type TaskMetadataOutcome =
   | { kind: "ok"; metadata: TaskLaunchMetadata }
   | { kind: "hub-unreadable"; detail: string }
-  | { kind: "task-missing" };
+  | { kind: "task-missing" }
+  | { kind: "hub-foreign"; detail: string };
 
-async function taskLaunchMetadata(taskId: string, hubUrl: string): Promise<TaskMetadataOutcome> {
+export async function taskLaunchMetadata(taskId: string, hubUrl: string, rigRoot: string = resolveRigRoot()): Promise<TaskMetadataOutcome> {
   let response: Response;
   try {
     response = await fetch(new URL("/state", hubUrl));
@@ -216,11 +219,22 @@ async function taskLaunchMetadata(taskId: string, hubUrl: string): Promise<TaskM
   if (!response.ok) {
     return { kind: "hub-unreadable", detail: `HTTP ${response.status}` };
   }
-  let state: { tasks?: Array<{ task_id: string; cast?: Record<string, AgentRoute>; checkout?: CheckoutRoute }> };
+  let state: { hub_root?: unknown; tasks?: Array<{ task_id: string; cast?: Record<string, AgentRoute>; checkout?: CheckoutRoute }> };
   try {
     state = (await response.json()) as typeof state;
   } catch (error) {
     return { kind: "hub-unreadable", detail: `/state returned unparseable JSON: ${(error as Error).message}` };
+  }
+  // Ownership handshake (hub-root): the legacy door must not plan a round against
+  // another workspace's hub just because it answers on the default port —
+  // records would land in the wrong workspace silently. Only a hub that
+  // names a different (non-empty) root is foreign; hubs too old to expose
+  // hub_root stay on the documented degraded path.
+  if (typeof state.hub_root === "string" && state.hub_root.length > 0) {
+    const served = canonicalRoot(state.hub_root);
+    if (served !== canonicalRoot(rigRoot)) {
+      return { kind: "hub-foreign", detail: `hub at ${hubUrl} serves ${served}, expected ${canonicalRoot(rigRoot)}` };
+    }
   }
   const task = state.tasks?.find((entry) => entry.task_id === taskId);
   if (task === undefined) return { kind: "task-missing" };
@@ -267,6 +281,15 @@ async function buildLegacyInvocation(request: LaunchRequest, invocation?: Launch
       `task '${request.task_id}' not found in hub state at ${hubUrl} — refusing to plan a round (create the task or fix the task id)`,
     );
   }
+  if (outcome.kind === "hub-foreign") {
+    // Same isolation breach, ownership flavor: the answering hub belongs to
+    // another workspace. Refuse loudly instead of launching with foreign
+    // checkout/cast metadata (run 'tut up' without --url in the intended
+    // workspace, or pass --url for that workspace's hub).
+    throw new Error(
+      `hub ownership mismatch — ${outcome.detail} — refusing to plan a round for task '${request.task_id}'`,
+    );
+  }
   if (outcome.kind === "hub-unreadable") {
     // Documented compat degradation (system-design 7.x): the legacy door
     // stays open when the hub is down/unreadable, but never silently —
@@ -295,10 +318,15 @@ async function buildLegacyInvocation(request: LaunchRequest, invocation?: Launch
       : {}),
   });
   const route = await routeForRequest(request, context, workspaceSnapshot, metadata);
+  // A cast is an explicit choice. Refuse before lifecycle mutation, including
+  // continuation of an existing pane, when its executable is unavailable.
+  if (route.source === "task-cast" && process.platform !== "win32") {
+    await resolvePosixTargetPresence(route.route.agent);
+  }
   const template = resolveTabLabelTemplateFromSnapshot(workspaceSnapshot);
   const naming: LaunchNaming = {
     tab_label: renderTabLabel(template, request.role, request.task_id, route.route.agent),
-    pane_label: `${request.task_id}.${request.role}`,
+    pane_label: rigLabel(`${request.task_id}.${request.role}`, context.hubRoot),
   };
   // One platform plan from the shared policy: POSIX stays pure (presence is
   // proved at birth per the legacy compat error path); Windows resolves its
@@ -360,6 +388,7 @@ async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
     process.stderr.write(`launch: cleanup — reaping panes of task '${entry.task_id}' requested (best-effort; inventory failures may leave panes open)\n`);
     await cleanupTaskPanes({
       task_id: entry.task_id,
+      hubRoot: process.env.TUT_HUB_ROOT ?? process.cwd(),
       client: lifecycleClient,
       dryRun: dryRun(),
       stdout: (text) => process.stdout.write(text),
@@ -440,7 +469,7 @@ async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
     : createGiveUpEscalation({
         agent: invocation.route.agent,
         pane: invocation.naming.pane_label,
-        env: process.env,
+        env: { ...process.env, ...(invocation.posix_direct ?? invocation.effective_agent)?.env },
       });
   const delivery = createDelivery({
     client,
@@ -508,6 +537,7 @@ async function runDeliveredRound(
         ...(birthExecutable !== undefined ? { executable: birthExecutable } : {}),
         dryRun: dryRun(),
         env: process.env,
+        paneEnvironment: rigEnvironment(invocation.context.hubRoot, invocation.hub_url, (invocation.posix_direct ?? invocation.effective_agent)?.env.TUT_EVENT_PORT_URL || process.env.TUT_EVENT_PORT_URL || "http://127.0.0.1:3002/agent-event"),
         stdout: (text) => process.stdout.write(text),
         stderr: (text) => process.stderr.write(text),
         ...(entry.invocation === undefined && plan !== undefined

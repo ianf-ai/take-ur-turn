@@ -1,7 +1,17 @@
+// These tests isolate provisioning/probes; real endpoint selection has its own integration suite.
+vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+  resolveUpHub: async (url: string, _explicit: boolean, _root: string, eventPort?: number) => ({ url, eventPort: eventPort ?? 3002 }),
+  discoverHub: async () => undefined,
+}));
+
+import { scopedFixture } from "./rig-fixtures.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 
 // The seed hint reads the project scope through the hub-client layer; mock
 // ONLY hubRead (the up handler's one hub-client call) so the hint branches are
@@ -43,6 +53,20 @@ const SAVED_WAIT = process.env.TUT_UP_HUB_WAIT_MS;
 const SAVED_NOTIFY_WAIT = process.env.TUT_UP_NOTIFY_WAIT_MS;
 const SAVED_SELF = process.env.TUT_UP_CLI_SELF;
 const TRASH: string[] = [];
+let fixtureRoot = process.cwd();
+let fixtureHub = "http://127.0.0.1:3001";
+let fixtureEvent = "http://127.0.0.1:3002/agent-event";
+async function runUp(args: string[]): Promise<number> {
+  const url = args.indexOf("--url"), port = args.indexOf("--event-port");
+  fixtureHub = url < 0 ? "http://127.0.0.1:3001" : args[url + 1]!;
+  fixtureEvent = "http://127.0.0.1:" + (port < 0 ? "3002" : args[port + 1]) + "/agent-event";
+  return main(args);
+}
+function serviceFixture(text: string): string {
+  const env = "TUT_HUB_ROOT=" + fixtureRoot + " TUT_HUB_URL=" + fixtureHub + " TUT_EVENT_PORT_URL=" + fixtureEvent;
+  if (text.includes("pane split") && !text.startsWith("up: [dry-run]")) return text + " --env TUT_HUB_ROOT=" + fixtureRoot + " --env TUT_HUB_URL=" + fixtureHub + " --env TUT_EVENT_PORT_URL=" + fixtureEvent;
+  return text.replace(/&& (?:TUT_EVENT_PORT_URL=\S+ )?node /, "&& " + env + " node ");
+}
 
 function makeProject(withPackageJson: boolean): { project: string; logPath: string; self: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), "tut-up-"));
@@ -52,6 +76,7 @@ function makeProject(withPackageJson: boolean): { project: string; logPath: stri
   // process.cwd() after chdir reports the REAL path (/private/var on macOS) —
   // every expected command string is built from cwd, so hand out the realpath.
   const project = realpathSync(dir);
+  fixtureRoot = project;
   // The provision target these tests model: a built dist/cli.js inside the
   // project (the path need not exist — it only rides inside command strings).
   const self = path.join(project, "dist", "cli.js");
@@ -81,7 +106,12 @@ function useFixtureHerdr(logPath: string, panes?: unknown[]): void {
   process.env.PATH = `${TEST_BIN}:${NODE_BIN_DIR}:/usr/bin:/bin`;
   process.env.TUT_HERDR_LOG = logPath;
   if (panes === undefined) delete process.env.TUT_HERDR_PANES;
-  else process.env.TUT_HERDR_PANES = JSON.stringify(panes);
+  else process.env.TUT_HERDR_PANES = JSON.stringify(panes.map((value) => {
+    const pane = value as Record<string, unknown>;
+    if (typeof pane.label !== "string" || !/^tut-(hub|notify)(-[a-f0-9]{8})?$/.test(pane.label)) return pane;
+    // Shared fixtures are declared before each temporary project exists.
+    return { ...pane, label: scopedFixture(pane.label.replace(/-[a-f0-9]{8}$/, ""), path.dirname(logPath)) };
+  }));
 }
 
 function readLog(logPath: string): string {
@@ -98,7 +128,7 @@ function logLines(logPath: string): string[] {
 }
 
 /** Capture process stdout/stderr into strings for the duration of a handler run. */
-function captureIo(): { out: () => string; err: () => string; restore: () => void } {
+function captureIo(onError?: (text: string) => void): { out: () => string; err: () => string; restore: () => void } {
   let outText = "";
   let errText = "";
   const out = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
@@ -107,20 +137,25 @@ function captureIo(): { out: () => string; err: () => string; restore: () => voi
   });
   const err = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
     errText += String(chunk);
+    onError?.(String(chunk));
     return true;
   });
   return { out: () => outText, err: () => errText, restore: () => { out.mockRestore(); err.mockRestore(); } };
 }
 
 function responseJson(obj: unknown, status = 200): Response {
-  return new Response(JSON.stringify(obj), { status });
+  return new Response(JSON.stringify(typeof obj === "object" && obj !== null && "flow_mode" in obj ? { hub_root: fixtureRoot, ...obj } : obj), { status });
 }
 
 const refused = (): Promise<Response> => Promise.reject(new TypeError("fetch failed"));
 
 /** Stub global fetch with a url-string dispatcher; returns the spy. */
 function stubFetch(impl: (url: string) => Promise<Response>): ReturnType<typeof vi.fn> {
-  const fn = vi.fn(async (input: unknown): Promise<Response> => impl(String(input)));
+  const fn = vi.fn(async (input: unknown): Promise<Response> => {
+    const response = await impl(String(input));
+    if (response.status !== 405) return response;
+    return new Response(JSON.stringify({ hub_root: fixtureRoot, hub_url: fixtureHub }), { status: 405, headers: response.headers });
+  });
   vi.stubGlobal("fetch", fn);
   return fn;
 }
@@ -178,7 +213,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   vi.mocked(hubRead).mockReset();
-  for (const dir of TRASH.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of TRASH.splice(0)) {
+    // All success, timeout, early-return and dry-run paths release ownership.
+    expect(existsSync(path.join(dir, ".context-hub/up.lock"))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("tut up (parse)", () => {
@@ -203,7 +242,7 @@ describe("tut up (behavior)", () => {
       process.chdir(bare);
       const fetchMock = stubFetch(() => refused());
 
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(1);
       // The remediation is concrete (tut init onboards — the missing piece
@@ -227,7 +266,7 @@ describe("tut up (behavior)", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
 
       expect(code).toBe(0);
       expect(io.out()).toContain("up: no workspace lineup config found");
@@ -261,7 +300,7 @@ describe("tut up (behavior)", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
 
       expect(code).toBe(0);
       expect(io.out()).not.toContain("no workspace lineup config found");
@@ -280,7 +319,7 @@ describe("tut up (behavior)", () => {
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(1);
       expect(io.err()).toContain("running from src layout");
@@ -300,26 +339,27 @@ describe("tut up (behavior)", () => {
     stubFetch(logAwareProbes(logPath));
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
-      const splitLine = `pane split --current --direction right --no-focus --cwd ${project}`;
+      const splitLine = serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`);
       expect(logLines(logPath)).toEqual([
         "pane list",
         splitLine,
         `tab create --label tut-sys --no-focus --cwd ${project}`,
         "pane move FIX:p1 --tab FIX:t1 --split down --ratio 0.5 --no-focus",
         "pane close FIX:root1", // tab create ships an empty root — cleaned up
-        "pane rename FIX:p1 tut-hub",
-        `pane run FIX:p1 cd ${project} && node ${self} serve`,
+        scopedFixture("pane rename FIX:p1 tut-hub", fixtureRoot),
+        serviceFixture(`pane run FIX:p1 cd ${project} && node ${self} serve`),
         "pane list", // report-time id resolution (fresh by-label lookup)
         splitLine,
         // second sys pane splits the hub pane explicitly — even halves, no
         // reliance on move's default target semantics
         "pane move FIX:p2 --tab FIX:t1 --split down --ratio 0.5 --no-focus --target-pane FIX:p1",
-        "pane rename FIX:p2 tut-notify",
-        `pane run FIX:p2 cd ${project} && node ${self} notify`,
+        scopedFixture("pane rename FIX:p2 tut-notify", fixtureRoot),
+        serviceFixture(`pane run FIX:p2 cd ${project} && node ${self} notify`),
         "pane list", // report-time id resolution
+        "pane list", // final uniqueness check
       ]);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001 (pane FIX:p1, tab tut-sys");
       expect(io.out()).toContain("up: notify running (pane FIX:p2, tab tut-sys)");
@@ -338,14 +378,14 @@ describe("tut up (behavior)", () => {
     // lists serve the pane under its POST-MOVE id with the label applied.
     // The success report must carry the CURRENT id, not the split-time one.
     const { project, logPath } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w1H:p2", label: "tut-hub", tab_id: "w1H" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w1H:p2", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w1H" }]);
     process.env.TUT_HERDR_LIST_LAG_POLLS = "1";
     process.env.TUT_HERDR_PANES_LAG = "[]";
     process.chdir(project);
     stubFetch(logAwareProbes(logPath));
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001 (pane w1H:p2, tab tut-sys");
@@ -362,14 +402,14 @@ describe("tut up (behavior)", () => {
   it("herdrPaneList extracts the optional tab_id (sys-pane discovery off pane list alone)", async () => {
     const { logPath } = makeProject(true);
     useFixtureHerdr(logPath, [
-      { pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" },
+      { pane_id: "w5:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w5:t2" },
       { pane_id: "w1:p0" },
     ]);
     try {
       const listing = await herdrPaneList();
       expect(listing).toEqual({
         panes: [
-          { pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" },
+          { pane_id: "w5:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w5:t2" },
           { pane_id: "w1:p0" },
         ],
       });
@@ -381,8 +421,8 @@ describe("tut up (behavior)", () => {
   it("dead sys pane reuse: labelled tut-hub pane reruns in place (no split/tab work); healthy notify side takes zero action", async () => {
     const { project, logPath, self } = makeProject(true);
     useFixtureHerdr(logPath, [
-      { pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" },
-      { pane_id: "w6:p1", label: "tut-notify", tab_id: "w5:t2" },
+      { pane_id: "w5:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w5:t2" },
+      { pane_id: "w6:p1", label: scopedFixture("tut-notify", fixtureRoot), tab_id: "w5:t2" },
       { pane_id: "w1:p0", label: "exec" },
     ]);
     process.chdir(project);
@@ -396,13 +436,14 @@ describe("tut up (behavior)", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane run w5:p1 cd ${project} && node ${self} serve`,
+        serviceFixture(`pane run w5:p1 cd ${project} && node ${self} serve`),
         "pane list", // report-time id resolution (by label)
+        "pane list", // final uniqueness check
       ]);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001 (pane w5:p1, tab tut-sys, reused");
       expect(io.out()).toContain("up: notify already listening");
@@ -413,7 +454,7 @@ describe("tut up (behavior)", () => {
 
   it("dead-pane reuse, mirror case: hub healthy, labelled tut-notify pane dead → rerun in place only", async () => {
     const { project, logPath, self } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: "tut-notify", tab_id: "w6:t1" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: scopedFixture("tut-notify", fixtureRoot), tab_id: "w6:t1" }]);
     process.chdir(project);
     // The reused pane's notifier must actually come up: the event probe is
     // log-aware (405 once the rerun is logged) — the success report waits
@@ -429,13 +470,14 @@ describe("tut up (behavior)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane run w6:p1 cd ${project} && node ${self} notify`,
+        serviceFixture(`pane run w6:p1 cd ${project} && node ${self} notify`),
         "pane list", // report-time id resolution (by label)
+        "pane list", // final uniqueness check
       ]);
       expect(io.out()).toContain("up: hub already running");
       expect(io.out()).toContain("up: notify running (pane w6:p1, tab tut-sys, reused)");
@@ -446,7 +488,7 @@ describe("tut up (behavior)", () => {
 
   it("notify joins an existing tut-sys tab: no tab create, no root close, move targets the hub pane", async () => {
     const { project, logPath, self } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w5:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w5:t2" }]);
     process.chdir(project);
     // Log-aware event probe: the fresh pane's notifier binds once its run
     // line is logged (the success report is gated on the probe).
@@ -461,17 +503,18 @@ describe("tut up (behavior)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       const log = logLines(logPath);
       expect(log).toEqual([
         "pane list",
-        `pane split --current --direction right --no-focus --cwd ${project}`,
+        serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`),
         "pane move FIX:p1 --tab w5:t2 --split down --ratio 0.5 --no-focus --target-pane w5:p1",
-        "pane rename FIX:p1 tut-notify",
-        `pane run FIX:p1 cd ${project} && node ${self} notify`,
+        scopedFixture("pane rename FIX:p1 tut-notify", fixtureRoot),
+        serviceFixture(`pane run FIX:p1 cd ${project} && node ${self} notify`),
         "pane list", // report-time id resolution (by label)
+        "pane list", // final uniqueness check
       ]);
       expect(log.filter((l) => l.startsWith("tab create") || l.startsWith("pane close")).length).toBe(0);
       expect(io.out()).toContain("up: hub already running");
@@ -489,14 +532,14 @@ describe("tut up (behavior)", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(1);
       expect(io.err()).toContain("could not move pane FIX:p1 into tab tut-sys");
       expect(io.err()).toContain("herdr pane close FIX:p1");
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane split --current --direction right --no-focus --cwd ${project}`,
+        serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`),
         `tab create --label tut-sys --no-focus --cwd ${project}`,
         "pane move FIX:p1 --tab FIX:t1 --split down --ratio 0.5 --no-focus",
       ]);
@@ -514,7 +557,7 @@ describe("tut up (behavior)", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(1);
       expect(io.err()).toContain("--current requires HERDR_PANE_ID");
@@ -524,7 +567,7 @@ describe("tut up (behavior)", () => {
       expect(io.err()).toContain("unset/empty");
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane split --current --direction right --no-focus --cwd ${project}`,
+        serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`),
       ]);
     } finally {
       io.restore();
@@ -546,10 +589,10 @@ describe("tut up (behavior)", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
-      expect(logLines(logPath)).toEqual(["pane list"]); // the only herdr call is the read
+      expect(logLines(logPath)).toEqual(["pane list", "pane list"]); // initial snapshot + final uniqueness check
       expect(io.out()).toContain("up: hub already running");
       expect(io.out()).toContain("up: notify already listening");
       expect(io.out()).toContain("up: agent panes are on-demand");
@@ -569,26 +612,26 @@ describe("tut up (behavior)", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
 
       expect(code).toBe(0);
       expect(logLines(logPath)).toEqual(["pane list"]); // probes + list only, zero mutating calls
       const out = io.out();
       // hub plan: full sequence, tab created fresh → root close included
-      expect(out).toContain("up: [dry-run] would provision the tut-hub pane into tab tut-sys:");
-      expect(out).toContain(`up: [dry-run]   pane split --current --direction right --no-focus --cwd ${project}`);
+      expect(out).toContain(scopedFixture("up: [dry-run] would provision the tut-hub pane into tab tut-sys:", fixtureRoot));
+      expect(out).toContain(serviceFixture(`up: [dry-run]   pane split --current --direction right --no-focus --cwd ${project}`));
       expect(out).toContain(`up: [dry-run]   tab create --label tut-sys --no-focus --cwd ${project}`);
       expect(out).toContain("up: [dry-run]   pane move <new-pane> --tab <new-tab> --split down --ratio 0.5 --no-focus");
       expect(out).toContain("up: [dry-run]   pane close <root-pane>");
-      expect(out).toContain("up: [dry-run]   pane rename <new-pane> tut-hub");
-      expect(out).toContain(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} serve`);
+      expect(out).toContain(scopedFixture("up: [dry-run]   pane rename <new-pane> tut-hub", fixtureRoot));
+      expect(out).toContain(serviceFixture(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} serve`));
       // notify plan: tab now planned-known → no tab create/close, move targets the hub pane
-      expect(out).toContain("up: [dry-run] would provision the tut-notify pane into tab tut-sys:");
+      expect(out).toContain(scopedFixture("up: [dry-run] would provision the tut-notify pane into tab tut-sys:", fixtureRoot));
       expect(out).toContain(
         "up: [dry-run]   pane move <new-pane> --tab <new-tab> --split down --ratio 0.5 --no-focus --target-pane <tut-hub-pane>",
       );
-      expect(out).toContain("up: [dry-run]   pane rename <new-pane> tut-notify");
-      expect(out).toContain(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`);
+      expect(out).toContain(scopedFixture("up: [dry-run]   pane rename <new-pane> tut-notify", fixtureRoot));
+      expect(out).toContain(serviceFixture(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`));
       // No role-pane actions, just the on-demand note.
       expect(out).toContain("up: agent panes are on-demand — launchers raise them at hand-off");
       // The activation block prints in dry-run too (ruling: --dry-run 同样打印).
@@ -611,11 +654,11 @@ describe("tut up (behavior)", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
 
       expect(code).toBe(0);
-      expect(io.out()).toContain(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} serve`);
-      expect(io.out()).toContain(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`);
+      expect(io.out()).toContain(serviceFixture(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} serve`));
+      expect(io.out()).toContain(serviceFixture(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`));
     } finally {
       io.restore();
     }
@@ -632,11 +675,11 @@ describe("tut up (behavior)", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
 
       expect(code).toBe(0);
       expect(io.out()).not.toContain("notify already listening");
-      expect(io.out()).toContain(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`);
+      expect(io.out()).toContain(serviceFixture(`up: [dry-run]   pane run <new-pane> cd ${project} && node ${self} notify`));
     } finally {
       io.restore();
     }
@@ -650,14 +693,14 @@ describe("tut up (behavior)", () => {
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(existsSync(logPath)).toBe(false); // herdr never ran → no log
       expect(fetchMock).toHaveBeenCalledTimes(2); // both probes still happened
       expect(io.out()).toContain("start manually");
-      expect(io.out()).toContain(`up:   cd ${project} && node ${self} serve`);
-      expect(io.out()).toContain(`up:   cd ${project} && node ${self} notify`);
+      expect(io.out()).toContain(serviceFixture(`up:   cd ${project} && node ${self} serve`));
+      expect(io.out()).toContain(serviceFixture(`up:   cd ${project} && node ${self} notify`));
       expect(io.out()).toContain("up: agent panes are on-demand");
       expect(io.out()).not.toContain("would split"); // not a dry-run — a degradation note
       expect(io.out()).not.toContain("invariants seed"); // hub down → no hint
@@ -677,7 +720,7 @@ describe("tut up (behavior)", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(io.err()).not.toContain("not on PATH"); // no agent-PATH checks in up anymore
@@ -697,19 +740,19 @@ describe("tut up (behavior)", () => {
     stubFetch(() => refused()); // /state never turns healthy
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(1);
       expect(io.err()).toContain("stayed unhealthy for 300ms");
-      const splitLine = `pane split --current --direction right --no-focus --cwd ${project}`;
+      const splitLine = serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`);
       expect(logLines(logPath)).toEqual([
         "pane list",
         splitLine,
         `tab create --label tut-sys --no-focus --cwd ${project}`,
         "pane move FIX:p1 --tab FIX:t1 --split down --ratio 0.5 --no-focus",
         "pane close FIX:root1",
-        "pane rename FIX:p1 tut-hub",
-        `pane run FIX:p1 cd ${project} && node ${self} serve`,
+        scopedFixture("pane rename FIX:p1 tut-hub", fixtureRoot),
+        serviceFixture(`pane run FIX:p1 cd ${project} && node ${self} serve`),
       ]);
       expect(io.out()).not.toContain("notify"); // aborted before step 2
     } finally {
@@ -727,48 +770,51 @@ describe("tut up invariants-seed hint", () => {
         : Promise.resolve(new Response("no", { status: 405, headers: { Allow: "POST" } }));
   }
 
-  it("hub reachable + empty project scope → prints the exact publish command as a hint", async () => {
+  it.each(["empty", "missing"])("%s project scope is explained once at startup, not on subsequent up calls", async (state) => {
     const { project, logPath } = makeProject(true);
-    useFixtureHerdr(logPath, [
-      { pane_id: "w8:p1", label: "arch" },
-      { pane_id: "w7:p1", label: "exec" },
-      { pane_id: "w9:p1", label: "review" },
-    ]);
+    useFixtureHerdr(logPath, []);
     process.chdir(project);
-    stubFetch(healthyProbes());
-    vi.mocked(hubRead).mockResolvedValue(projectRead([]));
+    stubFetch(logAwareProbes(logPath));
+    if (state === "missing") {
+      vi.mocked(hubRead).mockRejectedValue(new HubError("TASK_NOT_FOUND", "task not found: project"));
+    } else {
+      vi.mocked(hubRead).mockResolvedValue(projectRead([]));
+    }
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.out()).toContain("project scope is empty");
+      expect(io.out()).toContain("this is normal");
+      expect(io.out()).not.toContain("tut publish project");
+      for (let round = 0; round < 3; round++) {
+        expect(await runUp(["up"])).toBe(0);
+      }
+      expect(io.out().match(/project scope is empty/g)).toHaveLength(1);
+      expect(hubRead).toHaveBeenCalledTimes(4);
 
-      expect(code).toBe(0);
-      expect(hubRead).toHaveBeenCalledWith("http://127.0.0.1:3001", "project");
-      expect(io.out()).toContain("no invariants seed");
-      expect(io.out()).toContain(
-        "tut publish project --role human --content-type note --summary '不变量种子：记录永不删除；写入永不拒绝≠许可；预写答案的评测材料不入库'",
-      );
-      expect(io.out()).toContain("never auto-published");
+      // Once records arrive, the existing seed guidance works again.
+      vi.mocked(hubRead).mockResolvedValue(projectRead([projectNote("ADR", "append-only")]));
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.out().match(/no invariants seed/g)).toHaveLength(1);
+      vi.mocked(hubRead).mockResolvedValue(projectRead([projectNote("不变量", "记录永不删除")]));
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.out().match(/no invariants seed/g)).toHaveLength(1);
+      expect(io.out().match(/project scope is empty/g)).toHaveLength(1);
     } finally {
       io.restore();
     }
   });
 
-  it("fresh hub (project scope TASK_NOT_FOUND) also counts as unseeded → hint", async () => {
+  it("already-running services do not explain an empty scope", async () => {
     const { project, logPath } = makeProject(true);
-    useFixtureHerdr(logPath, [
-      { pane_id: "w8:p1", label: "arch" },
-      { pane_id: "w7:p1", label: "exec" },
-      { pane_id: "w9:p1", label: "review" },
-    ]);
+    useFixtureHerdr(logPath, []);
     process.chdir(project);
     stubFetch(healthyProbes());
-    vi.mocked(hubRead).mockRejectedValue(new HubError("TASK_NOT_FOUND", "task not found: project"));
     const io = captureIo();
     try {
-      const code = await main(["up"]);
-
-      expect(code).toBe(0);
-      expect(io.out()).toContain("no invariants seed");
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.out()).not.toContain("project scope is empty");
+      expect(io.out()).not.toContain("invariants seed");
     } finally {
       io.restore();
     }
@@ -788,7 +834,7 @@ describe("tut up invariants-seed hint", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(io.out()).not.toContain("invariants seed");
@@ -809,10 +855,13 @@ describe("tut up invariants-seed hint", () => {
     vi.mocked(hubRead).mockResolvedValue(projectRead([projectNote("ADR：append-only 日志", "状态由序列派生")]));
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(io.out()).toContain("no invariants seed");
+      expect(io.out()).toContain("tut publish project --role human --content-type note");
+      expect(io.out()).toContain("never auto-published");
+      expect(io.out()).not.toContain("project scope is empty");
     } finally {
       io.restore();
     }
@@ -830,10 +879,11 @@ describe("tut up invariants-seed hint", () => {
     vi.mocked(hubRead).mockRejectedValue(new HubError("MCP error", "connection closed"));
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(0);
       expect(io.out()).not.toContain("invariants seed");
+      expect(io.out()).not.toContain("project scope is empty");
     } finally {
       io.restore();
     }
@@ -847,11 +897,12 @@ describe("tut up invariants-seed hint", () => {
       { pane_id: "w9:p1", label: "review" },
     ]);
     process.chdir(project);
-    stubFetch(healthyProbes());
+    stubFetch((url) => url.includes(":3001/state")
+      ? Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] })) : refused());
     let io = captureIo();
     try {
-      expect(await main(["up", "--dry-run"])).toBe(0);
-      expect(io.out()).toContain("no invariants seed");
+      expect(await runUp(["up", "--dry-run"])).toBe(0);
+      expect(io.out()).toContain("project scope is empty");
     } finally {
       io.restore();
     }
@@ -859,7 +910,7 @@ describe("tut up invariants-seed hint", () => {
     stubFetch(() => refused());
     io = captureIo();
     try {
-      expect(await main(["up", "--dry-run"])).toBe(0);
+      expect(await runUp(["up", "--dry-run"])).toBe(0);
       expect(io.out()).not.toContain("invariants seed");
       expect(vi.mocked(hubRead).mock.calls.length).toBe(1); // only the reachable run read
     } finally {
@@ -881,7 +932,7 @@ describe("tut up --url (non-default local hub)", () => {
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--url", "http://example.com:3001"]);
+      const code = await runUp(["up", "--url", "http://example.com:3001"]);
 
       expect(code).toBe(1);
       // The example must NOT teach the event port (3002) — it used to.
@@ -901,7 +952,7 @@ describe("tut up --url (non-default local hub)", () => {
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--url", "http://127.0.0.1"]);
+      const code = await runUp(["up", "--url", "http://127.0.0.1"]);
 
       expect(code).toBe(1);
       expect(io.err()).toContain("--url must be an http loopback URL with an explicit port");
@@ -922,7 +973,7 @@ describe("tut up --url (non-default local hub)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run", "--url", "http://127.0.0.1:3101"]);
+      const code = await runUp(["up", "--dry-run", "--url", "http://127.0.0.1:3101"]);
 
       expect(code).toBe(0);
       // The probe went to the override hub, never to the default 3001.
@@ -930,8 +981,8 @@ describe("tut up --url (non-default local hub)", () => {
       expect(seen.some((u) => u.startsWith("http://127.0.0.1:3001"))).toBe(false);
       // Printed pane commands target the override: serve binds the parsed
       // port, notify polls the override url.
-      expect(io.out()).toContain(`pane run <new-pane> cd ${project} && node ${self} serve --port 3101`);
-      expect(io.out()).toContain(`pane run <new-pane> cd ${project} && node ${self} notify --url http://127.0.0.1:3101`);
+      expect(io.out()).toContain(serviceFixture(`pane run <new-pane> cd ${project} && node ${self} serve --port 3101`));
+      expect(io.out()).toContain(serviceFixture(`pane run <new-pane> cd ${project} && node ${self} notify --url http://127.0.0.1:3101`));
       expect(io.out()).not.toContain("serve --port 3001");
       expect(logLines(logPath)).toEqual(["pane list"]); // reads only, nothing mutated
     } finally {
@@ -947,6 +998,7 @@ describe("tut up --url (non-default local hub)", () => {
       { pane_id: "w1:p3", label: "review" },
     ]);
     process.chdir(project);
+    vi.mocked(hubRead).mockResolvedValue(projectRead([projectNote("ADR", "append-only")]));
     const seen: string[] = [];
     stubFetch((url) => {
       seen.push(url);
@@ -960,7 +1012,7 @@ describe("tut up --url (non-default local hub)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--url", "http://127.0.0.1:3101"]);
+      const code = await runUp(["up", "--url", "http://127.0.0.1:3101"]);
 
       expect(code).toBe(0);
       expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3101/state)");
@@ -971,7 +1023,7 @@ describe("tut up --url (non-default local hub)", () => {
       expect(io.out()).toContain(`--url http://127.0.0.1:3101`);
       expect(io.out()).not.toContain("would split");
       expect(seen.some((u) => u.startsWith("http://127.0.0.1:3001"))).toBe(false);
-      expect(logLines(logPath)).toEqual(["pane list"]); // all three role labels preset → skips only
+      expect(logLines(logPath)).toEqual(["pane list", "pane list"]); // initial snapshot + final uniqueness check
     } finally {
       io.restore();
     }
@@ -1002,16 +1054,17 @@ describe("up service commands through the pane dialect renderer", () => {
     stubFetch((url) => (url.includes("/state") || url.includes("/agent-event") ? refused() : refused()));
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
       expect(code).toBe(0);
       const run = logLines(logPath).find((l) => l.startsWith("pane run"));
       expect(run).toBeUndefined(); // dry-run logs no pane run; assert on the preview text
       const out = io.out();
-      const serveLine = out.split("\n").find((l) => l.includes("pane run") && l.includes("serve"));
+      const serveLine = out.split("\n").find((l) => l.includes("pane run"));
       expect(serveLine).toBeDefined();
-      expect(serveLine).toContain("Set-Location -LiteralPath");
+      expect(serveLine).toContain("pane-runner.js");
       expect(serveLine).not.toContain("&&");
-      expect(serveLine).toContain(`& 'node' '${self}' 'serve'`);
+      const token = /--payload '([A-Za-z0-9_-]+)'/u.exec(serveLine ?? "")?.[1] ?? "";
+      expect(JSON.parse(Buffer.from(token, "base64url").toString("utf8"))).toMatchObject({ cwd: project, args: [self, "serve"], env: { TUT_HUB_URL: fixtureHub, TUT_EVENT_PORT_URL: fixtureEvent } });
     } finally {
       io.restore();
       process.chdir(SAVED_CWD);
@@ -1026,11 +1079,12 @@ describe("up service commands through the pane dialect renderer", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
       expect(code).toBe(0);
-      const serveLine = io.out().split("\n").find((l) => l.includes("pane run") && l.includes("serve"));
-      expect(serveLine).toContain(`cd /d "${project}"`);
-      expect(serveLine).toContain(`&& "node" "${self}" "serve"`);
+      const serveLine = io.out().split("\n").find((l) => l.includes("pane run"));
+      expect(serveLine).toContain("pane-runner.js");
+      const token = /--payload "([A-Za-z0-9_-]+)"/u.exec(serveLine ?? "")?.[1] ?? "";
+      expect(JSON.parse(Buffer.from(token, "base64url").toString("utf8"))).toMatchObject({ cwd: project, args: [self, "serve"], env: { TUT_HUB_URL: fixtureHub, TUT_EVENT_PORT_URL: fixtureEvent } });
     } finally {
       io.restore();
       process.chdir(SAVED_CWD);
@@ -1052,7 +1106,7 @@ describe("up service commands through the pane dialect renderer", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
       expect(code).toBe(0);
       // "serve" lives only inside the payload token now — take the first
       // pane-run preview line (serve) by position, not by content.
@@ -1079,7 +1133,7 @@ describe("up service commands through the pane dialect renderer", () => {
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
       expect(code).toBe(1);
       expect(io.err()).toContain("TUT_PANE_SHELL 'csh'");
       expect(logLines(logPath)).toEqual([]); // not even pane list ran
@@ -1112,7 +1166,7 @@ describe("up port-conflict pre-check", () => {
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--url", "http://127.0.0.1:3002"]);
+      const code = await runUp(["up", "--url", "http://127.0.0.1:3002"]);
 
       expect(code).toBe(1);
       expect(io.err()).toContain("the hub port and the notifier event port are both 3002");
@@ -1135,14 +1189,14 @@ describe("up port-conflict pre-check", () => {
     let io = captureIo();
     try {
       // default hub 3001, event port moved ONTO it
-      let code = await main(["up", "--event-port", "3001"]);
+      let code = await runUp(["up", "--event-port", "3001"]);
       expect(code).toBe(1);
       expect(io.err()).toContain("the hub port and the notifier event port are both 3001");
       io.restore();
 
       io = captureIo();
       // both explicitly equal
-      code = await main(["up", "--url", "http://127.0.0.1:3003", "--event-port", "3003"]);
+      code = await runUp(["up", "--url", "http://127.0.0.1:3003", "--event-port", "3003"]);
       expect(code).toBe(1);
       expect(io.err()).toContain("the hub port and the notifier event port are both 3003");
       io.restore();
@@ -1150,7 +1204,7 @@ describe("up port-conflict pre-check", () => {
       io = captureIo();
       // a DIFFERENT event port with the collision-url passes the pre-check
       // (proceeds to the normal dry-run path — exit 0, no collision error)
-      code = await main(["up", "--url", "http://127.0.0.1:3002", "--event-port", "3005", "--dry-run"]);
+      code = await runUp(["up", "--url", "http://127.0.0.1:3002", "--event-port", "3005", "--dry-run"]);
       expect(code).toBe(0);
       expect(io.err()).not.toContain("cannot share one port");
       // dry-run still probes: hub state + default event port (double-notifier
@@ -1174,7 +1228,7 @@ describe("up --event-port full chain (render/probe same source)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run", "--event-port", "3105"]);
+      const code = await runUp(["up", "--dry-run", "--event-port", "3105"]);
 
       expect(code).toBe(0);
       // Probes: the moved port is the provisioning target; the default port
@@ -1187,9 +1241,9 @@ describe("up --event-port full chain (render/probe same source)", () => {
       // TUT_EVENT_PORT_URL is exported into the pane (launchers the notifier
       // spawns escalate to the port it actually listens on). serve untouched.
       expect(io.out()).toContain(
-        `pane run <new-pane> cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`,
+        serviceFixture(`pane run <new-pane> cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`),
       );
-      expect(io.out()).toContain(`pane run <new-pane> cd ${project} && node ${self} serve`);
+      expect(io.out()).toContain(serviceFixture(`pane run <new-pane> cd ${project} && node ${self} serve`));
     } finally {
       io.restore();
     }
@@ -1197,7 +1251,7 @@ describe("up --event-port full chain (render/probe same source)", () => {
 
   it("healthy notifier on the moved port: already-listening echo names it, nothing provisioned", async () => {
     const { project, logPath } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w1:p1", label: "tut-hub", tab_id: "w1:t1" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w1:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w1:t1" }]);
     process.chdir(project);
     const seen: string[] = [];
     stubFetch((url) => {
@@ -1210,19 +1264,19 @@ describe("up --event-port full chain (render/probe same source)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--event-port", "3105"]);
+      const code = await runUp(["up", "--event-port", "3105"]);
 
       expect(code).toBe(0);
       expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3001/state)");
       expect(io.out()).toContain("up: notify already listening (http://127.0.0.1:3105/agent-event)");
       expect(seen.some((u) => u.includes(":3105/agent-event"))).toBe(true); // probed the moved port
-      expect(logLines(logPath)).toEqual(["pane list"]); // reads only
+      expect(logLines(logPath)).toEqual(["pane list", "pane list"]); // initial snapshot + final uniqueness check
     } finally {
       io.restore();
     }
   });
 
-  it("double-notifier warning: a healthy notifier still on the default port while provisioning a moved one", async () => {
+  it("another rig on the default event port does not block or warn on fresh provisioning", async () => {
     const { project, logPath, self } = makeProject(true);
     useFixtureHerdr(logPath); // no preset panes → notify provisioning plans
     process.chdir(project);
@@ -1235,13 +1289,10 @@ describe("up --event-port full chain (render/probe same source)", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run", "--event-port", "3105"]);
+      const code = await runUp(["up", "--dry-run", "--event-port", "3105"]);
 
       expect(code).toBe(0);
-      expect(io.err()).toContain(
-        "another notifier is already listening on http://127.0.0.1:3002/agent-event — provisioning http://127.0.0.1:3105/agent-event would leave two notifiers running",
-      );
-      expect(io.err()).toContain("drop --event-port to reuse it");
+      expect(io.err()).not.toContain("another notifier");
       // Non-blocking: the moved-port plan still prints.
       expect(io.out()).toContain(`node ${self} notify --event-port 3105`);
     } finally {
@@ -1249,21 +1300,21 @@ describe("up --event-port full chain (render/probe same source)", () => {
     }
   });
 
-  it("default flags keep the byte-pinned legacy commands (no --event-port, no env prefix)", async () => {
+  it("default flags retain default ports with explicit rig environment", async () => {
     const { project, logPath, self } = makeProject(true);
     useFixtureHerdr(logPath);
     process.chdir(project);
     stubFetch(() => refused());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run"]);
+      const code = await runUp(["up", "--dry-run"]);
 
       expect(code).toBe(0);
       const out = io.out();
-      expect(out).toContain(`pane run <new-pane> cd ${project} && node ${self} serve`);
-      expect(out).toContain(`pane run <new-pane> cd ${project} && node ${self} notify`);
+      expect(out).toContain(serviceFixture(`pane run <new-pane> cd ${project} && node ${self} serve`));
+      expect(out).toContain(serviceFixture(`pane run <new-pane> cd ${project} && node ${self} notify`));
       expect(out).not.toContain("--event-port");
-      expect(out).not.toContain("TUT_EVENT_PORT_URL");
+      expect(out).toContain("TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event");
     } finally {
       io.restore();
     }
@@ -1282,8 +1333,8 @@ describe("up --event-port full chain (render/probe same source)", () => {
 describe("up occupied notify pane", () => {
   /** The review fixture: sys panes present, old notifier alive on 3002, 3105 down. */
   const OCCUPIED_FIXTURE = [
-    { pane_id: "w1:p1", label: "tut-hub", tab_id: "w1:t1" },
-    { pane_id: "w6:p1", label: "tut-notify", tab_id: "w1:t1" },
+    { pane_id: "w1:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w1:t1" },
+    { pane_id: "w6:p1", label: scopedFixture("tut-notify", fixtureRoot), tab_id: "w1:t1" },
   ];
 
   function occupiedProbes(): (url: string) => Promise<Response> {
@@ -1303,7 +1354,7 @@ describe("up occupied notify pane", () => {
     stubFetch(occupiedProbes());
     const io = captureIo();
     try {
-      const code = await main(["up", "--event-port", "3105"]);
+      const code = await runUp(["up", "--event-port", "3105"]);
 
       expect(code).toBe(1);
       // Refused WITHOUT any pane mutation — not even the hub step ran (fail fast).
@@ -1327,7 +1378,7 @@ describe("up occupied notify pane", () => {
     stubFetch(occupiedProbes());
     const io = captureIo();
     try {
-      const code = await main(["up", "--dry-run", "--event-port", "3105"]);
+      const code = await runUp(["up", "--dry-run", "--event-port", "3105"]);
 
       expect(code).toBe(1);
       expect(logLines(logPath)).toEqual(["pane list"]);
@@ -1353,10 +1404,10 @@ describe("up occupied notify pane", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--event-port", "3105"]);
+      const code = await runUp(["up", "--event-port", "3105"]);
 
       expect(code).toBe(0);
-      expect(logLines(logPath)).toEqual(["pane list"]); // skips only
+      expect(logLines(logPath)).toEqual(["pane list", "pane list"]); // initial snapshot + final uniqueness check
       expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3001/state)");
       expect(io.out()).toContain("up: notify already listening (http://127.0.0.1:3105/agent-event)");
       expect(io.err()).toContain("another notifier is already listening on http://127.0.0.1:3002/agent-event");
@@ -1368,7 +1419,7 @@ describe("up occupied notify pane", () => {
 
   it("reused pane that never binds: 'ran but never answered' failure instead of false success", async () => {
     const { project, logPath, self } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: "tut-notify", tab_id: "w6:t1" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: scopedFixture("tut-notify", fixtureRoot), tab_id: "w6:t1" }]);
     process.env.TUT_UP_NOTIFY_WAIT_MS = "300"; // shorten the 10s default (per-call knob)
     process.chdir(project);
     // The event port never answers — the pane is occupied or the notifier
@@ -1380,12 +1431,12 @@ describe("up occupied notify pane", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up"]);
+      const code = await runUp(["up"]);
 
       expect(code).toBe(1);
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane run w6:p1 cd ${project} && node ${self} notify`,
+        serviceFixture(`pane run w6:p1 cd ${project} && node ${self} notify`),
       ]);
       expect(io.err()).toContain("notify pane w6:p1 ran but http://127.0.0.1:3002/agent-event never answered");
       expect(io.err()).toContain("occupied");
@@ -1402,7 +1453,7 @@ describe("up occupied notify pane", () => {
     // post-run probe is the backstop: the run is swallowed, the moved port
     // never answers → failure, never "notify running".
     const { project, logPath, self } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: "tut-notify", tab_id: "w6:t1" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w6:p1", label: scopedFixture("tut-notify", fixtureRoot), tab_id: "w6:t1" }]);
     process.env.TUT_UP_NOTIFY_WAIT_MS = "300";
     process.chdir(project);
     stubFetch((url) =>
@@ -1412,12 +1463,12 @@ describe("up occupied notify pane", () => {
     );
     const io = captureIo();
     try {
-      const code = await main(["up", "--event-port", "3105"]);
+      const code = await runUp(["up", "--event-port", "3105"]);
 
       expect(code).toBe(1);
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane run w6:p1 cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`,
+        serviceFixture(`pane run w6:p1 cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`),
       ]);
       expect(io.err()).toContain("notify pane w6:p1 ran but http://127.0.0.1:3105/agent-event never answered");
       expect(io.err()).not.toContain("cannot start the notifier"); // pre-flight stayed silent (nothing on 3002)
@@ -1429,7 +1480,7 @@ describe("up occupied notify pane", () => {
 
   it("moved-port fresh provisioning is verified by the event-port probe before success", async () => {
     const { project, logPath, self } = makeProject(true);
-    useFixtureHerdr(logPath, [{ pane_id: "w5:p1", label: "tut-hub", tab_id: "w5:t2" }]);
+    useFixtureHerdr(logPath, [{ pane_id: "w5:p1", label: scopedFixture("tut-hub", fixtureRoot), tab_id: "w5:t2" }]);
     process.chdir(project);
     stubFetch((url) => {
       if (url.includes(":3001/state")) return Promise.resolve(responseJson({ flow_mode: "manual", tasks: [] }));
@@ -1443,16 +1494,17 @@ describe("up occupied notify pane", () => {
     });
     const io = captureIo();
     try {
-      const code = await main(["up", "--event-port", "3105"]);
+      const code = await runUp(["up", "--event-port", "3105"]);
 
       expect(code).toBe(0);
       expect(logLines(logPath)).toEqual([
         "pane list",
-        `pane split --current --direction right --no-focus --cwd ${project}`,
+        serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`),
         "pane move FIX:p1 --tab w5:t2 --split down --ratio 0.5 --no-focus --target-pane w5:p1",
-        "pane rename FIX:p1 tut-notify",
-        `pane run FIX:p1 cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`,
+        scopedFixture("pane rename FIX:p1 tut-notify", fixtureRoot),
+        serviceFixture(`pane run FIX:p1 cd ${project} && TUT_EVENT_PORT_URL=http://127.0.0.1:3105/agent-event node ${self} notify --event-port 3105`),
         "pane list", // report-time id resolution
+        "pane list", // final uniqueness check
       ]);
       expect(io.out()).toContain("up: hub already running (http://127.0.0.1:3001/state)");
       expect(io.out()).toContain("up: notify running (pane FIX:p1, tab tut-sys)");
@@ -1461,4 +1513,179 @@ describe("up occupied notify pane", () => {
       io.restore();
     }
   });
+});
+
+describe("up rig namespaces", () => {
+  it("does not reuse another root's system panes in the same Herdr inventory", async () => {
+    const first = makeProject(true);
+    const second = makeProject(true);
+    process.chdir(second.project);
+    useFixtureHerdr(second.logPath);
+    process.env.TUT_HERDR_PANES = JSON.stringify([
+      { pane_id: "other-hub", label: scopedFixture("tut-hub", first.project), tab_id: "other-tab" },
+      { pane_id: "other-notify", label: scopedFixture("tut-notify", first.project), tab_id: "other-tab" },
+    ]);
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      expect(await runUp(["up", "--url", "http://127.0.0.1:3011", "--event-port", "3012", "--dry-run"])).toBe(0);
+      expect(io.out()).toContain(scopedFixture("pane rename <new-pane> tut-hub", second.project));
+      expect(io.out()).toContain(scopedFixture("pane rename <new-pane> tut-notify", second.project));
+      expect(io.out()).not.toContain("reuse pane other-");
+      expect(io.out()).not.toContain("--tab other-tab");
+      expect(io.out()).toContain("TUT_HUB_URL=http://127.0.0.1:3011");
+      expect(io.out()).toContain("TUT_EVENT_PORT_URL=http://127.0.0.1:3012/agent-event");
+    } finally { io.restore(); }
+  });
+});
+
+
+describe("up final diagnostics", () => {
+  it.each([false, true])("foreign startup lock: dry-run=%s skips final uniqueness diagnostics", async (dryRun) => {
+    const { project, logPath } = makeProject(false);
+    process.chdir(project);
+    const label = scopedFixture("demo.executor", project);
+    useFixtureHerdr(logPath, [
+      { pane_id: "winner", label }, { pane_id: "loser", label },
+    ]);
+    // A real live process owns the lock; no process.kill or lock mocks.
+    const owner = spawn(process.execPath, ["-e", "process.stdin.resume(); process.stdout.write('ready');"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const exited = once(owner, "exit");
+    const lock = path.join(project, ".context-hub/up.lock");
+    const io = captureIo();
+    try {
+      await once(owner.stdout, "data");
+      const record = JSON.stringify({ pid: owner.pid, started_at: new Date().toISOString() });
+      writeFileSync(lock, record);
+      const fetch = stubFetch(async (url) => url.includes("/state")
+        ? responseJson({ flow_mode: "manual", tasks: [] })
+        : new Response("", { status: 405, headers: { Allow: "POST" } }));
+      expect(await runUp(dryRun ? ["up", "--dry-run"] : ["up"])).toBe(dryRun ? 0 : 1);
+      expect(readFileSync(lock, "utf8")).toBe(record);
+      expect(io.err()).not.toContain("duplicate pane label");
+      expect(logLines(logPath)).toEqual(dryRun ? ["pane list"] : []);
+      if (dryRun) {
+        expect(io.err()).not.toContain("another up");
+        expect(fetch).toHaveBeenCalled();
+      } else {
+        expect(io.err()).toContain(`another up (pid ${owner.pid})`);
+        expect(io.err()).toContain(`if you confirm no other tut up instance is running, remove the lock file ${lock} and retry`);
+        expect(fetch).not.toHaveBeenCalled();
+      }
+    } finally {
+      io.restore();
+      owner.stdin.end();
+      await exited;
+      rmSync(lock, { force: true });
+    }
+  });
+
+  it.each(["tut-hub", "demo.executor"])("rejects duplicate %s labels appearing after the first snapshot", async (label) => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath, []);
+    const scoped = scopedFixture(label, project);
+    stubFetch(async (url) => {
+      // The initial snapshot is already read before the service probes.
+      process.env.TUT_HERDR_PANES = JSON.stringify([
+        { pane_id: "winner", label: scoped }, { pane_id: "loser", label: scoped },
+      ]);
+      return url.includes("/state")
+        ? responseJson({ flow_mode: "manual", tasks: [] })
+        : new Response("", { status: 405, headers: { Allow: "POST" } });
+    });
+    const lockOwners: number[] = [];
+    const io = captureIo((text) => {
+      if (text.includes("duplicate pane label")) {
+        lockOwners.push(JSON.parse(readFileSync(path.join(project, ".context-hub/up.lock"), "utf8")).pid);
+      }
+    });
+    try {
+      expect(await runUp(["up"])).toBe(1);
+      expect(io.err()).toContain(`duplicate pane label ${scoped}: winner, loser`);
+      expect(lockOwners).toEqual([process.pid]);
+      expect(logLines(logPath)).toEqual(["pane list", "pane list"]);
+      expect(io.out()).not.toContain("up: activate a Host");
+      expect(existsSync(path.join(project, ".context-hub/up.lock"))).toBe(false);
+    } finally { io.restore(); }
+  });
+
+  it("ignores other rigs' duplicate base-name labels in the final non-dry-run check", async () => {
+    const other = makeProject(true);
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath, []);
+    stubFetch(async (url) => {
+      process.env.TUT_HERDR_PANES = JSON.stringify(
+        ["tut-hub", "tut-notify", "demo.executor"].flatMap((label) => [
+          { pane_id: `own-${label}`, label: scopedFixture(label, project) },
+          { pane_id: `foreign-one-${label}`, label: scopedFixture(label, other.project) },
+          { pane_id: `foreign-two-${label}`, label: scopedFixture(label, other.project) },
+        ]),
+      );
+      return url.includes("/state")
+        ? responseJson({ flow_mode: "manual", tasks: [] })
+        : new Response("", { status: 405, headers: { Allow: "POST" } });
+    });
+    const io = captureIo();
+    try {
+      expect(await runUp(["up"])).toBe(0);
+      expect(logLines(logPath)).toEqual(["pane list", "pane list"]);
+      expect(io.err()).not.toContain("duplicate pane label");
+      expect(io.out()).toContain("up: activate a Host");
+      expect(existsSync(path.join(project, ".context-hub/up.lock"))).toBe(false);
+    } finally { io.restore(); }
+  });
+
+  it("accepts an IPv6 loopback URL and prints the expected host relay label", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath, []);
+    stubFetch(async (url) => url.includes("/state")
+      ? responseJson({ flow_mode: "manual", tasks: [] })
+      : new Response("", { status: 405, headers: { Allow: "POST" } }));
+    const io = captureIo();
+    try {
+      expect(await runUp(["up", "--url", "http://[::1]:3003"])).toBe(0);
+      expect(io.err()).not.toContain("--url must be");
+      expect(io.out()).toContain(`expected host relay label: ${scopedFixture("tut-hub", project).replace("tut-hub", "tut-host")}`);
+    } finally { io.restore(); }
+  });
+
+  it("warns once when a new system tab has no workspace anchor", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath, []);
+    delete process.env.HERDR_PANE_ID;
+    stubFetch(logAwareProbes(logPath));
+    const io = captureIo();
+    try {
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.err().match(/workspace pinning unavailable/g)).toHaveLength(1);
+    } finally { io.restore(); }
+  });
+});
+
+
+it.each(["", "   ", "w1"])("handles system-tab workspace anchor %j", async (workspaceId) => {
+  const { project, logPath } = makeProject(true);
+  process.chdir(project);
+  process.env.HERDR_PANE_ID = "anchor:p1";
+  useFixtureHerdr(logPath, [{ pane_id: "anchor:p1", workspace_id: workspaceId }]);
+  stubFetch(logAwareProbes(logPath));
+  const io = captureIo();
+  try {
+    expect(await runUp(["up"])).toBe(0);
+    const tabCreate = logLines(logPath).filter((line) => line.startsWith("tab create"));
+    expect(tabCreate).toHaveLength(1);
+    if (workspaceId === "w1") {
+      expect(tabCreate[0]).toContain("--workspace w1");
+      expect(io.err()).not.toContain("workspace pinning unavailable");
+    } else {
+      expect(tabCreate[0]).not.toContain("--workspace");
+      expect(io.err().match(/workspace pinning unavailable/g)).toHaveLength(1);
+    }
+  } finally { io.restore(); }
 });

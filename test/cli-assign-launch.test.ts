@@ -1,3 +1,4 @@
+import { scopedFixture, agentFixture } from "./rig-fixtures.js";
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -212,8 +213,8 @@ describe("tut assign handler (temp project root, project-level .context-hub/work
 
 // --- launch.sh resolution ------------------------------------------------------
 // The REAL script with TUT_DRY_RUN=1: it prints the herdr command instead of
-// running it; a missing label→pane mapping is tolerated in dry-run, so no live
-// Herdr panes are required (a live Herdr merely upgrades the target to an id).
+// running it. An explicitly empty fixture inventory pins the placeholder
+// anchor regardless of whether the developer has a live Herdr rig.
 
 const LAUNCH_SH = path.join(SCRIPTS_DIR, "launch.sh");
 const runLaunch = promisify(execFile);
@@ -223,6 +224,8 @@ const CHAIN_L2 = mkdtempSync(path.join(os.tmpdir(), "tut-assign-chain-"));
 const dryRunEnv = {
   ...process.env,
   TUT_DRY_RUN: "1",
+  TUT_HERDR_EXECUTABLE: path.resolve(import.meta.dirname, "bin/herdr"),
+  TUT_HERDR_PANES: "[]",
   // Deterministic: hub down → degrade current/default; a live hub on the
   // default port must never leak its real /state (cast!) into these
   // resolution-chain assertions with dummy task ids.
@@ -257,11 +260,12 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
     const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor", "pi"], { env: chainEnv() });
 
     expect(stdout).toContain("DRY-RUN");
-    // Anchor may be real (a live herdr) or the dry-run placeholder — assert
-    // only the label segment, which is deterministic either way.
+    // With no anchor, labels use the placeholder Hub root, never the
+    // caller cwd or TUT_PROJECT_ROOT (which only selects routing config).
+    expect(stdout).toContain("--workspace <workspace> --cwd <cwd>");
     expect(stdout).toContain("--label TUT executor --no-focus");
-    expect(stdout).toContain("DRY-RUN: birth: herdr pane rename <root> t1.executor"); // pane label fixed (4.4)
-    expect(stdout).toContain("(agent 'pi', label 't1.executor')");
+    expect(stdout).toContain(scopedFixture("DRY-RUN: birth: herdr pane rename <root> t1.executor", "<hub-root>")); // pane label fixed (4.4)
+    expect(stdout).toContain(scopedFixture("(agent 'pi', label 't1.executor')", "<hub-root>"));
     expect(stdout).toContain("t1");
     expect(stdout).toContain("context.read");
   });
@@ -305,7 +309,7 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
     expect(stdout).toContain("(agent 'codex',"); // the chain always yields an agent
   });
 
-  it("custom naming.tab_label fixture: tab label renders the template, pane label stays byte-exact <task_id>.<role>", async () => {
+  it("custom naming.tab_label fixture: tab label renders the template, pane label keeps its task/role key and Hub-root suffix", async () => {
     // custom-template regression: a custom template may
     // reshape the TAB label, but must never leak into the pane addressing
     // key — both pinned in one vector under a template-bearing fixture.
@@ -321,8 +325,8 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
       expect(stdout).toContain("DRY-RUN");
       expect(stdout).toContain("--label [t1] pi --no-focus"); // template rendered ({task}/{agent})
       expect(stdout).not.toContain("--label TUT executor"); // default template NOT in play
-      expect(stdout).toContain("DRY-RUN: birth: herdr pane rename <root> t1.executor"); // pane label fixed, byte-exact
-      expect(stdout).toContain("(agent 'pi', label 't1.executor')");
+      expect(stdout).toContain(scopedFixture("DRY-RUN: birth: herdr pane rename <root> t1.executor", "<hub-root>")); // pane label fixed, byte-exact
+      expect(stdout).toContain(scopedFixture("(agent 'pi', label 't1.executor')", "<hub-root>"));
     } finally {
       rmSync(tplL1, { recursive: true, force: true });
     }
@@ -330,11 +334,11 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
 });
 
 describe("launch.sh round entry (prompt delivery regression guard)", () => {
-  it("delivers the round prompt verbatim in dry-run (first round after create uses the same entry)", async () => {
+  it("delivers the round prompt with a placeholder Hub-root label when no anchor exists", async () => {
     const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "architect", "pi"], { env: dryRunEnv });
 
     expect(stdout).toContain("DRY-RUN");
-    expect(stdout).toContain("(agent 'pi', label 't1.architect')");
+    expect(stdout).toContain(scopedFixture("(agent 'pi', label 't1.architect')", "<hub-root>"));
     expect(stdout).toContain("轮到你了（role: architect）");
     expect(stdout).toContain("t1");
   });
@@ -407,24 +411,24 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
 
     expect(stdout).not.toContain("send-text w2:p1"); // the existing pane receives NOTHING
     expect(stdout).toContain("DRY-RUN: birth: herdr tab create --workspace w11 --cwd /repo --label TUT executor --no-focus");
-    expect(stdout).toContain("DRY-RUN: birth: herdr pane rename <root> t1.executor");
-    expect(stdout).toContain("DRY-RUN: birth: herdr pane run <root> cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'");
-    expect(stdout).toContain("DRY-RUN: ready-probe <label:t1.executor> (born pane");
-    expect(stdout).toContain("(agent 'pi', label 't1.executor')");
+    expect(stdout).toContain(scopedFixture("DRY-RUN: birth: herdr pane rename <root> t1.executor", "/repo"));
+    expect(stdout).toContain(agentFixture("DRY-RUN: birth: herdr pane run <root> cd -- '/repo' && env 'PI_SKIP_VERSION_CHECK=1' 'pi'", "/repo", "http://127.0.0.1:1"));
+    expect(stdout).toContain(scopedFixture("DRY-RUN: ready-probe <label:t1.executor> (born pane", "/repo"));
+    expect(stdout).toContain(scopedFixture("(agent 'pi', label 't1.executor')", "/repo"));
   });
 
   it("cleanup preview: non-continuity idle panes close; a live continuity seat is KEPT; working ones are skipped with a warning", async () => {
     const { stdout, stderr } = await runLaunch(LAUNCH_SH, ["t1", "reviewer", "pi"], {
       env: fixtureEnv([
         HUB_PANE,
-        { pane_id: "w11:p5", label: "t1.architect", workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
-        { pane_id: "w11:p6", label: "t1.executor", workspace_id: "w11", cwd: "/repo", agent_status: "working" },
+        { pane_id: "w11:p5", label: scopedFixture("t1.architect", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
+        { pane_id: "w11:p6", label: scopedFixture("t1.executor", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "working" },
       ]),
     });
 
-    expect(stdout).toContain("DRY-RUN: cleanup: herdr pane close w11:p5 (label 't1.architect')"); // idle, non-continuity → closed (the original shape)
+    expect(stdout).toContain(scopedFixture("DRY-RUN: cleanup: herdr pane close w11:p5 (label 't1.architect')", "/repo")); // idle, non-continuity → closed (the original shape)
     expect(stdout).not.toContain("w11:p6"); // working → NOT closed (warning on stderr instead)
-    expect(stderr).toContain("pane 't1.executor' (w11:p6) still working — left open for the next lifecycle hook");
+    expect(stderr).toContain(scopedFixture("pane 't1.executor' (w11:p6) still working — left open for the next lifecycle hook", "/repo"));
   });
 
   it("legacy labels (arch/exec/review) are no longer lookup keys — no rename hint, no hit", async () => {
@@ -526,7 +530,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
         expect(createIdx).toBeGreaterThanOrEqual(0);
         const runIdx = lines.findIndex((l) => l.startsWith("pane run FIX:root1 ") && l.includes("probe-runner.js"));
         expect(runIdx).toBeGreaterThan(createIdx);
-        expect(lines).toContain("pane rename FIX:root1 t1.architect"); // round pane label from round one
+        expect(lines).toContain(scopedFixture("pane rename FIX:root1 t1.architect", "/x")); // round pane label from round one
         // FULL closed-loop order (design 斨1). Gate: exactly 6 reads (base
         // + 2 boot empties + the four-sample quiescence run).
         const isRead = (l: string) => l.startsWith("pane read FIX:root1");
@@ -569,7 +573,7 @@ describe("launch.sh delivery tail (birth → ready-probe → send-text → land-
       const lastList = lines.map((l) => l === "pane list").lastIndexOf(true);
       const createIdx = lines.findIndex((l) => l === "tab create --workspace w9 --cwd /x --label TUT executor --no-focus");
       expect(createIdx).toBeGreaterThan(lastList);
-      expect(lines).toContain("pane rename FIX:root1 t1.executor");
+      expect(lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/x"));
       const runIdx = lines.findIndex((l) => l.startsWith("pane run FIX:root1 ") && l.includes("probe-runner.js"));
       expect(runIdx).toBeGreaterThan(createIdx);
       const sendTextIdx = lines.findIndex((l) => l.startsWith("pane send-text FIX:root1"));

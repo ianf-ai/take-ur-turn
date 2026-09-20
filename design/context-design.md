@@ -66,12 +66,12 @@ Agent 协作需要的上下文分三层，各答一个问题（层与层之间�
 
 | content_type | 典型发布者 | 语义 | 对派生的影响 |
 |--------------|-----------|------|-------------|
-| design | Architect | 设计方案与推理 | 按 flow（主设计 3.1）：full/solo 中 designing → implementing；direct 中为**参考记录**——implementing 态不转态，其余态表外 |
+| design | Architect | 设计方案与推理 | 按 flow 派生（主设计 3.1） |
 | code_changes | Executor | 实现、验证结果 | 触发流转 |
 | review | Reviewer | 评审意见（含 verdict） | 触发流转（verdict 决定去向） |
 | revision | Executor | 对 review 的修改与回应 | 触发流转 |
-| note | 任何人 | 补充说明、问题标记 | 默认无（唯一例外：`reviewing` 态下 role=executor 的非 ack note 派生回 revising——收回回合，主设计 3.1；closed 吸收态与 ack note 不转态） |
-| decision | 人 | 拍板（approve/reject/close，或 project scope 里的决策） | 按主设计 3.1（仅 task scope；project scope 无流转） |
+| note | 任何人 | 补充说明、问题标记 | 默认无；唯一例外见主设计 3.1 |
+| decision | 人 | 拍板（approve/reject/close，或 project scope 里的决策） | 按主设计 3.1 |
 
 ### 2.3 payload 信封（schema）
 
@@ -120,8 +120,8 @@ body 是完整的 Markdown 叙述，不由 Server 校验小节标题或写作顺
 
 ### 2.5 链路回溯：ref_version
 
-- review `ref_version` → 它审的 code_changes
-- revision `ref_version` → 它回应的 review
+- review `ref_version` → 它审的那条交付记录（首轮为 code_changes，其余为 revision）
+- revision `ref_version` → 它回应的那条记录（review / decision(reject) / 收回 note）
 - 修订轮次多时，这是唯一可靠的对应关系来源
 
 ### 2.6 上下文可达性

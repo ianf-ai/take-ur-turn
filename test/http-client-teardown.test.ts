@@ -15,10 +15,11 @@ interface ChildResult {
   stderr: string;
 }
 
-function runCli(args: string[]): Promise<ChildResult> {
+function runCli(args: string[], cwd: string): Promise<ChildResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       env: process.env,
+      cwd,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -59,7 +60,7 @@ describe("short-lived HTTP clients", () => {
       creator: "test",
       role: "human",
     });
-    const child = await runCli(["list", "--url", running.url, "--json"]);
+    const child = await runCli(["list", "--url", running.url, "--json"], tmp);
 
     expect(child.code).toBe(0);
     expect(child.stderr).not.toMatch(/Assertion failed|UV_HANDLE_CLOSING/u);

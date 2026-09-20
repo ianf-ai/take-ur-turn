@@ -7,6 +7,7 @@
  * bounded root cleanup.  This module never resolves routes or naming values.
  */
 
+import { paneEnvArgs } from "../rig.js";
 import type { LaunchAnchor } from "../types.js";
 import type { HerdrCommandResult, HerdrPane } from "./herdr-client.js";
 
@@ -24,6 +25,7 @@ export interface BirthOptions {
   executable?: string;
   dryRun?: boolean;
   env?: NodeJS.ProcessEnv;
+  paneEnvironment?: Readonly<Record<string, string>>;
   stdout?: (text: string) => void;
   stderr?: (text: string) => void;
   /** Legacy preview-only presence check; canonical invocations are preflighted upstream. */
@@ -360,6 +362,7 @@ export async function birthPane(options: BirthOptions): Promise<string | undefin
   const split = await command(options.client, [
     "pane", "split", options.anchor.pane_id,
     "--direction", "right", "--no-focus", "--cwd", options.birthCwd,
+    ...paneEnvArgs(options.paneEnvironment ?? {}),
   ]);
   const newPane = succeeded(split) ? paneIdFrom(parseJson(split.stdout)) : undefined;
   if (newPane === undefined) {

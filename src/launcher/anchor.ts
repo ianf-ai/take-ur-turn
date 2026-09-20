@@ -6,6 +6,7 @@
  * root; it is never a substitute for the Herdr anchor used for birth.
  */
 
+import { rigLabel } from "../rig.js";
 import path from "node:path";
 import { HerdrClient, type HerdrPane } from "./herdr-client.js";
 import {
@@ -72,7 +73,7 @@ function validAnchorFromPane(pane: HerdrPane | undefined): LaunchAnchor | undefi
   };
 }
 
-function findValidSystemAnchor(panes: readonly HerdrPane[], label: "tut-hub" | "tut-notify"): LaunchAnchor | undefined {
+function findValidSystemAnchor(panes: readonly HerdrPane[], label: string): LaunchAnchor | undefined {
   for (const pane of panes) {
     if (pane.label !== label) continue;
     const anchor = validAnchorFromPane(pane);
@@ -86,7 +87,19 @@ function findValidSystemAnchor(panes: readonly HerdrPane[], label: "tut-hub" | "
  * any workspace environment variable.  The pane row supplies all three
  * values together so workspace/cwd cannot drift across records.
  */
-export function selectAnchor(panes: readonly HerdrPane[], splitBase?: string): SelectedAnchor | undefined {
+export function selectAnchor(panes: readonly HerdrPane[], splitBase?: string, hubRoot?: string): SelectedAnchor | undefined {
+  if (hubRoot !== undefined) {
+    const owned = panes.filter(p => p.label === rigLabel("tut-hub", hubRoot) || p.label === rigLabel("tut-notify", hubRoot));
+    for (const name of ["tut-hub", "tut-notify"] as const) {
+      const anchor = findValidSystemAnchor(owned, rigLabel(name, hubRoot));
+      if (anchor !== undefined) return { anchor, source: name };
+    }
+    if (owned.length > 0) return undefined; // malformed owned anchor must fail closed
+    const hasScopedRig = panes.some(p => /^tut-(hub|notify)-[a-f0-9]{8}$/.test(p.label ?? ""));
+    // A sole pre-namespacing rig remains usable during migration. Once scoped rigs
+    // coexist, legacy anchors may only be taken from the requested root.
+    if (hasScopedRig) panes = panes.filter(p => p.cwd !== undefined && path.resolve(p.cwd) === path.resolve(hubRoot));
+  }
   const hasSystemPane = panes.some((pane) => pane.label === "tut-hub" || pane.label === "tut-notify");
   const hub = findValidSystemAnchor(panes, "tut-hub");
   if (hub !== undefined) return { anchor: hub, source: "tut-hub" };
@@ -139,7 +152,7 @@ export async function resolveWorkspaceSnapshot(
     panes = [];
   }
 
-  const selected = selectAnchor(panes, environment.TUT_SPLIT_BASE);
+  const selected = selectAnchor(panes, environment.TUT_SPLIT_BASE, environment.TUT_HUB_ROOT ?? caller);
   // The checkout seam is resolved inside the one-shot context snapshot:
   // current keeps hubRoot=checkoutRoot=anchor.cwd; a worktree changes only
   // checkoutRoot, while routingRoot still follows TUT_PROJECT_ROOT or the
