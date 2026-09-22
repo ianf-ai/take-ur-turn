@@ -45,19 +45,19 @@ function mismatch(url: string, root: string, identity: HubIdentity): Error {
 }
 
 const discoveryUrls = Array.from({ length: 100 }, (_, i) => `http://127.0.0.1:${3001 + i * 2}`);
-export async function discoverHub(root: string): Promise<string | undefined> {
-  const identities = await Promise.all(discoveryUrls.map(probeHub));
-  return discoveryUrls.find((_, i) => identities[i]?.root === root);
+export async function discoverHub(root: string, urls: readonly string[] = discoveryUrls): Promise<string | undefined> {
+  const identities = await Promise.all(urls.map(probeHub));
+  return urls.find((_, i) => identities[i]?.root === root);
 }
 
-export async function resolveCliHubUrl(url: string, explicit: boolean, root = resolveRigRoot()): Promise<string> {
+export async function resolveCliHubUrl(url: string, explicit: boolean, root = resolveRigRoot(), urls?: readonly string[]): Promise<string> {
   const identity = await probeHub(url);
   if (identity?.root === root) return url;
   if (explicit) {
     if (identity) throw mismatch(url, root, identity);
     throw new TypeError(`fetch failed: identity handshake unavailable at ${url}/state`);
   }
-  const own = await discoverHub(root);
+  const own = await discoverHub(root, urls);
   if (own) return own;
   throw new Error(`No verified hub for workspace ${root}${identity ? ` (foreign hub at ${url})` : ""}. Run 'tut up' in this workspace to start its own serve/notify pair.`);
 }

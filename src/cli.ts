@@ -13,6 +13,7 @@
  * DEFAULT_HUB_URL applied in the handler). No deps.
  */
 
+import { runMcpCommand } from "./mcp-bridge.js";
 import { discoverHub, probeNotifier, notifierMatches, resolveNotifierPort, probeHub, resolveRigRoot, resolveCliHubUrl, resolveUpHub } from "./rig-discovery.js";
 import { acquireRigStartLock } from "./rig-lock.js";
 import { rigLabel, rigEnvironment, unscopedLabel } from "./rig.js";
@@ -124,6 +125,10 @@ function cliFetchInit(extra: RequestInit = {}): RequestInit {
 export const USAGE = `tut — Take Ur Turn Context Hub
 
 Usage:
+  tut mcp
+      Bridge MCP stdio to this workspace's verified local Hub.
+      Uses TUT_HUB_URL, TUT_HUB_ROOT/cwd and bounded discovery; stdout is MCP only.
+      Exit: 0 EOF, 1 usage/internal, 2 initial connection, 3 reconnect exhausted.
   tut serve [--port <n>] [--root <dir>]
       Start the Context Hub (MCP + /state). Default ${DEFAULT_HUB_URL}; port 0 = ephemeral.
   tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>] [--working-timeout <s>]
@@ -288,6 +293,7 @@ up automatically selects a free hub/notifier pair. An explicit foreign
 // --- parsed shapes (frozen — handlers consume these) -------------------------
 
 export type ParsedArgs =
+  | { command: "mcp" }
   | { command: "serve"; port?: number; root: string }
   | {
       command: "notify";
@@ -1107,6 +1113,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if (first === undefined) return { command: "usage" };
   const rest = args;
   switch (first) {
+    case "mcp": return rest.length === 0 ? { command: "mcp" } : { command: "usage", error: "mcp takes no arguments; configure TUT_HUB_ROOT / TUT_HUB_URL via env" };
     case "serve": return parseServe(rest);
     case "notify": return parseNotify(rest);
     case "mode": return parseMode(rest);
@@ -3088,6 +3095,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     }
   }
   switch (parsed.command) {
+    case "mcp": return runMcpCommand(DEFAULT_HUB_URL);
     case "serve": return HANDLERS.serve(parsed);
     case "notify": return HANDLERS.notify(parsed);
     case "mode": return HANDLERS.mode(parsed);

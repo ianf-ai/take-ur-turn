@@ -133,20 +133,32 @@ The boundary that keeps the division of labor honest: **drive, don't do the work
 
 ## Agent CLI Onboarding (one-time)
 
-The Hub exposes its MCP tools over **Streamable HTTP** at `http://127.0.0.1:3001/mcp` (online as soon as `tut serve` is up; stateless, no session stream). Configure once for every Agent CLI that will take part:
+Use the installed `tut mcp` command as a **stdio** MCP server. It discovers the Hub belonging to the current workspace, verifies `hub_root`, and bridges to its Streamable HTTP `/mcp` endpoint. Start that workspace's Hub with `tut up` first.
 
 **Codex CLI** (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.tut]
-url = "http://127.0.0.1:3001/mcp"
+command = "tut"
+args = ["mcp"]
 ```
 
-Other MCP clients that support Streamable HTTP: point them at the same URL.
+Other stdio MCP clients use the same command and arguments. The client must launch it in the intended workspace. If its working directory is not reliable, pin the owning Hub root with server-level environment configuration (task worktrees can share this root):
+
+```toml
+[mcp_servers.tut.env]
+TUT_HUB_ROOT = "/absolute/path/to/workspace"
+```
+
+Use the workspace directory, not its `.context-hub` subdirectory. A global root pin intentionally selects one workspace; remove or change it when switching projects. `TUT_HUB_URL` can supply a preferred local Hub base URL; ownership still has to match `TUT_HUB_ROOT` or the root derived from cwd. Otherwise the bridge scans the same bounded local Hub ports as the CLI (3001–3199, odd ports).
+
+**Migration from fixed HTTP URLs:** replace the old `url = "http://127.0.0.1:3001/mcp"` entry with `command` and `args` above (do not keep both), set the root if needed, and restart the client's MCP connection. Fixed URL connections remain available for HTTP clients, but bypass workspace discovery and can silently route writes to another rig. No user configuration is changed automatically.
+
+The bridge rechecks ownership before HTTP requests and reconnects with five bounded delays (250/500/1000/2000/4000ms), rediscovering a Hub that restarted on another port. It never replays an interrupted tool call: a write may already have landed, so read the task before retrying. Diagnostics go to stderr; stdout is reserved for MCP. Exit codes: 0 on stdin EOF, 1 for usage/internal errors, 2 for initial connection/identity failure, 3 when reconnect attempts run out (130/143 for SIGINT/SIGTERM). After a failure, start the correct Hub and restart the MCP connection.
 
 Once configured, the agent sees 5 tools: `context.create` / `context.publish` / `context.read` / `context.list` / `context.decide`.
 
-**CLIs without MCP-over-HTTP support**: use the equivalent CLI channel — the `tut create / publish / read / list / decide` subcommands map one-to-one onto the MCP tools, so an agent can simply call them from the shell (the per-role "tool cheat sheets" in the skills — an MCP | CLI mapping — are made for exactly these CLIs; the two channels can be mixed; on the same task, each role using its own channel is fully compatible).
+**CLIs without MCP support**: use the equivalent CLI channel — the `tut create / publish / read / list / decide` subcommands map one-to-one onto the MCP tools, so an agent can simply call them from the shell (the per-role "tool cheat sheets" in the skills — an MCP | CLI mapping — are made for exactly these CLIs; the two channels can be mixed; on the same task, each role using its own channel is fully compatible).
 
 **Environments with no way to configure MCP** (e.g. sandbox restrictions in some sessions): fall back to the CLI channel as above.
 
@@ -329,7 +341,7 @@ Native Windows works end to end (hub, MCP, CLI, flow driving were verified again
 
 **Troubleshooting**:
 
-- **Agent reports it cannot see the context.* tools**: make sure `tut serve` is running (`curl http://127.0.0.1:3001/state` responding means it is alive); check that the CLI's MCP config points at the `/mcp` endpoint; some CLI sessions may be sandboxed off from localhost loopback — in that case have that agent use the CLI channel (`tut read` / `tut publish`) instead; behavior is fully equivalent
+- **Agent reports it cannot see the context.* tools**: run `tut status` in the intended workspace to verify its Hub is reachable; check that the MCP config runs `tut mcp` in the correct workspace (or pins `TUT_HUB_ROOT`); some CLI sessions may be sandboxed off from localhost loopback — in that case have that agent use the CLI channel (`tut read` / `tut publish`) instead; behavior is fully equivalent
 - **Port 3001 already in use (EADDRINUSE)**: run `tut up` in the intended workspace. It verifies Hub ownership, discovers an existing local Hub for that workspace, or chooses a free Hub/notifier pair starting at 3003/3004 when the default pair is occupied. Ordinary CLI commands also discover the workspace's Hub; an explicit foreign `--url` is rejected. For a manually selected address use `tut serve --port <n>` and `--url`, and use `--event-port` to change the event listener (Hub and event ports must differ). Reusing a Hub does not imply its notifier is on the next port: `up` verifies the notifier's `hub_root` and `hub_url`, preserving both 3101/3002 and automatically assigned pairs. Older notifiers without identity fields must be upgraded/restarted; stop the existing notifier before moving its event port.
 - **Startup lock errors**: `another up (pid N) is provisioning` means wait for that invocation to finish; only after confirming no other `tut up` instance is running may you remove the reported `.context-hub/up.lock` and retry. `cannot verify startup lock` can mean a damaged lock or a race with its initial write: retry first; if it persists, inspect the lock and confirm no other `tut up` is running before removing it. `startup lock recovery in progress` means another invocation is reclaiming a stale lock: retry; if recovery was interrupted, inspect the reported `.context-hub/up.lock.reclaim` directory and remove it only after confirming no other `tut up` is running.
 - **Custom lineup lost after `npm i -g`** — resolved: the lineup lives in the project (`.context-hub/workspace.json`) or at the user level (`~/.config/tut/`); upgrades never touch either. See [Configuration ②](#-workspace-lineup--three-level-resolution-chain-project--user--built-in) for the migration steps

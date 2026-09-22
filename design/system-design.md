@@ -266,6 +266,14 @@ status / waiting_for / needs_attention 为派生结果（见第 3 节；project 
 
 Notifier 常驻轮询这个接口（默认间隔 5s，可配置，见 6.1），对比上一次快照，发现 `waiting_for` 变化、`needs_attention` 置位或 `degraded` 转变沿即发通知。一个只读 HTTP 接口就够了，Notifier 不需要 MCP 客户端能力。
 
+### 4.3.1 Agent stdio 接入桥
+
+`tut mcp` 是常驻 stdio ↔ Streamable HTTP 桥，复用 CLI discovery 与 SDK；Hub 的五工具与 schema 不变。启动冻结所属根（`TUT_HUB_ROOT` 优先，否则 cwd 向上寻找 `.context-hub`），候选 URL 取 `TUT_HUB_URL` 或默认 3001，再沿既有 3001–3199 奇数端口扫描。仅允许本机 HTTP loopback；`/state.hub_root` 规范化后必须相等才可发送 MCP，缺失身份也拒绝。HTTP 不跟随重定向，每次 MCP HTTP 请求前再验证身份，防止端口被另一 workspace 接管。
+
+桥通过 SDK 终结两端 initialize 并转发请求/结果，工具列表由上游提供，不复制工具 schema。下游 initialize 的 `serverInfo` 保留上游既有字段，并附加 `hubUrl`（发现、归属校验并成功连接的 Hub base URL）与 `hubRoot`（已校验的规范绝对根路径），供客户端识别所属 Hub；这是首次握手的连接快照，同根换端口重连不会向下游重新发送 initialize。stdout 只写 MCP，诊断只写 stderr。每 2 秒检查归属/可达性；传输失败或归属变化后关闭旧连接，按 250/500/1000/2000/4000ms 五次退避重新 discovery 和 initialize，支持同根 Hub 换端口。恢复时仅重建协议连接，**绝不重放已发送的业务请求**（断线时写入结果可能未知）；失败请求返回协议错误，调用者先 read 核实再决定是否重试。恢复期间新请求等待同一个有界恢复过程。
+
+退出码：0 = stdin EOF / 正常关闭；1 = 参数或桥内部错误；2 = 初始归属验证/连接失败（含不支持的 URL）；3 = 重连次数耗尽；SIGINT/SIGTERM 分别为 130/143。探测沿用 800ms 上限，HTTP 沿用 hub-client 的 10 秒超时。启动不代开 Hub，指引用户在所属 workspace 执行 `tut up`。配置推荐 `command = "tut"`、`args = ["mcp"]`；客户端不保证 cwd 时用 server 级 env 钉 `TUT_HUB_ROOT`。固定 `/mcp` URL 绕过发现与归属检查，多 rig 有误路由风险，迁移需移除旧 url 并重启客户端连接。
+
 ### 4.4 pane ↔ task 映射与生命周期（fresh session 的精确辖区）
 
 **跨角色必 fresh、同角色连续轮默认延续**（决策存档于 project scope 决策流）：角色变更（architect→executor→reviewer）一律现场诞生全新 pane/session——未记录的上下文不得跨角色泄漏，Hub 是唯一记忆；同任务同角色连续轮（executor→revision、reviewer→re-review）默认**延续现存 pane**——同角色会话不越过角色边界，清单作者核自己的单、代码作者修自己的 bug，免全量重读。「同角色想要外部视角」是显式选择：`--fresh` force-close 同角色 pane 后照常新生（见 7.2）。pane 是工位——跨角色短命、同角色任务内长存，记录才是交付物。
@@ -529,8 +537,9 @@ take-ur-turn/
 ├── scripts/               # 事件链 canonical：on-agent-event.mjs / herdr-hook.mjs（Node 入口，Windows 可用）；兼容薄 shim：launch.sh / on-agent-event.sh / hook.sh（POSIX only，只转发）；tut-resolve.mjs 为旧消费者/parity fixture 保留；workspace.json 为种子（运行时零读取）；assert-release.js（发布硬门：npm pack 前枚举断言 dist/cli.js 与 launcher 双 runner、role skills 等运行时契约物存在，防未构建/残缺包发布） / mcp-smoke.mjs（MCP 冒烟脚本）
 ├── src/
 │   ├── launcher/          # TS 启动器：轮次交接三分支 / birth 锚定 / 投递闭环 / checkout 路由（内部入口 dist/cli.js launch，见 7.2）
-│   ├── cli.ts             # tut CLI 入口：21 个子命令（全量语法见 src/cli.ts 顶部 USAGE）
+│   ├── cli.ts             # tut CLI 入口：含 stdio MCP 桥接子命令（全量语法见 src/cli.ts 顶部 USAGE）
 │   ├── server.ts          # tut serve：启动 MCP + /state（Notifier 由 tut notify 独立运行）
+│   ├── mcp-bridge.ts      # tut mcp：归属验证、stdio ↔ HTTP、断线重连
 │   ├── mcp.ts             # 5 个 MCP 工具的 schema 和 handler
 │   ├── state-machine.ts   # 派生规则（纯函数）+ waiting_for 计算
 │   ├── store.ts           # 文件读写、版本、并发队列
@@ -550,6 +559,7 @@ take-ur-turn/
 
 CLI 全量语法以 `src/cli.ts` 的 USAGE 为准。以下入口的关键契约：
 
+- `mcp`：stdio ↔ HTTP 接入桥，发现与归属验证、重连/退出语义见 4.3.1。
 - `watch`：退出码 0 = 轮次边界（含 pending_approval）、1 = 操作错误、2 = approved / closed 终态、3 = needs_attention；已处于终态或待处置时立即退出。
 - `ack`：追加 human ack note，是 3.2 的异常复位入口，不修改既有记录。
 - `status`：输出一次性状态总览。

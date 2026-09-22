@@ -132,20 +132,32 @@ Notifier 的辅通道（blocked 即时告警、done 交叉验证）依赖 Herdr 
 
 ## Agent CLI 接入（一次性）
 
-Hub 以 **Streamable HTTP** 暴露 MCP 工具，端点 `http://127.0.0.1:3001/mcp`（`tut serve` 起来后即在线；stateless 形态，无会话流）。每个要参与协作的 Agent CLI 配置一次：
+使用安装版 `tut mcp` 作为 **stdio** MCP Server。它发现当前 workspace 所属的 Hub，验证 `hub_root` 后桥接其 Streamable HTTP `/mcp` 端点。先在所属 workspace 执行 `tut up` 启动 Hub。
 
 **Codex CLI**（`~/.codex/config.toml`）：
 
 ```toml
 [mcp_servers.tut]
-url = "http://127.0.0.1:3001/mcp"
+command = "tut"
+args = ["mcp"]
 ```
 
-其他支持 Streamable HTTP 的 MCP 客户端：配置同一 URL 即可。
+其他 stdio MCP 客户端使用相同 command / args。客户端须在目标 workspace 启动命令；若不能保证工作目录，用 server 级 env 钉定所属 Hub 根（任务 worktree 可以共享该根）：
+
+```toml
+[mcp_servers.tut.env]
+TUT_HUB_ROOT = "/absolute/path/to/workspace"
+```
+
+填 workspace 目录，不是 `.context-hub` 子目录。全局钉根意味着明确选择一个 workspace，切换项目时须移除或修改。`TUT_HUB_URL` 可提供首选本机 Hub 基础 URL；归属仍须匹配 `TUT_HUB_ROOT` 或 cwd 推导出的根，否则沿 CLI 同源的 3001–3199 奇数 Hub 端口有界扫描。
+
+**从固定 HTTP URL 迁移**：将旧 `url = "http://127.0.0.1:3001/mcp"` 替换为上面的 command / args（不要同时保留），按需设置根，再重启客户端 MCP 连接。固定 URL 仍可供 HTTP 客户端使用，但绕过 workspace discovery，多 rig 时可能静默把写入路由到另一 workspace。TUT 不自动修改用户配置。
+
+桥在每次 HTTP 请求前复验归属，断线后按 250/500/1000/2000/4000ms 五次有界退避重新发现，支持同根 Hub 重启换端口。中断的工具调用不重放：写入可能已落盘，重试前先 read 核实。诊断只写 stderr，stdout 专用于 MCP。退出码：0 = stdin EOF，1 = 参数/内部错误，2 = 初始连接/归属验证失败，3 = 重连耗尽；SIGINT/SIGTERM 为 130/143。失败后启动正确 Hub，再重启 MCP 连接。
 
 配好后 Agent 会看到 5 个工具：`context.create` / `context.publish` / `context.read` / `context.list` / `context.decide`。
 
-**不支持 MCP over HTTP 的 CLI**：走等价的 CLI 通道——`tut create / publish / read / list / decide` 子命令与 MCP 工具一一对应，Agent 经 shell 调用即可（skills 里各角色的「工具速查」表（MCP | CLI 对照）就是为这类 CLI 准备的；两类通道可混用，同一任务里各角色各走各的通道完全兼容）。
+**不支持 MCP 的 CLI**：走等价的 CLI 通道——`tut create / publish / read / list / decide` 子命令与 MCP 工具一一对应，Agent 经 shell 调用即可（skills 里各角色的「工具速查」表（MCP | CLI 对照）就是为这类 CLI 准备的；两类通道可混用，同一任务里各角色各走各的通道完全兼容）。
 
 **无 MCP 配置能力的环境**（如某些会话的沙箱限制）：同上走 CLI 通道兜底。
 
@@ -323,7 +335,7 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 
 **排障**：
 
-- **Agent 说看不到 context.* 工具**：确认 `tut serve` 在跑（`curl http://127.0.0.1:3001/state` 有响应即活）；确认该 CLI 的 MCP 配置指向 `/mcp` 端点；个别 CLI 会话可能被沙箱挡住 localhost 回连——此时让该 Agent 改用 CLI 通道（`tut read` / `tut publish`），行为完全等价
+- **Agent 说看不到 context.* 工具**：在目标 workspace 执行 `tut status` 确认所属 Hub 可达；确认 MCP 配置在正确 workspace 运行 `tut mcp`（或钉定 `TUT_HUB_ROOT`）；个别 CLI 会话可能被沙箱挡住 localhost 回连——此时让该 Agent 改用 CLI 通道（`tut read` / `tut publish`），行为完全等价
 - **3001 端口被占用（EADDRINUSE）**：在目标 workspace 运行 `tut up`。它会验证 Hub 归属，发现该 workspace 的既有本地 Hub；默认端口对被占用时，从 3003/3004 起选择空闲端口对供给自己的 Hub/notifier。普通 CLI 也会发现所属 Hub；显式 `--url` 指向 foreign Hub 会被拒绝。手工指定地址可用 `tut serve --port <n>` 与 `--url`，挪事件端口用 `--event-port`（Hub 与事件端口不能相同）。复用 Hub 不代表 notifier 在相邻端口：`up` 通过 notifier 的 `hub_root` 与 `hub_url` 确认归属，保留 3101/3002 及自动分配的端口对。缺少身份字段的旧 notifier 需升级/重启；移动事件端口前先停止已有 notifier。
 - **启动锁错误**：`another up (pid N) is provisioning` 表示应等待该次启动完成；只有确认没有其它 `tut up` 实例在运行后，才可删除提示中的 `.context-hub/up.lock` 并重试。`cannot verify startup lock` 可能是锁文件损坏，也可能撞上初次写入的竞态：先重试；若持续失败，检查锁内容并确认没有其它 `tut up` 在运行后再删除。`startup lock recovery in progress` 表示另一个实例正在接管陈旧锁：先重试；若接管已中断，检查提示中的 `.context-hub/up.lock.reclaim` 目录，仅在确认没有其它 `tut up` 在运行后删除该目录。
 - **`npm i -g` 后自定义的阵容丢了**——已解决：阵容存于项目（`.context-hub/workspace.json`）或用户级（`~/.config/tut/`），升级不动它们。迁移步骤见[配置 ②](#-工作区阵容--三级解析链项目--用户--内置)
