@@ -2140,6 +2140,9 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
 // --- done-event pane sweep (supply hardening) ---------------------------------------
 
 describe("done-event pane sweep: final screens archived into the notify log", () => {
+  // These pane fixtures belong to cwd, even when a nested worktree has a parent Hub.
+  beforeEach(() => vi.stubEnv("TUT_HUB_ROOT", process.cwd()));
+  afterEach(() => vi.unstubAllEnvs());
   const T1_EXEC = { pane_id: "w11:p6", label: rigLabel("t1.executor", process.cwd()) };
   const T1_REV = { pane_id: "w11:p3", label: rigLabel("t1.reviewer", process.cwd()) };
   const INVENTORY = [
@@ -3837,6 +3840,9 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
 });
 
 describe("notifier rig isolation", () => {
+  // These pane fixtures belong to cwd, even when a nested worktree has a parent Hub.
+  beforeEach(() => vi.stubEnv("TUT_HUB_ROOT", process.cwd()));
+  afterEach(() => vi.unstubAllEnvs());
   it("ignores foreign rig events and scopes done sweeps even for identical task ids", async () => {
     const own = rigLabel("t1.executor", process.cwd());
     const foreign = rigLabel("t1.executor", "/foreign-rig");

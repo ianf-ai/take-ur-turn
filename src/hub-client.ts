@@ -207,7 +207,7 @@ function mcpEndpoint(url: string): URL {
  * (the per-request bound), composed with the transport's own abort signal (close must
  * still win immediately). AbortSignal.any: Node ≥ 20.3.
  */
-function timeoutFetch(timeoutMs: number): HubFetch {
+export function timeoutFetch(timeoutMs: number): HubFetch {
   return (input: string | URL, init?: RequestInit) => {
     const timeout = AbortSignal.timeout(timeoutMs);
     const signal = init?.signal !== undefined && init.signal !== null

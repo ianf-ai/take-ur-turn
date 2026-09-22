@@ -34,9 +34,6 @@ take-ur-turn/
 
 ## 开发约定
 
-- 开发机全局 `tut` 命令必须指向安装版（`npm i -g take-ur-turn`），禁止 npm-link 到仓库 live dist——并发 build 会中断所有 tut 消费者（含 TUT 自身迭代时的 hub/launcher）。
-
-
 - 完成编码后必须运行测试/构建验证，不允许只改代码不验证就交差
 - 状态派生规则以 `design/system-design.md` 3.1 节的规则表为准，修改规则属于设计变更，先在 system-design.md 中更新
 - MCP 工具的输入输出 schema 保持向后兼容；破坏性变更需在任务中明确说明
