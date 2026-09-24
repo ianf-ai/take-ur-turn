@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { derive, foldOntoCursor, initialCursor } from "../src/state-machine.js";
-import type { ContextRecord, DerivedState, Flow } from "../src/types.js";
+import { derive, foldOntoCursor, initialCursor } from "../src/hub/state-machine.js";
+import type { ContextRecord, DerivedState, Flow } from "../src/common/types.js";
 
 /**
  * Golden vectors are the single source of truth ("double

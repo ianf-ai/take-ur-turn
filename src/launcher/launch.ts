@@ -7,11 +7,11 @@
  * without adding a new content type or state transition.
  */
 
-import { hubPublish, hubRead, type HubPublishResult } from "./hub-client.js";
-import { commandHead, commandArgs } from "./agent-command.js";
-import { resolveAgentRouteWithSource } from "./workspace.js";
-import type { ResolveOptions } from "./workspace.js";
-import type { AgentRoute, Cast, CheckoutRoute, ContextRecord, LaunchMarkerProjection, LaunchRouteSource } from "./types.js";
+import { hubPublish, hubRead, type HubPublishResult } from "../hub/hub-client.js";
+import { commandHead, commandArgs } from "../common/agent-command.js";
+import { resolveAgentRouteWithSource } from "../common/workspace.js";
+import type { ResolveOptions } from "../common/workspace.js";
+import type { AgentRoute, Cast, CheckoutRoute, ContextRecord, LaunchMarkerProjection, LaunchRouteSource } from "../common/types.js";
 
 export type LaunchVia = "start-next" | "auto";
 

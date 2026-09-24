@@ -16,7 +16,7 @@ import {
   type CheckoutProvider,
 } from "../src/launcher/checkout.js";
 import { resolveWorkspaceSnapshot, type PaneListSource } from "../src/launcher/anchor.js";
-import type { HerdrPane } from "../src/launcher/herdr-client.js";
+import type { HerdrPane } from "../src/launcher/legacy-herdr-client.js";
 
 const hubPane: HerdrPane = {
   pane_id: "w1:p0",

@@ -41,7 +41,7 @@ import type {
   AgentRoute,
   LaunchInvocation,
   PosixDirectPlan,
-} from "../types.js";
+} from "../common/types.js";
 
 /** A route target could not be resolved to an executable this launcher may run. */
 export class AgentTargetError extends Error {

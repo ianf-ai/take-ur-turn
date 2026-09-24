@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { acquireRigStartLock } from "../src/rig-lock.js";
+import { acquireRigStartLock } from "../src/hub/rig-lock.js";
 
 let root: string;
 let file: string;

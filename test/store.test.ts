@@ -9,17 +9,17 @@ import path from "node:path";
  * tables; state-machine golden vectors live in state-machine.test.ts.
  * DerivedState is returned; real integration happens in seam.test.ts.
  */
-vi.mock("../src/state-machine.js", async (importOriginal) => {
+vi.mock("../src/hub/state-machine.js", async (importOriginal) => {
   // derive stays spied (call passthrough assertions) but REAL — the store's
   // folds run through the real incremental fold exports, so meta
   // and list entries carry true derived state in this file.
-  const actual = await importOriginal<typeof import("../src/state-machine.js")>();
+  const actual = await importOriginal<typeof import("../src/hub/state-machine.js")>();
   return { ...actual, derive: vi.fn(actual.derive) };
 });
 
-import { Store, StoreError } from "../src/store.js";
-import { derive } from "../src/state-machine.js";
-import { ErrorCode, type ContextRecord, type Flow, type Payload } from "../src/types.js";
+import { Store, StoreError } from "../src/hub/store.js";
+import { derive } from "../src/hub/state-machine.js";
+import { ErrorCode, type ContextRecord, type Flow, type Payload } from "../src/common/types.js";
 import { createHash } from "node:crypto";
 
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;

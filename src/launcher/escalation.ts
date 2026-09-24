@@ -1,79 +1,74 @@
-/**
- * Delivery give-up escalation: the launcher's voice on the Notifier's event
- * port (system-design 7.2.1 step 5, consumed by 6.1).  When the bounded
- * submit-retry window exhausts, the round prompt sits unconsumed in the
- * pane's input box and the agent never started; the launcher still exits 0
- * (a failure exit would re-trigger duplicate delivery), so without this
- * event the only immediate trace is the stderr diagnostics line forwarded
- * to the notify pane — nobody outside the machine learns until the 30-minute
- * stall watchdog fires.
- *
- * Transport mirrors scripts/on-agent-event.mjs (the canonical signal-source
- * entry): POST {event, agent, pane} as JSON with a 2s AbortController
- * timeout; URL resolution is TUT_EVENT_PORT_URL (non-empty override) over
- * the http://127.0.0.1:3002/agent-event default.  The body ADDITIVELY
- * carries the give-up evidence (box / transport / probe — the same triple
- * the give-up diag line reports): the event vocabulary is frozen, additive
- * fields are the documented integration path (7.2.1 step 5), so older
- * consumers still validate the three base fields.  Best-effort, never
- * throws: a lost escalation degrades to the existing stderr diagnostics +
- * stall watchdog, never to a changed delivery outcome.
- */
+/** Best-effort delivery escalation. Exit zero does not confirm consumption. */
+import type { DeliveryEvidenceV2 } from "./delivery.js";
+import { DEFAULT_NOTIFIER_EVENT_URL } from "../hub/rig-discovery.js";
 
-/** Last input-box observation carried by the give-up event (7.2.1
- *  three-state discipline): only box=held may claim the prompt still sits
- *  in the composer. */
+/** Historical input-box diagnostics; never authorize manual submission. */
 export type GiveUpBoxEvidence = "held" | "cleared" | "unknown";
 
-/** Relay visibility for the last Enter (diagnostic only — never a submit
- *  confirmation). */
-/**
- * "not-attempted" marks give-ups that never reached the submit phase
- * (land-never-observed: zero Enters, zero probes) — printing "unavailable"
- * there masqueraded a never-run probe as a broken relay and misled the
- * 0.7.0 real-machine triage into a false "pipe chain dead" finding.
- */
+/** Historical relay values accepted only for old event parsing. */
 export type GiveUpProbeEvidence = "observed" | "failed" | "unavailable" | "not-attempted";
 
-/**
- * Evidence fields on a delivery_giveup event body.  `box` is the last
- * input-box observation, `transport` the last Enter control call's
- * outcome; `probe` is optional — legacy payloads and producers without a
- * relay omit it, and consumers must degrade conservatively on ANY missing
- * field (box evidence unknown → inspect the pane first).
- */
+/** Legacy event evidence retained for compatibility only. */
 export interface GiveUpEvidence {
   box: GiveUpBoxEvidence;
   transport: boolean;
   probe?: GiveUpProbeEvidence;
 }
 
-/**
- * The three-state actionable guidance, word for word THE contract shared
- * by the launcher's give-up stderr and the notifier's alert copy (7.2.1
- * step 5): only box=held may direct a manual Enter; cleared means the
- * text left the box but the submit is unconfirmed — the round may
- * already have started, never a blind Enter; unknown degrades to the
- * conservative inspect-the-pane hint.  Callers add their own truthful,
- * source-specific diagnostic prefixes around these strings (the launcher
- * knows WHY a reading failed, the notifier only knows evidence is
- * absent); the guidance itself lives here so the two channels cannot
- * drift.
- */
-export function giveUpGuidance(box: GiveUpBoxEvidence): string {
-  if (box === "held") {
-    return "the prompt is still visible in the input box; press Enter there manually to start the round";
-  }
-  if (box === "cleared") {
-    return "the text has left the input box but the submit is unconfirmed; check whether the round has already started before pressing anything — do not press Enter blindly";
-  }
-  return "inspect the pane and press Enter there manually only if the prompt is still visible in the input box";
+/** Historical box arguments are accepted but never authorize an Enter. */
+export function giveUpGuidance(_box?: GiveUpBoxEvidence): string {
+  return "delivery unconfirmed; inspect the target pane. Press Enter manually once only after confirming the target is still the expected Agent, the prompt remains in the input box, and no control calls are outstanding; if the box is empty or work has started, inspect this round first — do not press Enter blindly or automatically resend";
 }
 
-/** The event emitted when a delivery's submit-retry window exhausts. */
+const transportFaults = new Set(["INVALID_ARGUMENT", "NOT_STARTED", "SPAWN_FAILED", "EXIT_ERROR", "SIGNAL", "TIMEOUT", "ABORTED", "INVALID_ACK", "INTERNAL"]);
+const readFaults = new Set([...transportFaults, "INVALID_JSON", "INVALID_SHAPE", "PANE_MISSING", "PANE_DUPLICATE", "IDENTITY_CHANGED", "STATUS_MISSING", "STATUS_INVALID", "LATE_RESULT", "WRONG_SEQUENCE"]);
+const reasons = new Set(["text-uncertain", "enter-not-sent", "enter-uncertain", "identity-invalid", "baseline-working", "baseline-unknown", "attribution-unavailable", "status-unavailable", "deadline", "cancelled"]);
+const statuses = new Set(["idle", "working", "blocked", "done", "unknown"]);
+const member = (set: Set<string>, value: unknown): boolean => typeof value === "string" && set.has(value);
+const nonnegative = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+/** Validate the optional block atomically; malformed additions do not reject an event. */
+export function parseDeliveryV2(value: unknown): DeliveryEvidenceV2 | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const v = value as Record<string, unknown>;
+  if (v.schema !== 2 || typeof v.attempt_id !== "string" || !v.attempt_id.trim() ||
+      typeof v.pane_id !== "string" || !v.pane_id.trim() || !member(reasons, v.reason) ||
+      !member(statuses, v.status_before) || !member(statuses, v.status_last) ||
+      !(v.status_error === null || member(readFaults, v.status_error)) || typeof v.status_flip !== "boolean" ||
+      v.submit_confirmed !== false || v.attribution !== "unavailable" || (v.text_calls !== 0 && v.text_calls !== 1) ||
+      (v.enter_calls !== 0 && v.enter_calls !== 1) || !nonnegative(v.budget_ms) || !nonnegative(v.total_elapsed_ms) ||
+      !(v.last_query_sequence === null || (typeof v.last_query_sequence === "number" && Number.isSafeInteger(v.last_query_sequence) && v.last_query_sequence > 0)) ||
+      v.detector_source !== null || v.detector_age_ms !== null || v.server_epoch !== null || v.agent_generation !== null) return undefined;
+  if (v.baseline_wait !== undefined) {
+    const wait = v.baseline_wait as Record<string, unknown> | null;
+    if (!wait || typeof wait !== 'object' || Array.isArray(wait) ||
+        !nonnegative(wait.budget_ms) || !nonnegative(wait.elapsed_ms)) return undefined;
+  }
+  if (v.text_calls === 0) {
+    if (v.text_transport !== 'not-sent' || v.text_error !== null || v.enter_calls !== 0 || v.status_flip ||
+        !['baseline-unknown', 'identity-invalid', 'cancelled', 'deadline'].includes(String(v.reason))) return undefined;
+  } else if (v.reason === "text-uncertain") {
+    if (v.text_transport !== "uncertain" || !member(transportFaults, v.text_error) || v.enter_calls !== 0) return undefined;
+  } else if (v.text_transport !== "sent" || v.text_error !== null) return undefined;
+  if (v.enter_calls === 0) {
+    if (v.enter_transport !== "not-attempted" || v.enter_error !== null || v.elapsed_ms !== null) return undefined;
+  } else {
+    if (!nonnegative(v.elapsed_ms)) return undefined;
+    if (v.enter_transport === "sent") {
+      if (v.enter_error !== null) return undefined;
+    } else if ((v.enter_transport !== "not-sent" && v.enter_transport !== "uncertain") || !member(transportFaults, v.enter_error)) return undefined;
+  }
+  if (v.status_flip && (!(v.status_before === "idle" || v.status_before === "blocked" || v.status_before === "done") ||
+      v.status_last !== "working" || v.enter_transport !== "sent" || v.status_error !== null ||
+      !nonnegative(v.elapsed_ms) || v.elapsed_ms >= v.budget_ms)) return undefined;
+  if (v.reason === "attribution-unavailable" && !v.status_flip) return undefined;
+  return v as unknown as DeliveryEvidenceV2;
+}
+
+/** The event emitted when a delivery attempt remains unconfirmed. */
 export const DELIVERY_GIVEUP_EVENT = "delivery_giveup" as const;
 
-const DEFAULT_EVENT_URL = "http://127.0.0.1:3002/agent-event";
+const DEFAULT_EVENT_URL = DEFAULT_NOTIFIER_EVENT_URL;
 const ESCALATION_TIMEOUT_MS = 2000;
 
 /** Same resolution rule as on-agent-event.mjs: env override, else default. */
@@ -90,7 +85,7 @@ export type EscalationDispatch = "sent" | "failed";
  * programming error of the injected fetch seam can throw.
  */
 export async function postAgentEvent(
-  evt: { event: string; agent: string; pane: string } & GiveUpEvidence,
+  evt: { event: string; agent: string; pane: string } & Partial<GiveUpEvidence> & { delivery_v2?: DeliveryEvidenceV2 },
   url: string,
   options: { timeoutMs?: number; fetchImpl?: typeof fetch } = {},
 ): Promise<EscalationDispatch> {

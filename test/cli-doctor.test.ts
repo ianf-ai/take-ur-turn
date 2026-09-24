@@ -1,7 +1,8 @@
 // This suite isolates doctor rendering; endpoint identity is covered separately.
-vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
-  resolveCliHubUrl: async (url: string) => url,
+vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+  resolveCliHubUrl: vi.fn(async (url: string) => url),
+  resolveRigRoot: vi.fn(() => "/owning/rig"),
 }));
 
 // tut doctor CLI wiring (0.7.0). The doctor module itself is
@@ -16,13 +17,14 @@ vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../src/doctor.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/doctor.js")>()),
+vi.mock("../src/doctor/index.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/doctor/index.js")>()),
   runDoctor: vi.fn(),
 }));
 
+import { resolveCliHubUrl } from "../src/hub/rig-discovery.js";
 import { DEFAULT_HUB_URL, USAGE, main, parseArgs } from "../src/cli.js";
-import { renderDoctorReport, runDoctor, type DoctorReport } from "../src/doctor.js";
+import { renderDoctorReport, runDoctor, type DoctorReport } from "../src/doctor/index.js";
 
 function captureIo(): { out: () => string; err: () => string; restore: () => void } {
   let outText = "";
@@ -124,8 +126,27 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
     const code = await main(["doctor", "--root", "/tmp/hub-x", "--url", "http://127.0.0.1:3999"]);
 
     expect(code).toBe(0);
-    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ root: "/tmp/hub-x", url: "http://127.0.0.1:3999" });
+    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ hubRoot: "/owning/rig", root: "/tmp/hub-x", url: "http://127.0.0.1:3999" });
     expect(io.out()).toBe(`${renderDoctorReport(report)}\n`);
+  });
+
+  it("passes the discovered Hub and frozen owning root together", async () => {
+    vi.mocked(resolveCliHubUrl).mockResolvedValueOnce("http://127.0.0.1:3003");
+    vi.mocked(runDoctor).mockResolvedValue(fixtureReport());
+    await main(["doctor"]);
+    expect(resolveCliHubUrl).toHaveBeenLastCalledWith(DEFAULT_HUB_URL, false, "/owning/rig");
+    expect(runDoctor).toHaveBeenCalledWith({ root: ".context-hub", hubRoot: "/owning/rig", url: "http://127.0.0.1:3003" });
+  });
+
+  it("preserves offline reporting when the Hub identity handshake fails", async () => {
+    const error = new Error("foreign hub");
+    vi.mocked(resolveCliHubUrl).mockRejectedValueOnce(error);
+    vi.mocked(runDoctor).mockResolvedValue(fixtureReport({ hub: "fail", notifier: "fail" }));
+    expect(await main(["doctor", "--json"])).toBe(1);
+    const options = vi.mocked(runDoctor).mock.calls[0]![0]!;
+    expect(options.hubRoot).toBe("/owning/rig");
+    await expect(options.fetchImpl!("http://127.0.0.1:3001/state")).rejects.toBe(error);
+    expect(JSON.parse(io.out()).checks).toHaveLength(8);
   });
 
   it("defaults to .context-hub and the default hub URL", async () => {
@@ -133,7 +154,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
 
     await main(["doctor"]);
 
-    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ root: ".context-hub", url: DEFAULT_HUB_URL });
+    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ hubRoot: "/owning/rig", root: ".context-hub", url: DEFAULT_HUB_URL });
   });
 
   it("maps report.ok=false to exit 1 while still rendering the FULL report", async () => {

@@ -40,9 +40,9 @@ import {
   StreamableHTTPServerTransport,
   type StreamableHTTPServerTransportOptions,
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { autoSectionOf, readConfig, writeFlowMode } from "./config.js";
-import { createMcpServer } from "./mcp.js";
-import { ErrorCode, PROJECT_TASK_ID, type AgentRoute, type Cast, type CheckoutRoute, type Flow } from "./types.js";
+import { autoSectionOf, readConfig, writeFlowMode } from "../common/config.js";
+import { createMcpServer } from "../mcp/server.js";
+import { ErrorCode, PROJECT_TASK_ID, type AgentRoute, type Cast, type CheckoutRoute, type Flow } from "../common/types.js";
 import { Store, StoreError, type RecoverRecordInput, type RepairMetaInput } from "./store.js";
 
 export interface RequestHandlerDeps {

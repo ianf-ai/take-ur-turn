@@ -1,3 +1,4 @@
+import { readConfig, autoSectionOf } from '../common/config.js';
 /**
  * POSIX-compatible launcher execution used by the internal `launch` entry.
  *
@@ -7,8 +8,8 @@
  * a .sh file.
  */
 
-import { rigLabel, rigEnvironment } from "../rig.js";
-import { canonicalRoot, resolveRigRoot } from "../rig-discovery.js";
+import { rigLabel, rigEnvironment } from "../hub/rig.js";
+import { canonicalRoot, resolveRigRoot } from "../hub/rig-discovery.js";
 import {
   buildLaunchInvocation,
   explicitRouteFromValues,
@@ -25,31 +26,31 @@ import { cleanupTaskPanes, runRoundLifecycle, type LifecycleClient } from "./lif
 import {
   createDelivery,
   createDeliveryDiagnostics,
-  type DeliveryClient,
-  type DeliveryProbeDispatch,
+  boundedCleanup,
+  type DeliveryEvidenceV2,
+  parseDeliveryKnobs,
+  type DeliveryOutcome,
 } from "./delivery.js";
-import { createDeliveryProbeChannel, deliveryProbeEndpoint } from "./probe-channel.js";
 import { DELIVERY_GIVEUP_EVENT, eventPortUrlOf, postAgentEvent, type GiveUpEvidence } from "./escalation.js";
 import { birthCwdOf } from "./checkout.js";
 import {
   renderPaneCommand,
-  defaultPaneRuntime,
-  encodePaneRunnerPayload,
   resolvePaneShellDialect,
   type PaneCommand,
   type RenderedPaneCommand,
   type ShellDialect,
 } from "./shell-renderer.js";
-import { normalizeAgentRoute } from "../agent-command.js";
+import { normalizeAgentRoute } from "../common/agent-command.js";
 import {
   defaultUserConfigDir,
   readWorkspaceConfigSnapshot,
   resolveAgentRouteWithSource,
   resolveTabLabelTemplateFromSnapshot,
   type WorkspaceConfigSnapshot,
-} from "../workspace.js";
+} from "../common/workspace.js";
 import { requireBirthAnchor, resolveExecutionContext } from "./anchor.js";
-import { HerdrClient } from "./herdr-client.js";
+import { paneIdentityFrom, type PaneIdentity } from "./herdr-client-v2.js";
+import { HerdrClient } from "./legacy-herdr-client.js";
 import type {
   AgentCommand,
   AgentRoute,
@@ -59,12 +60,12 @@ import type {
   LaunchNaming,
   LaunchRequest,
   LaunchRouteSource,
-} from "../types.js";
+} from "../common/types.js";
 import type { LaunchEntry } from "./entry.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { HerdrPane } from "./herdr-client.js";
-import type { LaunchAnchor } from "../types.js";
+import type { HerdrPane } from "./legacy-herdr-client.js";
+import type { LaunchAnchor } from "../common/types.js";
 
 interface HerdrResult {
   code: number | null;
@@ -86,7 +87,15 @@ async function herdr(args: readonly string[]): Promise<HerdrResult> {
 
 async function paneList(): Promise<{ panes: HerdrPane[]; usable: boolean; error?: string }> {
   try {
-    return { panes: (await herdrClient.paneList()).panes, usable: true };
+    // Keep the raw identity fields that the legacy tolerant pane adapter drops.
+    const response = await herdrClient.command(["pane", "list"]);
+    if (response.code !== 0) throw new Error("pane list failed");
+    let parsed;
+    try { parsed = JSON.parse(response.stdout); } catch { throw new Error("pane list returned invalid JSON"); }
+    if (parsed === null || typeof parsed !== "object" || parsed.error || parsed.result?.error) throw new Error("invalid pane list");
+    const rows = Array.isArray(parsed) ? parsed : (parsed.result ?? parsed).panes;
+    if (!Array.isArray(rows)) throw new Error("invalid pane list");
+    return { panes: rows.filter(row => row && typeof row.pane_id === "string"), usable: true };
   } catch (error) {
     return { panes: [], usable: false, error: (error as Error).message };
   }
@@ -97,23 +106,6 @@ const lifecycleClient: LifecycleClient = {
   closePane: async (paneId) => await herdr(["pane", "close", paneId]),
 };
 
-/** Delivery seam: every read is a visible-source read, every send a raw
- *  argv call; failures degrade to ""/false inside the delivery module. */
-export function createDeliveryClient(
-  command: (args: readonly string[]) => Promise<HerdrResult>,
-  options: { probe?: (paneId: string, marker: string) => Promise<DeliveryProbeDispatch> } = {},
-): DeliveryClient {
-  return {
-    readPane: async (paneId) => {
-      const result = await command(["pane", "read", paneId, "--source", "visible", "--lines", "40"]);
-      return result.code === 0 ? result.stdout : "";
-    },
-    sendText: async (paneId, text) => (await command(["pane", "send-text", paneId, text])).code === 0,
-    sendKeys: async (paneId, key) => (await command(["pane", "send-keys", paneId, key])).code === 0,
-    ...(options.probe === undefined ? {} : { sendProbe: options.probe }),
-  };
-}
-
 /** Render one invocation's platform plan into the pane command text.
  *
   POSIX keeps the bare executable, Windows plans carry their resolved
@@ -121,7 +113,6 @@ export function createDeliveryClient(
 export function renderInvocationPaneCommand(
   invocation: LaunchInvocation,
   dialect: ShellDialect,
-  probeEndpoint?: string,
 ): RenderedPaneCommand {
   const plan = invocation.posix_direct !== undefined
     ? invocation.posix_direct
@@ -139,25 +130,7 @@ export function renderInvocationPaneCommand(
     dialect,
     purpose: "agent",
   };
-  if (probeEndpoint === undefined) return renderPaneCommand(agentCommand);
-
-  const runtime = defaultPaneRuntime();
-  const probeRunnerEntry = runtime.probeRunnerEntry;
-  if (probeRunnerEntry === undefined) throw new Error("probe relay runtime entry is unavailable");
-  const relayCommand: PaneCommand = {
-    cwd: agentCommand.cwd,
-    executable: runtime.nodeExecutable,
-    args: [
-      probeRunnerEntry,
-      "--socket", probeEndpoint,
-      "--dialect", dialect,
-      "--payload", encodePaneRunnerPayload(agentCommand),
-    ],
-    env: {},
-    dialect,
-    purpose: "agent",
-  };
-  return renderPaneCommand(relayCommand, runtime);
+  return renderPaneCommand(agentCommand);
 }
 
 function renderTabLabel(template: string, role: string, taskId: string, agent: string): string {
@@ -361,20 +334,14 @@ function createGiveUpEscalation(options: {
   agent: string;
   pane: string;
   env: NodeJS.ProcessEnv;
-}): (paneId: string, evidence: GiveUpEvidence) => Promise<void> {
+}): (paneId: string, evidence: Readonly<DeliveryEvidenceV2>) => Promise<void> {
   const url = eventPortUrlOf(options.env);
   return async (_paneId, evidence) => {
-    const dispatch = await postAgentEvent(
-      {
-        event: DELIVERY_GIVEUP_EVENT,
-        agent: options.agent,
-        pane: options.pane,
-        box: evidence.box,
-        transport: evidence.transport,
-        ...(evidence.probe === undefined ? {} : { probe: evidence.probe }),
-      },
-      url,
-    );
+    // The existing serializer accepts arbitrary additive fields at runtime.
+    // C owns widening its legacy-only TypeScript input and consumer parser.
+    const event = { event: DELIVERY_GIVEUP_EVENT, agent: options.agent,
+      pane: options.pane, delivery_v2: evidence };
+    const dispatch = await postAgentEvent(event as typeof event & GiveUpEvidence, url);
     if (dispatch !== "sent") {
       process.stderr.write(
         `launch: delivery give-up escalation to ${url} failed (event dropped; stderr diagnostics and the stall watchdog remain)\n`,
@@ -384,6 +351,7 @@ function createGiveUpEscalation(options: {
 }
 
 async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
+  const deadlineMonoMs = performance.now() + 170_000;
   if (entry.kind === "cleanup") {
     process.stderr.write(`launch: cleanup — reaping panes of task '${entry.task_id}' requested (best-effort; inventory failures may leave panes open)\n`);
     await cleanupTaskPanes({
@@ -411,22 +379,8 @@ async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
   }
   const invocation = await buildLegacyInvocation(entry.request, entry.invocation);
   let rendered: RenderedPaneCommand;
-  // The probe endpoint mixes the hub root into its digest: the same
-  // task id living in two independent hubs must never share a relay endpoint
-  // — the newer relay would steal it (or, on named pipes, split marker
-  // traffic into the wrong pane). A placeholder root (dry-run context) carries
-  // no instance; dry-run computes no endpoint at all.
-  const probeEndpoint = dryRun()
-    ? undefined
-    : deliveryProbeEndpoint(
-      invocation.task_id,
-      invocation.role,
-      process.env,
-      process.platform,
-      invocation.context.hubRoot.startsWith("<") ? undefined : invocation.context.hubRoot,
-    );
   try {
-    rendered = renderInvocationPaneCommand(invocation, dialect, probeEndpoint);
+    rendered = renderInvocationPaneCommand(invocation, dialect);
   } catch (error) {
     process.stderr.write(`launch: ${(error as Error).message}\n`);
     return 1;
@@ -454,11 +408,8 @@ async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
     role: invocation.role,
     ...(invocation.context.hubRoot.startsWith("<") ? {} : { persistRootFallback: invocation.context.hubRoot }),
   });
-  const probeChannel = probeEndpoint === undefined ? undefined : createDeliveryProbeChannel({ endpoint: probeEndpoint });
-  const client = createDeliveryClient(herdr, {
-    ...(probeChannel === undefined ? {} : { probe: async (_paneId, marker) => await probeChannel.send(marker) }),
-  });
-  // Give-up escalation (7.2.1): when the submit-retry window exhausts, the
+  const client = herdrClient.deliveryV2;
+  // Give-up escalation: every unconfirmed attempt posts the frozen evidence. The
   // launcher posts a delivery_giveup agent event so the notifier escalates
   // through the configured channels immediately instead of leaving the
   // round silent until the stall watchdog.  The event's pane field carries
@@ -471,18 +422,36 @@ async function runCompatLaunchImpl(entry: LaunchEntry): Promise<number> {
         pane: invocation.naming.pane_label,
         env: { ...process.env, ...(invocation.posix_direct ?? invocation.effective_agent)?.env },
       });
+  const config = dryRun() ? null : await readConfig(path.join(invocation.context.hubRoot, ".context-hub"));
+  const remediationMode = autoSectionOf(config)?.remediate ?? (config?.flow_mode === "auto" ? "enter-repress" : "off");
   const delivery = createDelivery({
+    remediationEvidence: remediationMode === "enter-repress",
     client,
     diagnostics,
     env: process.env,
-    probeDialect: dialect,
+    deadlineMonoMs,
     ...(escalateGiveUp !== undefined ? { onGiveUp: escalateGiveUp } : {}),
   });
   try {
     return await runDeliveredRound(entry, invocation, anchor, delivery, rendered.command_text);
   } finally {
-    await diagnostics.flush();
+    await boundedCleanup(() => diagnostics.flush(), 2000);
   }
+}
+
+/** Boolean lifecycle seam means handled, never confirmed. Preserve/log the outcome here. */
+function handled(outcome: DeliveryOutcome): boolean {
+  try {
+    if (outcome.exitCode === 0) process.stderr.write("launch attempt completed; delivery confirmation is not implied\n");
+    else process.stderr.write(`launch: ${outcome.reason}; inspect the pane before another attempt\n`);
+  } catch { /* Diagnostic failure must not invite another delivery. */ }
+  return outcome.exitCode === 0;
+}
+function previewDelivery(pane: string, textPreview: string, branch: 'born' | 'continuation'): void {
+  process.stdout.write(`DRY-RUN: status-before ${pane} via herdr pane list (wait up to ${parseDeliveryKnobs(process.env).readyMs}ms before any input; ${branch === 'born' ? 'born: after working wait for idle, timeout uses final probe (unknown or invalid: no input)' : 'continuation: first classifiable baseline, working sends immediately'}; bounded by launcher deadline)\n`);
+  process.stdout.write(textPreview);
+  process.stdout.write(`DRY-RUN: herdr pane send-keys ${pane} Enter (at most once)\n`);
+  process.stdout.write(`DRY-RUN: status-observed ${pane} via herdr pane list; TUT_STATUS_FLIP_TIMEOUT_MS=${process.env.TUT_STATUS_FLIP_TIMEOUT_MS ?? "30000"}, TUT_STATUS_POLL_MS=${process.env.TUT_STATUS_POLL_MS ?? "250"}; bounded monotonic deadline; working-observed requires manual inspection (attribution unavailable)\n`);
 }
 
 async function runDeliveredRound(
@@ -511,15 +480,10 @@ async function runDeliveredRound(
     stderr: (text) => process.stderr.write(text),
     onContinuation: async (existing) => {
       if (dryRun()) {
-        process.stdout.write(`DRY-RUN: herdr pane send-text ${existing.pane_id} "${invocation.prompt}"\n`);
-        process.stdout.write(`DRY-RUN: text-land check ${existing.pane_id} (timeout ${process.env.TUT_TEXT_LAND_TIMEOUT_MS ?? "5000"}ms; prompt-fragment match, NEW instance vs pre-send baseline; prompt carries a per-delivery nonce suffix for attribution)\n`);
-        process.stdout.write(`DRY-RUN: on land: herdr pane send-keys ${existing.pane_id} Enter\n`);
-        process.stdout.write(`DRY-RUN: on land: delivery probe ${existing.pane_id} (out-of-band shell relay + one read; never writes probe text to the Agent TUI; diagnostic only — never confirms nor blocks the submit)\n`);
-        process.stdout.write(`DRY-RUN: on land: submit verify ${existing.pane_id} (ONE monotonic budget: ${process.env.TUT_SUBMIT_RETRY_TIMEOUT_MS ?? "30000"}ms total from the first Enter; initial observation ≤ min(${process.env.TUT_SUBMIT_TIMEOUT_MS ?? "3000"}ms, budget) by transport+box-cleared; bounded Enter resend loop — interval ${process.env.TUT_SUBMIT_RETRY_MS ?? "1500"}ms within the remaining budget, probe diagnostic-only; exhaustion → evidence-based manual-fallback note, still exit 0)\n`);
-        process.stdout.write(`DRY-RUN: on land-timeout: NO Enter, NO probe — observe-only wait for a late landing (same new-instance rule) within the remaining ${process.env.TUT_SUBMIT_RETRY_TIMEOUT_MS ?? "30000"}ms budget; exhausted without the text → give-up reason=land-never-observed (attempts=0) + escalation\n`);
+        previewDelivery(existing.pane_id, `DRY-RUN: herdr pane send-text ${existing.pane_id} "${invocation.prompt}"\n`, 'continuation');
         return true;
       }
-      return await delivery.deliver({ paneId: existing.pane_id, prompt: invocation.prompt, branch: "continuation" });
+      return handled(await delivery.deliver({ target: paneIdentityFrom(existing as unknown as Record<string, unknown>), prompt: invocation.prompt, branch: "continuation" }));
     },
     onBirth: async () => {
       const birthAnchor = anchor ?? invocation.context.anchor;
@@ -553,16 +517,16 @@ async function runDeliveredRound(
   if (lifecycle.kind !== "birth" || lifecycle.pane_id === undefined) return 1;
   if (dryRun()) {
     const target = `<label:${paneLabel}>`;
-    process.stdout.write(`DRY-RUN: ready-probe ${target} (born pane; floor ${process.env.TUT_READY_FLOOR_MS ?? "1500"}ms, timeout ${process.env.TUT_READY_TIMEOUT_MS ?? "15000"}ms, quiescence ${process.env.TUT_READY_STABLE_POLLS ?? "4"}×poll identical samples)\n`);
-    process.stdout.write(`DRY-RUN: herdr pane send-text ${target} (agent '${route.agent}', label '${paneLabel}') "${invocation.prompt}"\n`);
-    process.stdout.write(`DRY-RUN: text-land check ${target} (timeout ${process.env.TUT_TEXT_LAND_TIMEOUT_MS ?? "5000"}ms; prompt-fragment match, NEW instance vs pre-send baseline; prompt carries a per-delivery nonce suffix for attribution)\n`);
-    process.stdout.write(`DRY-RUN: on land: herdr pane send-keys ${target} Enter\n`);
-    process.stdout.write(`DRY-RUN: on land: delivery probe ${target} (out-of-band shell relay + one read; never writes probe text to the Agent TUI; diagnostic only — never confirms nor blocks the submit)\n`);
-    process.stdout.write(`DRY-RUN: on land: submit verify ${target} (ONE monotonic budget: ${process.env.TUT_SUBMIT_RETRY_TIMEOUT_MS ?? "30000"}ms total from the first Enter; initial observation ≤ min(${process.env.TUT_SUBMIT_TIMEOUT_MS ?? "3000"}ms, budget) by transport+box-cleared; bounded Enter resend loop — interval ${process.env.TUT_SUBMIT_RETRY_MS ?? "1500"}ms within the remaining budget, probe diagnostic-only; exhaustion → evidence-based manual-fallback note, still exit 0)\n`);
-    process.stdout.write(`DRY-RUN: on land-timeout: NO Enter, NO probe — observe-only wait for a late landing (same new-instance rule) within the remaining ${process.env.TUT_SUBMIT_RETRY_TIMEOUT_MS ?? "30000"}ms budget; exhausted without the text → give-up reason=land-never-observed (attempts=0) + escalation\n`);
+    previewDelivery(target, `DRY-RUN: herdr pane send-text ${target} (agent '${route.agent}', label '${paneLabel}') "${invocation.prompt}"\n`, 'born');
     return 0;
   }
-  return (await delivery.deliver({ paneId: lifecycle.pane_id, prompt: invocation.prompt, branch: "born" })) ? 0 : 1;
+  // Capture the created pane's available identity before freezing the attempt.
+  // This is target selection, never a readiness check.
+  const snapshot = await paneList();
+  const matches = snapshot.panes.filter(p => p.pane_id === lifecycle.pane_id);
+  if (!snapshot.usable || matches.length !== 1) return 1;
+  const target: PaneIdentity = paneIdentityFrom(matches[0] as unknown as Record<string, unknown>);
+  return handled(await delivery.deliver({ target, prompt: invocation.prompt, branch: "born" })) ? 0 : 1;
 }
 
 /** Recompute the digest from a private plan for child/marker consistency tests. */

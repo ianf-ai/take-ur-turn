@@ -20,7 +20,7 @@ import {
   type PaneRuntimeOptions,
 } from "../src/launcher/shell-renderer.js";
 import { posixDirectPlanFor } from "../src/launcher/target-resolver.js";
-import { HerdrClient, type HerdrClientOptions } from "../src/launcher/herdr-client.js";
+import { HerdrClient, type HerdrClientOptions } from "../src/launcher/legacy-herdr-client.js";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 

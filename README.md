@@ -90,6 +90,8 @@ tut up
 tut init
 ```
 
+**Delivery confirmation v2:** born and continuing panes receive the original prompt at most once, with at most one Enter and bounded status observation. Even a transition to working cannot attribute consumption to this input (`attribution-unavailable`); exit 0 is not confirmation. No automatic resend occurs. Inspect the expected Agent, visible input and outstanding control calls before manually pressing Enter once; if input has cleared or work has started, inspect the round first. `TUT_STATUS_FLIP_TIMEOUT_MS` defaults to 30000 (1–60000ms); `TUT_STATUS_POLL_MS` defaults to min(250, flip budget), within 1–flip budget. Each v2 call has a 10s maximum, clipped to the remaining deadline. See [the delivery contract](design/system-design.md#721-投递机制delivery-confirmation-v2-单次尝试与有界观察).
+
 **Kick off a task** (two steps on the initiating side — the task exists before any delivery, and the first round is an ordinary round):
 
 ```bash

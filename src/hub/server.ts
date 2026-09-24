@@ -9,7 +9,7 @@
  */
 
 import { type Server, createServer } from "node:http";
-import { ensureConfig } from "./config.js";
+import { ensureConfig } from "../common/config.js";
 import { createRequestHandler } from "./http.js";
 import { Store } from "./store.js";
 

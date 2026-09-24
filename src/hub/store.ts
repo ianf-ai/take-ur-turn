@@ -15,8 +15,8 @@ import {
   type Status,
   type WaitingFor,
   type Warning,
-} from "./types.js";
-import { AgentCommandError, validateAgentRoute } from "./agent-command.js";
+} from "../common/types.js";
+import { AgentCommandError, validateAgentRoute } from "../common/agent-command.js";
 import { WAITING_FOR_BASE, derive, foldOntoCursor, initialCursor, type FoldCursor } from "./state-machine.js";
 
 /**
@@ -44,7 +44,7 @@ export class StoreError extends Error {
  * package.json version of the running build, stamped as `tut_version` onto
  * every record this store appends (system-design 4.2 — one write door, both
  * serve and CLI land here). Resolved lazily, once per process, relative to
- * the compiled module (dist/../package.json; repo root under vitest).
+ * the compiled module (dist/hub/../../package.json; repo root under vitest).
  * Undefined (field omitted) when the manifest is missing or unreadable —
  * an honest gap, never a fabricated value. Dev-branch caveat: one manifest
  * version covers uncommitted changes, so it approximates the build identity.
@@ -55,7 +55,7 @@ function tutVersionOfBuild(): string | undefined {
   if (!buildTutVersionResolved) {
     buildTutVersionResolved = true;
     try {
-      const manifestPath = fileURLToPath(new URL("../package.json", import.meta.url));
+      const manifestPath = fileURLToPath(new URL("../../package.json", import.meta.url));
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { version?: unknown };
       if (typeof manifest.version === "string" && manifest.version.length > 0) {
         buildTutVersion = manifest.version;

@@ -156,6 +156,16 @@ describe("config get (effective values)", () => {
 });
 
 describe("config set (validated, key-preserving writes)", () => {
+  it("auto.remediate reports the effective defaults and the saved switch", async () => {
+    expect(await main(["config", "get", "auto.remediate", "--root", root])).toBe(0);
+    expect(io.out()).toContain("off");
+    await main(["config", "set", "flow_mode", "auto", "--root", root]);
+    await main(["config", "get", "auto.remediate", "--root", root]);
+    expect(io.out()).toContain("enter-repress");
+    expect(await main(["config", "set", "auto.remediate", "off", "--root", root])).toBe(0);
+    expect(io.out()).toContain("auto.remediate = off");
+    expect(JSON.parse(readFileSync(configFile(), "utf8")).auto.remediate).toBe("off");
+  });
   it("set flow_mode on a missing config creates the file", async () => {
     expect(await main(["config", "set", "flow_mode", "auto", "--root", root])).toBe(0);
     expect(io.out()).toContain("flow_mode = auto");

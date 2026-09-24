@@ -12,29 +12,26 @@
 // by the notifier (src/notifier.ts), so a missing file launches agents without
 // their role skill. That is the same packaging-risk class as 0.5.0, so the
 // gate enumerates all of them explicitly.
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// dist/cli.js keeps the 10KB heuristic from the 0.5.0 incident; the runners
-// only need to exist, be regular files (symlinks to regular files count —
+// dist/cli.js: the 10KB heuristic from the 0.5.0 incident assumed the
+// pre-reorganization monolith; cli.ts is now a thin dispatcher (~6KB compiled), so the
+// guard only needs to catch empty/truncated builds. The runners still only
+// need to exist, be regular files (symlinks to regular files count —
 // statSync follows them; a directory passes neither test), and be non-empty.
 const RUNTIME_ENTRIES = [
   {
     rel: path.join("dist", "cli.js"),
     why: "bin entry (package.json bin)",
-    minBytes: 10_000,
+    minBytes: 2_000,
   },
   {
     rel: path.join("dist", "launcher", "pane-runner.js"),
     why: "rendered into pane commands by absolute path (src/launcher/shell-renderer.ts defaultPaneRuntime) — missing means every pane birth flash-crashes",
-    minBytes: 1,
-  },
-  {
-    rel: path.join("dist", "launcher", "probe-runner.js"),
-    why: "agent-birth probe entry, rendered into pane commands by absolute path (src/launcher/shell-renderer.ts defaultPaneRuntime)",
     minBytes: 1,
   },
   ...["architect", "executor", "reviewer", "host"].map((role) => ({
@@ -63,6 +60,14 @@ for (const { rel, why, minBytes } of RUNTIME_ENTRIES) {
     console.error(
       `assert-release: ${rel} is suspiciously small (${size} bytes, expected >= ${minBytes}) — the build likely did not complete. Run \`npm run build\` and retry.`,
     );
+    failed = true;
+  }
+}
+// Retirement regression gate: tsc does not remove stale build products.
+for (const name of existsSync(path.join(root, "dist", "launcher"))
+  ? readdirSync(path.join(root, "dist", "launcher")) : []) {
+  if (/^probe-(runner|channel)\.(?:js|d\.ts|map|js\.map|d\.ts\.map)$/.test(name)) {
+    console.error(`assert-release: retired artifact dist/launcher/${name} must not enter the package; remove stale build products and rebuild.`);
     failed = true;
   }
 }

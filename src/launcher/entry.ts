@@ -5,7 +5,7 @@ import {
   requestFromLegacyArgs,
 } from "./invocation.js";
 import { runCompatLaunch } from "./compat.js";
-import type { LaunchInvocation, LaunchRequest } from "../types.js";
+import type { LaunchInvocation, LaunchRequest } from "../common/types.js";
 
 export type LaunchEntry =
   | { kind: "cleanup"; task_id: string }

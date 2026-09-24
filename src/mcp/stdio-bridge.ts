@@ -6,8 +6,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ErrorCode, McpError, ResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { HUB_FETCH_TIMEOUT_MS, timeoutFetch } from "./hub-client.js";
-import { canonicalRoot, probeHub, resolveCliHubUrl, resolveRigRoot } from "./rig-discovery.js";
+import { HUB_FETCH_TIMEOUT_MS, timeoutFetch } from "../hub/hub-client.js";
+import { canonicalRoot, probeHub, resolveCliHubUrl, resolveRigRoot } from "../hub/rig-discovery.js";
 
 export interface BridgeOptions {
   url: string;

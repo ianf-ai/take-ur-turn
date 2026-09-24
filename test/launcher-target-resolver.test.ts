@@ -1,11 +1,11 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
 }));
 
 import { agentFixture } from "./rig-fixtures.js";
-import { rigLabel } from "../src/rig.js";
+import { rigLabel } from "../src/hub/rig.js";
 /**
  * Platform target resolution (launcher port design §3) — the unit-3 seam.
  *
@@ -28,14 +28,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // The start-next wiring test mocks the Hub client the same way as
 // test/cli-start-next.test.ts: the door must fail its Windows target pre-check
 // BEFORE the launch marker (hubPublish must never fire).
-vi.mock("../src/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub-client.js")>()),
+vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
 }));
 
 import { main } from "../src/cli.js";
-import { hubPublish, hubRead } from "../src/hub-client.js";
+import { hubPublish, hubRead } from "../src/hub/hub-client.js";
 
 import {
   AgentTargetError,
@@ -55,7 +55,7 @@ import {
 } from "../src/launcher/target-resolver.js";
 import { buildLaunchInvocation, deserializeLaunchInvocation, serializeLaunchInvocation, targetDigest } from "../src/launcher/invocation.js";
 import { runLaunchEntry } from "../src/launcher/entry.js";
-import type { AgentCommand, LaunchInvocation } from "../src/types.js";
+import type { AgentCommand, LaunchInvocation } from "../src/common/types.js";
 
 // --- Windows fixtures --------------------------------------------------------------
 

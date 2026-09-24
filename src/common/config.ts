@@ -29,6 +29,7 @@ export type FlowMode = "manual" | "auto";
  */
 export interface AutoConfig {
   launch_roles: string[];
+  remediate?: "off" | "enter-repress";
 }
 
 /** Extend-only tolerance: unknown extra keys are preserved and ignored. */
@@ -209,9 +210,14 @@ export function autoSectionOf(config: Config | null | undefined): AutoConfig | u
   const candidate = config?.auto;
   if (typeof candidate !== "object" || candidate === null) return undefined;
   const roles = (candidate as { launch_roles?: unknown }).launch_roles;
-  if (roles === undefined) return { launch_roles: [] };
-  if (!Array.isArray(roles) || !roles.every((role) => typeof role === "string")) return undefined;
-  return { launch_roles: roles };
+  if (candidate.remediate !== undefined && candidate.remediate !== "off" && candidate.remediate !== "enter-repress") {
+    process.stderr.write('tut: invalid auto.remediate (expected "off" | "enter-repress"); using "off"\n');
+  }
+  const remediate = candidate.remediate === undefined ? {} : { remediate: candidate.remediate === "enter-repress" ? "enter-repress" as const : "off" as const };
+  if (roles === undefined) return { launch_roles: [], ...remediate };
+  if (!Array.isArray(roles) || !roles.every((role) => typeof role === "string"))
+    return candidate.remediate === undefined ? undefined : { launch_roles: [], ...remediate };
+  return { launch_roles: roles, ...remediate };
 }
 
 /**
@@ -245,16 +251,17 @@ export async function writeFlowMode(root: string, mode: FlowMode): Promise<Confi
 // (same discipline as tut assign editing workspace.json directly).
 
 /** Scalar-settable config keys exposed to `tut config set`. */
-export type ConfigKey = "flow_mode" | "auto.launch_roles";
+export type ConfigKey = "flow_mode" | "auto.launch_roles" | "auto.remediate";
 
 /** All keys `tut config set` accepts, in hint-listing order. */
-export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles"];
+export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles", "auto.remediate"];
 
 /** One typed key/value pair ready to apply (discriminated so writeConfigKey narrows). */
-export type ConfigKeyAssignment = { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] };
+export type ConfigKeyAssignment = { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] } | { key: "auto.remediate"; value: "off" | "enter-repress" };
 
 /** Legal-value domain hint for a key — used by `tut config` error text and help. */
 export function configKeyDomain(key: ConfigKey): string {
+  if (key === "auto.remediate") return '"off" | "enter-repress"';
   return key === "flow_mode"
     ? '"manual" | "auto"'
     : `comma-separated bare role names (${KNOWN_ROLES.join("|")}), e.g. ${KNOWN_ROLES.join(",")}; "" clears the whitelist`;
@@ -279,6 +286,10 @@ export function parseConfigValue(
   if (key === "flow_mode") {
     if (raw === "manual" || raw === "auto") return { ok: true, assignment: { key, value: raw } };
     return { ok: false, error: `invalid value for flow_mode: "${raw}" (expected ${configKeyDomain("flow_mode")})` };
+  }
+  if (key === "auto.remediate") {
+    if (raw === "off" || raw === "enter-repress") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for auto.remediate: "${raw}" (expected ${configKeyDomain(key)})` };
   }
   const roles: string[] = [];
   for (const piece of raw.split(",")) {
@@ -320,7 +331,13 @@ export async function writeConfigKey(root: string, assignment: ConfigKeyAssignme
       config.flow_mode = assignment.value;
     } else {
       const existing = typeof config.auto === "object" && config.auto !== null ? config.auto : {};
-      config.auto = { ...existing, launch_roles: assignment.value }; // siblings inside auto survive
+      if (assignment.key === "auto.launch_roles") {
+        config.auto = { ...existing, launch_roles: assignment.value };
+      } else if (assignment.key === "auto.remediate") {
+        config.auto = { launch_roles: [], ...existing, remediate: assignment.value };
+      } else {
+        throw new Error(`unsupported config key: ${key}`);
+      }
     }
     await mkdir(root, { recursive: true });
     await writeConfigAtomic(filePath, config);

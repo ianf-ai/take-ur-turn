@@ -27,7 +27,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-import { defaultLoadRouting } from "../src/notifier.js";
+import { defaultLoadRouting } from "../src/notifier/notifier.js";
 
 let tmp: string;
 let projectRoot: string;

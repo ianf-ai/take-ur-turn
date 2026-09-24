@@ -1,12 +1,12 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
   resolveNotifierPort: async () => 3002,
 }));
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -15,8 +15,8 @@ import path from "node:path";
 // default hub URL — not reachable in tests. The real client against a real
 // hub is covered in test/hub-client.test.ts; mode/start-next take --url and
 // are tested against a real server below.
-vi.mock("../src/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub-client.js")>()),
+vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
   hubCreate: vi.fn(),
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
@@ -26,16 +26,16 @@ vi.mock("../src/hub-client.js", async (importOriginal) => ({
 
 // The notify-clamp tests below need the handler boundary without running a
 // real Notifier loop — mock runNotify only, everything else stays real.
-vi.mock("../src/notifier.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/notifier.js")>()),
+vi.mock("../src/notifier/notifier.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/notifier/notifier.js")>()),
   runNotify: vi.fn(),
 }));
 
 import { USAGE, main, parseArgs, notifyHealthy, DEFAULT_HUB_URL, DEFAULT_EVENT_PORT, CLI_FETCH_TIMEOUT_MS } from "../src/cli.js";
-import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError } from "../src/hub-client.js";
-import { Notifier, runNotify } from "../src/notifier.js";
-import { startServer, type RunningServer } from "../src/server.js";
-import { Store } from "../src/store.js";
+import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError } from "../src/hub/hub-client.js";
+import { Notifier, runNotify } from "../src/notifier/notifier.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
+import { Store } from "../src/hub/store.js";
 import http from "node:http";
 import { readFileSync } from "node:fs";
 
@@ -853,7 +853,7 @@ describe("mode / start-next handlers (real hub)", () => {
     expect(out).toContain("DRY-RUN"); // launch.sh honored the passthrough env
     expect(out).toContain("(agent 'pi', label"); // DEFAULT_ROLES: executor → pi (chain L3)
     expect(out).toContain(created.task_id);
-    expect(out).toContain(`launched executor for ${created.task_id}`);
+    expect(out).toContain(`launch attempt completed; delivery confirmation is not implied (executor for ${created.task_id}`);
   });
 
   it("start-next blocks a duplicate launch before appending or spawning", async () => {
@@ -893,7 +893,7 @@ describe("mode / start-next handlers (real hub)", () => {
 
     expect(code).toBe(1);
     expect(io.err().split("\n")[0]).toContain("tut: ALREADY_LAUNCHED: executor launched at v2");
-    expect(io.err()).toContain("use --force to relaunch");
+    expect(io.err()).toContain("inspect this round and outstanding control calls before considering --force");
     expect(vi.mocked(hubPublish)).not.toHaveBeenCalled();
     expect(io.out()).not.toContain("DRY-RUN");
   });
@@ -1325,10 +1325,13 @@ describe("default URL/port convergence", () => {
     expect(parseArgs(["watch"])).toMatchObject({ command: "watch", url: DEFAULT_HUB_URL });
   });
 
-  it("structural guard: the quoted hub-url literal appears exactly once in src/cli.ts", () => {
+  it("structural guard: the quoted hub-url literal appears exactly once across the CLI modules", () => {
     // The constant's definition is the ONLY quoted literal; a re-forked copy
     // in a parser, handler, or rendered command trips this count.
-    const src = readFileSync(path.resolve(import.meta.dirname, "../src/cli.ts"), "utf8");
+    const cliDir = path.resolve(import.meta.dirname, "../src/cli");
+    const src = [path.resolve(cliDir, "../cli.ts"),
+      ...readdirSync(cliDir).filter(name => name.endsWith(".ts")).map(name => path.join(cliDir, name))]
+      .map(file => readFileSync(file, "utf8")).join("\n");
     expect(src.split('"http://127.0.0.1:3001"').length - 1).toBe(1);
   });
 

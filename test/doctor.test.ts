@@ -1,5 +1,6 @@
-import * as rig from "../src/rig.js";
-import { HerdrClient } from "../src/launcher/herdr-client.js";
+import * as rig from "../src/hub/rig.js";
+import { probeNotifierEvidence } from "../src/hub/rig-discovery.js";
+import { HerdrClient } from "../src/launcher/legacy-herdr-client.js";
 // tut doctor (0.7.0) — report-only environment & assembly self-check.
 // Module-stage discipline: the doctor module is exercised through runDoctor
 // with injected seams (fetchImpl / resolveTarget) against real temp-dir
@@ -15,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { AgentTargetError } from "../src/launcher/target-resolver.js";
-import { Store } from "../src/store.js";
+import { Store } from "../src/hub/store.js";
 import {
   renderDoctorReport,
   runDoctor,
@@ -23,7 +24,7 @@ import {
   type DoctorCheck,
   type DoctorOptions,
   type DoctorReport,
-} from "../src/doctor.js";
+} from "../src/doctor/index.js";
 
 // --- fixture helpers -------------------------------------------------------------
 
@@ -98,7 +99,7 @@ function healthyRoot(): string {
 function fixtureEnv(): { env: NodeJS.ProcessEnv; userDir: string } {
   const userDir = path.join(tmp, "user-config");
   mkdirSync(userDir, { recursive: true });
-  return { env: { TUT_USER_CONFIG_DIR: userDir }, userDir };
+  return { env: { TUT_USER_CONFIG_DIR: userDir, TUT_HUB_ROOT: path.join(tmp, "proj") }, userDir };
 }
 
 const RESOLVED_TARGET_OK = { platform: "posix", posix_direct: { agent: "stub" } } as unknown;
@@ -122,12 +123,12 @@ function healthyFetch(hubBody?: Record<string, unknown>): typeof fetch {
     const url = urlOf(input);
     if (url.includes("/state")) {
       return new Response(
-        JSON.stringify(hubBody ?? { flow_mode: "manual", tasks: [{ task_id: "demo-task", needs_attention: false }] }),
+        JSON.stringify(hubBody === undefined ? { hub_root: path.join(tmp, "proj"), flow_mode: "manual", tasks: [{ task_id: "demo-task", needs_attention: false }] } : { hub_root: path.join(tmp, "proj"), ...hubBody }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }
-    if (url.includes("/agent-event")) {
-      return new Response("method not allowed: use POST /agent-event", { status: 405, headers: { Allow: "POST" } });
+    if (url === "http://127.0.0.1:3002/agent-event") {
+      return new Response(JSON.stringify({ hub_root: path.join(tmp, "proj"), hub_url: "http://127.0.0.1:3001" }), { status: 405, headers: { Allow: "POST" } });
     }
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
@@ -226,7 +227,7 @@ describe("tut doctor hub check", () => {
 // --- check 2: notifier -------------------------------------------------------------
 
 describe("tut doctor notifier check", () => {
-  it("warns (not fails) when nothing listens on the event port", async () => {
+  it("fails when nothing listens on the event port", async () => {
     const opts = baseOptions(healthyRoot());
     opts.fetchImpl = (async (input: unknown) => {
       const url = urlOf(input);
@@ -234,10 +235,10 @@ describe("tut doctor notifier check", () => {
       return healthyFetch()(input as never);
     }) as unknown as typeof fetch;
     const report = await runDoctor(opts);
-    expect(report.ok).toBe(true);
+    expect(report.ok).toBe(false);
     const notifier = check(report, "notifier");
-    expect(notifier.status).toBe("warn");
-    expect(notifier.fix).toContain("tut notify");
+    expect(notifier.status).toBe("fail");
+    expect(notifier.fix).toContain("tut up");
   });
 
   it("fails when a non-notifier service occupies the event port", async () => {
@@ -251,12 +252,13 @@ describe("tut doctor notifier check", () => {
     expect(report.ok).toBe(false);
     const notifier = check(report, "notifier");
     expect(notifier.status).toBe("fail");
-    expect(notifier.summary).toContain("EADDRINUSE");
-    expect(notifier.fix).toContain("TUT_EVENT_PORT_URL");
+    expect(notifier.details.join(" ")).toContain("not the Notifier");
+    expect(notifier.fix).toContain("tut up");
   });
 
   it("fails statically when the hub URL and event port collide", async () => {
     const opts = baseOptions(healthyRoot());
+    opts.environment.TUT_EVENT_PORT_URL = "http://localhost:3002/agent-event";
     opts.url = "http://127.0.0.1:3002"; // hub on the notifier's default event port
     const report = await runDoctor(opts);
     const notifier = check(report, "notifier");
@@ -512,15 +514,6 @@ describe("tut doctor paths check", () => {
     expect(check(reportHostile, "paths").details.join("\n")).toContain("metacharacters");
   });
 
-  it("warns when TUT_DELIVERY_PROBE_DIR overflows sun_path", async () => {
-    const opts = baseOptions(healthyRoot());
-    opts.environment = { ...opts.environment, TUT_DELIVERY_PROBE_DIR: `/tmp/${"d".repeat(85)}` };
-    opts.platform = "darwin";
-    const report = await runDoctor(opts);
-    const paths = check(report, "paths");
-    expect(paths.status).toBe("warn");
-    expect(paths.details.join("\n")).toContain("sun_path");
-  });
 });
 
 // --- check 7: platform -----------------------------------------------------------------
@@ -543,11 +536,11 @@ describe("tut doctor platform check", () => {
     expect(platform.fix).toContain("TUT_PANE_SHELL");
   });
 
-  it("lists env knobs and the TUT_SUBMIT_RETRY_TIMEOUT_MS hint", async () => {
+  it("lists status observation env knobs", async () => {
     const report = await runDoctor(baseOptions(healthyRoot()));
     const text = check(report, "platform").details.join("\n");
-    expect(text).toContain("TUT_SUBMIT_RETRY_TIMEOUT_MS unset");
-    expect(text).toContain("TUT_SUBMIT_RETRY_TIMEOUT_MS raised");
+    expect(text).toContain("TUT_STATUS_FLIP_TIMEOUT_MS unset");
+    expect(text).toContain("TUT_STATUS_POLL_MS unset");
   });
 });
 
@@ -1107,5 +1100,163 @@ describe("rig hash collision diagnosis", () => {
     try {
       expect(check(await runDoctor(baseOptions(healthyRoot())), "paths").status).toBe("ok");
     } finally { hash.mockRestore(); list.mockRestore(); }
+  });
+});
+
+// Ownership fixtures route exact URLs: unknown ports never impersonate a notifier.
+describe("notifier ownership discovery", () => {
+  function setup(options: {
+    ownPorts?: number[]; explicit?: string | undefined; hubRoot?: unknown; hubDown?: boolean;
+    identity?: unknown; raw?: string; timeout?: boolean;
+  } = {}) {
+    const opts = baseOptions(healthyRoot());
+    opts.url = "http://127.0.0.1:3003";
+    opts.environment.TUT_EVENT_PORT_URL = options.explicit;
+    const root = path.join(tmp, "proj");
+    const requests: Array<{ url: string; init?: RequestInit | undefined }> = [];
+    opts.fetchImpl = (async (input, init) => {
+      const url = urlOf(input);
+      requests.push({ url, init });
+      const parsed = new URL(url);
+      if (parsed.pathname === "/state") {
+        if (options.hubDown) throw new Error("offline");
+        return Response.json({ flow_mode: "manual", tasks: [], hub_root: options.hubRoot === undefined ? root : options.hubRoot });
+      }
+      if (parsed.pathname !== "/agent-event") return new Response("wrong path", { status: 404 });
+      if (parsed.port === "3002") return Response.json({ hub_root: "/foreign/rig", hub_url: "http://127.0.0.1:3001" }, { status: 405, headers: { Allow: "POST" } });
+      if ((options.ownPorts ?? [3004]).includes(Number(parsed.port))) {
+        if (options.timeout) return await new Promise<Response>((_, reject) => init!.signal!.addEventListener("abort", () => reject(new Error("timeout")), { once: true }));
+        return new Response(options.raw ?? JSON.stringify(options.identity ?? { hub_root: root, hub_url: opts.url }), { status: 405, headers: { Allow: "POST" } });
+      }
+      throw new Error("connection refused");
+    }) as typeof fetch;
+    return { opts, root, requests };
+  }
+
+  it.each([undefined, ""])("finds 3004 and reports foreign 3002 with override %s", async explicit => {
+    const { opts, root, requests } = setup({ explicit });
+    const before = snapshotTree(tmp);
+    const report = await runDoctor(opts);
+    const result = check(report, "notifier");
+    expect(result.status).toBe("ok");
+    expect(result.summary).toContain(":3004/agent-event");
+    expect(result.details.join(" ")).toContain("非本 workspace（来自 /foreign/rig）");
+    expect(result.details.join(" ")).toContain(":3002/agent-event");
+    expect(result.details.join(" ")).toContain(root);
+    expect(snapshotTree(tmp)).toEqual(before);
+    expect(requests.every(r => !r.init?.method || r.init.method === "GET")).toBe(true);
+    expect(requests.every(r => r.init?.redirect === "manual")).toBe(true);
+    expect(new Set(requests.map(r => r.url)).size).toBe(requests.length);
+    expect(JSON.parse(JSON.stringify(report))).toEqual(report);
+    expect(renderDoctorReport(report)).toContain(result.summary);
+  });
+
+  it.each([false, true])("fails if own notifier is unavailable (timeout=%s), despite foreign signature", async timeout => {
+    const { opts, root } = setup({ ownPorts: timeout ? [3004] : [], timeout });
+    const report = await runDoctor(opts);
+    expect(report.ok).toBe(false);
+    expect(check(report, "notifier").status).toBe("fail");
+    expect(check(report, "notifier").fix).toContain(root);
+    expect(check(report, "notifier").fix).toContain("tut up");
+    expect(check(report, "notifier").summary).not.toContain("3004");
+  });
+
+  it.each([3018, 45002])("finds a non-adjacent notifier at %s", async port => {
+    const { opts } = setup({ ownPorts: [port], explicit: port > 3200 ? `http://127.0.0.1:${port}/agent-event` : undefined });
+    const result = check(await runDoctor(opts), "notifier");
+    expect(result.status).toBe("ok");
+    expect(result.summary).toContain(`:${port}/agent-event`);
+  });
+
+  it.each([
+    {}, { hub_root: "relative", hub_url: "http://127.0.0.1:3003" },
+    { hub_root: "/foreign/rig", hub_url: "http://127.0.0.1:3003" },
+  ])("rejects missing or foreign identity %j", async identity => {
+    const { opts } = setup({ identity });
+    expect(check(await runDoctor(opts), "notifier").status).toBe("fail");
+  });
+
+  it.each(["http://127.0.0.1:3001", "not a URL"])("rejects stale or malformed Hub identity %s", async hub_url => {
+    const { root } = setup();
+    const other = setup({ identity: { hub_root: root, hub_url } });
+    expect(check(await runDoctor(other.opts), "notifier").status).toBe("fail");
+  });
+
+  it("reports invalid JSON as unknown ownership", async () => {
+    const { opts } = setup({ raw: "{bad" });
+    const result = check(await runDoctor(opts), "notifier");
+    expect(result.status).toBe("fail");
+    expect(result.details.join(" ")).toContain("invalid JSON");
+  });
+
+  it.each([null, "relative", "/foreign/rig"])("never pairs a notifier when Hub root is %s", async hubRoot => {
+    const { opts } = setup({ hubRoot });
+    const report = await runDoctor(opts);
+    expect(check(report, "hub").status).toBe("fail");
+    expect(check(report, "notifier").status).toBe("fail");
+    expect(report.checks).toHaveLength(8);
+  });
+
+  it("never pairs a notifier when Hub is offline", async () => {
+    const { opts } = setup({ hubDown: true });
+    expect(check(await runDoctor(opts), "notifier").status).toBe("fail");
+  });
+
+  it("normalizes roots and loopback aliases without counting aliases twice", async () => {
+    const { root } = setup();
+    const { opts, requests } = setup({ explicit: "http://localhost:3004/agent-event", identity: { hub_root: `${root}/../proj`, hub_url: "http://[::1]:3003/anything" } });
+    const result = check(await runDoctor(opts), "notifier");
+    expect(result.status).toBe("ok");
+    expect(requests.filter(r => new URL(r.url).port === "3004")).toHaveLength(1);
+  });
+
+  it("reports duplicate owned endpoints", async () => {
+    const { opts } = setup({ ownPorts: [3004, 3012] });
+    const result = check(await runDoctor(opts), "notifier");
+    expect(result.status).toBe("fail");
+    expect(result.summary).toContain("multiple notifiers");
+    expect(result.summary).toContain("3012");
+    expect(result.summary).toContain("3004");
+  });
+
+  it.each(["not a URL", "http://127.0.0.1:3002/agent-event", "http://127.0.0.1:3004/wrong", "http://localhost:3003/agent-event", "http://127.0.0.1:45001/agent-event"])("explicit misroute %s fails even when 3004 is healthy", async explicit => {
+    const { opts } = setup({ explicit });
+    const result = check(await runDoctor(opts), "notifier");
+    expect(result.status).toBe("fail");
+    expect(result.fix).toContain("TUT_EVENT_PORT_URL");
+    expect(result.details.join(" ")).toContain("verified workspace notifier endpoint(s): http://127.0.0.1:3004/agent-event");
+  });
+
+  it("resolves module ownership from injected TUT_HUB_ROOT, independently of project/storage roots", async () => {
+    const { opts, root } = setup();
+    opts.environment.TUT_PROJECT_ROOT = "/unrelated/worktree";
+    opts.root = path.join(tmp, "other-storage");
+    const result = check(await runDoctor(opts), "notifier");
+    expect(result.status).toBe("ok");
+    expect(result.details.join(" ")).toContain(root);
+  });
+});
+
+
+describe("read-only notifier probe boundaries", () => {
+  it.each([200, 302, 404])("rejects HTTP %s without following redirects", async status => {
+    const fetchImpl = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      expect(init?.redirect).toBe("manual");
+      expect(init?.method).toBe("GET");
+      return new Response("not notifier", { status, headers: { Location: "http://127.0.0.1:3004/agent-event" } });
+    });
+    expect((await probeNotifierEvidence("http://127.0.0.1:3002/agent-event", fetchImpl as typeof fetch)).outcome).toBe("occupied");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds response-body reads as well as header reads", async () => {
+    const fetchImpl = (async (_input, init) => new Response(new ReadableStream({
+      start(controller) {
+        init!.signal!.addEventListener("abort", () => controller.error(new Error("body timeout")), { once: true });
+      },
+    }), { status: 405, headers: { Allow: "POST" } })) as typeof fetch;
+    const result = await probeNotifierEvidence("http://127.0.0.1:3004/agent-event", fetchImpl);
+    expect(result.identity).toEqual({});
+    expect(result.detail).toContain("body unreadable/timeout");
   });
 });

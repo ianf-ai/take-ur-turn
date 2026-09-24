@@ -90,6 +90,8 @@ tut up
 tut init
 ```
 
+**Delivery confirmation v2 投递**：新生与延续 pane 均最多发送一次原 prompt、一次 Enter，并有界观察状态。即使翻转到 working，也无法归因到本轮输入（`attribution-unavailable`）；exit 0 不代表提交确认，不自动重投。仅在人工确认目标仍是预期 Agent、提示仍在输入框且没有尚待执行的控制调用后，才可按一次 Enter；输入框已空或工作已开始时先核查本轮。`TUT_STATUS_FLIP_TIMEOUT_MS` 默认 30000（1–60000ms）；`TUT_STATUS_POLL_MS` 默认 min(250, flip 预算)，范围 1–flip 预算。单次 v2 调用最多 10s，并裁剪到剩余 deadline。详见 [投递合同](design/system-design.md#721-投递机制delivery-confirmation-v2-单次尝试与有界观察)。
+
 **发起一个任务**（发起侧两步——任务先于投递存在，首轮即普通轮）：
 
 ```bash

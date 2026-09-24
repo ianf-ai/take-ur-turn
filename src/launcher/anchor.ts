@@ -6,14 +6,14 @@
  * root; it is never a substitute for the Herdr anchor used for birth.
  */
 
-import { rigLabel } from "../rig.js";
+import { rigLabel } from "../hub/rig.js";
 import path from "node:path";
-import { HerdrClient, type HerdrPane } from "./herdr-client.js";
+import { HerdrClient, type HerdrPane } from "./legacy-herdr-client.js";
 import {
   resolveCheckout,
   type CheckoutProvider,
 } from "./checkout.js";
-import type { CheckoutRoute, ExecutionContext, LaunchAnchor } from "../types.js";
+import type { CheckoutRoute, ExecutionContext, LaunchAnchor } from "../common/types.js";
 
 export type AnchorSource = "tut-hub" | "tut-notify" | "split-base";
 

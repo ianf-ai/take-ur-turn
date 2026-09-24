@@ -1,6 +1,6 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
 }));
 
@@ -20,8 +20,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // that combination. The launch-log seam (readLaunchLog/markLaunched) goes
 // through hub-client, mocked the same way as test/cli.test.ts; the launcher
 // itself is the REAL scripts/launch.sh run under TUT_DRY_RUN=1.
-vi.mock("../src/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub-client.js")>()),
+vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
   hubCreate: vi.fn(),
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
@@ -30,8 +30,9 @@ vi.mock("../src/hub-client.js", async (importOriginal) => ({
 }));
 
 import { main, parseArgs } from "../src/cli.js";
-import { hubDecide, hubPublish, hubRead } from "../src/hub-client.js";
-import type { AgentRoute } from "../src/types.js";
+import { ensureNotifierEventUrl } from "../src/cli/task.js";
+import { hubDecide, hubPublish, hubRead } from "../src/hub/hub-client.js";
+import type { AgentRoute } from "../src/common/types.js";
 
 // --- parse -----------------------------------------------------------------------
 
@@ -207,7 +208,7 @@ describe("start-next no-arg default (handler, /state stubbed)", () => {
     expect(out).toContain("DRY-RUN"); // real launch.sh honored the passthrough env
     expect(out).toContain(scopedFixture("(agent 'pi', label 't-unique.executor')", "<hub-root>")); // fresh round pane (4.4)
     expect(out).toContain("t-unique");
-    expect(out).toContain("launched executor for t-unique via tut launch");
+    expect(out).toContain("launch attempt completed; delivery confirmation is not implied (executor for t-unique via tut launch");
     expect(out).not.toContain("[!!]"); // clean task: no attention marker
     // The auto-selected id flows into the launch-note guard path verbatim.
     expect(vi.mocked(hubPublish)).toHaveBeenCalledWith("http://hub.test", {
@@ -500,8 +501,6 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
       process.env.TUT_READY_POLL_MS = "20";
       process.env.TUT_READY_FLOOR_MS = "0";
       process.env.TUT_READY_TIMEOUT_MS = "300";
-      process.env.TUT_TEXT_LAND_TIMEOUT_MS = "200";
-      process.env.TUT_SUBMIT_TIMEOUT_MS = "100";
       process.env.TUT_SUBMIT_RETRIES = "2";
       return main(["start-next", "t-fresh", "--fresh", "--url", "http://hub.test"]).finally(() => {
         rmSync(herdrLog, { force: true });
@@ -511,8 +510,6 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
         delete process.env.TUT_READY_POLL_MS;
         delete process.env.TUT_READY_FLOOR_MS;
         delete process.env.TUT_READY_TIMEOUT_MS;
-        delete process.env.TUT_TEXT_LAND_TIMEOUT_MS;
-        delete process.env.TUT_SUBMIT_TIMEOUT_MS;
         delete process.env.TUT_SUBMIT_RETRIES;
         if (prev !== undefined) process.env.TUT_DRY_RUN = prev;
       });
@@ -521,7 +518,7 @@ describe("start-next --fresh: parsed and passed to the launcher (orthogonal to -
     expect(code).toBe(0);
     expect(io.err()).toContain(scopedFixture("--fresh — force-closing panes labeled 't-fresh.executor'", "/repo"));
     expect(io.err()).not.toContain("same-role continuation"); // the flag bypassed the seat
-    expect(io.out()).toContain("start-next: launched executor for t-fresh via tut launch");
+    expect(io.out()).toContain("start-next: launch attempt completed; delivery confirmation is not implied (executor for t-fresh via tut launch)");
     // Pane policy ≠ dedup policy: the launch marker was appended as usual.
     expect(vi.mocked(hubPublish)).toHaveBeenCalledWith("http://hub.test", {
       task_id: "t-fresh",
@@ -751,3 +748,153 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
     expect(io.out()).not.toContain("pane run");
   });
 });
+
+describe("manual launch notifier endpoint selection", () => {
+  it("injects the owned non-default endpoint into the start-next round launch", async () => {
+    const io = captureIo();
+    const tmp = realpathSync(mkdtempSync(path.join(os.tmpdir(), "tut-snext-event-")));
+    mkdirSync(path.join(tmp, ".context-hub"), { recursive: true });
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.TUT_HUB_ROOT;
+    const previousUserDir = process.env.TUT_USER_CONFIG_DIR;
+    const previousEventUrl = process.env.TUT_EVENT_PORT_URL;
+    const previousHerdrPanes = process.env.TUT_HERDR_PANES;
+    process.chdir(tmp);
+    process.env.TUT_HUB_ROOT = tmp;
+    process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
+    delete process.env.TUT_EVENT_PORT_URL;
+    const taskId = "t-own-event";
+    stubState([{ task_id: taskId, status: "implementing", waiting_for: "agent:executor" }]);
+    vi.mocked(hubRead).mockResolvedValue({ task_id: taskId, title: "Own event", status: "implementing", versions: [] });
+    vi.mocked(hubPublish).mockResolvedValue({ task_id: taskId, version: 1, status: "implementing", needs_attention: false });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/state") return new Response(JSON.stringify({ flow_mode: "manual", tasks: [{ task_id: taskId, status: "implementing", waiting_for: "agent:executor" }] }));
+      if (url.pathname === "/agent-event" && init?.method === "GET" && url.port === "3104") {
+        return new Response(JSON.stringify({ hub_root: tmp, hub_url: "http://hub.test:3103" }), { status: 405, headers: { Allow: "POST" } });
+      }
+      if (url.pathname === "/agent-event" && init?.method === "GET" && url.port === "3002") {
+        return new Response(JSON.stringify({ hub_root: path.join(tmp, "foreign"), hub_url: "http://foreign.test" }), { status: 405, headers: { Allow: "POST" } });
+      }
+      if (url.pathname === "/agent-event") return new Response("not a notifier", { status: 404 });
+      throw new Error(`unexpected request ${url.href}`);
+    }));
+    try {
+      const code = await withFixtureHerdr(async () => {
+        process.env.TUT_HERDR_PANES = JSON.stringify([
+          { pane_id: "FIX:p1", workspace_id: "FIX", cwd: tmp, label: "tut-hub" },
+        ]);
+        try {
+          return await withDryRun(() => main(["start-next", taskId, "--url", "http://hub.test:3103"]));
+        } finally {
+          if (previousHerdrPanes === undefined) delete process.env.TUT_HERDR_PANES;
+          else process.env.TUT_HERDR_PANES = previousHerdrPanes;
+        }
+      });
+      expect(code).toBe(0);
+      expect(io.err()).not.toContain("WARNING");
+      expect(io.out()).toContain("TUT_EVENT_PORT_URL=http://127.0.0.1:3104/agent-event");
+      expect(io.out()).not.toContain("foreign.test");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousRoot === undefined) delete process.env.TUT_HUB_ROOT;
+      else process.env.TUT_HUB_ROOT = previousRoot;
+      if (previousUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
+      else process.env.TUT_USER_CONFIG_DIR = previousUserDir;
+      if (previousEventUrl === undefined) delete process.env.TUT_EVENT_PORT_URL;
+      else process.env.TUT_EVENT_PORT_URL = previousEventUrl;
+      rmSync(tmp, { recursive: true, force: true });
+      vi.unstubAllGlobals();
+      io.restore();
+    }
+  });
+
+  it("keeps an explicit foreign URL unchanged in the start-next child environment", async () => {
+    const io = captureIo();
+    const taskId = "t-explicit-event";
+    const explicit = "http://127.0.0.1:3999/agent-event?rig=foreign";
+    const previousEventUrl = process.env.TUT_EVENT_PORT_URL;
+    process.env.TUT_EVENT_PORT_URL = explicit;
+    stubState([{ task_id: taskId, status: "implementing", waiting_for: "agent:executor" }]);
+    vi.mocked(hubRead).mockResolvedValue({ task_id: taskId, title: "Explicit event", status: "implementing", versions: [] });
+    vi.mocked(hubPublish).mockResolvedValue({ task_id: taskId, version: 1, status: "implementing", needs_attention: false });
+    try {
+      const code = await withFixtureHerdr(() => withDryRun(() => main(["start-next", taskId, "--url", "http://hub.test"])));
+      expect(code).toBe(0);
+      expect(io.out()).toContain(explicit);
+      expect(io.err()).not.toContain("WARNING");
+    } finally {
+      if (previousEventUrl === undefined) delete process.env.TUT_EVENT_PORT_URL;
+      else process.env.TUT_EVENT_PORT_URL = previousEventUrl;
+      io.restore();
+    }
+  });
+
+  it("uses discovery for the legacy tut launch entry too", async () => {
+    const io = captureIo();
+    const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-launch-event-"));
+    mkdirSync(path.join(tmp, ".context-hub"), { recursive: true });
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.TUT_HUB_ROOT;
+    const previousHubUrl = process.env.TUT_HUB_URL;
+    const previousUserDir = process.env.TUT_USER_CONFIG_DIR;
+    const previousEventUrl = process.env.TUT_EVENT_PORT_URL;
+    const previousPath = process.env.PATH;
+    process.chdir(tmp);
+    process.env.TUT_HUB_ROOT = tmp;
+    process.env.TUT_HUB_URL = "http://hub.test";
+    process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
+    process.env.PATH = `${path.resolve(import.meta.dirname, "bin")}:${previousPath ?? ""}`;
+    process.env.TUT_HERDR_PANES = "[]";
+    delete process.env.TUT_EVENT_PORT_URL;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/state") return new Response(JSON.stringify({ hub_root: tmp, tasks: [{ task_id: "t-legacy-event", flow: "direct", checkout: { kind: "current" } }] }));
+      if (url.pathname === "/agent-event" && init?.method === "GET" && url.port === "3104") {
+        return new Response(JSON.stringify({ hub_root: tmp, hub_url: "http://hub.test" }), { status: 405, headers: { Allow: "POST" } });
+      }
+      if (url.pathname === "/agent-event") return new Response("not a notifier", { status: 404 });
+      throw new Error(`unexpected request ${url.href}`);
+    }));
+    try {
+      const code = await withDryRun(() => main(["launch", "t-legacy-event", "executor", "pi"]));
+      expect(code).toBe(0);
+      expect(io.out()).toContain("3104/agent-event");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousRoot === undefined) delete process.env.TUT_HUB_ROOT;
+      else process.env.TUT_HUB_ROOT = previousRoot;
+      if (previousHubUrl === undefined) delete process.env.TUT_HUB_URL;
+      else process.env.TUT_HUB_URL = previousHubUrl;
+      if (previousUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
+      else process.env.TUT_USER_CONFIG_DIR = previousUserDir;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousEventUrl === undefined) delete process.env.TUT_EVENT_PORT_URL;
+      else process.env.TUT_EVENT_PORT_URL = previousEventUrl;
+      delete process.env.TUT_HERDR_PANES;
+      rmSync(tmp, { recursive: true, force: true });
+      vi.unstubAllGlobals();
+      io.restore();
+    }
+  });
+
+  it("warns once with fallback URL and the failed discovery reason", async () => {
+    const io = captureIo();
+    const environment: NodeJS.ProcessEnv = {};
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not a notifier", { status: 404 })));
+    try {
+      await ensureNotifierEventUrl(environment, "http://127.0.0.1:3101", "/tmp/rig-a");
+      expect(environment.TUT_EVENT_PORT_URL).toBe("http://127.0.0.1:3002/agent-event");
+      const lines = io.err().trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("WARNING");
+      expect(lines[0]).toContain("escalation will use http://127.0.0.1:3002/agent-event");
+      expect(lines[0]).toContain("does not answer as a verified Notifier");
+    } finally {
+      io.restore();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+import { realpathSync } from "node:fs";

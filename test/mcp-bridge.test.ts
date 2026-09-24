@@ -9,8 +9,8 @@ import { createInterface } from "node:readline";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { runMcpBridge, type BridgeOptions } from "../src/mcp-bridge.js";
-import { startServer, type RunningServer } from "../src/server.js";
+import { runMcpBridge, type BridgeOptions } from "../src/mcp/stdio-bridge.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
 import { parseArgs, USAGE } from "../src/cli.js";
 
 const realFetch = globalThis.fetch;

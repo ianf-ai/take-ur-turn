@@ -1,4 +1,4 @@
-import { rigLabel } from "../src/rig.js";
+import { rigLabel } from "../src/hub/rig.js";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -19,8 +19,8 @@ import {
 import { parseLaunchEntry, runLaunchEntry } from "../src/launcher/entry.js";
 import { privateDigestOf } from "../src/launcher/compat.js";
 import { cliEntryPath, DEFAULT_CHILD_TIMEOUT_MS, runInternalLaunchInvocation, runNodeCommand, type DirectSpawn } from "../src/launcher/process.js";
-import { Notifier } from "../src/notifier.js";
-import type { ContextRecord, LaunchInvocation } from "../src/types.js";
+import { Notifier } from "../src/notifier/notifier.js";
+import type { ContextRecord, LaunchInvocation } from "../src/common/types.js";
 
 function invocation(): LaunchInvocation {
   return buildLaunchInvocation({
@@ -269,10 +269,6 @@ describe("compat birth plan", () => {
       "TUT_READY_POLL_MS",
       "TUT_READY_FLOOR_MS",
       "TUT_READY_TIMEOUT_MS",
-      "TUT_TEXT_LAND_TIMEOUT_MS",
-      "TUT_SUBMIT_TIMEOUT_MS",
-      "TUT_SUBMIT_RETRY_MS",
-      "TUT_SUBMIT_RETRY_TIMEOUT_MS",
     ];
     const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]])) as Record<string, string | undefined>;
     const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -286,10 +282,6 @@ describe("compat birth plan", () => {
     process.env.TUT_READY_POLL_MS = "1";
     process.env.TUT_READY_FLOOR_MS = "0";
     process.env.TUT_READY_TIMEOUT_MS = "1";
-    process.env.TUT_TEXT_LAND_TIMEOUT_MS = "1";
-    process.env.TUT_SUBMIT_TIMEOUT_MS = "1";
-    process.env.TUT_SUBMIT_RETRY_MS = "1";
-    process.env.TUT_SUBMIT_RETRY_TIMEOUT_MS = "1";
     try {
       const base = invocation();
       const plan = buildLaunchInvocation({
@@ -327,16 +319,10 @@ describe("compat birth plan", () => {
       const herdrLines = readFileSync(herdrLog, "utf8").split("\n").filter((line) => line.length > 0);
       const runLine = herdrLines.find((line) => line.startsWith("pane run FIX:root1 "));
       expect(runLine).toBeDefined();
-      expect(runLine).toContain("probe-runner.js");
-      const token = runLine?.match(/'--payload' '([A-Za-z0-9_-]+)'/u)?.[1];
-      expect(token).toBeDefined();
-      expect(JSON.parse(Buffer.from(token ?? "", "base64url").toString("utf8"))).toMatchObject({
-        cwd: "/work/project",
-        executable: "codex",
-        args: ["--model", "fast"],
-        env: { PLAN_FLAG: "yes" },
-        purpose: "agent",
-      });
+      expect(runLine).not.toContain("probe-runner.js");
+      expect(runLine).toContain("cd -- '/work/project'");
+      expect(runLine).toContain("'codex' '--model' 'fast'");
+      expect(runLine).toContain("'PLAN_FLAG=yes'");
       expect(plan.marker_projection?.target_digest).toBe(privateDigestOf(plan));
     } finally {
       output.mockRestore();

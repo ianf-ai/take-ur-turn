@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ContextRecord } from "../src/types.js";
+import type { ContextRecord } from "../src/common/types.js";
 
-vi.mock("../src/hub-client.js", () => ({
+vi.mock("../src/hub/hub-client.js", () => ({
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
 }));
 
-import { hubPublish } from "../src/hub-client.js";
-import { launchBlocked, markLaunched, resolveLaunchTarget } from "../src/launch.js";
+import { hubPublish } from "../src/hub/hub-client.js";
+import { launchBlocked, markLaunched, resolveLaunchTarget } from "../src/launcher/launch.js";
 
 function record(
   version: number,

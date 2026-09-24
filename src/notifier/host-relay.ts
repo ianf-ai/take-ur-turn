@@ -1,6 +1,6 @@
-import { resolveRigRoot } from "./rig-discovery.js";
-import { rigLabel } from "./rig.js";
-import { HerdrClient } from "./launcher/herdr-client.js";
+import { resolveRigRoot } from "../hub/rig-discovery.js";
+import { rigLabel } from "../hub/rig.js";
+import { HerdrClient } from "../launcher/legacy-herdr-client.js";
 
 /** A signal for the host, never an instruction or an approval. */
 export interface HostStatusReport {

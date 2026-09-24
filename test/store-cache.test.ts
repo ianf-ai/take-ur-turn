@@ -53,8 +53,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-import { Store } from "../src/store.js";
-import type { ContextRecord } from "../src/types.js";
+import { Store } from "../src/hub/store.js";
+import type { ContextRecord } from "../src/common/types.js";
 
 const payload = { summary: "s", body: "b" };
 

@@ -1,3 +1,5 @@
+import { createEnterRepress, RemediationAttempts, type Remediator } from '../remediator.js';
+import { createRemediationAudit, type DeliveryDiagnostics } from '../launcher/delivery.js';
 /**
  * Notifier (system-design ch. 6). `tut notify` runs runNotify below as a daemon in a
  * dedicated pane (8.2): stdout/stderr is the log, crashes are visible.
@@ -47,11 +49,11 @@
  * flood the notify log.
  */
 
-import { canonicalRoot, resolveRigRoot } from "./rig-discovery.js";
-import { rigLabel, rigEnvironment, unscopedLabel } from "./rig.js";
+import { canonicalRoot, resolveRigRoot } from "../hub/rig-discovery.js";
+import { rigLabel, rigEnvironment, unscopedLabel } from "../hub/rig.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
-import { createChannels, type Channel, type Notification } from "./channels.js";
+import { createChannels, type Channel, type Notification } from "../common/channels.js";
 import {
   launchBlocked,
   latestRecordVersion,
@@ -59,24 +61,24 @@ import {
   readLaunchLog,
   resolveLaunchTargetWithSource,
   type LaunchVia,
-} from "./launch.js";
-import { commandHead, commandArgs } from "./agent-command.js";
-import type { GiveUpBoxEvidence, GiveUpProbeEvidence } from "./launcher/escalation.js";
-import { giveUpGuidance } from "./launcher/escalation.js";
-import { assertLaunchStateGate, bindLaunchBaseVersion, buildLaunchInvocation } from "./launcher/invocation.js";
+} from "../launcher/launch.js";
+import { commandHead, commandArgs } from "../common/agent-command.js";
+import type { GiveUpBoxEvidence, GiveUpProbeEvidence } from "../launcher/escalation.js";
+import { giveUpGuidance, parseDeliveryV2 } from "../launcher/escalation.js";
+import { assertLaunchStateGate, bindLaunchBaseVersion, buildLaunchInvocation } from "../launcher/invocation.js";
 import {
   AgentTargetError,
   UnsupportedWindowsShimError,
   planForPlatform,
   resolvePosixTargetPresence,
   type PlatformExecutionPlan,
-} from "./launcher/target-resolver.js";
-import { runInternalLaunch, runInternalLaunchInvocation, spawnDirect, DEFAULT_CHILD_TIMEOUT_MS } from "./launcher/process.js";
-import { requireBirthAnchor, resolveExecutionContext } from "./launcher/anchor.js";
-import { relayHostStatus, type HostStatusReport } from "./host-status-relay.js";
-import { HerdrClient } from "./launcher/herdr-client.js";
-import { HUB_FETCH_TIMEOUT_MS, HubSession, hubReadVia } from "./hub-client.js";
-import type { AgentCommand, AgentRoute, Cast, CheckoutRoute, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "./types.js";
+} from "../launcher/target-resolver.js";
+import { runInternalLaunch, runInternalLaunchInvocation, DEFAULT_CHILD_TIMEOUT_MS } from "../launcher/process.js";
+import { requireBirthAnchor, resolveExecutionContext } from "../launcher/anchor.js";
+import { relayHostStatus, type HostStatusReport } from "./host-relay.js";
+import { HerdrClient } from "../launcher/legacy-herdr-client.js";
+import { HUB_FETCH_TIMEOUT_MS, HubSession, hubReadVia } from "../hub/hub-client.js";
+import type { AgentCommand, AgentRoute, Cast, CheckoutRoute, ContextRecord, ExecutionContext, LaunchInvocation, LaunchMarkerProjection, LaunchRequest, LaunchRouteSource } from "../common/types.js";
 import {
   KNOWN_ROLES,
   defaultUserConfigDir,
@@ -84,7 +86,7 @@ import {
   resolveAgentRouteFromSnapshot,
   resolveTabLabelTemplateFromSnapshot,
   type WorkspaceConfigSnapshot,
-} from "./workspace.js";
+} from "../common/workspace.js";
 
 export interface NotifyOptions {
   /** Hub BASE url (default http://127.0.0.1:3001); /state is appended. */
@@ -126,6 +128,7 @@ export interface StateTask {
  *  launch_roles is optional only for tolerance — an older hub or a fixture
  *  without it behaves as an empty whitelist (withhold all). */
 export interface StateAuto {
+  remediate?: "off" | "enter-repress";
   launch_roles?: string[];
 }
 
@@ -147,40 +150,23 @@ export interface AgentEvent {
   /**
    * working / blocked / done are the agent-status events (Herdr signal
    * source).  delivery_giveup is emitted by the LAUNCHER (7.2.1): its
-   * bounded submit-retry window exhausted.  What happened to the prompt
-   * is in the optional evidence fields below — the alert copy follows
-   * them, never a fixed "press Enter" claim.
+   * bounded delivery attempt is unconfirmed. Optional v2 evidence explains
+   * the reason, but never proves prompt consumption.
    */
   event: "working" | "blocked" | "done" | "delivery_giveup";
   agent: string;
   pane: string;
-  /** Give-up evidence (7.2.1 additive fields, launcher-emitted only):
-   *  the last input-box observation and the last Enter transport result;
-   *  `probe` is the relay's diagnostic visibility.  Legacy give-up
-   *  events without them degrade to the conservative inspect-the-pane
-   *  hint. */
+  /** Optional v2 evidence is validated atomically; old fields are historical diagnostics. */
+  delivery_v2?: unknown;
   box?: GiveUpBoxEvidence;
   transport?: boolean;
   probe?: GiveUpProbeEvidence;
 }
 
-/**
- * Give-up alert copy follows the launcher's three-state evidence
- * discipline word for word (7.2.1 step 5) by consuming the SAME
- * single-source guidance as the launcher's stderr (giveUpGuidance).
- * The required core evidence pair `box + transport` is ATOMIC: only a
- * complete, well-typed pair may drive the copy — a half-valid payload
- * (one field present, the other missing or ill-typed) or box=unknown
- * itself degrades to the conservative inspect-the-pane hint, never a
- * blind "press Enter".  `probe` stays optional and never gates the
- * copy.
- */
-function deliveryGiveUpHint(evt: Pick<AgentEvent, "box" | "transport">): string {
-  const box = evt.box;
-  if ((box !== "held" && box !== "cleared" && box !== "unknown") || typeof evt.transport !== "boolean" || box === "unknown") {
-    return `box evidence unavailable — ${giveUpGuidance("unknown")}`;
-  }
-  return giveUpGuidance(box);
+/** Only a complete v2 block explains the outcome; legacy fields are diagnostic. */
+function deliveryGiveUpHint(evt: Pick<AgentEvent, "delivery_v2">): string {
+  const evidence = parseDeliveryV2(evt.delivery_v2);
+  return `${evidence ? `reason=${evidence.reason} — ` : ""}${giveUpGuidance()}`;
 }
 
 /** A pane-list row consumed by the done-event sweep (system-design 4.4). */
@@ -294,6 +280,8 @@ export interface NotifierDeps {
    * read --source visible). Injectable for tests.
    */
   readPane?(paneId: string): Promise<string>;
+  remediator?: Remediator;
+  remediationAudit?(taskId: string, role: string): DeliveryDiagnostics;
 }
 
 // --- defaults --------------------------------------------------------------------
@@ -409,7 +397,7 @@ async function buildAutoInvocation(
   const agentPlan = plan.platform === "posix" ? plan.posix_direct : plan.effective_agent;
   agentPlan.env = { ...agentPlan.env, ...rigEnvironment(context.hubRoot, hubUrl, environment.TUT_EVENT_PORT_URL || "http://127.0.0.1:3002/agent-event") };
   const template = resolveTabLabelTemplateFromSnapshot(workspaceSnapshot);
-  const skillPath = fileURLToPath(new URL(`../skills/${role}.md`, import.meta.url));
+  const skillPath = fileURLToPath(new URL(`../../skills/${role}.md`, import.meta.url));
   const request: LaunchRequest = {
     kind: "round",
     task_id: task.task_id,
@@ -759,6 +747,11 @@ export class Notifier {
   private logCache = new Map<string, LogCacheEntry>();
 
   private snapshot: Map<string, StateTask> | null = null;
+  private remediationMode: "off" | "enter-repress" = "off";
+  private readonly remediator: Remediator;
+  private readonly remediationAttempts = new RemediationAttempts();
+  private readonly remediationAudit: (taskId: string, role: string) => DeliveryDiagnostics;
+  private closed = false;
   /** Tasks whose pending_approval entry edge has already been notified. */
   private pendingApprovalTasks = new Set<string>();
   /** Degraded ids as of the last successful poll (system-design 4.3);
@@ -845,6 +838,11 @@ export class Notifier {
   private readonly paneReader: (paneId: string) => Promise<string>;
 
   constructor(options: NotifyOptions, deps: Partial<NotifierDeps> = {}) {
+    this.remediator = deps.remediator ?? createEnterRepress();
+    this.remediationAudit = deps.remediationAudit ?? ((taskId, role) => createRemediationAudit({
+      env: { ...process.env, TUT_PROJECT_ROOT: this.rigRoot },
+      task_id: taskId, role, stderr: text => this.log(text.trimEnd()),
+    }));
     this.stateUrl = stateUrlOf(options.url);
     this.intervalMs = Math.max(1, options.interval) * 1000;
     this.stallMs = Math.max(0, options.stallTimeoutMin) * 60_000;
@@ -1075,6 +1073,7 @@ export class Notifier {
     const prevDegraded = this.lastDegraded;
     const now = this.deps.now();
     this.snapshot = new Map(state.tasks.map((t) => [t.task_id, t]));
+    this.remediationMode = state.auto?.remediate ?? (state.flow_mode === "auto" ? "enter-repress" : "off");
     this.lastDegraded = new Set(state.degraded ?? []);
     this.reconcileLogCache(state, prev);
     // A task omitted from /state has left the observable workflow. Forget its
@@ -1761,11 +1760,11 @@ export class Notifier {
         this.armWorkingWatch(task, role, agent, launchVersion);
       }
       this.log(
-        `[${task.task_id}] launch succeeded for ${role}; waiting for working signal within ${Math.ceil(this.workingTimeoutMs / 1000)}s`,
+        `[${task.task_id}] launch attempt completed; delivery confirmation is not implied for ${role}; waiting for working signal within ${Math.ceil(this.workingTimeoutMs / 1000)}s`,
       );
       await this.sendAll({
         title: `TUT ${task.task_id}: auto-launched ${role}`,
-        body: `${task.title} — status: ${task.status}; launch succeeded for ${role} via tut launch (pane: ${task.task_id}.${role}); waiting for the agent's working signal`,
+        body: `${task.title} — status: ${task.status}; launch attempt completed; delivery confirmation is not implied for ${role} via tut launch (pane: ${task.task_id}.${role}); waiting for the agent's working signal`,
         task_id: task.task_id,
       });
       // A real launcher can still be awaiting its final verification while
@@ -1987,14 +1986,9 @@ export class Notifier {
   }
 
   /**
-   * Delivery give-up escalation (7.2.1): the launcher exhausted its bounded
-   * submit-retry window and the submit stayed unconfirmed — whether the
-   * prompt still sits in the pane's input box is exactly what the event's
-   * evidence fields (box/transport/probe) report.  Escalate through the
-   * configured channels IMMEDIATELY (the gap this closes: without it,
-   * nobody outside the machine learns until the 30-minute stall watchdog
-   * fires); the alert copy branches on that evidence per
-   * deliveryGiveUpHint — never a blind "press Enter".
+   * Escalate an unconfirmed delivery immediately through configured channels.
+   * A valid v2 block supplies the reason; every event uses conditional manual
+   * guidance without interpreting legacy box evidence as permission.
    *
    * Deliberately does NOT mark progress: a give-up is the opposite of
    * progress, so the stall watchdog keeps its clock as the backstop
@@ -2033,6 +2027,55 @@ export class Notifier {
       }
     }
     const paneRole = this.roundRoleFromPane(taskId, evt.pane);
+    const evidence = parseDeliveryV2(evt.delivery_v2);
+    if (this.remediationMode === "enter-repress" && evidence && paneRole) {
+      const task = this.snapshot?.get(taskId);
+      const eligible = (current: StateTask | undefined) => !!task && !!current &&
+        current.status === task.status && current.waiting_for === `agent:${paneRole}` && !current.needs_attention &&
+        (paneRole === 'architect' ? current.status === 'designing' :
+          paneRole === 'reviewer' ? current.status === 'reviewing' : ['implementing', 'revising'].includes(current.status));
+      let stopped = false;
+      const canAct = async () => {
+        if (stopped || this.closed || this.remediationMode !== 'enter-repress' || !eligible(this.snapshot?.get(taskId))) {
+          stopped = true;
+          return false;
+        }
+        try {
+          // Read through HTTP without running another compare/launch cycle.
+          // Notes may advance version while the same role round remains active.
+          const latest = await this.deps.fetchState(this.stateUrl);
+          const enabled = (latest.auto?.remediate ?? (latest.flow_mode === 'auto' ? 'enter-repress' : 'off')) === 'enter-repress';
+          stopped = this.closed || this.remediationMode !== 'enter-repress' || !enabled || (latest.degraded ?? []).includes(taskId) ||
+            !eligible(latest.tasks.find(t => t.task_id === taskId)) || !eligible(this.snapshot?.get(taskId));
+        } catch { stopped = true; }
+        return !stopped;
+      };
+      if (await canAct()) {
+        const claim = this.remediationAttempts.claim(evidence.attempt_id);
+        if (claim === 'duplicate') return;
+        if (claim === 'full') {
+          this.log(`[${taskId}] remediation attempt capacity reached; escalating manually without another key`);
+        } else try {
+          const sink = this.remediationAudit(taskId, paneRole);
+          const recordAction = async (remediation: import('../remediator.js').RemediationEvidence) => {
+            sink.emit(`remediation pane=${evidence.pane_id} delivery_v2=${JSON.stringify({ ...evidence, remediation })}`);
+            await sink.flush();
+          };
+          const remediation = await this.remediator.remediate({ agent: evt.agent, pane: evt.pane, evidence, canAct, recordAction });
+          sink.emit(`remediation pane=${evidence.pane_id} delivery_v2=${JSON.stringify({ ...evidence, remediation })}`);
+          await sink.flush();
+          if (remediation.result === "working-observed") {
+            await this.handleWorkingSignal(evt, taskId);
+            await this.sendAll({ title: `TUT ${taskId}: machine remediation`,
+              body: `${taskId} — 机器补救：机器代按 Enter 后观察到 working（${remediation.strategy}）；非输入消费证明`, task_id: taskId });
+            return;
+          }
+          if (remediation.action === "machine-enter") this.log(`[${taskId}] 二次 give-up：机器代按 Enter 后未确认翻转，升级人工，不再补按`);
+        } catch (error) {
+          this.log(`[${taskId}] remediation failed; escalating manually: ${(error as Error).message}`);
+        }
+      }
+    }
     const roleSeg = paneRole !== undefined ? ` for ${paneRole}` : "";
     const via = taskId !== evt.pane ? ` (pane ${evt.pane})` : "";
     const hint = deliveryGiveUpHint(evt);
@@ -2054,8 +2097,8 @@ export class Notifier {
     const seconds = Math.ceil(this.workingTimeoutMs / 1000);
     this.log(`[${watch.task.task_id}] launch working timeout for ${watch.role} after ${seconds}s; no working signal observed`);
     await this.sendAll({
-      title: `TUT ${watch.task.task_id}: launch succeeded but no working signal`,
-      body: `${watch.task.title} — ${watch.role} was launched via tut launch, but no working signal arrived within ${seconds}s; intervene manually`,
+      title: `TUT ${watch.task.task_id}: launch attempt completed; delivery confirmation is not implied — no working signal`,
+      body: `${watch.task.title} — ${watch.role} launch attempt completed via tut launch, but no working signal arrived within ${seconds}s; intervene manually`,
       task_id: watch.task.task_id,
     });
     // Keep the key in the method signature so a future repeated-watch policy
@@ -2515,10 +2558,15 @@ export class Notifier {
       sendJson(res, 400, { error: "invalid JSON" });
       return;
     }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      sendJson(res, 400, { error: "invalid event shape" });
+      return;
+    }
     const evt = parsed as {
       event?: unknown;
       agent?: unknown;
       pane?: unknown;
+      delivery_v2?: unknown;
       box?: unknown;
       transport?: unknown;
       probe?: unknown;
@@ -2533,12 +2581,7 @@ export class Notifier {
       sendJson(res, 200, { ok: true, ignored: true });
       return;
     }
-    // Give-up evidence (7.2.1 additive fields): the required core pair
-    // box + transport is normalized ATOMICALLY — both pass through only
-    // when both are well-typed; a half-valid payload degrades to no
-    // evidence (conservative hint), never to a trusted box.  probe is
-    // optional and independent; legacy three-field bodies and typo'd
-    // fields drop out the same way.
+    // Preserve well-typed legacy diagnostics without using them as guidance.
     const box = evt.box;
     const transport = evt.transport;
     const atomic = (box === "held" || box === "cleared" || box === "unknown") && typeof transport === "boolean";
@@ -2549,7 +2592,9 @@ export class Notifier {
       evt.probe === "not-attempted"
         ? evt.probe
         : undefined;
+    const deliveryV2 = parseDeliveryV2(evt.delivery_v2);
     this.receiveEvent({
+      ...(deliveryV2 === undefined ? {} : { delivery_v2: deliveryV2 }),
       event: evt.event,
       agent: evt.agent,
       pane: evt.pane,
@@ -2570,6 +2615,7 @@ export class Notifier {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     if (this.pollTimer !== null) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;

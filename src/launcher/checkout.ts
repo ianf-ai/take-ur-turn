@@ -11,14 +11,14 @@
  */
 
 import path from "node:path";
-import type { CheckoutRoute, ExecutionContext } from "../types.js";
+import type { CheckoutRoute, ExecutionContext } from "../common/types.js";
 
 /**
  * Current checkout or an explicitly named, pre-created worktree route.
  * The route is carried as frozen metadata; this provider resolves a path but
  * never creates, guesses, or removes a worktree.
  */
-export type { CheckoutRoute } from "../types.js";
+export type { CheckoutRoute } from "../common/types.js";
 
 /** What one checkout resolution freezes for the execution context. */
 export interface CheckoutSelection {

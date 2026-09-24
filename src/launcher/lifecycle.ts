@@ -9,9 +9,9 @@
  * execution context.
  */
 
-import { rigLabel, unscopedLabel } from "../rig.js";
-import type { LaunchInvocation } from "../types.js";
-import type { HerdrPane } from "./herdr-client.js";
+import { rigLabel, unscopedLabel } from "../hub/rig.js";
+import type { LaunchInvocation } from "../common/types.js";
+import type { HerdrPane } from "./legacy-herdr-client.js";
 
 export type LifecyclePane = HerdrPane;
 
@@ -49,6 +49,7 @@ export interface RoundLifecycleResult {
   pane?: LifecyclePane;
   pane_id?: string;
   reason?: string;
+  /** Compatibility projection: attempt handled, NOT delivery confirmation. */
   delivered?: boolean;
 }
 
@@ -59,6 +60,7 @@ export interface RoundLifecycleOptions extends LifecycleWriters {
   continuityRoles?: ReadonlySet<string> | string;
   /** Dry-run still performs discovery, but never closes a pane. */
   dryRun?: boolean;
+  /** true means exitCode===0 (handled, automatic retry forbidden). */
   onContinuation(pane: LifecyclePane): Promise<boolean>;
   /** Returns undefined when birth failed, and a pane id on success. */
   onBirth(): Promise<string | undefined>;

@@ -14,7 +14,7 @@ import {
   writeConfigKey,
   writeFlowMode,
   type Config,
-} from "../src/config.js";
+} from "../src/common/config.js";
 
 let tmp: string;
 let root: string;
@@ -397,5 +397,26 @@ describe("concurrent config writes (unique temp suffix + serialized write chain)
     const onDisk = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8")) as Config;
     expect(onDisk.flow_mode === "manual" || onDisk.flow_mode === "auto").toBe(true);
     expect(onDisk.auto).toEqual({ launch_roles: ["executor", "reviewer"] });
+  });
+});
+
+describe('auto.remediate', () => {
+  it('validates the switch and preserves launch roles through writes and /state projection', async () => {
+    expect(parseConfigValue('auto.remediate', 'enter-repress')).toEqual({ ok: true,
+      assignment: { key: 'auto.remediate', value: 'enter-repress' } });
+    expect(parseConfigValue('auto.remediate', 'retry').ok).toBe(false);
+    await writeConfigKey(root, { key: 'auto.launch_roles', value: ['executor'] });
+    const cfg = await writeConfigKey(root, { key: 'auto.remediate', value: 'off' });
+    expect(autoSectionOf(cfg)).toEqual({ launch_roles: ['executor'], remediate: 'off' });
+    expect(autoSectionOf({ flow_mode: 'auto', auto: { launch_roles: [], remediate: 'bad' } } as unknown as Config))
+      .toEqual({ launch_roles: [], remediate: 'off' });
+    expect(stderrWrite).toHaveBeenCalledWith(expect.stringContaining('invalid auto.remediate'));
+  });
+  it('rejects an unsupported runtime key without changing config', async () => {
+    await writeConfigKey(root, { key: 'auto.remediate', value: 'off' });
+    const before = readFileSync(path.join(root, 'config.json'), 'utf8');
+    await expect(writeConfigKey(root, { key: 'auto.future', value: 'on' } as unknown as Parameters<typeof writeConfigKey>[1]))
+      .rejects.toThrow('unsupported config key');
+    expect(readFileSync(path.join(root, 'config.json'), 'utf8')).toBe(before);
   });
 });
