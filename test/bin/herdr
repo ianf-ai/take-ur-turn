@@ -12,8 +12,7 @@
 //   pane close  → {"result":{"type":"ok"}}
 //   pane rename → {"result":{"pane":{"pane_id","label"},"type":"pane_info"}}
 //   pane run    → {"result":{"type":"ok"}}
-//   pane send-text → {"result":{"type":"ok"}} (the delivery probe uses a
-//                 literal printf command with a trailing escaped newline)
+//   pane send-text → {"result":{"type":"ok"}}
 //   pane send-keys → {"result":{"type":"ok"}}
 //   pane read   → RAW TEXT (no JSON envelope — mirrors real herdr): the value
 //                 of TUT_HERDR_PANE_READ; when TUT_HERDR_READ_EMPTY_POLLS=N
@@ -30,9 +29,7 @@
 //                 being read, read serves screens[enters-on-this-pane], the
 //                 last screen repeating — models “each Enter swallowed
 //                 until the k-th commits” CAUSALLY, independent of poll
-//                 cadence (loop-resend tests). A read immediately after a
-//                 probe send can echo its marker when the probe script allows
-//                 it. Pre-text reads (gate / continuation snapshot) fall back
+//                 cadence. Pre-text reads fall back
 //                 to the knobs above.
 //   tab list    -> {"result":{"tabs":[...]}} from TUT_HERDR_TABS (JSON array
 //                 of {label, tab_id} objects) — the tab-id recovery
@@ -57,11 +54,6 @@
 //                 screens[send-keys-Enter count on that pane], the last
 //                 screen repeating (wins over everything for post-text
 //                 reads; pre-text reads use the knobs above)
-//   TUT_HERDR_PROBE_SCRIPT — optional JSON boolean array; the nth probe read
-//                 includes its marker only when the nth value is true. When
-//                 omitted, enter-script screens containing "prompt" model a
-//                 swallowed Enter and otherwise echo a probe on non-empty
-//                 screens.
 //   TUT_HERDR_TABS           — tabs served by `tab list` (tab-id recovery)
 //   TUT_HERDR_PANE_LABEL      — label served by `pane get` (default "<id>:label");
 //                 TUT_HERDR_PANE_LABEL_RAW instead prints arbitrary raw text
@@ -113,38 +105,6 @@ const readLogFile = () => {
   } catch {
     return "";
   }
-};
-
-/** The most recent probe send immediately preceding this pane read. */
-const latestProbeBeforeRead = (paneId, logText) => {
-  const lines = logText.split("\n").filter((line) => line.length > 0);
-  const current = lines[lines.length - 1] ?? "";
-  if (!current.startsWith(`pane read ${paneId} `)) return undefined;
-  const previous = lines[lines.length - 2] ?? "";
-  const prefix = `pane send-text ${paneId} printf '`;
-  if (!previous.startsWith(prefix)) return undefined;
-  const suffix = previous.slice(prefix.length);
-  return suffix.match(/^(TUT-DELIVERY-PROBE-[0-9A-F]{8})'\\n$/u)?.[1];
-};
-
-/** Whether the current probe's marker should appear in its one read. */
-const probeShouldEcho = (paneId, logText, base) => {
-  const lines = logText.split("\n").filter((line) => line.length > 0);
-  const probeLines = lines.filter((line) => line.startsWith(`pane send-text ${paneId} printf '`));
-  const script = process.env.TUT_HERDR_PROBE_SCRIPT;
-  if (script !== undefined) {
-    const values = JSON.parse(script);
-    return values[Math.min(Math.max(probeLines.length - 1, 0), values.length - 1)] === true;
-  }
-  if (process.env.TUT_HERDR_PROBE_ECHO === "0") return false;
-  const enterScript = process.env.TUT_HERDR_READ_ENTER_SCRIPT;
-  if (enterScript !== undefined) {
-    const enters = lines.filter((line) => line === `pane send-keys ${paneId} Enter`).length;
-    const screens = JSON.parse(enterScript);
-    const screen = screens[Math.min(Math.max(enters, 0), screens.length - 1)] ?? "";
-    return base.length > 0 && !screen.includes("prompt");
-  }
-  return base.length > 0;
 };
 
 // Failure injection: "pane:move" fails every call; "pane:rename:1" only the 1st.
@@ -213,6 +173,16 @@ if (argv[0] === "pane" && sub === "list") {
     if (!visiblePanes.some((p) => p.pane_id === target)) {
       visiblePanes = [...visiblePanes, { pane_id: target, label: "", agent_status: status }];
     }
+  }
+  // delivery confirmation v2 fixture: born panes become queryable and default Enter transitions to
+  // working. Explicit status timelines can model swallowed/foreign input.
+  const runIds = [...new Set(logText.split("\n").filter(l => l.startsWith("pane run ")).map(l => l.split(" ")[2]))];
+  for (const paneId of runIds) {
+    if (!visiblePanes.some(p => p.pane_id === paneId)) visiblePanes.push({ pane_id: paneId, agent_status: "idle" });
+  }
+  if (process.env.TUT_HERDR_AGENT_STATUS === undefined && process.env.TUT_HERDR_AGENT_STATUS_SCRIPT === undefined) {
+    visiblePanes = visiblePanes.map(p => logText.includes(`pane send-keys ${p.pane_id} Enter\n`)
+      ? { ...p, agent_status: "working" } : p);
   }
   if (process.env.TUT_HERDR_PANES_RAW !== undefined) {
     process.stdout.write(process.env.TUT_HERDR_PANES_RAW);
@@ -311,12 +281,7 @@ if (argv[0] === "pane" && sub === "list") {
     }
   }
   screen ??= "";
-  const marker = latestProbeBeforeRead(paneId, logText);
-  if (marker !== undefined && probeShouldEcho(paneId, logText, screen)) {
-    process.stdout.write(`${screen}${screen.length > 0 ? "\n" : ""}${marker}`);
-  } else {
-    process.stdout.write(screen);
-  }
+  process.stdout.write(screen);
 } else {
   emit({ id: "cli:pane:fixture", result: { type: "ok" } });
 }

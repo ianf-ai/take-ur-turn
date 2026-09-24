@@ -17,7 +17,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 const sent: { title: string; body: string; task_id?: string }[] = [];
-vi.mock("../src/channels.js", () => ({
+vi.mock("../src/common/channels.js", () => ({
   createChannels: () => [
     { name: "desktop", send: async (msg: { title: string; body: string; task_id?: string }) => { sent.push(msg); } },
   ],
@@ -33,7 +33,7 @@ vi.mock("../src/launcher/process.js", async (importOriginal) => ({
 }));
 
 import { DEFAULT_CHILD_TIMEOUT_MS } from "../src/launcher/process.js";
-import { Notifier, spawnLaunchInvocation, type StateResponse } from "../src/notifier.js";
+import { Notifier, spawnLaunchInvocation, type StateResponse } from "../src/notifier/notifier.js";
 import { buildLaunchInvocation } from "../src/launcher/invocation.js";
 
 function invocation() {

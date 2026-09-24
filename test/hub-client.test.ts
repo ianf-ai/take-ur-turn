@@ -12,8 +12,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { startServer, type RunningServer } from "../src/server.js";
-import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError, HubSession, hubReadVia } from "../src/hub-client.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
+import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError, HubSession, hubReadVia } from "../src/hub/hub-client.js";
 
 let tmp: string;
 let running: RunningServer;

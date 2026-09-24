@@ -7,7 +7,11 @@
  * verbatim is the final command passed to `pane run`.
  */
 
-import { paneEnvArgs } from "../rig.js";
+import { performance } from "node:perf_hooks";
+import { validDeliveryAck, parseStatusSample } from "./herdr-client-v2.js";
+import type { CallContext, CallTrace, DeliveryClientV2, PaneIdentity, SendResult, StatusSample, TransportFault } from "./herdr-client-v2.js";
+export * from "./herdr-client-v2.js";
+import { paneEnvArgs } from "../hub/rig.js";
 import type { ChildProcess } from "node:child_process";
 import { spawnDirect, type DirectSpawn, type DirectSpawnOptions } from "./process.js";
 
@@ -58,6 +62,8 @@ export interface HerdrCommandResult {
   error?: Error;
   /** True when the command timed out and the child was killed. */
   timedOut?: true;
+  /** Present for delivery confirmation v2 calls only. */
+  trace?: CallTrace;
 }
 
 export type HerdrErrorCode = "SPAWN_ERROR" | "EXIT_ERROR" | "INVALID_RESPONSE" | "INVALID_ARGUMENT" | "TIMEOUT";
@@ -274,6 +280,13 @@ function mutationResponse(result: HerdrCommandResult): HerdrMutationResult {
  * same HerdrClientError shape.
  */
 export class HerdrClient {
+  /** Additive adapter: existing structural mocks and method types stay unchanged. */
+  readonly deliveryV2: DeliveryClientV2 = {
+    sendText: (target, text, call) => this.deliverySend(["pane", "send-text", target?.paneId, text], call),
+    sendEnter: (target, call) => this.sendEnter(target, call),
+    readAgentStatus: (target, call) => this.readAgentStatus(target, call),
+  };
+  private readonly revisions = new WeakMap<PaneIdentity, { attemptId: string; revision: number }>();
   private readonly configuredExecutable: string | undefined;
   private readonly platform: NodeJS.Platform;
   /** An explicit env is frozen; the default client follows the process env. */
@@ -301,53 +314,101 @@ export class HerdrClient {
     });
   }
 
+  /** Each v2 call has a hard 10s cap (or a smaller configured timeout),
+   * clipped to the caller deadline. The flip budget comprises multiple calls
+   * of at most C plus sleeps; it does not extend any single call beyond C. */
+  private deliveryDeadline(call: CallContext, startedMonoMs: number): number {
+    const cap = Number.isFinite(this.timeoutMs) && this.timeoutMs > 0 ? Math.min(this.timeoutMs, 10_000) : 10_000;
+    return Math.min(call.deadlineMonoMs, startedMonoMs + cap);
+  }
+
   /** Execute an exact Herdr argv and return its process result without throwing.
    *  A command that exceeds the configured timeout is killed (SIGKILL reaches
    *  even a stopped process) and resolved with timedOut: true — "never
    *  returns" becomes "fails". */
-  command(args: readonly string[]): Promise<HerdrCommandResult> {
-    const argv = args.map((value, index) => argument(value, `herdr argv[${index}]`));
+  command(args: readonly string[], call?: CallContext): Promise<HerdrCommandResult> {
+    const startedMonoMs = performance.now();
+    const trace: CallTrace | undefined = call && {
+      attemptId: call.attemptId, sequence: call.sequence, startedMonoMs,
+      finishedMonoMs: startedMonoMs, spawned: false, exitCode: null, signal: null, fault: null,
+    };
+    let argv: string[];
+    try {
+      argv = args.map((value, index) => argument(value, `herdr argv[${index}]`));
+      if (call && (!call.attemptId || !Number.isSafeInteger(call.sequence) || call.sequence < 1
+        || !Number.isFinite(call.deadlineMonoMs) || !(call.signal instanceof AbortSignal))) {
+        throw new Error("invalid call context");
+      }
+    } catch (error) {
+      if (!trace) throw error; // Preserve the legacy validation contract.
+      return Promise.resolve({ code: null, signal: null, stdout: "", stderr: "",
+        trace: { ...trace, finishedMonoMs: performance.now(), fault: "INVALID_ARGUMENT" } });
+    }
     return new Promise((resolve) => {
       let stdout = "";
       let stderr = "";
       let settled = false;
-      let timedOut = false;
-      let child: ChildProcess;
-      try {
-        const options: DirectSpawnOptions = {
-          shell: false,
-          env: { ...(this.environment ?? process.env) },
-          stdio: ["ignore", "pipe", "pipe"],
-        };
-        child = this.spawnFn(this.executable, argv, options);
-      } catch (error) {
-        resolve({ code: null, signal: null, stdout, stderr, error: error as Error });
-        return;
-      }
-      const killer = Number.isFinite(this.timeoutMs) && this.timeoutMs > 0
-        ? setTimeout(() => {
-            timedOut = true;
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // An already-dead child still emits `close`; nothing to do.
-            }
-          }, this.timeoutMs)
-        : null;
-      const settle = (result: HerdrCommandResult): void => {
-        if (killer !== null) clearTimeout(killer);
+      let spawned = false;
+      let legacyTimedOut = false;
+      let child: ChildProcess | undefined;
+      let killer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = call ? this.deliveryDeadline(call, startedMonoMs) : Infinity;
+      const settle = (result: HerdrCommandResult, fault: TransportFault | null = null): void => {
         if (settled) return;
         settled = true;
-        resolve(result);
+        if (killer) clearTimeout(killer);
+        call?.signal.removeEventListener("abort", abort);
+        child?.stdout?.removeListener("data", out);
+        child?.stderr?.removeListener("data", err);
+        resolve({ ...result, ...(trace ? { trace: { ...trace, spawned,
+          finishedMonoMs: performance.now(), exitCode: result.code, signal: result.signal, fault } } : {}) });
       };
-      child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-      child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      const stop = (fault: TransportFault): void => {
+        // Settle before kill: synchronous fake close and late real close cannot win.
+        settle({ code: null, signal: null, stdout, stderr,
+          ...(fault === "TIMEOUT" ? { timedOut: true as const } : {}) }, fault);
+        try { child?.kill("SIGKILL"); } catch { /* kill cannot undo remote writes */ }
+      };
+      const abort = (): void => stop("ABORTED");
+      const out = (chunk: Buffer): void => { if (!settled) stdout += chunk.toString("utf8"); };
+      const err = (chunk: Buffer): void => { if (!settled) stderr += chunk.toString("utf8"); };
+      if (call?.signal.aborted) { abort(); return; }
+      if (call && performance.now() >= deadline) { stop("NOT_STARTED"); return; }
+      try {
+        const options: DirectSpawnOptions = {
+          shell: false, env: { ...(this.environment ?? process.env) }, stdio: ["ignore", "pipe", "pipe"],
+        };
+        child = this.spawnFn(this.executable, argv, options);
+        spawned = child.pid !== undefined;
+      } catch (error) {
+        settle({ code: null, signal: null, stdout, stderr, error: error as Error }, "SPAWN_FAILED");
+        return;
+      }
+      child.once("spawn", () => { if (!settled) spawned = true; });
+      child.stdout?.on("data", out);
+      child.stderr?.on("data", err);
       child.once("error", (error) => {
-        settle({ code: null, signal: null, stdout, stderr, error });
+        const knownSpawnFailure = !spawned && ["ENOENT", "EACCES", "ENOEXEC", "ENOTDIR", "E2BIG"].includes((error as NodeJS.ErrnoException).code ?? "");
+        settle({ code: null, signal: null, stdout, stderr, error }, knownSpawnFailure ? "SPAWN_FAILED" : "INTERNAL");
       });
       child.once("close", (code, signal) => {
-        settle({ code, signal, stdout, stderr, ...(timedOut ? { timedOut: true } : {}) });
+        const fault = call?.signal.aborted ? "ABORTED" : call && performance.now() >= deadline ? "TIMEOUT"
+          : legacyTimedOut ? "TIMEOUT" : signal ? "SIGNAL" : code !== 0 ? "EXIT_ERROR" : null;
+        settle({ code, signal, stdout, stderr, ...(fault === "TIMEOUT" ? { timedOut: true as const } : {}) }, fault);
       });
+      call?.signal.addEventListener("abort", abort, { once: true });
+      if (call?.signal.aborted) { abort(); return; }
+      const timeout = call ? deadline - performance.now() : this.timeoutMs;
+      if (call || (Number.isFinite(timeout) && timeout > 0)) {
+        killer = setTimeout(() => {
+          if (call) stop("TIMEOUT");
+          else {
+            // Legacy callers keep their close/signal behavior.
+            legacyTimedOut = true;
+            try { child?.kill("SIGKILL"); } catch { /* already dead */ }
+          }
+        }, Math.max(0, timeout));
+      }
     });
   }
 
@@ -550,6 +611,59 @@ export class HerdrClient {
 
   sendText(paneId: string, text: string): Promise<HerdrMutationResult> {
     return this.paneSendText(paneId, text);
+  }
+
+  sendEnter(target: PaneIdentity, call: CallContext): Promise<SendResult> {
+    return this.deliverySend(["pane", "send-keys", target?.paneId, "Enter"], call);
+  }
+
+  private async deliverySend(args: string[], call: CallContext): Promise<SendResult> {
+    const startedMonoMs = performance.now();
+    try {
+      const result = await this.command(args, call);
+      const trace = result.trace!;
+      if (trace.fault === null) {
+        const validAck = trace.spawned && validDeliveryAck(result.stdout);
+        trace.finishedMonoMs = performance.now();
+        if (call.signal.aborted) trace.fault = "ABORTED";
+        else if (trace.finishedMonoMs >= this.deliveryDeadline(call, trace.startedMonoMs)) trace.fault = "TIMEOUT";
+        else if (!validAck) trace.fault = "INVALID_ACK";
+      }
+      const notSent = !trace.spawned && ["INVALID_ARGUMENT", "NOT_STARTED", "SPAWN_FAILED", "ABORTED"].includes(trace.fault ?? "");
+      return { kind: notSent ? "not-sent" : trace.fault === null ? "sent" : "uncertain", trace };
+    } catch {
+      // Unknown adapter failures cannot prove that nothing was sent.
+      return { kind: "uncertain", trace: { attemptId: call.attemptId, sequence: call.sequence,
+        startedMonoMs, finishedMonoMs: performance.now(), spawned: false,
+        exitCode: null, signal: null, fault: "INTERNAL" } };
+    }
+  }
+
+  async readAgentStatus(target: PaneIdentity, call: CallContext): Promise<StatusSample> {
+    let sample: StatusSample = { attemptId: call?.attemptId ?? "", sequence: call?.sequence ?? 0,
+      startedMonoMs: performance.now(), finishedMonoMs: performance.now(), status: "unknown",
+      identity: null, paneRevision: null, error: null, readSource: "herdr-pane-list",
+      detectorSource: null, detectorAgeMs: null, attribution: "unavailable" };
+    try {
+      if (call == null) throw new HerdrClientError("INVALID_ARGUMENT", "readAgentStatus", "call context is required");
+      argument(target?.paneId, "paneId");
+      const result = await this.command(["pane", "list"], call);
+      const trace = result.trace!;
+      sample = { ...sample, startedMonoMs: trace.startedMonoMs, finishedMonoMs: trace.finishedMonoMs, error: trace.fault };
+      if (trace.fault) return sample;
+      const previous = this.revisions.get(target);
+      sample = parseStatusSample(result.stdout, target, sample, previous?.attemptId === call.attemptId ? previous.revision : undefined);
+      sample.finishedMonoMs = performance.now();
+      if (call.signal.aborted) return { ...sample, status: "unknown", error: "ABORTED" };
+      if (sample.finishedMonoMs >= this.deliveryDeadline(call, trace.startedMonoMs)) return { ...sample, status: "unknown", error: "LATE_RESULT" };
+      if (sample.identity && sample.paneRevision !== null && sample.error !== "IDENTITY_CHANGED") {
+        this.revisions.set(target, { attemptId: call.attemptId, revision: sample.paneRevision });
+      }
+      return sample;
+    } catch (error) {
+      return { ...sample, finishedMonoMs: performance.now(), error:
+        error instanceof HerdrClientError && error.code === "INVALID_ARGUMENT" ? "INVALID_ARGUMENT" : "INTERNAL" };
+    }
   }
 
   async paneSendKeys(paneId: string, ...keys: string[]): Promise<HerdrMutationResult> {

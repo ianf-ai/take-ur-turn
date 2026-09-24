@@ -20,9 +20,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { Store, StoreError } from "./store.js";
-import { worktreePathWarning } from "./checkout-warning.js";
-import type { CheckoutRoute, Payload } from "./types.js";
+import { Store, StoreError } from "../hub/store.js";
+import { worktreePathWarning } from "../common/checkout-warning.js";
+import type { CheckoutRoute, Payload } from "../common/types.js";
 
 /**
  * Run a Store operation and shape it as a tool result. Success → the result

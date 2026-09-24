@@ -24,28 +24,12 @@ describe("event port URL resolution", () => {
   });
 });
 
-// The three-state guidance is THE word-for-word contract shared by the
-// launcher's give-up stderr and the notifier's alert copy (7.2.1 step 5).
-// Full-string equality pins each text: any wording change must land HERE
-// and is then immediately visible to both channels — no independent
-// near-copies on either side (review R2 P2).
-describe("giveUpGuidance single source (word-for-word three-state contract)", () => {
-  it("held — the only state that may direct a manual Enter", () => {
-    expect(giveUpGuidance("held")).toBe(
-      "the prompt is still visible in the input box; press Enter there manually to start the round",
-    );
-  });
-
-  it("cleared — submit unconfirmed, never a blind Enter", () => {
-    expect(giveUpGuidance("cleared")).toBe(
-      "the text has left the input box but the submit is unconfirmed; check whether the round has already started before pressing anything — do not press Enter blindly",
-    );
-  });
-
-  it("unknown — conservative inspect-the-pane hint", () => {
-    expect(giveUpGuidance("unknown")).toBe(
-      "inspect the pane and press Enter there manually only if the prompt is still visible in the input box",
-    );
+describe("giveUpGuidance single conservative contract", () => {
+  it.each(["held", "cleared", "unknown"] as const)("ignores historical %s evidence", (box) => {
+    expect(giveUpGuidance(box)).toBe(giveUpGuidance());
+    expect(giveUpGuidance(box)).toContain("still the expected Agent");
+    expect(giveUpGuidance(box)).toContain("no control calls are outstanding");
+    expect(giveUpGuidance(box)).toContain("do not press Enter blindly or automatically resend");
   });
 });
 

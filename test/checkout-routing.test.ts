@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { resolveExecutionContext } from "../src/launcher/anchor.js";
 import { buildLaunchInvocation, serializeLaunchInvocation, validateLaunchInvocation } from "../src/launcher/invocation.js";
-import { Store } from "../src/store.js";
-import { readWorkspaceConfigSnapshot, resolveAgentRouteWithSource, resolveTabLabelTemplateFromSnapshot } from "../src/workspace.js";
+import { Store } from "../src/hub/store.js";
+import { readWorkspaceConfigSnapshot, resolveAgentRouteWithSource, resolveTabLabelTemplateFromSnapshot } from "../src/common/workspace.js";
 
 const tempRoots: string[] = [];
 

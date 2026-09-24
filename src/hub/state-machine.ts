@@ -8,7 +8,7 @@ import {
   type WaitingFor,
   type Warning,
   type WarningCode,
-} from "./types.js";
+} from "../common/types.js";
 
 /**
  * Derivation (system-design 3.1-3.3). Pure function: no IO, no

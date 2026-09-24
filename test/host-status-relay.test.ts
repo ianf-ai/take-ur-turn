@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { relayHostStatus } from "../src/host-status-relay.js";
+import { relayHostStatus } from "../src/notifier/host-relay.js";
 
 const report = { task_id: "a-task", status: "needs_attention" as const, waiting_for: "human" };
 const RIG = "/tmp/rig-under-test";
@@ -11,7 +11,7 @@ function client(labels: string[]) {
 }
 // rigHash is sha256 truncated to 8 hex; compute the suffixed default the
 // same way the implementation does so the test pins behavior, not constants.
-import { rigLabel } from "../src/rig.js";
+import { rigLabel } from "../src/hub/rig.js";
 const defaultLabel = rigLabel("tut-host", RIG);
 
 describe("host status relay transport", () => {

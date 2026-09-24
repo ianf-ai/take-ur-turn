@@ -42,9 +42,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { startServer, type RunningServer } from "../src/server.js";
-import { Notifier } from "../src/notifier.js";
-import { hubCreate, hubDecide, hubPublish, hubRead } from "../src/hub-client.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
+import { Notifier } from "../src/notifier/notifier.js";
+import { hubCreate, hubDecide, hubPublish, hubRead } from "../src/hub/hub-client.js";
 import { main } from "../src/cli.js";
 
 // --- shared harness -----------------------------------------------------------------
@@ -636,7 +636,7 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
     expect(out).toContain("--label TUT executor"); // tab label: naming template (default)
     expect(out).toContain("(agent 'pi', label");
     expect(out).toContain(id); // the prompt tells the agent which task to read
-    expect(out).toContain(`launched executor for ${id}`);
+    expect(out).toContain(`launch attempt completed; delivery confirmation is not implied (executor for ${id}`);
     const log = await hubRead(baseUrl, id);
     expect(log.versions.at(-1)?.payload.launch).toEqual(expect.objectContaining({
       protocol_version: 2,

@@ -40,57 +40,42 @@ afterAll(() => {
 const HUB_PANE = { pane_id: "w11:p2", label: scopedFixture("tut-hub", "/repo"), workspace_id: "w11", cwd: "/repo", tab_id: "w11:t2", agent_status: "idle" };
 const NOTIFY_PANE = { pane_id: "w11:p4", label: scopedFixture("tut-notify", "/repo"), workspace_id: "w11", cwd: "/repo", tab_id: "w11:t3", agent_status: "idle" };
 
-// Screen timelines for the closed-loop delivery (7.2.1): the born branch
-// consumes 6 reads (base + 2 boot empties + the FOUR-sample quiescence run
-// that releases the gate, TUT_READY_STABLE_POLLS default 4), then
-// land-confirm sees the prompt text, then the submit verify sees the
-// reaction. The continuation branch starts at the seat's live screen (no
-// gate): snapshot → text lands → reaction. PROMPT_MARK embeds every role's
-// prompt head-fragment: the text-match landing criterion (7.2.1 step 3)
-// only accepts a screen that actually shows the sent text.
+// Screen fixtures remain available to detect accidental screen-based delivery.
+// Delivery confirmation v2 uses pane-list status observations only.
 const PROMPT_MARK =
-  "轮到你了（role: architect）：请用 轮到你了（role: executor）：请用 轮到你了（role: reviewer）：请用 开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）";
+  "轮到你了（role: architect）：请用 轮到你了（role: executor）：请用 轮到你了（role: reviewer）：请用 开始本轮工作，完成后发布相应记录（context.publish）。";
 const BORN_SCREENS = JSON.stringify(["", "", "pi ready", "pi ready", "pi ready", "pi ready", `pi ready ▎${PROMPT_MARK}`, "working"]);
 const CONT_SCREENS = JSON.stringify(["idle seat", `idle seat ▎${PROMPT_MARK}`, "working"]);
 
-/** Closed-loop delivery tail on $pane (success shape): exactly one prompt
- *  send-text, a land-confirm read between the text and the Enter, and the
- *  existing verify reads after it. The probe is out-of-band through the birth
- *  relay, so no probe command is ever sent to the foreground TUI. */
-const expectDelivered = (lines: string[], pane: string) => {
+/** Single delivery attempt: classifiable baseline before prompt, at most one Enter. */
+const expectDelivered = (lines: string[], pane: string, baselineWorking = false) => {
   const promptPrefix = `pane send-text ${pane} 轮到你了`;
   const sendIdx = lines.findIndex((l) => l.startsWith(promptPrefix));
   expect(sendIdx).toBeGreaterThanOrEqual(0);
   const enterIdx = lines.indexOf(`pane send-keys ${pane} Enter`);
   expect(enterIdx).toBeGreaterThan(sendIdx);
-  expect(lines.slice(sendIdx + 1, enterIdx).length).toBeGreaterThanOrEqual(1); // land-confirm ran
-  expect(lines.slice(sendIdx + 1, enterIdx).every((l) => l.startsWith(`pane read ${pane}`))).toBe(true);
+  expect(lines[sendIdx - 1]).toBe("pane list");
+  expect(lines.slice(sendIdx + 1, enterIdx)).toEqual([]);
   expect(lines.filter((l) => l === `pane send-keys ${pane} Enter`)).toHaveLength(1);
   const afterEnter = lines.slice(enterIdx + 1);
-  expect(afterEnter.length).toBeGreaterThanOrEqual(1); // relay probe is not a Herdr input call
+  if (baselineWorking) expect(afterEnter).toHaveLength(0);
+  else expect(afterEnter.length).toBeGreaterThanOrEqual(1);
   expect(afterEnter.some((l) => /^pane send-text .* (printf|Write-Output|echo\()/u.test(l))).toBe(false);
-  expect(afterEnter.some((l) => l.startsWith(`pane read ${pane}`))).toBe(true); // the verifying read
+  if (!baselineWorking) expect(afterEnter).toContain("pane list");
+  expect(lines.some(l => l.startsWith("pane read "))).toBe(false); // the verifying read
 };
 
 /** Assert the birth command installs the out-of-band relay and preserve the
  * target command as a decoded payload instead of asserting an opaque token. */
-const expectProbeRelayRun = (lines: string[], pane: string, target: { executable: string; args: string[]; env: Record<string, string> }) => {
+const expectAgentRun = (lines: string[], pane: string, target: { executable: string; args: string[]; env: Record<string, string> }) => {
   const line = lines.find((candidate) => candidate.startsWith(`pane run ${pane} `));
   expect(line).toBeDefined();
-  expect(line).toContain("probe-runner.js");
-  expect(line).toContain("--socket");
-  expect(line).toContain("'--dialect' 'posix'");
-  const token = line?.match(/'--payload' '([A-Za-z0-9_-]+)'/u)?.[1];
-  expect(token).toBeDefined();
-  const payload = JSON.parse(Buffer.from(token ?? "", "base64url").toString("utf8")) as {
-    protocol_version: number;
-    cwd: string;
-    purpose: string;
-    executable: string;
-    args: string[];
-    env: Record<string, string>;
-  };
-  expect(payload).toEqual({ protocol_version: 1, cwd: "/repo", ...target, env: { ...target.env, TUT_HUB_ROOT: "/repo", TUT_HUB_URL: "http://127.0.0.1:1", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" }, purpose: "agent" });
+  expect(line).not.toContain("probe-runner.js");
+  expect(line).toContain(`'${target.executable}'`);
+  for (const arg of target.args) expect(line).toContain(`'${arg}'`);
+  for (const [key, value] of Object.entries(target.env)) expect(line).toContain(`'${key}=${value}'`);
+  expect(line).toContain("cd -- '/repo'");
+
 };
 
 /** Env with the fixture herdr first on PATH; panes/fixtures parameterized.
@@ -109,10 +94,6 @@ const env = (panes: unknown[], extra: Record<string, string> = {}, dryRun = fals
   TUT_READY_POLL_MS: "20",
   TUT_READY_FLOOR_MS: "0",
   TUT_READY_TIMEOUT_MS: "300",
-  TUT_TEXT_LAND_TIMEOUT_MS: "200",
-  TUT_SUBMIT_TIMEOUT_MS: "100",
-  TUT_SUBMIT_RETRY_MS: "60",
-  TUT_SUBMIT_RETRY_TIMEOUT_MS: "400",
   ...extra,
 });
 
@@ -148,6 +129,46 @@ async function runLogged(
 }
 
 // --- birth anchoring ----------------------------------------------------------------
+
+describe('born settling through the real legacy compat chain', () => {
+  it.each([false, true])('waits for idle before input (fresh=%s)', async fresh => {
+    const r = await runLogged([...(fresh ? ['--fresh'] : []), 't1', 'executor', 'pi'], [HUB_PANE,
+      ...(fresh ? [{ pane_id: 'w11:p6', label: scopedFixture('t1.executor', '/repo'),
+        workspace_id: 'w11', cwd: '/repo', agent_status: 'working' }] : [])], {
+      TUT_HERDR_AGENT_STATUS_SCRIPT: JSON.stringify(['working', 'working', 'working', 'idle', 'working']),
+      TUT_BASELINE_READY_TIMEOUT_MS: '3000', TUT_STATUS_POLL_MS: '20', TUT_STATUS_FLIP_TIMEOUT_MS: '1000',
+    });
+    expect(r.code, r.stderr).toBe(0);
+    const run = r.lines.findIndex(line => line.startsWith('pane run FIX:root1 '));
+    const text = r.lines.findIndex(line => line.startsWith('pane send-text FIX:root1 '));
+    // One target-selection query, then two working samples and the idle sample.
+    expect(r.lines.slice(run + 1, text)).toEqual(Array(4).fill('pane list'));
+    expectDelivered(r.lines, 'FIX:root1');
+    expect(r.stderr).toContain('baseline-wait-start pane=FIX:root1 branch=born status=working');
+    expect(r.stderr).toContain('baseline-ready pane=FIX:root1 branch=born status=idle');
+    expect(r.stderr).toContain('"status_before":"idle"');
+    if (fresh) expect(r.lines).toContain('pane close w11:p6');
+  });
+  it('continuation working still reads once and immediately sends text and Enter', async () => {
+    const r = await runLogged(['t1', 'executor', 'pi'], [HUB_PANE,
+      { pane_id: 'w11:p6', label: scopedFixture('t1.executor', '/repo'), workspace_id: 'w11',
+        cwd: '/repo', agent_status: 'working' }]);
+    expect(r.code, r.stderr).toBe(0);
+    expectDelivered(r.lines, 'w11:p6', true);
+    expect(r.lines.every(line => !/^pane (run|close|rename)/u.test(line))).toBe(true);
+    expect(r.stderr).not.toContain('baseline-wait-start');
+    expect(r.stderr).toContain('"reason":"baseline-working"');
+  });
+  it.each([false, true])('dry-run describes the selected branch (continuation=%s)', async continuation => {
+    const r = await runLogged(['t1', 'executor', 'pi'], [HUB_PANE,
+      ...(continuation ? [{ pane_id: 'w11:p6', label: scopedFixture('t1.executor', '/repo'),
+        workspace_id: 'w11', cwd: '/repo', agent_status: 'working' }] : [])], {}, true);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toContain(continuation ? 'continuation: first classifiable baseline, working sends immediately'
+      : 'born: after working wait for idle, timeout uses final probe (unknown or invalid: no input)');
+    expect(r.lines.some(line => /^pane send-(text|keys)/u.test(line))).toBe(false);
+  });
+});
 
 describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail", () => {
   it("anchors on the tut-hub pane's (workspace_id, cwd) — flags land on tab create", async () => {
@@ -226,14 +247,8 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
       expect(stdout).toContain("DRY-RUN: birth: herdr tab create --workspace <workspace> --cwd <cwd> --label TUT reviewer --no-focus");
       expect(stdout).toContain(scopedFixture("DRY-RUN: birth: herdr pane rename <root> t2.reviewer", "<hub-root>")); // pane label fixed
       expect(stdout).toContain(scopedFixture("(agent 'pi', label 't2.reviewer')", "<hub-root>"));
-      // Closed-loop preview: land-confirm + verified-submit lines with
-      // their knobs, both for the born branch.  The plan is CONDITIONAL:
-      // Enter/probe only on land; land-timeout is an observe-only wait
-      // ending in an attempts=0 give-up — never "submit anyway".
-      expect(stdout).toContain(scopedFixture("DRY-RUN: text-land check <label:t2.reviewer> (timeout 5000ms; prompt-fragment match, NEW instance vs pre-send baseline; prompt carries a per-delivery nonce suffix for attribution)", "<hub-root>"));
-      expect(stdout).toContain(scopedFixture("DRY-RUN: on land: herdr pane send-keys <label:t2.reviewer> Enter", "<hub-root>"));
-      expect(stdout).toContain(scopedFixture("DRY-RUN: on land: submit verify <label:t2.reviewer> (ONE monotonic budget: 30000ms total from the first Enter; initial observation ≤ min(3000ms, budget) by transport+box-cleared; bounded Enter resend loop — interval 1500ms within the remaining budget, probe diagnostic-only; exhaustion → evidence-based manual-fallback note, still exit 0)", "<hub-root>"));
-      expect(stdout).toContain("DRY-RUN: on land-timeout: NO Enter, NO probe — observe-only wait for a late landing (same new-instance rule) within the remaining 30000ms budget; exhausted without the text → give-up reason=land-never-observed (attempts=0) + escalation");
+      // Preview advertises the status baseline for the single attempt.
+      expect(stdout).toContain(scopedFixture("DRY-RUN: status-before <label:t2.reviewer> via herdr pane list", "<hub-root>"));
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }
@@ -293,10 +308,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
     ], { TUT_HERDR_READ_SCRIPT: CONT_SCREENS });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("same-role continuation — delivering to existing pane w11:p6");
-    // Deliver-only: no lifecycle mutation, no birth sequence. The readiness
-    // GATE is the born-pane mechanism — but the closed loop (snapshot /
-    // land-confirm / verify reads) applies here too: reads are expected,
-    // close/create/split/rename are not.
+    // Deliver-only: baseline/status queries, with no lifecycle mutation or birth.
     expect(
       r.lines.some((l) =>
         l.startsWith("pane close") || l.startsWith("tab create") || l.startsWith("pane split") || l.startsWith("pane rename"),
@@ -308,7 +320,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
     // NO gate: the snapshot read sits directly before the send-text (a born
     // pane would show the 4-read boot/paint gate sequence instead).
     const sendIdx = r.lines.findIndex((l) => l.startsWith("pane send-text w11:p6"));
-    expect(r.lines[sendIdx - 1]).toMatch(/^pane read w11:p6 /);
+    expect(r.lines[sendIdx - 1]).toBe("pane list");
     expectDelivered(r.lines, "w11:p6");
   });
 
@@ -332,7 +344,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
       expect(r.code).toBe(0);
       expect(r.stderr).toContain("same-role continuation — delivering to existing pane w11:p6");
       expect(r.lines.some((l) => l.startsWith("pane close") || l.startsWith("tab create"))).toBe(false);
-      expectDelivered(r.lines, "w11:p6");
+      expectDelivered(r.lines, "w11:p6", status === "working");
     }
   });
 
@@ -348,10 +360,7 @@ describe("same-role continuation: live `<T>.<role>` seat + continuity role → d
     );
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("DRY-RUN: herdr pane send-text w11:p6");
-    expect(r.stdout).toContain("DRY-RUN: text-land check w11:p6 (timeout 200ms; prompt-fragment match, NEW instance vs pre-send baseline; prompt carries a per-delivery nonce suffix for attribution)");
-    expect(r.stdout).toContain("DRY-RUN: on land: herdr pane send-keys w11:p6 Enter");
-    expect(r.stdout).toContain("DRY-RUN: on land: submit verify w11:p6 (ONE monotonic budget: 400ms total from the first Enter; initial observation ≤ min(100ms, budget) by transport+box-cleared; bounded Enter resend loop — interval 60ms within the remaining budget, probe diagnostic-only; exhaustion → evidence-based manual-fallback note, still exit 0)");
-    expect(r.stdout).toContain("DRY-RUN: on land-timeout: NO Enter, NO probe — observe-only wait for a late landing (same new-instance rule) within the remaining 400ms budget; exhausted without the text → give-up reason=land-never-observed (attempts=0) + escalation");
+    expect(r.stdout).toContain("DRY-RUN: status-before w11:p6 via herdr pane list");
     expect(r.stderr).toContain("same-role continuation");
     expect(r.lines.every((l) => l === "pane list")).toBe(true); // read-only discovery, nothing else
   });
@@ -395,7 +404,7 @@ describe("narrowed reap (birth branch): continuity seats survive, corpses and no
 });
 
 describe("--fresh (explicit outside perspective) + addressing-key guard", () => {
-  it("force-closes the role's own panes (idle AND working), then births + gated delivery to the newborn only", async () => {
+  it("force-closes the role's own panes (idle AND working), then births + single delivery attempt to the newborn only", async () => {
     const r = await runLogged(
       ["--fresh", "t1", "executor", "pi"],
       [
@@ -412,7 +421,7 @@ describe("--fresh (explicit outside perspective) + addressing-key guard", () => 
     expect(r.lines).toContain("pane close w11:p9"); // working seat — the explicit choice authorizes it
     expect(r.lines).toContain("tab create --workspace w11 --cwd /repo --label TUT executor --no-focus");
     expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
-    expect(r.lines.some((l) => l.startsWith("pane read"))).toBe(true); // readiness gate — born pane
+    expect(r.lines.some((l) => l.startsWith("pane read"))).toBe(false); // readiness gate — born pane
     const sends = r.lines.filter((l) => l.startsWith("pane send-text FIX:root1 轮到你了"));
     expect(sends).toHaveLength(1);
     expect(sends[0]).toMatch(/^pane send-text FIX:root1 /);
@@ -522,7 +531,7 @@ describe("--cleanup <task_id>: unconditional reap, best-effort", () => {
 // --- self-update suppression at launch (supply hardening) -------------------------
 
 describe("self-update suppression: the agent run command disables startup update checks", () => {
-  it("codex birth runs with the startup update check off — the registered self-update race cannot start; the closed-loop delivery completes", async () => {
+  it("codex birth runs with the startup update check off — the registered self-update race cannot start; the bounded delivery attempt completes", async () => {
     // Fixture-level simulation of the incident scenario: the pane paints
     // normally (BORN_SCREENS) BECAUSE the run command carries the
     // suppression — the six-minute npm self-update window is prevented at
@@ -531,7 +540,7 @@ describe("self-update suppression: the agent run command disables startup update
       TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
     });
     expect(r.code).toBe(0);
-    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "codex", args: ["-c", "check_for_update_on_startup=false"], env: {} });
+    expectAgentRun(r.lines, "FIX:root1", { executable: "codex", args: ["-c", "check_for_update_on_startup=false"], env: {} });
     expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expectDelivered(r.lines, "FIX:root1");
   });
@@ -541,7 +550,7 @@ describe("self-update suppression: the agent run command disables startup update
       TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
     });
     expect(r.code).toBe(0);
-    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
+    expectAgentRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:root1");
   });
 
@@ -557,7 +566,7 @@ describe("self-update suppression: the agent run command disables startup update
     });
     expect(r.code).toBe(0);
     expect(r.stderr).toContain("falling back to the anchored split sequence");
-    expectProbeRelayRun(r.lines, "FIX:p1", { executable: "codex", args: ["-c", "check_for_update_on_startup=false"], env: {} });
+    expectAgentRun(r.lines, "FIX:p1", { executable: "codex", args: ["-c", "check_for_update_on_startup=false"], env: {} });
   });
 
   it("unknown agents pass through unchanged; the presence check probes the BARE agent name", async () => {
@@ -571,7 +580,7 @@ describe("self-update suppression: the agent run command disables startup update
         PATH: `${bin}:${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
       });
       expect(r.code).toBe(0);
-      expectProbeRelayRun(r.lines, "FIX:root1", { executable: "stubagent", args: [], env: {} });
+      expectAgentRun(r.lines, "FIX:root1", { executable: "stubagent", args: [], env: {} });
 
       // Presence check: an agent not on PATH fails the birth with the BARE
       // name in the message (the wrapped form is never what is probed).
@@ -589,7 +598,7 @@ describe("self-update suppression: the agent run command disables startup update
       TUT_SUPPRESS_AGENT_UPDATE: "0",
     });
     expect(r.code).toBe(0);
-    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: {} });
+    expectAgentRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: {} });
   });
 
   it("dry-run preview shows the suppressed run command", async () => {
@@ -625,7 +634,7 @@ describe("adopt-root fallback: anchored split sequence when root adoption fails"
     expect(r.lines).toContain("pane move FIX:p1 --tab FIX:t1 --split down");
     // the fallback tab's stray panes are swept — FIX:root1 matches again (idempotent close, same target)
     expect(r.lines).toContain(scopedFixture("pane rename FIX:p1 t1.executor", "/repo"));
-    expectProbeRelayRun(r.lines, "FIX:p1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
+    expectAgentRun(r.lines, "FIX:p1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:p1");
   });
 
@@ -659,7 +668,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     // Root discovery fell to channel 2 (pane list by tab_id) and the birth
     // sequence completed on the recovered tab's root pane.
     expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
-    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
+    expectAgentRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:root1");
   });
 
@@ -699,7 +708,7 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
     expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
     expect(r.lines.some((l) => l.startsWith("pane rename FIX:fx1"))).toBe(false); // the foreign pane is untouched
     expect(r.lines.some((l) => l.startsWith("pane close FIX:fx1"))).toBe(false);
-    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
+    expectAgentRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:root1");
   });
 
@@ -785,7 +794,7 @@ describe("tab create signal termination: recover or refuse, never blindly duplic
     expect(r.lines.filter((l) => l.startsWith("tab create"))).toHaveLength(1);
     expect(r.lines).toContain("tab list --workspace w11");
     expect(r.lines).toContain(scopedFixture("pane rename FIX:root1 t1.executor", "/repo"));
-    expectProbeRelayRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
+    expectAgentRun(r.lines, "FIX:root1", { executable: "pi", args: [], env: { PI_SKIP_VERSION_CHECK: "1" } });
     expectDelivered(r.lines, "FIX:root1");
     expect(r.stderr).toContain("signal SIGTERM");
     expect(r.stderr).toContain("tab id recovered via tab list");

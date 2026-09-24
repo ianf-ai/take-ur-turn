@@ -15,9 +15,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { startServer, type RunningServer } from "../src/server.js";
-import { Store } from "../src/store.js";
-import { writeConfigKey } from "../src/config.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
+import { Store } from "../src/hub/store.js";
+import { writeConfigKey } from "../src/common/config.js";
 
 let tmp: string;
 let root: string;

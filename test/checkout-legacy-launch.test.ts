@@ -20,8 +20,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
-import { hubCreate } from "../src/hub-client.js";
-import { startServer, type RunningServer } from "../src/server.js";
+import { hubCreate } from "../src/hub/hub-client.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
 
 const runLaunch = promisify(execFile);
 const DIST_CLI = path.resolve(import.meta.dirname, "../dist/cli.js");
@@ -119,10 +119,6 @@ describe("combination: create with a worktree path → legacy positional launch 
             TUT_READY_STABLE_POLLS: "2",
             TUT_READY_FLOOR_MS: "0",
             TUT_READY_TIMEOUT_MS: "300",
-            TUT_TEXT_LAND_TIMEOUT_MS: "200",
-            TUT_SUBMIT_TIMEOUT_MS: "100",
-            TUT_SUBMIT_RETRY_MS: "60",
-            TUT_SUBMIT_RETRY_TIMEOUT_MS: "400",
           },
         },
       );
@@ -201,10 +197,6 @@ describe("legacy door: /state metadata failure modes", () => {
       TUT_READY_STABLE_POLLS: "2",
       TUT_READY_FLOOR_MS: "0",
       TUT_READY_TIMEOUT_MS: "300",
-      TUT_TEXT_LAND_TIMEOUT_MS: "200",
-      TUT_SUBMIT_TIMEOUT_MS: "100",
-      TUT_SUBMIT_RETRY_MS: "60",
-      TUT_SUBMIT_RETRY_TIMEOUT_MS: "400",
     };
   }
 

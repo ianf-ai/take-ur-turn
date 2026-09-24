@@ -12,8 +12,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
  * exercised end-to-end, exactly as a real MCP client would see them.
  */
 
-import { createMcpServer } from "../src/mcp.js";
-import { Store } from "../src/store.js";
+import { createMcpServer } from "../src/mcp/server.js";
+import { Store } from "../src/hub/store.js";
 
 let tmp: string;
 let store: Store;

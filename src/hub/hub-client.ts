@@ -31,7 +31,7 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Cast, CheckoutRoute, ContextRecord, Flow, Warning } from "./types.js";
+import type { Cast, CheckoutRoute, ContextRecord, Flow, Warning } from "../common/types.js";
 
 /** Structural twin of the SDK's FetchLike (its public name is a deep internal path — same shape, no deep import). */
 type HubFetch = (url: string | URL, init?: RequestInit) => Promise<Response>;

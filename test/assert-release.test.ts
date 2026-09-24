@@ -30,7 +30,6 @@ async function makeRoot(files: Record<string, string>): Promise<string> {
 const HEALTHY_FILES: Record<string, string> = {
   "dist/cli.js": `#!/usr/bin/env node\n${"x".repeat(10_001)}`,
   "dist/launcher/pane-runner.js": "export {};\n",
-  "dist/launcher/probe-runner.js": "export {};\n",
   "skills/architect.md": "# architect\n",
   "skills/executor.md": "# executor\n",
   "skills/reviewer.md": "# reviewer\n",
@@ -86,13 +85,14 @@ describe("scripts/assert-release.js release gate", () => {
     expect(result.stderr).toContain("pane-runner.js");
   });
 
-  it("fails when dist/launcher/probe-runner.js is missing", async () => {
-    const files = { ...HEALTHY_FILES };
-    delete files["dist/launcher/probe-runner.js"];
-    const root = await freshRoot(files);
+  // Deletion regression: every emitted artifact must be rejected in dirty dist.
+  it.each(["probe-runner", "probe-channel"].flatMap(name =>
+    ["js", "d.ts", "map", "js.map", "d.ts.map"].map(ext => `${name}.${ext}`)))
+  ("rejects retired artifact %s", async name => {
+    const root = await freshRoot({ ...HEALTHY_FILES, [`dist/launcher/${name}`]: "stale" });
     const result = await runGate(root);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("probe-runner.js");
+    expect(result.stderr).toContain(`retired artifact dist/launcher/${name}`);
   });
 
   it("fails when a skills role file is missing (kickoff prompt contract)", async () => {
@@ -127,9 +127,9 @@ describe("scripts/assert-release.js release gate", () => {
   it("accepts a symlink pointing at a regular file (statSync follows links)", async () => {
     const root = await freshRoot(HEALTHY_FILES);
     const launcher = path.join(root, "dist", "launcher");
-    await copyFile(path.join(launcher, "pane-runner.js"), path.join(launcher, "probe-runner.real.js"));
-    await rm(path.join(launcher, "probe-runner.js"));
-    await symlink(path.join(launcher, "probe-runner.real.js"), path.join(launcher, "probe-runner.js"));
+    await copyFile(path.join(launcher, "pane-runner.js"), path.join(launcher, "pane-runner.real.js"));
+    await rm(path.join(launcher, "pane-runner.js"));
+    await symlink(path.join(launcher, "pane-runner.real.js"), path.join(launcher, "pane-runner.js"));
     const result = await runGate(root);
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("assert-release: ok");

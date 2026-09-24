@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { LaunchInvocation } from "../src/types.js";
-import type { HerdrCommandResult, HerdrPane } from "../src/launcher/herdr-client.js";
+import type { LaunchInvocation } from "../src/common/types.js";
+import type { HerdrCommandResult, HerdrPane } from "../src/launcher/legacy-herdr-client.js";
 import { birthPane } from "../src/launcher/birth.js";
 import {
   cleanupTaskPanes,

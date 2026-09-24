@@ -12,7 +12,7 @@ import {
   normalizeAgentRoute,
   parseAgentInvocation,
   validateAgentRoute,
-} from "../agent-command.js";
+} from "../common/agent-command.js";
 import type {
   AgentCommand,
   AgentRoute,
@@ -24,7 +24,7 @@ import type {
   LaunchRequest,
   LaunchRouteSource,
   PosixDirectPlan,
-} from "../types.js";
+} from "../common/types.js";
 
 export class LaunchInvocationError extends Error {
   constructor(message: string) {

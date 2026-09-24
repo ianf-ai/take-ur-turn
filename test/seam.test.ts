@@ -3,9 +3,9 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { derive } from "../src/state-machine.js";
-import { Store, StoreError, type AppendInput, type AppendResult, type CreateTaskInput } from "../src/store.js";
-import { ErrorCode, type ContextRecord, type DerivedState, type Flow } from "../src/types.js";
+import { derive } from "../src/hub/state-machine.js";
+import { Store, StoreError, type AppendInput, type AppendResult, type CreateTaskInput } from "../src/hub/store.js";
+import { ErrorCode, type ContextRecord, type DerivedState, type Flow } from "../src/common/types.js";
 
 /**
  * Seam integration: the REAL store on a temp dir

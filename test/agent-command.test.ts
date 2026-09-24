@@ -12,11 +12,11 @@ import {
   parseAgentInvocation,
   parseAgentRoute,
   validateAgentRoute,
-} from "../src/agent-command.js";
+} from "../src/common/agent-command.js";
 import { parseArgs } from "../src/cli.js";
-import { resolveAgent, resolveAgentRoute } from "../src/workspace.js";
-import { Store } from "../src/store.js";
-import { resolveLaunchTarget } from "../src/launch.js";
+import { resolveAgent, resolveAgentRoute } from "../src/common/workspace.js";
+import { Store } from "../src/hub/store.js";
+import { resolveLaunchTarget } from "../src/launcher/launch.js";
 
 const run = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");

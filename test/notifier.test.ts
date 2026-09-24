@@ -1,5 +1,6 @@
-import { canonicalRoot, resolveRigRoot } from "../src/rig-discovery.js";
-import { rigLabel } from "../src/rig.js";
+import { createRemediationAudit } from '../src/launcher/delivery.js';
+import { canonicalRoot, resolveRigRoot } from "../src/hub/rig-discovery.js";
+import { rigLabel } from "../src/hub/rig.js";
 /**
  * Notifier unit tests: fake-clock-driven compare loop, mocked channels,
  * injected fetch/launch/now. The event HTTP listener is exercised for real on an
@@ -22,7 +23,7 @@ const h = vi.hoisted(() => {
   const channelsSeen: unknown[] = [];
   return { sent, channelsSeen };
 });
-vi.mock("../src/channels.js", () => ({
+vi.mock("../src/common/channels.js", () => ({
   createChannels: (cfg: unknown) => {
     h.channelsSeen.push(cfg);
     return [
@@ -32,13 +33,13 @@ vi.mock("../src/channels.js", () => ({
   },
 }));
 
-import { Notifier, runNotify, spawnLaunch, type StateResponse, type StateTask } from "../src/notifier.js";
-import { giveUpGuidance } from "../src/launcher/escalation.js";
-import { launchBlocked } from "../src/launch.js";
-import { derive } from "../src/state-machine.js";
-import { Store } from "../src/store.js";
-import { startServer } from "../src/server.js";
-import type { AgentRoute, ContextRecord } from "../src/types.js";
+import { Notifier, runNotify, spawnLaunch, type StateResponse, type StateTask } from "../src/notifier/notifier.js";
+import { giveUpGuidance, parseDeliveryV2 } from "../src/launcher/escalation.js";
+import { launchBlocked } from "../src/launcher/launch.js";
+import { derive } from "../src/hub/state-machine.js";
+import { Store } from "../src/hub/store.js";
+import { startServer } from "../src/hub/server.js";
+import type { AgentRoute, ContextRecord } from "../src/common/types.js";
 import { HANDLERS, parseArgs } from "../src/cli.js";
 
 const U1 = "2026-08-15T10:00:00.000Z";
@@ -78,6 +79,7 @@ function state(
 }
 
 interface HarnessOpts {
+  remediator?: import("../src/remediator.js").Remediator;
   flowMode?: string;
   notify?: unknown;
   /** auto-mode launch whitelist (state.auto.launch_roles); omitted = no auto key. */
@@ -115,7 +117,7 @@ interface HarnessOpts {
   sweepDelayMs?: number;
   /** Close-edge cleanup seam; default records into `cleanups`. */
   cleanup?: (taskId: string) => Promise<void>;
-  relay?: (report: import("../src/host-status-relay.js").HostStatusReport, notify: unknown) => Promise<void>;
+  relay?: (report: import("../src/notifier/host-relay.js").HostStatusReport, notify: unknown) => Promise<void>;
 }
 
 const openNotifiers: Notifier[] = [];
@@ -129,6 +131,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   let failing = false;
   let nowMs = 0;
   const logs: string[] = [];
+  const auditLines: string[] = [];
   const launches: { taskId: string; role: string; agent: string; args?: string[] }[] = [];
   const cleanups: string[] = [];
   const sweptReads: string[] = [];
@@ -143,6 +146,14 @@ function makeHarness(opts: HarnessOpts = {}) {
       ...(opts.workingTimeoutSec !== undefined ? { workingTimeoutSec: opts.workingTimeoutSec } : {}),
     },
     {
+      ...(opts.remediator ? { remediator: opts.remediator } : {}),
+      remediationAudit: (taskId, role) => createRemediationAudit({
+        task_id: taskId, role, env: { ...process.env, TUT_PROJECT_ROOT: '/fixture' },
+        stderr: line => logs.push(line), fs: {
+          isDirectory: () => true, mkdir: async () => {}, size: async () => 0,
+          append: async (_file, line) => { auditLines.push(line); }, rename: async () => {},
+        },
+      }),
       fetchState: async (url: string) => {
         if (failing) throw new Error(`connect ECONNREFUSED ${url}`);
         fetches += 1;
@@ -244,6 +255,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       nowMs = ms;
     },
     logs,
+    auditLines,
     launches,
     cleanups,
     sweptReads,
@@ -275,15 +287,21 @@ async function freePort(): Promise<number> {
 }
 
 beforeEach(() => {
+  // Fixture labels use cwd; never discover a parent checkout's live Hub root.
+  vi.stubEnv("TUT_HUB_ROOT", process.cwd());
   vi.useFakeTimers();
   h.sent.length = 0;
   h.channelsSeen.length = 0;
 });
 
 afterEach(async () => {
-  for (const n of openNotifiers.splice(0)) await n.close();
-  vi.useRealTimers();
-  vi.restoreAllMocks();
+  try {
+    for (const n of openNotifiers.splice(0)) await n.close();
+  } finally {
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
 });
 
 // --- compare loop -------------------------------------------------------------------
@@ -726,12 +744,12 @@ describe("auto-mode gate", () => {
 
     expect(titlesMatching("auto-launched executor")).toHaveLength(1);
     expect(titlesMatching("agent working")).toHaveLength(0);
-    expect(hz.logs.some((line) => line.includes("launch succeeded") && line.includes("working signal"))).toBe(true);
+    expect(hz.logs.some((line) => line.includes("launch attempt completed; delivery confirmation is not implied") && line.includes("working signal"))).toBe(true);
 
     hz.notifier.receiveEvent({ event: "working", agent: "pi", pane: "t1.executor" });
     await hz.flush();
     expect(titlesMatching("agent working")).toHaveLength(1);
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0);
     expect(hz.logs.some((line) => line.includes("working signal received"))).toBe(true);
   });
 
@@ -743,10 +761,10 @@ describe("auto-mode gate", () => {
 
     await vi.advanceTimersByTimeAsync(4_999);
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1);
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(1);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(1);
     expect(hz.logs.some((line) => line.includes("launch working timeout"))).toBe(true);
   });
 
@@ -762,7 +780,7 @@ describe("auto-mode gate", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     await hz.flush();
     expect(titlesMatching("agent working")).toHaveLength(1);
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0);
   });
 
   it("keeps the launch watch across an ordinary note and still times out without working", async () => {
@@ -804,7 +822,7 @@ describe("auto-mode gate", () => {
 
     await vi.advanceTimersByTimeAsync(5_000);
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(1);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(1);
   });
 
   it("keeps the launch watch across an ordinary note so the current pane can clear it", async () => {
@@ -849,7 +867,7 @@ describe("auto-mode gate", () => {
     expect(titlesMatching("agent working")).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(5_000);
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0);
   });
 
   it("keeps a working signal that arrives while launch.sh is still returning", async () => {
@@ -886,7 +904,7 @@ describe("auto-mode gate", () => {
     expect(titlesMatching("agent working")).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(5_000);
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0);
   });
 
   it("retires an old-role watch before a late working event can refresh the task", async () => {
@@ -915,7 +933,7 @@ describe("auto-mode gate", () => {
 
     await vi.advanceTimersByTimeAsync(5_000);
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(1);
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(1);
     expect(titlesMatching("agent working")).toHaveLength(0);
   });
 
@@ -1993,11 +2011,11 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     expect(gaveUp?.msg.body).toContain("t1.executor");
     // Missing evidence fields → conservative hint only, composed from the
     // shared single-source guidance (notifier prefix + giveUpGuidance).
-    expect(gaveUp?.msg.body).toContain(`box evidence unavailable — ${giveUpGuidance("unknown")}`);
+    expect(gaveUp?.msg.body).toContain(`${giveUpGuidance("unknown")}`);
     expect(gaveUp?.msg.body).not.toContain("sits unconsumed in the input box");
-    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("held"));
+    expect(gaveUp?.msg.body).not.toContain("press Enter there manually to start the round");
     expect(hz.fetchCount()).toBe(baselineFetches); // no compare enqueued
-    expect(hz.logs.some((l) => l.includes("delivery gave up for executor") && l.includes("box evidence unavailable"))).toBe(true);
+    expect(hz.logs.some((l) => l.includes("delivery gave up for executor") && l.includes("delivery unconfirmed"))).toBe(true);
   });
 
   it("half-valid core pair (box=held, transport missing) degrades to the conservative hint — atomic normalization", async () => {
@@ -2010,11 +2028,11 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held" });
     await hz.flush();
     const gaveUp = h.sent.find((s) => s.msg.title === "TUT t1: prompt delivery gave up");
-    expect(gaveUp?.msg.body).toContain(`box evidence unavailable — ${giveUpGuidance("unknown")}`);
-    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("held"));
+    expect(gaveUp?.msg.body).toContain(`${giveUpGuidance("unknown")}`);
+    expect(gaveUp?.msg.body).not.toContain("press Enter there manually to start the round");
   });
 
-  it("box=held evidence → the alert may direct a manual Enter, word-for-word the shared held guidance", async () => {
+  it("box=held is historical only; the alert requires all manual checks", async () => {
     const hz = makeHarness();
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare();
@@ -2022,11 +2040,11 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     await hz.flush();
     const gaveUp = h.sent.find((s) => s.msg.title === "TUT t1: prompt delivery gave up");
     expect(gaveUp?.msg.body).toContain(giveUpGuidance("held"));
-    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("cleared"));
+    expect(gaveUp?.msg.body).not.toContain("the text has left the input box");
     expect(hz.logs.some((l) => l.includes("delivery gave up for executor") && l.includes(giveUpGuidance("held")))).toBe(true);
   });
 
-  it("box=cleared evidence → confirm-round-first hint; the alert must NOT direct an Enter (double-prompt hazard)", async () => {
+  it("box=cleared is historical only; the alert requires all manual checks", async () => {
     const hz = makeHarness();
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare();
@@ -2036,7 +2054,7 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     expect(gaveUp?.msg.body).toContain(giveUpGuidance("cleared"));
     // The core defect this closes: the alert channel must never send the
     // human to the exact action the launcher evidence forbids.
-    expect(gaveUp?.msg.body).not.toContain(giveUpGuidance("held"));
+    expect(gaveUp?.msg.body).not.toContain("press Enter there manually to start the round");
     expect(gaveUp?.msg.body).not.toContain("press Enter there manually");
   });
 
@@ -2062,7 +2080,7 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     expect(hz.logs.some((l) => l.includes("short working fuse disarmed"))).toBe(true);
     await vi.advanceTimersByTimeAsync(5_000); // the fuse window would elapse
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0); // disarmed, not fired
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0); // disarmed, not fired
   });
 
   it("in-flight give-up (real auto ordering): launch return does NOT re-arm the short fuse, stall clock intact", async () => {
@@ -2110,7 +2128,7 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     expect(hz.logs.some((l) => l.includes("short working fuse not armed"))).toBe(true);
     await vi.advanceTimersByTimeAsync(5_000); // the (never-armed) fuse window would elapse
     await hz.flush();
-    expect(titlesMatching("launch succeeded but no working signal")).toHaveLength(0); // no duplicate alarm
+    expect(titlesMatching("launch attempt completed; delivery confirmation is not implied — no working signal")).toHaveLength(0); // no duplicate alarm
     expect(titlesMatching("prompt delivery gave up")).toHaveLength(1); // still exactly one give-up alert
     hz.at(30 * 60_000); // stall watchdog on its original clock
     await hz.notifier.requestCompare();
@@ -2303,7 +2321,7 @@ describe("done-event pane sweep: final screens archived into the notify log", ()
 
 describe("defaultLoadRouting: the real loader reads the three-level chain (cwd L1 + TUT_USER_CONFIG_DIR L2)", () => {
   it("L1 fixture defines the maps; L2 covers roles L1 lacks; legacy labels absent", async () => {
-    const { defaultLoadRouting } = await import("../src/notifier.js");
+    const { defaultLoadRouting } = await import("../src/notifier/notifier.js");
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
@@ -2339,7 +2357,7 @@ describe("defaultLoadRouting: the real loader reads the three-level chain (cwd L
   });
 
   it("no config anywhere → built-in DEFAULT_ROLES with agent-named identities only", async () => {
-    const { defaultLoadRouting } = await import("../src/notifier.js");
+    const { defaultLoadRouting } = await import("../src/notifier/notifier.js");
     const { mkdtempSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
@@ -2369,7 +2387,7 @@ describe("custom tab-label template regression: template output never enters eve
     // pane addressing inputs stay template-free — pinned against a fixture
     // that actually carries naming.tab_label (same vector as the launcher
     // test in cli-assign-launch.test.ts).
-    const { defaultLoadRouting } = await import("../src/notifier.js");
+    const { defaultLoadRouting } = await import("../src/notifier/notifier.js");
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
@@ -2773,18 +2791,15 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
     expect(hz.fetchCount()).toBe(0);
   });
 
-  it("delivery_giveup: core evidence pair box+transport normalized ATOMICALLY; complete payloads take their branches", async () => {
-    // Review R2 P1 closure matrix: a half-valid pair (one field well-typed,
-    // the other missing/ill-typed) must degrade to the conservative
-    // inspect-pane hint — never the held copy; complete payloads still
-    // drive their own branch.
+  it("delivery_giveup: all legacy evidence variants retain conservative guidance", async () => {
+    // Old producer payloads remain accepted, with one conditional manual hint.
     const { hz, port } = await startListenerHarness();
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare(); // baseline
     const sentBaseline = h.sent.length; // h.sent is module-global across tests
     const post = (body: unknown): Promise<{ status: number; body: string }> =>
       rawRequest(port, "POST", "/agent-event", JSON.stringify(body));
-    const conservative = `box evidence unavailable — ${giveUpGuidance("unknown")}`;
+    const conservative = `${giveUpGuidance("unknown")}`;
     // half pairs — every one must be conservative:
     const heldNoTransport = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held" });
     expect(heldNoTransport.status).toBe(200);
@@ -2809,7 +2824,7 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
     expect(notAttempted.status).toBe(200);
     const received = receiveSpy.mock.calls.at(-1)?.[0] as { probe?: string };
     expect(received.probe).toBe("not-attempted");
-    // complete payloads still take their own branches:
+    // Complete historical payloads use the same guidance:
     const completeHeld = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held", transport: true, probe: "failed" });
     expect(completeHeld.status).toBe(200);
     const completeCleared = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "cleared", transport: false });
@@ -2821,11 +2836,77 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
       .map((s) => s.msg.body);
     expect(bodies).toHaveLength(9);
     const conservativeBodies = bodies.filter((b) => b.includes(conservative));
-    expect(conservativeBodies).toHaveLength(7); // 4 half pairs + legacy + garbage + not-attempted
-    // No conservative alert may direct the manual-Enter action.
-    expect(conservativeBodies.every((b) => !b.includes(giveUpGuidance("held")))).toBe(true);
-    expect(bodies.filter((b) => b.includes(giveUpGuidance("held")))).toHaveLength(1);
-    expect(bodies.filter((b) => b.includes(giveUpGuidance("cleared")))).toHaveLength(1);
+    expect(conservativeBodies).toHaveLength(9); // all legacy variants use the same conditional guidance
+
+  });
+
+  it("delivery_v2 is atomic over HTTP, explains valid reasons, and overrides historical evidence", async () => {
+    const { hz, port } = await startListenerHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    const valid = {
+      schema: 2, attempt_id: "attempt-1", pane_id: "pane-1", reason: "attribution-unavailable",
+      status_before: "idle", status_last: "working", status_error: null, status_flip: true,
+      submit_confirmed: false, attribution: "unavailable", text_transport: "sent", text_error: null,
+      enter_transport: "sent", enter_error: null, text_calls: 1, enter_calls: 1,
+      budget_ms: 100, elapsed_ms: 50, total_elapsed_ms: 75, last_query_sequence: 3,
+      detector_source: null, detector_age_ms: null, server_epoch: null, agent_generation: null,
+    };
+    const invalid: unknown[] = [undefined, null, [], {}, { ...valid, schema: 3 }];
+    // Every required field is checked, not just the reason and schema.
+    for (const key of Object.keys(valid)) {
+      const missing: Record<string, unknown> = { ...valid };
+      delete missing[key];
+      invalid.push(missing, { ...valid, [key]: {} });
+    }
+    invalid.push(
+      { ...valid, enter_calls: 0 }, { ...valid, elapsed_ms: 100 },
+      { ...valid, status_before: "working" }, { ...valid, status_last: "done" },
+      { ...valid, status_error: "TIMEOUT" }, { ...valid, status_flip: false },
+      { ...valid, text_error: "TIMEOUT" }, { ...valid, text_transport: "uncertain" },
+      { ...valid, enter_transport: "uncertain" }, { ...valid, enter_error: "TIMEOUT" },
+      { ...valid, reason: "text-uncertain" }, { ...valid, budget_ms: -1 },
+      { ...valid, last_query_sequence: 0 }, { ...valid, last_query_sequence: 1.5 },
+    );
+    for (const value of [NaN, Infinity, -Infinity]) {
+      for (const key of ["budget_ms", "elapsed_ms", "total_elapsed_ms", "last_query_sequence"]) {
+        expect(parseDeliveryV2({ ...valid, [key]: value })).toBeUndefined();
+      }
+    }
+    const accepted = [valid,
+      { ...valid, reason: 'baseline-unknown', status_before: 'unknown', status_last: 'unknown',
+        status_flip: false, text_calls: 0, text_transport: 'not-sent', enter_calls: 0,
+        enter_transport: 'not-attempted', elapsed_ms: null, total_elapsed_ms: 90_000,
+        baseline_wait: { budget_ms: 90_000, elapsed_ms: 90_000 } },
+      { ...valid, reason: "deadline", status_last: "idle", status_flip: false, elapsed_ms: 100 },
+      { ...valid, reason: "text-uncertain", text_transport: "uncertain", text_error: "TIMEOUT",
+        enter_calls: 0, enter_transport: "not-attempted", elapsed_ms: null, status_flip: false },
+      ...["not-sent", "uncertain"].map((transport) => ({ ...valid, reason: `enter-${transport}`,
+        enter_transport: transport, enter_error: "TIMEOUT", status_flip: false })),
+      ...["identity-invalid", "baseline-working", "baseline-unknown", "status-unavailable", "cancelled"].map((reason) => ({
+        ...valid, reason, status_flip: false,
+      })),
+    ];
+    const spy = vi.spyOn(hz.notifier, "receiveEvent");
+    for (const evidence of [...accepted, ...invalid]) {
+      const before = h.sent.length;
+      const response = await rawRequest(port, "POST", "/agent-event", JSON.stringify({
+        event: "delivery_giveup", agent: "pi", pane: "t1.executor", delivery_v2: evidence,
+        box: "held", transport: true, probe: "observed",
+      }));
+      expect(response.status).toBe(200);
+      await hz.flush();
+      const bodies = h.sent.slice(before).filter((entry) => entry.name === "desktop").map((entry) => entry.msg.body);
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0]).toContain(giveUpGuidance());
+      if (accepted.includes(evidence as typeof valid)) {
+        expect(spy.mock.calls.at(-1)?.[0].delivery_v2).toEqual(evidence);
+        expect(bodies[0]).toContain(`reason=${(evidence as typeof valid).reason}`);
+      } else {
+        expect(spy.mock.calls.at(-1)?.[0].delivery_v2).toBeUndefined();
+        expect(bodies[0]).not.toContain("reason=");
+      }
+    }
   });
 
   it("wrong path → 404; GET → 405", async () => {
@@ -2911,34 +2992,21 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
           TUT_SPLIT_BASE: "w9:p0",
           TUT_HUB_URL: "http://127.0.0.1:1", // hub down: file chain + stderr note
           TUT_USER_CONFIG_DIR: path.join(os.tmpdir(), `tut-tee-l2-${process.pid}`),
-          TUT_DELIVERY_NONCE: "A1B2C3D4",
-          TUT_READY_POLL_MS: "20",
-          TUT_READY_FLOOR_MS: "0",
-          TUT_READY_TIMEOUT_MS: "4000",
-          TUT_TEXT_LAND_TIMEOUT_MS: "200",
-          TUT_SUBMIT_TIMEOUT_MS: "100",
-          TUT_HERDR_READ_SCRIPT: JSON.stringify([
-            "",
-            "",
-            "pi TUI ready — status 0.0%",
-            "pi TUI ready — status 0.0%",
-            "pi TUI ready — status 0.0%",
-            "pi TUI ready — status 0.0%",
-            // The landed view embeds every role's prompt head-fragment: the
-            // text-match landing criterion (7.2.1 step 3) only accepts a
-            // screen that actually shows the sent text.
-            "pi TUI ready ▎轮到你了（role: architect）：请用 轮到你了（role: executor）：请用 轮到你了（role: reviewer）：请用 开始本轮工作，完成后发布相应记录（context.publish）。 （tut delivery A1B2C3D4）",
-            "working — round started",
-          ]),
+          TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event",
+          TUT_STATUS_FLIP_TIMEOUT_MS: "100",
+          TUT_STATUS_POLL_MS: "20",
+
         });
         expect(out).toBe(""); // stdout consumed as before
         const text = seen.join("");
         expect(text).toContain("tut-delivery t="); // diagnostics were tee'd
-        expect(text).toContain("gate-release pane=FIX:root1");
-        expect(text).toContain("submit-confirmed pane=FIX:root1 attempt=1");
+        expect(text).toContain("status-before pane=FIX:root1 sequence=");
+        expect(text).toMatch(/started=.*finished=.*status=.*error=.*identity=.*detector_source=null detector_age_ms=null/);
+        expect(text).toContain("give-up pane=FIX:root1 delivery_v2=");
+        expect(text).not.toContain("submit-confirmed");
         // The birth really ran against the fixture (not a dry-run).
         const lines = readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0);
-        expect(lines.some((line) => line.startsWith("pane run FIX:root1 ") && line.includes("probe-runner.js"))).toBe(true);
+        expect(lines.some((line) => line.startsWith("pane run FIX:root1 ") && !line.includes("probe-runner.js"))).toBe(true);
       } finally {
         spy.mockRestore();
         rmSync(log, { force: true });
@@ -3859,7 +3927,7 @@ describe("notifier rig isolation", () => {
 
   it("freezes the actual notifier endpoint in the auto worker plan", async () => {
     let current = state([task({ task_id: "t1", status: "designing", waiting_for: "agent:architect" })], { flow_mode: "auto", auto: ALL_ROLES });
-    const plans: import("../src/types.js").LaunchInvocation[] = [];
+    const plans: import("../src/common/types.js").LaunchInvocation[] = [];
     const notifier = new Notifier({ url: "http://127.0.0.1:4311", eventPort: 4312, interval: 5, stallTimeoutMin: 30 }, {
       fetchState: async () => current,
       readLog: async () => [],
@@ -3939,4 +4007,106 @@ describe("host status relay edges", () => {
     expect(relay).toHaveBeenCalledTimes(1);
     finish();
   });
+});
+
+describe('notifier remediation policy and pluggable interface', () => {
+  it.each(['role', 'status', 'attention', 'missing', 'off', 'read-error'])(
+    'refreshes lifecycle: notes survive but %s stops remediation', async change => {
+      const base = task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor', version: 1 });
+      const decisions: boolean[] = [];
+      const remediate = vi.fn(async (request: import('../src/remediator.js').RemediationRequest) => {
+        hz.set(state([{ ...base, version: 2 }], { flow_mode: 'auto' }));
+        decisions.push(await request.canAct()); // no compare: callback must fetch fresh /state
+        if (change === 'read-error') hz.setFailing(true);
+        else hz.set(state(change === 'missing' ? [] : [{ ...base, version: 3,
+          ...(change === 'role' ? { waiting_for: 'agent:reviewer' } : {}),
+          ...(change === 'status' ? { status: 'revising' } : {}),
+          ...(change === 'attention' ? { needs_attention: true } : {}) }],
+          { flow_mode: 'auto', ...(change === 'off' ? { auto: { remediate: 'off' } } : {}) }));
+        decisions.push(await request.canAct());
+        hz.setFailing(false);
+        hz.set(state([base], { flow_mode: 'auto' }));
+        decisions.push(await request.canAct()); // a stopped attempt never revives
+        return { strategy: 'test', action: 'none' as const, result: 'skipped' as const,
+          enter_transport: 'not-attempted' as const, status_flip: false, attribution: 'unavailable' as const, reason: 'lifecycle-changed' };
+      });
+      const hz = makeHarness({ remediator: { remediate } });
+      hz.set(state([base], { flow_mode: 'auto' }));
+      await hz.notifier.requestCompare();
+      hz.notifier.receiveEvent({ event: 'delivery_giveup', agent: 'pi', pane: 't1.executor', delivery_v2: evidence });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(decisions).toEqual([true, false, false]);
+      expect(h.sent.some(s => s.msg.title.includes('prompt delivery gave up'))).toBe(true);
+    });
+  const evidence = {
+    schema: 2, attempt_id: 'fixture-01', pane_id: 'pane-1', reason: 'deadline',
+    status_before: 'idle', status_last: 'idle', status_error: null, status_flip: false,
+    submit_confirmed: false, attribution: 'unavailable', text_transport: 'sent', text_error: null,
+    enter_transport: 'sent', enter_error: null, text_calls: 1, enter_calls: 1,
+    budget_ms: 10, elapsed_ms: 10, total_elapsed_ms: 10, last_query_sequence: 3,
+    detector_source: null, detector_age_ms: null, server_epoch: null, agent_generation: null,
+  };
+  it.each([
+    ['auto', undefined, true], ['manual', undefined, false],
+    ['auto', 'off', false], ['manual', 'off', false], ['manual', 'enter-repress', true],
+  ] as const)('%s with %s invokes strategy=%s', async (mode, setting, enabled) => {
+    vi.stubEnv('TUT_DELIVERY_DIAG', '0');
+    const remediate = vi.fn(async (_request: import('../src/remediator.js').RemediationRequest) => ({ strategy: 'test-future-strategy', action: 'machine-enter' as const,
+      result: 'working-observed' as const, enter_transport: 'sent' as const, status_flip: true,
+      attribution: 'machine-remediation' as const, reason: 'working-observed' }));
+    const hz = makeHarness({ remediator: { remediate } });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })],
+      { flow_mode: mode, ...(setting ? { auto: { remediate: setting } } : {}) }));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: 'delivery_giveup', agent: 'pi', pane: 't1.executor', delivery_v2: evidence });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(remediate).toHaveBeenCalledTimes(enabled ? 1 : 0);
+    if (enabled) {
+      expect(remediate.mock.calls[0]?.[0]).toMatchObject({ agent: 'pi', pane: 't1.executor', evidence });
+      expect(h.sent.some(s => s.msg.body.includes('机器补救'))).toBe(true);
+      hz.notifier.receiveEvent({ event: 'delivery_giveup', agent: 'pi', pane: 't1.executor', delivery_v2: evidence });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(remediate).toHaveBeenCalledTimes(1);
+    } else {
+      expect(h.sent.some(s => s.msg.body.includes(giveUpGuidance()))).toBe(true);
+      expect(hz.logs.some(l => l.includes('remediation'))).toBe(false);
+    }
+  });
+  it('second give-up upgrades to human once without recursively invoking strategy', async () => {
+    vi.stubEnv('TUT_DELIVERY_DIAG', '0');
+    const remediate = vi.fn(async () => ({ strategy: 'enter-repress', action: 'machine-enter' as const,
+      result: 'give-up' as const, enter_transport: 'sent' as const, status_flip: false,
+      attribution: 'unavailable' as const, reason: 'deadline' }));
+    const hz = makeHarness({ remediator: { remediate } });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })], { flow_mode: 'auto' }));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: 'delivery_giveup', agent: 'pi', pane: 't1.executor', delivery_v2: evidence });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(remediate).toHaveBeenCalledTimes(1);
+    expect(hz.logs.some(l => l.includes('二次 give-up'))).toBe(true);
+    expect(h.sent.some(s => s.msg.title.includes('prompt delivery gave up'))).toBe(true);
+  });
+  it.each(['0', '1'])('retains action and result audit in both sinks with diag=%s', async diag => {
+    vi.stubEnv('TUT_DELIVERY_DIAG', diag);
+    const result = { strategy: 'enter-repress', action: 'machine-enter' as const,
+      result: 'working-observed' as const, enter_transport: 'sent' as const,
+      status_flip: true, attribution: 'machine-remediation' as const, reason: 'working-observed' };
+    const remediate = vi.fn(async (request: import('../src/remediator.js').RemediationRequest) => {
+      await request.recordAction!({ ...result, result: 'attempting', reason: '机器代按 Enter' });
+      return result;
+    });
+    const hz = makeHarness({ remediator: { remediate } });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })], { flow_mode: 'auto' }));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: 'delivery_giveup', agent: 'pi', pane: 't1.executor', delivery_v2: evidence });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hz.auditLines).toHaveLength(2);
+    for (const sink of [hz.logs.filter(l => l.includes('delivery_v2=')), hz.auditLines]) {
+      const records = sink.map(line => JSON.parse(line.split('delivery_v2=')[1]!));
+      expect(records).toHaveLength(2);
+      expect(records[0]).toMatchObject({ ...evidence, remediation: { result: 'attempting', reason: '机器代按 Enter' } });
+      expect(records[1]).toMatchObject({ ...evidence, remediation: result });
+    }
+  });
+
 });

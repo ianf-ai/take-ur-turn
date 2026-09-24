@@ -72,19 +72,81 @@ export async function portFree(port: number): Promise<boolean> {
 
 export interface NotifierIdentity { root?: string; hubUrl?: string }
 
-/** The existing 405 + Allow: POST contract remains; identity is additive. */
-export async function probeNotifier(eventUrl: string): Promise<NotifierIdentity | undefined> {
+export interface NotifierProbe {
+  url: string;
+  outcome: "signature" | "occupied" | "unavailable";
+  identity?: NotifierIdentity;
+  detail: string;
+}
+
+export const DEFAULT_NOTIFIER_EVENT_URL = "http://127.0.0.1:3002/agent-event";
+
+/** Read-only evidence; the timeout covers both headers and the JSON body. */
+export async function probeNotifierEvidence(eventUrl: string, fetchImpl: typeof fetch = fetch): Promise<NotifierProbe> {
   try {
-    const response = await fetch(eventUrl, {
-      signal: AbortSignal.timeout(800), headers: { Connection: "close" }, redirect: "manual",
+    const response = await fetchImpl(eventUrl, {
+      method: "GET", signal: AbortSignal.timeout(800), headers: { Connection: "close" }, redirect: "manual",
     });
-    if (response.status !== 405 || !(response.headers.get("allow") ?? "").toUpperCase().split(/[\s,]+/).includes("POST")) return undefined;
-    const body = await response.json().catch(() => null) as { hub_root?: unknown; hub_url?: unknown } | null;
-    if (body && typeof body.hub_root === "string" && path.isAbsolute(body.hub_root) && typeof body.hub_url === "string") {
-      return { root: canonicalRoot(body.hub_root), hubUrl: body.hub_url };
+    if (response.status !== 405 || !(response.headers.get("allow") ?? "").toUpperCase().split(/[\s,]+/).includes("POST")) {
+      await response.body?.cancel();
+      return { url: eventUrl, outcome: "occupied", detail: `HTTP ${response.status}: not the Notifier's 405 + Allow: POST signature` };
     }
-    return {};
-  } catch { return undefined; }
+    let body: unknown;
+    try { body = await response.json(); }
+    catch (error) {
+      return { url: eventUrl, outcome: "signature", identity: {}, detail: `405 + Allow: POST; 归属无法确认 (${error instanceof SyntaxError ? "invalid JSON" : `body unreadable/timeout: ${String(error)}`})` };
+    }
+    const value = body as { hub_root?: unknown; hub_url?: unknown } | null;
+    const identity: NotifierIdentity = {};
+    if (value && typeof value.hub_root === "string" && path.isAbsolute(value.hub_root)) identity.root = canonicalRoot(value.hub_root);
+    if (value && typeof value.hub_url === "string") {
+      try {
+        const url = new URL(value.hub_url);
+        if (["http:", "https:"].includes(url.protocol)) identity.hubUrl = value.hub_url;
+      } catch { /* Invalid identity stays unknown. */ }
+    }
+    return { url: eventUrl, outcome: "signature", identity, detail: "405 + Allow: POST" };
+  } catch (error) {
+    return { url: eventUrl, outcome: "unavailable", detail: `unreachable/timeout: ${String(error)}` };
+  }
+}
+
+/** Preserve the startup resolver's signature/unknown/offline contract. */
+export async function probeNotifier(eventUrl: string): Promise<NotifierIdentity | undefined> {
+  const probe = await probeNotifierEvidence(eventUrl);
+  if (probe.outcome !== "signature") return undefined;
+  return probe.identity?.root && probe.identity.hubUrl ? probe.identity : {};
+}
+
+/** Normalize aliases without discarding the producer's path or query. */
+export function eventEndpoint(url: string): string {
+  const parsed = new URL(url);
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error("expected HTTP(S) URL without credentials");
+  if (["localhost", "[::1]"].includes(parsed.hostname)) parsed.hostname = "127.0.0.1";
+  parsed.hash = "";
+  return parsed.href;
+}
+
+/** Same bounded local port range as startup discovery; never binds a port. */
+export async function discoverNotifierEvidence(hubUrl: string, explicit: string | undefined, fetchImpl: typeof fetch): Promise<NotifierProbe[]> {
+  const urls = explicit ? [explicit] : [];
+  const ports = [3002, ...Array.from({ length: 200 }, (_, i) => 3001 + i)];
+  try { ports.unshift(Number(new URL(hubUrl).port) + 1); } catch { /* Hub check reports invalid URL. */ }
+  urls.push(...ports.filter(p => p > 0 && p <= 65535).map(p => `http://127.0.0.1:${p}/agent-event`));
+  const candidates = new Map<string, string>();
+  for (const url of urls) {
+    try { const key = eventEndpoint(url); if (!candidates.has(key)) candidates.set(key, url); } catch { /* Caller reports invalid explicit URL. */ }
+  }
+  const pending = [...candidates.values()];
+  const results: NotifierProbe[] = new Array(pending.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(32, pending.length) }, async () => {
+    while (next < pending.length) {
+      const index = next++;
+      results[index] = await probeNotifierEvidence(pending[index]!, fetchImpl);
+    }
+  }));
+  return results;
 }
 
 function hubEndpoint(url: string): string {
@@ -96,6 +158,63 @@ function hubEndpoint(url: string): string {
 export function notifierMatches(identity: NotifierIdentity | undefined, root: string, hubUrl: string): boolean {
   try { return identity?.root === root && identity.hubUrl !== undefined && hubEndpoint(identity.hubUrl) === hubEndpoint(hubUrl); }
   catch { return false; }
+}
+
+export type NotifierOwnership = "owned" | "unknown-root" | "foreign-workspace" | "unknown-hub-url" | "hub-url-mismatch";
+
+/** Shared ownership classification for doctor and launch-time endpoint selection. */
+export function notifierOwnership(identity: NotifierIdentity | undefined, root: string, hubUrl: string): NotifierOwnership {
+  if (!identity?.root) return "unknown-root";
+  if (identity.root !== root) return "foreign-workspace";
+  if (!identity.hubUrl) return "unknown-hub-url";
+  return notifierMatches(identity, root, hubUrl) ? "owned" : "hub-url-mismatch";
+}
+
+export interface WorkspaceNotifierDiscovery {
+  probes: NotifierProbe[];
+  owned: NotifierProbe[];
+}
+
+/** One ownership proof shared by doctor and manual launch endpoint derivation. */
+export async function discoverWorkspaceNotifiers(
+  hubUrl: string,
+  root: string,
+  explicit: string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<WorkspaceNotifierDiscovery> {
+  const probes = await discoverNotifierEvidence(hubUrl, explicit, fetchImpl);
+  const owned = probes.filter(probe => probe.outcome === "signature" && notifierOwnership(probe.identity, root, hubUrl) === "owned");
+  return { probes, owned };
+}
+
+/** Resolve the sole verified event endpoint for a workspace. Explicit producer
+ *  configuration is intentionally returned unchanged, including a foreign URL. */
+export async function resolveNotifierEventEndpoint(
+  hubUrl: string,
+  root: string,
+  explicit?: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  if (explicit !== undefined && explicit.length > 0) return explicit;
+  const { probes, owned } = await discoverWorkspaceNotifiers(hubUrl, root, undefined, fetchImpl);
+  if (owned.length === 1) return owned[0]!.url;
+  if (owned.length > 1) {
+    throw new Error(`multiple verified notifier endpoints belong to workspace ${root}: ${owned.map(probe => probe.url).join(", ")}`);
+  }
+
+  const signed = probes.filter(probe => probe.outcome === "signature");
+  const stale = signed.find(probe => notifierOwnership(probe.identity, root, hubUrl) === "hub-url-mismatch");
+  if (stale) throw new Error(`notifier at ${stale.url} reports a different Hub URL (${stale.identity?.hubUrl ?? "unknown"})`);
+  const unknown = signed.find(probe => {
+    const ownership = notifierOwnership(probe.identity, root, hubUrl);
+    return ownership === "unknown-root" || ownership === "unknown-hub-url";
+  });
+  if (unknown) throw new Error(`notifier at ${unknown.url} has incomplete workspace identity`);
+  const foreign = signed.find(probe => notifierOwnership(probe.identity, root, hubUrl) === "foreign-workspace");
+  if (foreign) throw new Error(`reachable notifier at ${foreign.url} belongs to another workspace (${foreign.identity?.root ?? "unknown root"})`);
+  const occupied = probes.find(probe => probe.outcome === "occupied");
+  if (occupied) throw new Error(`candidate ${occupied.url} is occupied but does not answer as a verified Notifier (${occupied.detail})`);
+  throw new Error(`no reachable verified notifier endpoint for workspace ${root} via Hub ${hubUrl}`);
 }
 
 /** Reuse needs an ownership proof, never an arithmetic port guess or a pane label. */

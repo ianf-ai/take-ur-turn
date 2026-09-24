@@ -10,7 +10,7 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { serializeLaunchInvocation } from "./invocation.js";
-import type { LaunchInvocation } from "../types.js";
+import type { LaunchInvocation } from "../common/types.js";
 
 export interface DirectSpawnOptions {
   cwd?: string;
@@ -65,11 +65,11 @@ export interface RunNodeCommandOptions extends DirectSpawnOptions {
 }
 
 /**
- * Default child timeout: generous by design — it must sit above
- * the default launcher phase budgets summed up:
- * gate 15s + land 5s + born late-land 60s + submit 30s = 110s.
- * The 180s default leaves 70s for birth/control spawns and escalation;
- * custom phase overrides remain subject to this finite backstop.
+ * Default child timeout: the 180s parent cap sits above the v2 launcher's
+ * 170s internal total budget, started before planning/birth and covering
+ * send-text, at most one Enter, and bounded status observation.
+ * This leaves 10s of headroom; custom phase overrides remain subject to
+ * the internal deadline and this finite parent backstop.
  * A wedged child (ancestor sent SIGSTOP, a
  * dependency path hangs) becomes a failure return instead of a pending
  * promise that freezes its caller forever.

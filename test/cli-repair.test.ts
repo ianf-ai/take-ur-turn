@@ -20,9 +20,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { DEFAULT_HUB_URL, USAGE, main, parseArgs } from "../src/cli.js";
-import { createMcpServer } from "../src/mcp.js";
-import { startServer, type RunningServer } from "../src/server.js";
-import { Store } from "../src/store.js";
+import { createMcpServer } from "../src/mcp/server.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
+import { Store } from "../src/hub/store.js";
 
 // --- parsing (pure parseArgs) ---------------------------------------------------
 

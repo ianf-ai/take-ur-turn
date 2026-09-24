@@ -8,17 +8,17 @@ import { createServer } from "node:net";
 // Virtualize only fixed port occupancy. HTTP/MCP below use real ephemeral
 // servers, so this suite never binds or mutates a developer's live 3001 rig.
 const availability = vi.hoisted(() => vi.fn(async (_port: number) => true));
-vi.mock("../src/rig-discovery.js", async importOriginal => {
-  const actual = await importOriginal<typeof import("../src/rig-discovery.js")>();
+vi.mock("../src/hub/rig-discovery.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/hub/rig-discovery.js")>();
   return { ...actual, resolveUpHub: (url: string, explicit: boolean, root: string, event?: number) =>
     actual.resolveUpHub(url, explicit, root, event, availability) };
 });
 
-import { canonicalRoot, portFree, probeHub, resolveCliHubUrl, resolveRigRoot, resolveUpHub } from "../src/rig-discovery.js";
-import { startServer, type RunningServer } from "../src/server.js";
-import { hubCreate, hubList } from "../src/hub-client.js";
+import { canonicalRoot, portFree, probeHub, resolveCliHubUrl, resolveRigRoot, resolveUpHub, resolveNotifierEventEndpoint } from "../src/hub/rig-discovery.js";
+import { startServer, type RunningServer } from "../src/hub/server.js";
+import { hubCreate, hubList } from "../src/hub/hub-client.js";
 import { main } from "../src/cli.js";
-import { rigLabel } from "../src/rig.js";
+import { rigLabel } from "../src/hub/rig.js";
 
 const cwd = process.cwd();
 const repo = path.resolve(import.meta.dirname, "..");
@@ -99,6 +99,55 @@ afterEach(async () => {
   process.chdir(cwd);
   vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs();
   rmSync(tmp, { recursive: true, force: true });
+});
+
+describe("launch notifier event endpoint resolution", () => {
+  const hubUrl = "http://127.0.0.1:3103";
+
+  function notifierFetch(identities: Map<string, { hub_root: string; hub_url: string }>) {
+    return vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/agent-event" && identities.has(url.port)) {
+        return new Response(JSON.stringify(identities.get(url.port)), { status: 405, headers: { Allow: "POST" } });
+      }
+      if (url.pathname === "/agent-event") return new Response("not a notifier", { status: 404 });
+      throw new Error(`unexpected probe ${url.href}`);
+    }) as typeof fetch;
+  }
+
+  it("selects this workspace's verified non-default endpoint among multiple rigs", async () => {
+    const fetchImpl = notifierFetch(new Map([
+      ["3002", { hub_root: a, hub_url: "http://127.0.0.1:3001" }],
+      ["3104", { hub_root: b, hub_url: hubUrl }],
+    ]));
+
+    await expect(resolveNotifierEventEndpoint(hubUrl, b, undefined, fetchImpl))
+      .resolves.toBe("http://127.0.0.1:3104/agent-event");
+  });
+
+  it("preserves an explicit foreign endpoint without probing or rewriting it", async () => {
+    const fetchImpl = vi.fn() as typeof fetch;
+    const explicit = "http://127.0.0.1:3002/custom-event?rig=foreign";
+
+    await expect(resolveNotifierEventEndpoint(hubUrl, b, explicit, fetchImpl)).resolves.toBe(explicit);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("fails when only a foreign workspace notifier responds", async () => {
+    const fetchImpl = notifierFetch(new Map([
+      ["3002", { hub_root: a, hub_url: "http://127.0.0.1:3104" }],
+    ]));
+
+    await expect(resolveNotifierEventEndpoint(hubUrl, b, undefined, fetchImpl))
+      .rejects.toThrow("belongs to another workspace");
+  });
+
+  it("fails when no notifier has a verifiable workspace identity", async () => {
+    const fetchImpl = notifierFetch(new Map());
+
+    await expect(resolveNotifierEventEndpoint(hubUrl, b, undefined, fetchImpl))
+      .rejects.toThrow("does not answer as a verified Notifier");
+  });
 });
 
 describe("Hub root handshake", () => {

@@ -1,6 +1,6 @@
 // These tests isolate provisioning/probes; real endpoint selection has its own integration suite.
-vi.mock("../src/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/rig-discovery.js")>()),
+vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
   resolveUpHub: async (url: string, _explicit: boolean, _root: string, eventPort?: number) => ({ url, eventPort: eventPort ?? 3002 }),
   discoverHub: async () => undefined,
 }));
@@ -16,14 +16,14 @@ import { once } from "node:events";
 // The seed hint reads the project scope through the hub-client layer; mock
 // ONLY hubRead (the up handler's one hub-client call) so the hint branches are
 // drivable without a live MCP endpoint — the same pattern as test/cli.test.ts.
-vi.mock("../src/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub-client.js")>()),
+vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
   hubRead: vi.fn(),
 }));
 
 import { herdrPaneList, main, parseArgs } from "../src/cli.js";
-import { hubRead, HubError, type HubReadResult } from "../src/hub-client.js";
-import type { ContextRecord } from "../src/types.js";
+import { hubRead, HubError, type HubReadResult } from "../src/hub/hub-client.js";
+import type { ContextRecord } from "../src/common/types.js";
 
 // tut up — parse layer first; behavior tests below drive the real
 // handler through main() with:

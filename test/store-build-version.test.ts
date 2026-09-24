@@ -26,7 +26,7 @@ afterEach(() => {
 it.each(["missing", "corrupt", "unreadable"])("appends without tut_version when the build manifest is %s", async (mode) => {
   manifest.mode = mode;
   vi.resetModules();
-  const { Store } = await import("../src/store.js");
+  const { Store } = await import("../src/hub/store.js");
   root = mkdtempSync(path.join(os.tmpdir(), "tut-manifest-"));
   const store = new Store(root);
   const { task_id } = await store.createTask({ title: "version fallback", description: "test", creator: "human", role: "executor" });
