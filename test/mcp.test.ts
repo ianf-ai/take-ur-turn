@@ -148,12 +148,13 @@ describe("context.create", () => {
     expect(created.isError).toBe(false);
     expect(created.json?.task_id).toBeTruthy();
     expect(String(created.json?.warning)).toContain("does not exist yet");
+    expect(String(created.json?.warning)).toContain("缺少验收场景");
 
     const existing = mkdtempSync(path.join(tmp, "real-worktree-"));
     try {
       const quiet = await call("context.create", {
         title: "Real route",
-        description: "no warning",
+        description: "## 验收场景\n1. Existing checkout is preserved",
         creator: "tester",
         role: "architect",
         flow: "direct",
@@ -571,5 +572,24 @@ describe("context.decide", () => {
     const out = await call("context.decide", { task_id: "ghost", decision: "approve", by: "alice" });
     expect(out.isError).toBe(true);
     expect(out.text.startsWith("TASK_NOT_FOUND:")).toBe(true);
+  });
+});
+
+describe('spec lint through MCP', () => {
+  it.each(['legacy', '## 验收场景\nplain', '## 验收场景\n1. ', '## 验收场景\n1. TBD'])('creates incomplete spec %s with a warning and no records', async (description) => {
+    const result = await call('context.create', {title: 'lint create', description, creator: 't', role: 'human', flow: 'direct'});
+    expect(result.isError).toBe(false);
+    expect(result.json).toMatchObject({version: 0, status: 'implementing', warning: expect.stringContaining('验收场景')});
+    expect((await call('context.read', {task_id: result.json?.task_id})).json?.versions).toEqual([]);
+  });
+  it('lands incomplete review and returns diagnostic counts', async () => {
+    const created = await call('context.create', {title: 'lint review', description: '## 验收场景\n1. first\n2. second', creator: 't', role: 'human', flow: 'direct'});
+    const task_id = created.json?.task_id;
+    expect(created.json).not.toHaveProperty('warning');
+    await call('context.publish', {task_id, role: 'executor', content_type: 'code_changes', payload: {summary: 's', body: 'b'}});
+    const published = await call('context.publish', {task_id, role: 'Reviewer', content_type: 'review', payload: {summary: 's', verdict: 'pass', body: '## 退出条件逐条核验\n1. 满足 — checked'}});
+    expect(published.isError).toBe(false);
+    expect(published.json).toMatchObject({version: 2, status: 'pending_approval', needs_attention: true, warnings: expect.arrayContaining([expect.objectContaining({code: 'REVIEW_EXIT_CONDITIONS_INCOMPLETE', message: '退出条件已判定 1 / 应判定 2'})])});
+    expect((await call('context.read', {task_id})).json?.versions).toHaveLength(2);
   });
 });

@@ -30,7 +30,7 @@
 ## 发布 design
 
 - 信封：`summary` 必填一句话（列表展示与通知文案都用它）；`body` 必填 Markdown，完整推理过程；CLI 长 body 用 `--payload-file`（整个文件作为 body）。
-- **expected_version** 用法见 `skills/common.md`「版本与增量」；首轮接手通常是投递你的 launch note。
+- **expected_version** 用法见 `skills/common.md`「版本与增量」；首轮接手时，通常最新记录是系统为本轮投递落下的 launch note，并非要求 Architect 自己发布。
 
 body 按以下模板逐节填写（小节标题保真，括号内是填写指引）：
 

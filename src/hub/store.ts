@@ -16,8 +16,10 @@ import {
   type WaitingFor,
   type Warning,
 } from "../common/types.js";
+import { TASK_SPEC_HEADINGS, taskSpecWarning } from "../common/task-spec.js";
+import { foldWithLint, type LintCursor } from "./record-lint.js";
 import { AgentCommandError, validateAgentRoute } from "../common/agent-command.js";
-import { WAITING_FOR_BASE, derive, foldOntoCursor, initialCursor, type FoldCursor } from "./state-machine.js";
+import { WAITING_FOR_BASE, derive, initialCursor } from "./state-machine.js";
 
 /**
  * File-backed store. API maps 1:1 to the MCP tools of
@@ -84,6 +86,7 @@ export interface CreateTaskResult {
   task_id: string;
   status: Status;
   version: 0;
+  warning?: string;
 }
 
 export interface AppendInput {
@@ -579,7 +582,9 @@ interface TaskFoldCache {
   /** Sorted fold-relevant file names joined with "\n"; "" = empty task dir. */
   token: string;
   /** Fold cursor after that name set; null = project scope (probe only). */
-  cursor: FoldCursor | null;
+  cursor: LintCursor | null;
+  /** Projection inputs beyond the record-name token; absent for project scope. */
+  specKey?: string;
   /** Project scope only: max record version the probe validated (extension floor). */
   probeMaxVersion: number;
 }
@@ -660,11 +665,13 @@ export class Store {
       // fold-relevant names, so the empty token matches the first reader.
       this.foldCache.set(taskId, {
         token: "",
+        specKey: JSON.stringify([flow ?? "full", description]),
         cursor: initialCursor(flow ?? "full"),
         probeMaxVersion: 0,
       });
       await this.writeMeta(taskId, meta);
-      return { task_id: taskId, status: meta.status ?? "designing", version: 0 as const };
+      const warning = taskSpecWarning(description);
+      return { task_id: taskId, status: meta.status ?? "designing", version: 0 as const, ...(warning ? { warning } : {}) };
     });
   }
 
@@ -748,10 +755,13 @@ export class Store {
       // warm cache this costs zero record-file reads regardless of sequence
       // length (the readdir above already produced the invalidation token);
       // a cold cache reads the sequence once and seeds the cursor.
-      let derived: ReturnType<typeof foldOntoCursor> | null = null;
+      let derived: ReturnType<typeof foldWithLint> | null = null;
       if (!isProject) {
-        const cursor = await this.foldCursorFor(taskId, meta.flow ?? "full", names); // VALIDATION_ERROR on unrecovered corruption → nothing lands
-        derived = foldOntoCursor(cursor, [record], meta.flow ?? "full");
+        // Hand-corrupted meta (non-string description) must not turn every
+        // later publish into a pre-write TypeError: no string, no baseline.
+        const description = typeof meta.description === "string" ? meta.description : undefined;
+        const cursor = await this.foldCursorFor(taskId, meta.flow ?? "full", description, names); // VALIDATION_ERROR on unrecovered corruption → nothing lands
+        derived = foldWithLint(cursor, [record], meta.flow ?? "full", description);
       }
 
       const fileName = recordFileName(newVersion, input.content_type);
@@ -785,7 +795,8 @@ export class Store {
             // the cache then simply re-derives from the token on next read.
             this.foldCache.set(taskId, {
               token: foldTokenOf([...names, fileName]),
-              cursor: { status: derived.status, prevVersion: derived.prevVersion, warnings: derived.warnings },
+              cursor: derived,
+              specKey: JSON.stringify([meta.flow ?? "full", meta.description ?? ""]),
               probeMaxVersion: derived.prevVersion,
             });
           }
@@ -847,7 +858,7 @@ export class Store {
       result.flow = meta.flow ?? "full"; // deferred registration item: always present, normalized
       if (meta.cast !== undefined) result.cast = meta.cast;
       if (meta.checkout !== undefined) result.checkout = meta.checkout;
-      const derived = await this.derivedFor(taskId, meta.flow, names, new Map(readPaired.map((p) => [p.name, p.record])));
+      const derived = await this.derivedFor(taskId, meta.flow, meta.description, names, new Map(readPaired.map((p) => [p.name, p.record])));
       if (derived) result.status = derived.status;
     }
     return result;
@@ -943,7 +954,7 @@ export class Store {
         if (!(error instanceof SyntaxError) && !isErrnoException(error, "ENOENT")) throw error;
       }
       const frozen = typeof originalDescription === "string" &&
-        ["要改变的行为", "验收场景", "明确不做", "必要依赖及理由"].every(
+        TASK_SPEC_HEADINGS.every(
           (heading) => originalDescription.split(/\r?\n/u).some((line) => line.trimEnd() === `## ${heading}`),
         );
       if (frozen && description !== undefined && description !== originalDescription) {
@@ -975,7 +986,7 @@ export class Store {
       };
       if (!isProject) {
         try {
-          this.cacheDerived(meta, derive(taskId, await this.readRecords(taskId), meta.flow));
+          this.cacheDerived(meta, foldWithLint(initialCursor(meta.flow ?? "full"), await this.readRecords(taskId), meta.flow ?? "full", meta.description));
         } catch (e) {
           // Records damaged too — meta rebuild lands (A fixed), the task stays
           // degraded until B-class recovery resolves the records (4.3).
@@ -1258,7 +1269,7 @@ export class Store {
       }
       let derived: ReturnType<typeof derive> | null;
       try {
-        derived = await this.derivedFor(taskId, meta.flow, names);
+        derived = await this.derivedFor(taskId, meta.flow, meta.description, names);
       } catch (e) {
         process.stderr.write(`tut: warning: task ${taskId} degraded (records unreadable/unparseable): ${(e as Error).message}\n`);
         degraded.push(taskId);
@@ -1410,11 +1421,14 @@ export class Store {
   private async foldCursorFor(
     taskId: string,
     flow: Flow,
+    description: string | undefined,
     names: readonly string[],
     alreadyRead: ReadonlyMap<string, ContextRecord> = new Map(),
-  ): Promise<FoldCursor> {
+  ): Promise<LintCursor> {
     const token = foldTokenOf(names);
-    const cached = this.foldCache.get(taskId);
+    const specKey = JSON.stringify([flow, description ?? ""]);
+    const entry = this.foldCache.get(taskId);
+    const cached = entry?.specKey === specKey ? entry : undefined;
     if (cached !== undefined && cached.token === token && cached.cursor !== null) {
       return cached.cursor; // hit — the directory's fold-relevant names are unchanged
     }
@@ -1445,9 +1459,9 @@ export class Store {
             : (await this.readNamedRecordsPaired(taskId, unread)).map(({ name, record }) => [name, record]),
         );
         const fresh = additions.map((name) => readByName.get(name) ?? loaded.get(name)!);
-        const folded = foldOntoCursor(cached.cursor, fresh, flow);
-        const next: FoldCursor = { status: folded.status, prevVersion: folded.prevVersion, warnings: folded.warnings };
-        this.foldCache.set(taskId, { token, cursor: next, probeMaxVersion: next.prevVersion });
+        const folded = foldWithLint(cached.cursor, fresh, flow, description);
+        const next: LintCursor = folded;
+        this.foldCache.set(taskId, { token, specKey, cursor: next, probeMaxVersion: next.prevVersion });
         return next;
       }
     }
@@ -1461,9 +1475,9 @@ export class Store {
         : (await this.readNamedRecordsPaired(taskId, unread)).map(({ name, record }) => [name, record]),
     );
     const records = recordNames.map((name) => readByName.get(name) ?? loaded.get(name)!);
-    const folded = foldOntoCursor(initialCursor(flow), records, flow);
-    const cursor: FoldCursor = { status: folded.status, prevVersion: folded.prevVersion, warnings: folded.warnings };
-    this.foldCache.set(taskId, { token, cursor, probeMaxVersion: cursor.prevVersion });
+    const folded = foldWithLint(initialCursor(flow), records, flow, description);
+    const cursor: LintCursor = folded;
+    this.foldCache.set(taskId, { token, specKey, cursor, probeMaxVersion: cursor.prevVersion });
     return cursor;
   }
 
@@ -1513,11 +1527,12 @@ export class Store {
   private async derivedFor(
     taskId: string,
     flow: Flow | undefined,
+    description: string | undefined,
     names: readonly string[],
     alreadyRead: ReadonlyMap<string, ContextRecord> = new Map(),
   ): Promise<ReturnType<typeof derive> | null> {
     if (taskId === PROJECT_TASK_ID) return null;
-    const cursor = await this.foldCursorFor(taskId, flow ?? "full", names, alreadyRead);
+    const cursor = await this.foldCursorFor(taskId, flow ?? "full", description, names, alreadyRead);
     const needsAttention = cursor.warnings.length > 0;
     return {
       status: cursor.status,

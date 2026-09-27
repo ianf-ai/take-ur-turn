@@ -179,6 +179,11 @@ describe("workspace stdio MCP bridge", () => {
     await hub(own, next);
     await vi.waitFor(() => expect(b.logs.some(line => line.includes("MCP_RECONNECTED:"))).toBe(true));
     expect((await b.client.listTools()).tools).toHaveLength(5);
+    // Pin the serverInfo snapshot after a same-root port move: the bridge
+    // keeps the initialize-time hubUrl (known snapshot semantics — the working
+    // connection and discovery follow the new endpoint; refreshing serverInfo
+    // would be a behavior change, tracked separately). hubRoot stays valid.
+    expect(b.serverInfo()).toEqual({ ...b.client.getServerVersion(), hubUrl: preferred, hubRoot: own });
   });
 
   it("never forwards to a port taken over by another workspace, then exits 3 on exhaustion", async () => {

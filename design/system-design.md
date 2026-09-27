@@ -124,7 +124,11 @@ needs_attention 是**叠加在 status 上的布尔标志，不是状态机的第
 
 表外组合（如 designing 状态出现 review）**不拒绝写入**：记录照常落盘，但不参与状态折叠，派生结果记入 warnings 并置 `needs_attention`。publish 的返回暴露 warnings 和 needs_attention——这是 warning 明细唯一的公开读取入口（落盘 meta.json 的派生缓存仅供直接调试）；/state 与 context.list 只暴露 needs_attention 布尔。错过 publish 即时响应时，事后凭 needs_attention 置位经 context.read / `tut read` 查看触发异常的记录定位问题、提醒人处置——warning code 本身不随 read 暴露（read 暴露明细属加法契约，须另立代码任务，不在文档中预支）。
 
-warnings 词表冻结于 `src/types.ts`（5 个）：`OUT_OF_TABLE`（表外组合，不折叠）、`CLOSED_ABSORB`（closed 后的非 note/close 记录，保持 closed）、`INVALID_VERDICT`（review 缺失/非法 verdict，不转态）、`VERSION_GAP`（版本跳号）与 `VERSION_DUPLICATE`（版本重复，两者折叠照常按版本序进行）——任何 warning 均置 needs_attention，waiting_for 随之为 human。
+warnings 词表起始于 `src/common/types.ts` 的五个基础码：`OUT_OF_TABLE`（表外组合，不折叠）、`CLOSED_ABSORB`（closed 后的非 note/close 记录，保持 closed）、`INVALID_VERDICT`（review 缺失/非法 verdict，不转态）、`VERSION_GAP`（版本跳号）与 `VERSION_DUPLICATE`（版本重复，两者折叠照常按版本序进行）——任何 warning 均置 needs_attention，waiting_for 随之为 human。0.8.1 增加记录诊断覆盖层 `src/hub/record-lint.ts`（四个新 WarningCode：REVIEW_EXIT_CONDITIONS_INCOMPLETE、REVIEW_SCOPE_SECTION_MISSING、EXPECTED_REVISION、NON_CANONICAL_ROLE，外加可选 `Warning.message`；create 规格缺失警告为自由文本 warning 字段，非 WarningCode）——**全部非阻断**（不拒收、不改状态折叠），但**会使 needs_attention 置位**，升级后对存量记录是回溯生效的：
+- 覆盖检查与超规格声明检查**仅当 description 带验收场景基线时生效**（无基线的存量任务免疫）；
+- EXPECTED_REVISION **仅当 description 带验收场景基线时武装**（与覆盖/超规格检查同一门控；无基线的存量任务免疫，review 本身是否结构化不影响武装）；
+- NON_CANONICAL_ROLE 无门（role 大小写漂移任何时候都该可见）。
+存量部署升级后，带基线的旧格式 review 记录会亮灯（closed 任务显示 waiting_for=human），清理动作 = `tut ack`；实测影响面见发车说明。
 
 **closed 是吸收态**：任务派生为 closed 后，note 照常落盘且不改变状态；其他类型的记录同样落盘，但状态保持 closed 并置 needs_attention——例外是 decision(close) **幂等**：重复 close 只落盘，状态不变、不置 needs_attention。
 
@@ -507,6 +511,16 @@ Notifier 消费 delivery_giveup 后通过最小 `Remediator.remediate(request)` 
 - **Agent 直报**：Agent 自身经 lifecycle hooks 上报状态，绕过终端容器——依赖各 Agent CLI 的集成能力，是后续路径
 - **Hub repo 化之后**：Herdr 从必需的粘合层降级为可选的本机增强——通知主通道（轮询本地 /state）不依赖它；不用的代价是 blocked 检测与交叉验证退化为超时兜底、auto 启动需要另配启动器。能力清单不减，必要性下降
 
+### 7.4 用量审计（opt-in 测量 watcher）
+
+用量测量是独立 harness（`scripts/usage-audit/`），用户显式开启才工作，默认 **off**——off 时零读写零进程；Hub、launcher、notifier、worker skills 一律不 import、不启动它。测量职责在专用 harness，永不在被测方：产品运行时不承担任何统计工作，测量的开销与故障都不进入轮次链路。
+
+- **开关与启动**：workspace config 顶层键 `usage_audit`（`"off" | "on"`，缺省 off）。`tut up` 在 on 时 detached 启动打包内 watcher（`--watch`），日志落 `.context-hub/usage-audit.log`；off、脚本缺失或 spawn 失败只提示不阻断（non-fatal，spawn 的异步失败有 error 监听兜底）。
+- **数据形态**：watcher 每 pass 经 Hub 只读接口取全量任务记录，按 launch→delivery 轮次归集 token 四元组与原生成本，写入任务目录旁车文件 `tasks/<id>/usage.json`。**usage.json 不是记录**：不参与状态折叠、不进 meta、fold/sweep/repair 一律不碰——「记录永不删除」的不变量不因它改变。schema 冻结 v1，细则见 `scripts/usage-audit/README.md`。
+- **归集口径**：按 launch marker 的 frozen route agent 定位原生会话（pi 按 cwd 目录名，codex 全机扫 session_meta.cwd 并排除 subagent），消息正文解析即弃、只留元数据；歧义、缺失、损坏一律记 unresolved，绝不造数补零。未变化的会话文件按 mtime+size 跳过重读；重复相同失败限频记日志。
+- **单实例与自愈**：canonical root 的 SHA-256 锁存于 OS tmpdir（内含 pid）；崩溃残留锁在确认 pid 已死（ESRCH）后自愈，自愈以 `.reclaim` mkdir 互斥串行化（同 rig-lock 模式）；空、损坏、EPERM 锁一律按活处理拒抢。
+- **隐私边界**：纯本地——正文不出本机、诊断不含内容、usage.json 落盘前剥离 cwd/task_id/launch_ts 等路径信息；除访问本机 Hub 外零网络。
+
 ## 8. 技术选型（当前实现）
 
 本章集中记录当前的具体选型——它们都是可替换的实现细节，不属于架构（各模块的架构语义见前述各章）。
@@ -545,7 +559,7 @@ take-ur-turn/
 │   ├── system-design.md               # 本文档
 │   ├── context-design.md              # 上下文设计（放什么、怎么管理）
 ├── skills/                # Agent skill 文本
-├── scripts/               # 事件链 canonical：on-agent-event.mjs / herdr-hook.mjs（Node 入口，Windows 可用）；兼容薄 shim：launch.sh / on-agent-event.sh / hook.sh（POSIX only，只转发）；tut-resolve.mjs 为旧消费者/parity fixture 保留；workspace.json 为种子（运行时零读取）；assert-release.js（发布硬门：npm pack 前枚举断言 dist/cli.js 与 launcher pane-runner（并拒绝退役 probe 构建残留）、role skills 等运行时契约物存在，防未构建/残缺包发布） / mcp-smoke.mjs（MCP 冒烟脚本）
+├── scripts/               # 事件链 canonical：on-agent-event.mjs / herdr-hook.mjs（Node 入口，Windows 可用）；兼容薄 shim：launch.sh / on-agent-event.sh / hook.sh（POSIX only，只转发）；tut-resolve.mjs 为旧消费者/parity fixture 保留；workspace.json 为种子（运行时零读取）；assert-release.js（发布硬门：npm pack 前枚举断言 dist/cli.js 与 launcher pane-runner（并拒绝退役 probe 构建残留）、role skills 等运行时契约物存在，防未构建/残缺包发布） / mcp-smoke.mjs（MCP 冒烟脚本）；usage-audit/（opt-in 用量审计 watcher，见 7.4）
 ├── src/
 │   ├── cli.ts             # tut CLI 入口与命令分派；构建入口保持 dist/cli.js
 │   ├── cli/               # args / usage / shared / task / rig / misc / bridge：参数、命令处理与 MCP 桥接入口

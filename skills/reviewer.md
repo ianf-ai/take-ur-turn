@@ -2,7 +2,7 @@
 
 共同规则见 `skills/common.md`，与本文件共同生效。
 
-你担任 Reviewer：代码与方案 review。从 Context Hub 领 reviewing 态任务，读全量上下文，用 commits 里的 hash `git show` 读真实改动，发布带 verdict 的 review；revision 回来后按关闭条件逐条核销，不重新裁量。
+你担任 Reviewer：代码与方案 review。从 Context Hub 领 reviewing 态任务，读全量上下文，用 commits 里的 hash `git show` 读真实改动，发布带 verdict 的 review。
 
 ## 流程差分（review 侧）
 
@@ -67,14 +67,21 @@ body 按以下模板逐节填写（小节标题保真，括号内是填写指引
 ```markdown
 ## 总体评价
 
+## 退出条件逐条核验
+1. 满足 — <description 第 1 条条件原文或可追溯摘要>；证据：<测试/检查/记录引用>
+2. 不满足 — <第 2 条条件>；证据：<缺口与检查结果>
+（按 description 有效条件的出现顺序逐条编号，保持 1..N；判定只用「满足 / 不满足 / 外部阻塞 / 已批准延后」，后接 — 与非空说明。不要合并成“全部通过”。已批准延后引用 human 拍板；外部未验证按 blocked_external 处理。重审可引用已核销证据，不重新裁量已关闭问题。旧 description 无有效条件时如实披露基线缺失，不宣称规格已通过。）
+
+## 超出规格的改动
+无
+（如有改动，改填清单，逐项写授权出处、必要性与对应验收；未获授权的越界按范围核查给 fail_code。结构齐全不代表范围或证据已合格。）
+
 ## 问题列表
 （按严重度排列，定位到 file:line，给出建议修法；
- 每条附**关闭条件**——怎样算修好的可验证判据，如「过期 token 返回 401 且有测试覆盖」。
- 下一轮 review 按关闭条件逐条核销，不重新裁量）
+ 每条附**关闭条件**——怎样算修好的可验证判据，如「过期 token 返回 401 且有测试覆盖」）
 
 ## 建议与延后候选
-（pass 判据：未延后的问题全部满足关闭条件。
- 认为可以延后的问题在这里列出——Reviewer 只有建议权，延后由人拍板）
+（认为可以延后的问题在这里列出——Reviewer 只有建议权，延后由人拍板）
 ```
 
 发布调用：
@@ -84,7 +91,7 @@ context.publish {"task_id": "<id>", "role": "reviewer", "content_type": "review"
 tut publish <id> --role reviewer --content-type review --summary "…" --payload-file review.md --verdict fail_code --ref-version 3 --expected-version 3
 ```
 
-发布后核对返回：`needs_attention` 为 true 时读 warnings——通常是 verdict 拼错或记录时序表外；用 note 说明情况交人处置，不要试图修改已落盘的记录（append-only）。needs_attention 的复位由人进行：一条带 `ack: true` 的 note（MCP 直接发，或人用 `tut ack` CLI 入口）。补充说明（澄清某个判据、指出参考实现）发 note，不转态。
+发布后核对返回：`needs_attention` 为 true 时读 warnings——可能是 verdict 拼错、记录时序表外、逐条件判定缺漏、超规格声明缺失或 role 未精确小写；用 note 说明情况交人处置，不要试图修改已落盘的记录（append-only）。needs_attention 的复位由人进行：一条带 `ack: true` 的 note（MCP 直接发，或人用 `tut ack` CLI 入口）。补充说明（澄清某个判据、指出参考实现）发 note，不转态。
 
 ### 设计交付物的审查判据
 

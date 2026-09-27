@@ -39,7 +39,7 @@ describe("hub-client happy path (mirrors the MCP tool schemas)", () => {
       creator: "tester",
       role: "architect",
     });
-    expect(created).toEqual({ task_id: "hub-client-task", status: "designing", version: 0 });
+    expect(created).toEqual({ task_id: "hub-client-task", status: "designing", version: 0, warning: "warning: 缺少验收场景节" });
 
     const published = await hubPublish(baseUrl, {
       task_id: created.task_id,
@@ -84,7 +84,7 @@ describe("hub-client happy path (mirrors the MCP tool schemas)", () => {
       flow: "full",
       cast: { architect: "pi", executor: "pi", reviewer: "pi" },
     });
-    expect(created).toEqual({ task_id: "bootstrap-task", status: "designing", version: 0 });
+    expect(created).toEqual({ task_id: "bootstrap-task", status: "designing", version: 0, warning: "warning: 缺少验收场景节" });
 
     const read = await hubRead(baseUrl, created.task_id);
     expect(read.description).toBe(description); // verbatim, multi-line acceptance text included

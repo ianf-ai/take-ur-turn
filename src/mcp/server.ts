@@ -143,7 +143,7 @@ export function createMcpServer(store: Store): McpServer {
         });
         // Non-blocking typo mitigation: the route is frozen and never
         // repaired, so surface a missing path right at create time.
-        const warning = worktreePathWarning(input.checkout as CheckoutRoute | undefined);
+        const warning = [result.warning, worktreePathWarning(input.checkout as CheckoutRoute | undefined)].filter(Boolean).join("\n") || undefined;
         return warning === undefined ? result : { ...result, warning };
       }),
   );

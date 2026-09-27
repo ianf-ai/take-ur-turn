@@ -638,10 +638,32 @@ describe("tut up (behavior)", () => {
       expect(out).toContain("up: activate a Host — tell any coding-agent session in this repo:");
       expect(out).toContain("「担任 TUT Host，全程驱动这个任务：<你的需求>」");
       expect(out).not.toContain("invariants seed"); // hub down → hint suppressed in dry-run
+      expect(out).not.toContain("tut-usage"); // usage_audit off (default) → watcher not provisioned
     } finally {
       io.restore();
     }
   });
+
+  it("--dry-run with usage_audit=on plans the detached usage watcher; off stays absent", async () => {
+    const { project, logPath } = makeProject(true);
+    mkdirSync(path.join(project, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(project, ".context-hub", "config.json"), JSON.stringify({ flow_mode: "auto", usage_audit: "on" }));
+    useFixtureHerdr(logPath); // no preset panes → hub + notify down
+    process.chdir(project);
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      const code = await runUp(["up", "--dry-run"]);
+
+      expect(code).toBe(0);
+      const out = io.out();
+      expect(out).toContain("up: [dry-run] would start the usage watcher (detached; log at .context-hub/usage-audit.log)");
+      expect(out).not.toContain("tut-usage"); // headless watcher — no pane
+    } finally {
+      io.restore();
+    }
+  });
+
 
   it("shape checks: 2xx /state without flow_mode+tasks and a non-405 event port both count as down", async () => {
     const { project, logPath, self } = makeProject(true);

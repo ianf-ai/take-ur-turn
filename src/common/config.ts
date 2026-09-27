@@ -251,16 +251,17 @@ export async function writeFlowMode(root: string, mode: FlowMode): Promise<Confi
 // (same discipline as tut assign editing workspace.json directly).
 
 /** Scalar-settable config keys exposed to `tut config set`. */
-export type ConfigKey = "flow_mode" | "auto.launch_roles" | "auto.remediate";
+export type ConfigKey = "usage_audit" | "flow_mode" | "auto.launch_roles" | "auto.remediate";
 
 /** All keys `tut config set` accepts, in hint-listing order. */
-export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles", "auto.remediate"];
+export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles", "auto.remediate", "usage_audit"];
 
 /** One typed key/value pair ready to apply (discriminated so writeConfigKey narrows). */
-export type ConfigKeyAssignment = { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] } | { key: "auto.remediate"; value: "off" | "enter-repress" };
+export type ConfigKeyAssignment = { key: "usage_audit"; value: "off" | "on" } | { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] } | { key: "auto.remediate"; value: "off" | "enter-repress" };
 
 /** Legal-value domain hint for a key — used by `tut config` error text and help. */
 export function configKeyDomain(key: ConfigKey): string {
+  if (key === "usage_audit") return '"off" | "on"';
   if (key === "auto.remediate") return '"off" | "enter-repress"';
   return key === "flow_mode"
     ? '"manual" | "auto"'
@@ -283,6 +284,10 @@ export function parseConfigValue(
   key: ConfigKey,
   raw: string,
 ): { ok: true; assignment: ConfigKeyAssignment } | { ok: false; error: string } {
+  if (key === "usage_audit") {
+    if (raw === "off" || raw === "on") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for usage_audit: "${raw}" (expected off | on)` };
+  }
   if (key === "flow_mode") {
     if (raw === "manual" || raw === "auto") return { ok: true, assignment: { key, value: raw } };
     return { ok: false, error: `invalid value for flow_mode: "${raw}" (expected ${configKeyDomain("flow_mode")})` };
@@ -327,7 +332,9 @@ export async function writeConfigKey(root: string, assignment: ConfigKeyAssignme
       throw new Error(`cannot set ${key}: ${filePath} is unreadable or corrupt`);
     }
     const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
-    if (assignment.key === "flow_mode") {
+    if (assignment.key === "usage_audit") {
+      config.usage_audit = assignment.value;
+    } else if (assignment.key === "flow_mode") {
       config.flow_mode = assignment.value;
     } else {
       const existing = typeof config.auto === "object" && config.auto !== null ? config.auto : {};

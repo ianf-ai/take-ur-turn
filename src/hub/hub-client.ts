@@ -74,6 +74,7 @@ export interface HubCreateInput {
   checkout?: CheckoutRoute;
 }
 export interface HubCreateResult {
+  warning?: string;
   task_id: string;
   status: string;
   version: number;

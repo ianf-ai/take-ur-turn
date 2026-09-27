@@ -431,11 +431,9 @@ async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Prom
 
 async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Promise<number> {
   try {
-    // Non-blocking typo mitigation: the route is frozen and never repaired,
-    // so surface a missing worktree path right at create time (stderr keeps
-    // stdout machine-parseable; the task is still created).
-    const warning = worktreePathWarning(parsed.checkout);
-    if (warning !== undefined) process.stderr.write(`${warning}\n`);
+    // Preserve the local path hint even when the Hub is unreachable.
+    const checkoutWarning = worktreePathWarning(parsed.checkout);
+    if (checkoutWarning) process.stderr.write(`${checkoutWarning}\n`);
     // Same non-blocking discipline: a free-form creator role outside
     // the conventional set is almost certainly a typo, and everything
     // downstream of an unknown role is a silent fallback (workspace routing
@@ -447,17 +445,19 @@ async function runCreate(parsed: Extract<ParsedArgs, { command: "create" }>): Pr
         `routing for unknown roles falls back to the '${UNKNOWN_ROLE_AGENT}' builtin and no skills/${parsed.role}.md ships; the task is still created\n`,
       );
     }
-    printJson(
-      await hubCreate(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, {
-        title: parsed.title,
-        description: parsed.description,
-        creator: parsed.creator,
-        role: parsed.role,
-        ...(parsed.flow !== undefined ? { flow: parsed.flow } : {}),
-        ...(parsed.cast !== undefined ? { cast: parsed.cast } : {}),
-        ...(parsed.checkout !== undefined ? { checkout: parsed.checkout } : {}),
-      }),
-    );
+    const result = await hubCreate(parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL, {
+      title: parsed.title,
+      description: parsed.description,
+      creator: parsed.creator,
+      role: parsed.role,
+      ...(parsed.flow !== undefined ? { flow: parsed.flow } : {}),
+      ...(parsed.cast !== undefined ? { cast: parsed.cast } : {}),
+      ...(parsed.checkout !== undefined ? { checkout: parsed.checkout } : {}),
+    });
+    for (const warning of result.warning?.split("\n") ?? []) {
+      if (warning !== checkoutWarning) process.stderr.write(`${warning}\n`);
+    }
+    printJson(result);
     return 0;
   } catch (e) {
     return failWith(e, parsed.url ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL);
