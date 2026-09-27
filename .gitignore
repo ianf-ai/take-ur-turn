@@ -5,6 +5,9 @@ node_modules/
 dist/
 build/
 
+# Persistent local git worktrees used for parallel TUT lanes
+.worktrees/
+
 # Pack artifacts
 *.tgz
 

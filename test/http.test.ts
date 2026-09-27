@@ -755,3 +755,31 @@ describe("POST /mode concurrency", () => {
     expect(readdirSync(root).filter((f) => f.endsWith(".tmp"))).toEqual([]);
   });
 });
+
+it('exposes replayed review lint attention on /state and clears it after ack', async () => {
+  const { task_id } = await store.createTask({title: 'http lint', description: '## 验收场景\n1. first\n2. second', creator: 't', role: 'human', flow: 'direct'});
+  await store.append(task_id, {role: 'executor', content_type: 'code_changes', payload: {summary: 's', body: 'b'}});
+  await store.append(task_id, {role: 'reviewer', content_type: 'review', payload: {summary: 's', body: 'missing sections', verdict: 'pass'}});
+  const state = async () => ((await (await fetch(`${baseUrl}/state`)).json()) as {tasks: Array<{task_id: string}>}).tasks.find((t: {task_id: string}) => t.task_id === task_id);
+  expect(await state()).toMatchObject({status: 'pending_approval', needs_attention: true, waiting_for: 'human'});
+  await store.append(task_id, {role: 'human', content_type: 'note', payload: {summary: 'ack', body: 'ack', ack: true}});
+  expect(await state()).toMatchObject({status: 'pending_approval', needs_attention: false});
+});
+
+it('built CLI create returns spec and checkout hints through the real Hub with exit zero', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const { fileURLToPath } = await import('node:url');
+  const { stdout, stderr } = await promisify(execFile)(process.execPath, [
+    fileURLToPath(new URL('../dist/cli.js', import.meta.url)), 'create', '--url', baseUrl,
+    '--title', 'cli lint', '--description', '## 验收场景\n1. TODO', '--creator', 't', '--role', 'human',
+    '--flow', 'direct', '--checkout', `worktree:${path.join(tmp, 'missing-checkout')}`,
+  ], {cwd: tmp, env: {...process.env, TUT_HUB_ROOT: tmp}, timeout: 10000});
+  const result = JSON.parse(stdout);
+  expect(result).toMatchObject({version: 0, status: 'implementing'});
+  expect(stderr).toContain('第 1 条为空或占位');
+  expect(stderr.match(/does not exist yet/gu)).toHaveLength(1);
+  expect(result.warning).toContain('第 1 条为空或占位');
+  expect(result.warning).toContain('does not exist yet');
+  expect((await store.readTask(result.task_id)).versions).toEqual([]);
+});

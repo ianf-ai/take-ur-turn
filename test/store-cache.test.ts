@@ -478,3 +478,27 @@ describe("per-task mutation queues", () => {
     expect(tails.size).toBe(0); // settled tail reclaimed, not accumulated
   });
 });
+
+describe('lint cache continuity', () => {
+  it('folds only new records while retaining pending fail_design across readers', async () => {
+    const store = new Store(root);
+    const { task_id } = await store.createTask({title: 'lint cache', description: '## 验收场景\n1. result', creator: 't', role: 'human'});
+    const reader = new Store(root);
+    for (const content_type of ['design', 'code_changes', 'review', 'design']) {
+      await store.append(task_id, {role: 'executor', content_type, payload: {...payload, verdict: 'fail_design', body: '## 退出条件逐条核验\n1. 满足 — checked\n## 超出规格的改动\n无'}});
+      fsm.recordReads = 0;
+      await reader.listTasks();
+      expect(fsm.recordReads).toBe(1);
+      fsm.recordReads = 0;
+      await reader.listTasks();
+      expect(fsm.recordReads).toBe(0);
+    }
+    for (const active of [store, reader, new Store(root)]) {
+      await active.readTask(task_id, 5); // no record payload to load, primes a cold cursor
+      fsm.recordReads = 0;
+      const result = await active.append(task_id, {role: 'executor', content_type: 'code_changes', payload});
+      expect(result.warnings?.some(w => w.code === 'EXPECTED_REVISION')).toBe(true);
+      expect(fsm.recordReads).toBe(0);
+    }
+  });
+});

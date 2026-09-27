@@ -207,20 +207,25 @@ export interface ContextRecord {
 }
 
 /**
- * Warning code vocabulary — shared with test/fixtures/sequences.json ($comment there mirrors this list).
- * Warnings are structured {version, code}; message text never enters the contract.
+ * Warning code vocabulary: transition warnings plus Store diagnostic overlays.
+ * Warnings retain {version, code}; diagnostic overlays may add an explanatory message.
  */
 export type WarningCode =
   | "OUT_OF_TABLE" // record does not fit current state: no fold, needs_attention
   | "CLOSED_ABSORB" // non-note/non-close record after closed: stays closed + needs_attention
   | "INVALID_VERDICT" // review with missing/invalid verdict: no transition + needs_attention
   | "VERSION_GAP" // version skips (e.g. v1 then v3): fold by version order anyway
+  | "REVIEW_EXIT_CONDITIONS_INCOMPLETE"
+  | "REVIEW_SCOPE_SECTION_MISSING"
+  | "EXPECTED_REVISION"
+  | "NON_CANONICAL_ROLE"
   | "VERSION_DUPLICATE"; // repeated version: fold by version order anyway
 
 export interface Warning {
   /** Version of the record responsible for the warning. */
   version: number;
   code: WarningCode;
+  message?: string;
 }
 
 /** Derivation output, system-design 3.1/3.2. needs_attention is an overlay flag, not an 8th status. */

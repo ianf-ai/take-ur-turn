@@ -1,7 +1,8 @@
 import { discoverHub, probeNotifier, notifierMatches, resolveNotifierPort, probeHub, resolveRigRoot, resolveUpHub } from "../hub/rig-discovery.js";
 import { acquireRigStartLock } from "../hub/rig-lock.js";
 import { rigLabel, rigEnvironment, unscopedLabel } from "../hub/rig.js";
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, openSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startServer } from "../hub/server.js";
@@ -83,6 +84,15 @@ async function runConfig(parsed: Extract<ParsedArgs, { command: "config" }>): Pr
       return 1;
     }
     switch (parsed.key) {
+      case "usage_audit": {
+        const value = outcome.status === "ok" && outcome.config.usage_audit !== undefined ? outcome.config.usage_audit : "off";
+        if (value !== "off" && value !== "on") {
+          process.stderr.write("tut: invalid usage_audit (expected off | on)\n");
+          return 1;
+        }
+        process.stdout.write(`${value}\n`);
+        return 0;
+      }
       case "flow_mode": {
         const value = outcome.status === "ok" ? outcome.config.flow_mode : "manual";
         process.stdout.write(`${value}\n`);
@@ -134,7 +144,9 @@ async function runConfig(parsed: Extract<ParsedArgs, { command: "config" }>): Pr
     return 1;
   }
   const rendered =
-    parsedValue.assignment.key === "flow_mode"
+    parsedValue.assignment.key === "usage_audit"
+      ? config.usage_audit
+      : parsedValue.assignment.key === "flow_mode"
       ? config.flow_mode
       : parsedValue.assignment.key === "auto.remediate"
         ? config.auto?.remediate
@@ -787,6 +799,56 @@ async function runUp(parsed: Extract<ParsedArgs, { command: "up" }>): Promise<nu
           `up: notify running (pane ${await reportedPaneId(SYS_NOTIFY_PANE_LABEL, provisioned.paneId)}, tab ${SYS_TAB_LABEL}${provisioned.reused ? ", reused" : ""})\n`,
         );
       }
+    }
+
+    // Step 2b — usage watcher: opt-in via usage_audit = "on".
+    // Measurement is a user-run tool, never product runtime: this only STARTS
+    // the shipped script (scripts/usage-audit/run.mjs), which reads agent
+    // session files and maintains tasks/<id>/usage.json. Everything here is
+    // non-fatal — measurement must never fail the rig — and off/default
+    // provisions nothing, so nothing reads agent data unless enabled.
+    try {
+      const usageOutcome = await readConfigFile(path.join(cwd, ".context-hub"));
+      if (usageOutcome.status === "invalid") {
+        process.stderr.write("tut: up: usage_audit skipped — .context-hub/config.json is unreadable or corrupt; fix it by hand\n");
+      }
+      const usageAuditOn = usageOutcome.status === "ok" && usageOutcome.config.usage_audit === "on";
+      if (usageOutcome.status === "ok" && usageOutcome.config.usage_audit !== undefined && usageOutcome.config.usage_audit !== "on" && usageOutcome.config.usage_audit !== "off") {
+        process.stderr.write(`tut: up: ignoring invalid usage_audit "${String(usageOutcome.config.usage_audit)}" (expected "off" | "on")\n`);
+      }
+      if (usageAuditOn) {
+        const usageScript = fileURLToPath(new URL("../../scripts/usage-audit/run.mjs", import.meta.url));
+        if (!existsSync(usageScript)) {
+          process.stderr.write("tut: up: usage watcher script not found in this installation — measurement not started (non-fatal)\n");
+        } else if (dryRun) {
+          process.stdout.write("up: [dry-run] would start the usage watcher (detached; log at .context-hub/usage-audit.log)\n");
+        } else {
+          // Detached background process, NOT a pane: the watcher is headless
+          // measurement — nobody watches its output. Diagnostics land in the
+          // log; per-round usage lands in tasks/<id>/usage.json. The file lock
+          // makes reruns self-healing (a second instance exits immediately).
+          const logPath = path.join(cwd, ".context-hub", "usage-audit.log");
+          const out = openSync(logPath, "a");
+          const child = spawn(process.execPath, [usageScript, "--watch", "--root", cwd, "--url", hubUrl], {
+            detached: true,
+            stdio: ["ignore", out, out],
+            env: process.env,
+            windowsHide: true,
+          });
+          // Spawn failures arrive asynchronously (ENOENT/EMFILE/...) — without
+          // a listener they escape the catch above and kill `tut up`.
+          child.on("error", (err) => {
+            try { closeSync(out); } catch {}
+            process.stderr.write(`tut: up: usage watcher failed to start (non-fatal): ${err.message}\n`);
+          });
+          child.unref();
+          if (child.pid !== undefined) {
+            process.stdout.write(`up: usage watcher spawned (pid ${child.pid}; per-round usage lands in tasks/<id>/usage.json)\n`);
+          }
+        }
+      }
+    } catch {
+      process.stderr.write("tut: up: usage watcher step failed (non-fatal) — measurement not started\n");
     }
 
     // Degradation: no usable Herdr → manual commands for whatever is down,

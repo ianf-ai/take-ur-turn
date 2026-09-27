@@ -22,7 +22,7 @@ Usage:
       file serve re-reads every request, so writes take effect on the next
       poll cycle, no restart; works with the Hub down, same discipline as
       tut assign). Keys: flow_mode ("manual"|"auto" — the offline equivalent
-      of tut mode), auto.remediate (off | enter-repress), auto.launch_roles (comma-separated bare role names —
+      of tut mode), usage_audit (off | on; when on, tut up starts the shipped usage watcher), auto.remediate (off | enter-repress), auto.launch_roles (comma-separated bare role names —
       e.g. architect,executor,reviewer; "" clears the whitelist). get also
       reads notify (read-only: an object config,
       edit config.json by hand). Unknown keys and illegal values are

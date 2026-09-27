@@ -18,6 +18,7 @@ vi.mock("../src/hub/state-machine.js", async (importOriginal) => {
 });
 
 import { Store, StoreError } from "../src/hub/store.js";
+import { TASK_SPEC_HEADINGS } from "../src/common/task-spec.js";
 import { derive } from "../src/hub/state-machine.js";
 import { ErrorCode, type ContextRecord, type Flow, type Payload } from "../src/common/types.js";
 import { createHash } from "node:crypto";
@@ -90,7 +91,7 @@ describe("createTask", () => {
     const { store, root } = newStore();
     const result = await store.createTask({ title: "Auth Refactor!", description: "d", creator: "alice", role: "agent:architect" });
 
-    expect(result).toEqual({ task_id: "auth-refactor", status: "designing", version: 0 });
+    expect(result).toEqual({ task_id: "auth-refactor", status: "designing", version: 0, warning: "warning: 缺少验收场景节" });
     expect(recordFiles(root, "auth-refactor")).toEqual([]);
     const meta = readMeta(root, "auth-refactor");
     expect(meta.version).toBe(0);
@@ -1629,4 +1630,56 @@ describe("task ID dot hygiene", () => {
     expect(await store.readTask(id)).toMatchObject({ task_id: id, status: "reviewing" });
     expect(readFileSync(recordPath)).toEqual(original);
   });
+});
+
+describe("spec diagnostic contract", () => {
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import("../src/hub/state-machine.js")>("../src/hub/state-machine.js");
+    vi.mocked(derive).mockImplementation(actual.derive);
+  });
+  it("uses all four headings from the actual host freeze template (each mutation breaks parity)", () => {
+    const host = readFileSync(new URL('../skills/host.md', import.meta.url), 'utf8');
+    const template = host.split('### 开工范围冻结')[1]!.match(/```markdown\n([\s\S]*?)```/u)![1]!;
+    const headings = (text: string) => [...text.matchAll(/^## (.+)$/gmu)].map(m => m[1]);
+    expect(headings(template)).toEqual([...TASK_SPEC_HEADINGS]);
+    for (const heading of TASK_SPEC_HEADINGS) {
+      expect(headings(template.replace(`## ${heading}`, `## changed ${heading}`))).not.toEqual([...TASK_SPEC_HEADINGS]);
+    }
+  });
+  it.each(['legacy', '## 验收场景\nplain', '## 验收场景\n1. ', '## 验收场景\n1. TODO'])("create diagnoses %s without adding records or attention", async (description) => {
+    const { store } = newStore();
+    const created = await store.createTask({ title: 'spec', description, creator: 't', role: 'human', flow: 'direct' });
+    expect(created).toMatchObject({version: 0, status: 'implementing', warning: expect.stringContaining('验收场景')});
+    expect((await store.readTask(created.task_id)).versions).toEqual([]);
+    expect((await store.listTasks())[0]).toMatchObject({needs_attention: false});
+  });
+  it("replays identical diagnostics through hot/cold reads, repair and ack without changing records", async () => {
+    const { store, root } = newStore();
+    const description = '## 验收场景\n1. first\n2. second';
+    const { task_id } = await store.createTask({title: 'replay lint', description, role: 'human', creator: 't', flow: 'direct'});
+    await store.append(task_id, {role: 'executor', content_type: 'code_changes', payload: validPayload()});
+    const published = await store.append(task_id, {role: 'reviewer', content_type: 'review', payload: validPayload({verdict: 'pass', body: '## 退出条件逐条核验\n1. 满足 — first; test passed'})});
+    expect(published.status).toBe('pending_approval');
+    expect(published.warnings?.map(w => w.code)).toEqual(['REVIEW_EXIT_CONDITIONS_INCOMPLETE', 'REVIEW_SCOPE_SECTION_MISSING']);
+    for (const reader of [store, new Store(root)]) {
+      expect((await reader.listTasks())[0]).toMatchObject({needs_attention: true, waiting_for: 'human'});
+      expect((await reader.readTask(task_id, 2)).status).toBe(published.status);
+      const response = await reader.append(task_id, {role: 'human', content_type: 'note', payload: validPayload()});
+      expect(response.warnings).toEqual(published.warnings);
+    }
+    const recordsBefore = recordFiles(root, task_id).map(name => readFileSync(path.join(taskDir(root, task_id), name), 'utf8'));
+    writeFileSync(path.join(taskDir(root, task_id), 'meta.json'), '{'); // isolated corruption fixture
+    await store.repairMeta(task_id, {description, flow: 'direct'});
+    expect(readMeta(root, task_id).warnings).toEqual(published.warnings);
+    expect(recordFiles(root, task_id).map(name => readFileSync(path.join(taskDir(root, task_id), name), 'utf8'))).toEqual(recordsBefore);
+    expect((await store.append(task_id, {role: 'human', content_type: 'note', payload: validPayload({ack: true})})).needs_attention).toBe(false);
+    expect((await new Store(root).listTasks())[0]).toMatchObject({needs_attention: false});
+  });
+});
+
+it('keeps project records outside task lint even for review and uppercase role', async () => {
+  const {store, root} = newStore();
+  expect(await store.append('project', {role: 'Reviewer', content_type: 'review', payload: validPayload({verdict: 'pass'})})).toEqual({task_id: 'project', version: 1});
+  expect(await new Store(root).readTask('project')).not.toHaveProperty('status');
+  expect((await new Store(root).listTasks())[0]).not.toHaveProperty('needs_attention');
 });

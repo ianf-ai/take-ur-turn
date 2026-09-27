@@ -1490,3 +1490,14 @@ describe("notify --interval clamp", () => {
     }
   });
 });
+
+it('prints returned spec warnings to stderr while preserving create JSON and exit zero', async () => {
+  const result = {task_id: 'spec-warning', status: 'implementing', version: 0, warning: 'warning: 缺少验收场景节'};
+  vi.mocked(hubCreate).mockResolvedValue(result);
+  const io = captureIo();
+  try {
+    expect(await main(['create', '--title', 'spec', '--description', 'legacy', '--creator', 't', '--role', 'human'])).toBe(0);
+    expect(JSON.parse(io.out())).toEqual(result);
+    expect(io.err()).toContain(result.warning);
+  } finally { io.restore(); }
+});

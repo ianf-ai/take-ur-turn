@@ -156,6 +156,22 @@ describe("config get (effective values)", () => {
 });
 
 describe("config set (validated, key-preserving writes)", () => {
+  it("usage_audit defaults off without writing and round-trips on/off without losing keys", async () => {
+    expect(await main(["config", "get", "usage_audit", "--root", root])).toBe(0);
+    expect(io.out()).toBe("off\n");
+    writeFileSync(configFile(), JSON.stringify({ flow_mode: "manual", custom: { keep: true } }));
+    expect(await main(["config", "set", "usage_audit", "on", "--root", root])).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), "utf8"))).toEqual({ flow_mode: "manual", custom: { keep: true }, usage_audit: "on" });
+    expect(await main(["config", "get", "usage_audit", "--root", root])).toBe(0);
+    expect(io.out()).toContain("on\n");
+    expect(await main(["config", "set", "usage_audit", "off", "--root", root])).toBe(0);
+    const before = readFileSync(configFile(), "utf8");
+    expect(await main(["config", "set", "usage_audit", "yes", "--root", root])).toBe(1);
+    expect(readFileSync(configFile(), "utf8")).toBe(before);
+    writeFileSync(configFile(), JSON.stringify({ flow_mode: "manual", usage_audit: "invalid" }));
+    expect(await main(["config", "get", "usage_audit", "--root", root])).toBe(1);
+  });
+
   it("auto.remediate reports the effective defaults and the saved switch", async () => {
     expect(await main(["config", "get", "auto.remediate", "--root", root])).toBe(0);
     expect(io.out()).toContain("off");
