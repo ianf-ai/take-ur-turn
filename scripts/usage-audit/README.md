@@ -165,7 +165,17 @@ callers must inspect coverage instead of treating process success as accuracy.
 Common diagnostics: missing_launch, missing_route, superseded_launch,
 agent_conflict, unsupported_agent, missing_session_or_end, ambiguous_sessions,
 overlapping_rounds, partial_jsonl_tail, missing_baseline, cumulative_reset,
-invalid_pi_usage, missing_terminal_usage. Unreadable session candidates prevent
+invalid_pi_usage, missing_terminal_usage, no_matching_rounds.
+Tasks with no extracted delivery rounds (for example, a launch without delivery)
+emit `{ "task_id": "…", "changed": false, "reason": "no_matching_rounds" }`.
+This task-level diagnostic has no measured totals or delivery-level unresolved
+entries and does not create or modify `usage.json`; snapshot schema v1 is unchanged.
+Watch emits it on first sight and deduplicates identical subsequent reports.
+Backfill and since use the same diagnostic, independent of the since cutoff
+because no delivery timestamp exists to filter. Tasks with delivery rounds all
+before the cutoff remain excluded. A delivery whose native session has disappeared
+instead retains the existing `missing_session_or_end` unresolved behavior.
+Unreadable session candidates prevent
 unique attribution for that agent; repair/restore the source, then backfill.
 No unresolved condition is converted to zero.
 

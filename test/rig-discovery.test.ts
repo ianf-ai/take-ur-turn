@@ -14,7 +14,7 @@ vi.mock("../src/hub/rig-discovery.js", async importOriginal => {
     actual.resolveUpHub(url, explicit, root, event, availability) };
 });
 
-import { canonicalRoot, portFree, probeHub, resolveCliHubUrl, resolveRigRoot, resolveUpHub, resolveNotifierEventEndpoint } from "../src/hub/rig-discovery.js";
+import { canonicalRoot, discoverHub, portFree, probeHub, resolveCliHubUrl, resolveRigRoot, resolveUpHub, resolveNotifierEventEndpoint } from "../src/hub/rig-discovery.js";
 import { startServer, type RunningServer } from "../src/hub/server.js";
 import { hubCreate, hubList } from "../src/hub/hub-client.js";
 import { main } from "../src/cli.js";
@@ -151,6 +151,76 @@ describe("launch notifier event endpoint resolution", () => {
 });
 
 describe("Hub root handshake", () => {
+  // Wait for the production timeout signal rather than synthesizing a timeout
+  // error, so the retry must use a fresh 800ms budget (including body reads).
+  function untilAborted(init?: RequestInit): Promise<never> {
+    const signal = init?.signal;
+    if (!signal) throw new Error("missing handshake timeout");
+    return new Promise((_, reject) => {
+      if (signal.aborted) reject(signal.reason);
+      else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }
+
+  it("discovers the Hub when the first handshake times out and the retry succeeds", async () => {
+    const url = "http://127.0.0.1:3001";
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockImplementationOnce((_input, init) => untilAborted(init))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ hub_root: b })));
+    vi.stubGlobal("fetch", fetchMock);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+
+    expect(await discoverHub(b, [url])).toBe(url);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(timeout.mock.calls).toEqual([[800], [800]]);
+    expect(fetchMock.mock.calls[0]![1]!.signal!.aborted).toBe(true);
+    expect(fetchMock.mock.calls[1]![1]!.signal!.aborted).toBe(false);
+  });
+
+  it("completes a CLI command when the first handshake body times out", async () => {
+    const server = await start(b);
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockImplementationOnce(async (_input, init) => {
+        const response = new Response();
+        vi.spyOn(response, "json").mockImplementation(() => untilAborted(init));
+        return response;
+      })
+      .mockImplementation(realFetch);
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await main(["list", "--json", "--url", server.url]), errors).toBe(0);
+    const handshakes = fetchMock.mock.calls.filter(([input]) => new URL(String(input)).pathname === "/state");
+    expect(handshakes).toHaveLength(2);
+    expect(errors).not.toContain("HUB_UNREACHABLE");
+  });
+
+  it.each(["timeout", "connection refused"])("fails loud after exactly two attempts on %s", async failure => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((_input, init) => {
+      if (failure === "timeout") return untilAborted(init);
+      return Promise.reject(new TypeError("fetch failed: connection refused"));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await main(["list", "--url", "http://127.0.0.1:3001"])).toBe(1);
+    expect(errors).toContain("HUB_UNREACHABLE");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["foreign identity", 200, JSON.stringify({ hub_root: "/foreign-workspace" })],
+    ["missing identity", 200, "{}"],
+    ["invalid JSON", 200, "not json"],
+    ["HTTP error", 503, "unavailable"],
+    ["redirect", 302, ""],
+  ])("does not retry or accept a responder with %s", async (_label, status, body) => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(body, { status }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(resolveCliHubUrl("http://127.0.0.1:3001", true, b)).rejects.toThrow("foreign hub");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![1]!.redirect).toBe("manual");
+  });
+
   it("A at 3001: B up selects 3003/3004, namespaces panes, and default list keeps pools separate", async () => {
     const aServer = await start(a); await seed(aServer, "Only A");
     endpoints.set("3001", aServer.url); provision = true;

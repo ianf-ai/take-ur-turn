@@ -103,6 +103,40 @@ test('identical pass reports are not repeated every interval; content changes re
   assert.equal(lines.filter(l=>l.includes(`"${f.id}"`)).length,2);
   assert.equal(lines.filter(l=>l.includes('"other"')).length,1);
 });
+test('launch without delivery or sessions reports once in watch, without a usage snapshot',async t=>{
+  const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const {task_id:id}=await store.createTask({title:'No rounds',description:'test',role:'human',creator:'test',flow:'direct'});
+  await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:0,route:{agent:'pi',args:[]}}}});
+  const hub={list:()=>store.listTasks(),read:id=>store.readTask(id)};
+  const options={root,piRoot:path.join(root,'pi'),codexRoot:path.join(root,'codex'),intervalMs:1,timeoutMs:Infinity};
+  const expected={task_id:id,changed:false,reason:'no_matching_rounds'};
+  const ac=new AbortController(),passes=[];
+  await run({...options,watch:true,signal:ac.signal},{hub,enabled:async()=>true,sleep:async()=>{},
+    report:reports=>{passes.push(reports);if(passes.length===2)ac.abort();}});
+  assert.deepEqual(passes,[[expected],[]]);
+  assert.deepEqual(await collect({...options,watch:false},{hub}),[expected]);
+  assert.deepEqual(await collect({...options,since:Date.now()+10000},{hub}),[expected]);
+  assert.deepEqual(await collect({...options,task:'absent'},{hub}),[]);
+  const dir=path.join(root,'.context-hub/tasks',id);
+  assert.equal(await loadUsage(dir),null);
+  // Once delivery arrives, retain the existing missing-session diagnostic.
+  await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
+  assert.deepEqual(await collect({...options,since:Date.now()+10000},{hub}),[]);
+  assert.equal(await loadUsage(dir),null);
+  const [report]=await collect(options,{hub});
+  assert.equal(report.reason,undefined);
+  assert.equal(report.unresolved[0].reason,'missing_session_or_end');
+});
+test('zero-round task remains visible alongside measured tasks and respects task selection',async t=>{
+  const f=await fixture(t);
+  const {task_id:id}=await f.store.createTask({title:'Empty',description:'test',role:'human',creator:'test',flow:'direct'});
+  const reports=await collect(f.options,{hub:f.hub});
+  assert.equal(reports.length,2);
+  assert.equal(reports.find(r=>r.task_id===id).reason,'no_matching_rounds');
+  assert.equal(reports.find(r=>r.task_id===f.id).total.rounds,1);
+  assert.deepEqual(await collect({...f.options,task:id},{hub:f.hub}),[{task_id:id,changed:false,reason:'no_matching_rounds'}]);
+  assert.equal(await loadUsage(path.join(f.root,'.context-hub/tasks',id)),null);
+});
 test('unchanged session files are not re-read between watch passes; changed ones are',async t=>{
   const f=await fixture(t);
   let reads=0;

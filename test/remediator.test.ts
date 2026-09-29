@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createEnterRepress, RemediationAttempts, MAX_REMEDIATION_ATTEMPTS, MAX_CONCURRENT_REMEDIATIONS, type Remediator, type RemediationRequest } from '../src/remediator.js';
+import { createEnterRepress, pendingCodexInput, RemediationAttempts, MAX_REMEDIATION_ATTEMPTS, MAX_CONCURRENT_REMEDIATIONS, type Remediator, type RemediationRequest } from '../src/remediator.js';
 import { createDelivery, promptTailEvidence, type DeliveryEvidenceV2 } from '../src/launcher/delivery.js';
 import type { DeliveryClientV2, PaneIdentity, StatusSample } from '../src/launcher/herdr-client-v2.js';
 
@@ -286,7 +286,7 @@ describe('controlled Enter remediation', () => {
     f.text.mockImplementation(async (_pane, _text, ctx) => ({ kind: 'sent', trace: { ...ctx, startedMonoMs: f.now(),
       finishedMonoMs: f.now(), spawned: true, exitCode: 0, signal: null, fault: null } }));
     let evidence: DeliveryEvidenceV2 | undefined;
-    await createDelivery({ remediationEvidence: true, client: f.client, env: f.env, now: f.now, sleep: f.sleep, stderr: () => {},
+    await createDelivery({ remediationEvidence: true, client: f.client, env: { ...f.env, TUT_STATUS_FLIP_TIMEOUT_MS: '300' }, now: f.now, sleep: f.sleep, stderr: () => {},
       onGiveUp: async (_pane, e) => { evidence = e; } }).deliver({ target: deliveryTarget, prompt: 'Task t1: please begin your executor round.', branch: 'born' });
     expect(evidence).toMatchObject({ reason: 'deadline', target: deliveryTarget, prompt_tail: f.evidence.prompt_tail,
       status_before: 'idle', baseline_wait: { elapsed_ms: 2 } });
@@ -302,7 +302,7 @@ describe('controlled Enter remediation', () => {
       finishedMonoMs: f.now(), spawned: true, exitCode: 0, signal: null, fault: null } }));
     let evidence: DeliveryEvidenceV2 | undefined;
     await createDelivery({ remediationEvidence: true, client: f.client,
-      env: { ...f.env, TUT_BASELINE_READY_TIMEOUT_MS: '6' }, now: f.now, sleep: f.sleep, stderr: () => {},
+      env: { ...f.env, TUT_BASELINE_READY_TIMEOUT_MS: '6', TUT_STATUS_FLIP_TIMEOUT_MS: '300' }, now: f.now, sleep: f.sleep, stderr: () => {},
       onGiveUp: async (_pane, e) => { evidence = e; } }).deliver({ target, prompt: 'probe', branch: 'born' });
     expect(evidence).toMatchObject({ reason: `baseline-${status}`, baseline_wait: { elapsed_ms: 6 },
       text_calls: status === 'working' ? 1 : 0 });
@@ -394,5 +394,103 @@ describe('revision v5 safeguards', () => {
     release(false); await Promise.all(active);
     expect((await f.strategy.remediate(request(1001))).reason).toBe('pane-mismatch');
     expect(f.enter).not.toHaveBeenCalled();
+  });
+});
+
+describe('historical working reevaluation', () => {
+  const prompt = 'Task t1: please begin your executor round.';
+  const viewport = `Earlier output\n\n› ${prompt}\n\n  GPT-6-Luna max · project\n  ? for shortcuts`;
+  function retryFixture() {
+    const f = fixture();
+    Object.assign(f.evidence, { reason: 'attribution-unavailable', status_last: 'working', status_flip: true, elapsed_ms: 5 });
+    f.evidence.target = { ...target, agentSession: null };
+    f.screen.mockResolvedValue(viewport);
+    const strategy = createEnterRepress({ client: f.client, readPane: f.screen, matchesPane: f.matches,
+      env: { ...f.env, TUT_BASELINE_READY_TIMEOUT_MS: '5000', TUT_STATUS_POLL_MS: '10' },
+      now: f.now, sleep: f.sleep });
+    return { ...f, strategy };
+  }
+  it('rechecks after the initial veto, presses once for stable idle with pending text, and never resends', async () => {
+    const f = retryFixture();
+    const original = JSON.stringify(f.evidence);
+    const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(async (pane, ctx) => ({ ...await read(pane, ctx),
+      ...(f.now() < 100 ? { status: 'working' as const } : {}) }));
+    const audit = vi.fn(async () => {});
+    f.request.recordAction = audit;
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'machine-enter',
+      result: 'working-observed', reevaluated: true, staged_basis: 'codex-input-tail' });
+    expect(f.now()).toBe(2100);
+    expect(audit.mock.calls).toHaveLength(2);
+    expect(audit).toHaveBeenNthCalledWith(1, expect.objectContaining({ action: 'none', reason: 'evidence-insufficient' }));
+    await f.strategy.remediate(f.request);
+    expect(f.enter).toHaveBeenCalledTimes(1);
+    expect(f.text).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.evidence)).toBe(original);
+  });
+  it.each(['working', 'unknown', 'blocked', 'done'] as const)('never presses during persistent %s', async status => {
+    const f = retryFixture();
+    const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(async (pane, ctx) => ({ ...await read(pane, ctx), status }));
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none', reason: 'reevaluation-deadline' });
+    expect(f.now()).toBe(5000);
+    expect(f.enter).not.toHaveBeenCalled();
+  });
+  it.each(['working', 'unknown', 'error', 'late', 'sequence'] as const)('resets idle stability after %s', async fault => {
+    const f = retryFixture();
+    const read = f.read.getMockImplementation()!;
+    f.read.mockImplementation(async (pane, ctx) => {
+      const s = await read(pane, ctx);
+      if (f.now() !== 1500) return s;
+      if (fault === 'error') return { ...s, error: 'TIMEOUT' };
+      if (fault === 'late') return { ...s, finishedMonoMs: ctx.deadlineMonoMs };
+      if (fault === 'sequence') return { ...s, sequence: -1 };
+      return { ...s, status: fault };
+    });
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'machine-enter' });
+    expect(f.now()).toBe(3510);
+    expect(f.text).not.toHaveBeenCalled();
+  });
+  it.each(['identity', 'label', 'lifecycle', 'screen', 'input-changed', 'audit-working'] as const)(
+    'vetoes changed %s before the key', async condition => {
+      const f = retryFixture();
+      if (condition === 'identity') f.setBadStatus();
+      if (condition === 'label') f.matches.mockResolvedValue(false);
+      if (condition === 'lifecycle') f.request.canAct = () => f.now() < 100;
+      if (condition === 'screen') f.screen.mockResolvedValue(`› Ask Codex to do anything\n\n  ? for shortcuts`);
+      if (condition === 'input-changed') f.screen.mockResolvedValueOnce(viewport).mockResolvedValue('');
+      if (condition === 'audit-working') f.request.recordAction = async e => {
+        if (e.action === 'machine-enter') f.setWorking();
+      };
+      expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none' });
+      expect(f.enter).not.toHaveBeenCalled(); expect(f.text).not.toHaveBeenCalled();
+    });
+  it('concurrent duplicates and a failed machine Enter cannot schedule another key', async () => {
+    const f = retryFixture(); f.setFlip(false);
+    const results = await Promise.all([f.strategy.remediate(f.request), f.strategy.remediate(f.request)]);
+    expect(results[0]).toMatchObject({ action: 'machine-enter', result: 'give-up' });
+    expect(results[1]).toMatchObject({ action: 'none' });
+    await f.strategy.remediate(f.request);
+    expect(f.enter).toHaveBeenCalledTimes(1); expect(f.text).not.toHaveBeenCalled();
+  });
+  it.each(['transport', 'status-error', 'agent', 'missing-tail'] as const)('does not weaken the %s gate', async condition => {
+    const f = retryFixture();
+    if (condition === 'transport') { f.evidence.enter_transport = 'uncertain'; f.evidence.enter_error = 'TIMEOUT'; }
+    if (condition === 'status-error') f.evidence.status_error = 'TIMEOUT';
+    if (condition === 'agent') f.request.agent = 'pi';
+    if (condition === 'missing-tail') delete f.evidence.prompt_tail;
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none' });
+    expect(f.enter).not.toHaveBeenCalled();
+  });
+  it('recognizes wrapped input and rejects historical or unframed matches', () => {
+    const tail = promptTailEvidence(prompt);
+    expect(pendingCodexInput(viewport, tail)).toBe(true);
+    expect(pendingCodexInput(viewport.replace(prompt, 'Task t1: please begin\n  your executor round.'), tail)).toBe(true);
+    expect(pendingCodexInput(`${viewport}\n\n› Ask Codex to do anything\n\n  ? for shortcuts`, tail)).toBe(false);
+    expect(pendingCodexInput(viewport.replace('› ', ''), tail)).toBe(false);
+    expect(pendingCodexInput(viewport.replace('  GPT-6-Luna max · project\n  ? for shortcuts', ''), tail)).toBe(false);
+    expect(pendingCodexInput(viewport.replace('  ? for shortcuts', ''), tail)).toBe(true);
+    expect(pendingCodexInput(viewport.replace('\n\n  GPT-', '\n\n• Already answered\n\n  GPT-'), tail)).toBe(false);
+    expect(pendingCodexInput(viewport, undefined)).toBe(false);
   });
 });

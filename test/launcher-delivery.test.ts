@@ -665,3 +665,62 @@ it('remediation audit retains stderr when diagnostics are off and persistence fa
   expect(stderr[0]).toContain('remediation action=machine-enter');
   expect(mem.files.size).toBe(0);
 });
+
+describe('Codex composer pacing', () => {
+  it.each(['born', 'continuation'] as const)('exhausts a short working-baseline budget before Enter (%s)', async branch => {
+    const f = fixture({ baseline: 'working', post: ['working'], env: {
+      TUT_BASELINE_READY_TIMEOUT_MS: '6', TUT_STATUS_FLIP_TIMEOUT_MS: '100', TUT_HERDR_TIMEOUT_MS: '1000',
+    } });
+    expect(await f.delivery.deliver({ target, prompt: 'one', branch, agent: 'codex' }))
+      .toMatchObject({ exitCode: 0, reason: 'deadline', retry: 'forbidden', enter: 'not-attempted' });
+    expect(f.calls.filter(c => c.phase === 'text')).toHaveLength(1);
+    expect(f.calls.filter(c => c.phase === 'enter')).toHaveLength(0);
+    expect(f.events[0]).toMatchObject({ status_before: 'working', total_elapsed_ms: branch === 'born' ? 106 : 100 });
+    validEvidence(f.events[0]!);
+  });
+  it.each(['born', 'continuation'] as const)('shares the pre-settle working-baseline deadline with Enter (%s)', async branch => {
+    const f = fixture({ baseline: 'working', post: ['working'], env: {
+      TUT_BASELINE_READY_TIMEOUT_MS: '6', TUT_STATUS_FLIP_TIMEOUT_MS: '300', TUT_HERDR_TIMEOUT_MS: '1000',
+    } });
+    expect(await f.delivery.deliver({ target, prompt: 'one', branch, agent: 'codex' }))
+      .toMatchObject({ reason: 'baseline-working', enter: 'sent', exitCode: 0 });
+    const enters = f.calls.filter(c => c.phase === 'enter');
+    expect(enters).toHaveLength(1);
+    expect(enters[0]!.ctx.deadlineMonoMs).toBe(branch === 'born' ? 306 : 300);
+    expect(f.calls.filter(c => c.phase === 'text')).toHaveLength(1);
+    expect(f.calls.at(-1)?.phase).toBe('enter');
+    expect(f.events[0]).toMatchObject({ status_before: 'working', elapsed_ms: 250,
+      total_elapsed_ms: branch === 'born' ? 256 : 250 });
+    validEvidence(f.events[0]!);
+  });
+  it.each(['born', 'continuation'] as const)('separates text from Enter for a sessionless %s Codex pane', async branch => {
+    const f = fixture({ post: ['working'], env: { TUT_STATUS_FLIP_TIMEOUT_MS: '1000' } });
+    await f.delivery.deliver({ target, prompt: 'original prompt', branch, agent: 'codex' });
+    expect(f.calls.map(c => c.phase)).toEqual(['read', 'text', 'enter', 'read']);
+    expect(f.events[0]).toMatchObject({ reason: 'attribution-unavailable', total_elapsed_ms: 250, elapsed_ms: 250 });
+    expect(f.calls.find(c => c.phase === 'enter')!.ctx.deadlineMonoMs).toBe(260);
+    validEvidence(f.events[0]!);
+  });
+  it('keeps a deadline during settling exit-zero and never issues Enter or resends', async () => {
+    const f = fixture({ env: { TUT_STATUS_FLIP_TIMEOUT_MS: '100' } });
+    expect(await f.delivery.deliver({ target, prompt: 'one', branch: 'born', agent: 'codex' }))
+      .toMatchObject({ exitCode: 0, reason: 'deadline', retry: 'forbidden' });
+    expect(f.calls.filter(c => c.phase === 'text')).toHaveLength(1);
+    expect(f.calls.some(c => c.phase === 'enter')).toBe(false);
+    validEvidence(f.events[0]!);
+  });
+  it('honors cancellation during settling without a key', async () => {
+    const f = fixture();
+    const d = createDelivery({ client: f.client, signal: f.controller.signal,
+      sleep: async () => { f.controller.abort(); }, stderr: () => {} });
+    expect(await d.deliver({ target, prompt: 'one', branch: 'born', agent: 'codex' }))
+      .toMatchObject({ reason: 'cancelled', enter: 'not-attempted', exitCode: 0 });
+    expect(f.calls.filter(c => c.phase === 'text')).toHaveLength(1);
+    expect(f.calls.some(c => c.phase === 'enter')).toBe(false);
+  });
+  it('leaves other agent transports unchanged', async () => {
+    const f = fixture({ post: ['working'] });
+    await f.delivery.deliver({ target, prompt: 'one', branch: 'born', agent: 'pi' });
+    expect(f.events[0]?.total_elapsed_ms).toBe(0);
+  });
+});

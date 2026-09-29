@@ -1,4 +1,5 @@
-import { createRemediationAudit } from '../src/launcher/delivery.js';
+import { createRemediationAudit, promptTailEvidence } from '../src/launcher/delivery.js';
+import { createEnterRepress } from '../src/remediator.js';
 import { canonicalRoot, resolveRigRoot } from "../src/hub/rig-discovery.js";
 import { rigLabel } from "../src/hub/rig.js";
 /**
@@ -4010,6 +4011,42 @@ describe("host status relay edges", () => {
 });
 
 describe('notifier remediation policy and pluggable interface', () => {
+  it('keeps one attempt claimed while the real strategy reevaluates a historical working veto', async () => {
+    let clock = 0;
+    let entered = false;
+    const target = { paneId: 'pane-1', terminalId: null, workspaceId: null,
+      agentSession: null, serverEpoch: null, agentGeneration: null };
+    const enter = vi.fn(async (_pane, ctx) => {
+      entered = true;
+      return { kind: 'sent' as const, trace: { ...ctx, startedMonoMs: clock, finishedMonoMs: clock,
+        spawned: true, exitCode: 0, signal: null, fault: null } };
+    });
+    const strategy = createEnterRepress({ client: { sendEnter: enter,
+      readAgentStatus: async (pane, ctx) => ({ ...ctx, startedMonoMs: clock, finishedMonoMs: clock,
+        status: entered || clock < 1000 ? 'working' : 'idle', identity: pane, paneRevision: 1,
+        error: null, readSource: 'herdr-pane-list', detectorSource: null, detectorAgeMs: null, attribution: 'unavailable' }) },
+      matchesPane: async () => true,
+      readPane: async () => '› original prompt\n\n  GPT-6-Luna max · ~/project',
+      env: { TUT_BASELINE_READY_TIMEOUT_MS: '5000', TUT_STATUS_POLL_MS: '250' },
+      now: () => clock, sleep: async ms => { clock += ms; } });
+    const hz = makeHarness({ remediator: strategy });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })], { flow_mode: 'auto' }));
+    await hz.notifier.requestCompare();
+    const event = { event: 'delivery_giveup' as const, agent: 'codex', pane: 't1.executor',
+      delivery_v2: { ...evidence, target, prompt_tail: promptTailEvidence('original prompt'),
+        reason: 'attribution-unavailable', status_last: 'working', status_flip: true, elapsed_ms: 5 } };
+    hz.notifier.receiveEvent(event);
+    hz.notifier.receiveEvent(event);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(enter).toHaveBeenCalledTimes(1);
+    expect(clock).toBe(3000);
+    const records = hz.auditLines.map(line => JSON.parse(line.split('delivery_v2=')[1]!));
+    expect(records).toHaveLength(3);
+    expect(records[0].remediation).toMatchObject({ action: 'none', reason: 'evidence-insufficient' });
+    expect(records[1].remediation).toMatchObject({ action: 'machine-enter', result: 'attempting', reevaluated: true });
+    expect(records[2].remediation).toMatchObject({ result: 'working-observed', staged_basis: 'codex-input-tail' });
+    expect(h.sent.some(s => s.msg.body.includes('机器补救'))).toBe(true);
+  });
   it.each(['role', 'status', 'attention', 'missing', 'off', 'read-error'])(
     'refreshes lifecycle: notes survive but %s stops remediation', async change => {
       const base = task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor', version: 1 });

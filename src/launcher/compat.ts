@@ -483,7 +483,7 @@ async function runDeliveredRound(
         previewDelivery(existing.pane_id, `DRY-RUN: herdr pane send-text ${existing.pane_id} "${invocation.prompt}"\n`, 'continuation');
         return true;
       }
-      return handled(await delivery.deliver({ target: paneIdentityFrom(existing as unknown as Record<string, unknown>), prompt: invocation.prompt, branch: "continuation" }));
+      return handled(await delivery.deliver({ target: paneIdentityFrom(existing as unknown as Record<string, unknown>), prompt: invocation.prompt, branch: "continuation", agent: route.agent }));
     },
     onBirth: async () => {
       const birthAnchor = anchor ?? invocation.context.anchor;
@@ -526,7 +526,7 @@ async function runDeliveredRound(
   const matches = snapshot.panes.filter(p => p.pane_id === lifecycle.pane_id);
   if (!snapshot.usable || matches.length !== 1) return 1;
   const target: PaneIdentity = paneIdentityFrom(matches[0] as unknown as Record<string, unknown>);
-  return handled(await delivery.deliver({ target, prompt: invocation.prompt, branch: "born" })) ? 0 : 1;
+  return handled(await delivery.deliver({ target, prompt: invocation.prompt, branch: "born", agent: route.agent })) ? 0 : 1;
 }
 
 /** Recompute the digest from a private plan for child/marker consistency tests. */

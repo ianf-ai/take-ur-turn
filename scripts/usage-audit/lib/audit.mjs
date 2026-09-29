@@ -178,7 +178,7 @@ export async function collect(options, deps = {}) {
     tasks.push(await hub.read(e.task_id));
   }
   const rounds = tasks.flatMap(t => extract(t, options.root));
-  const targets = rounds.filter(r => !options.task || r.task_id === options.task);
+  const targets = tasks.filter(t => !options.task || t.task_id === options.task);
   if (!targets.length) return [];
   const sessions = [], diagnostics = [];
   const discover = deps.files ?? files, read = deps.readSession ?? readSession;
@@ -211,10 +211,15 @@ export async function collect(options, deps = {}) {
   // An unreadable candidate cannot be silently discarded to make another
   // candidate appear unique. Its cwd may itself be unreadable.
   for (const m of matches) if (diagnostics.some(d => d.agent === m.round.agent)) m.reason = 'unreadable_session_candidate';
-  for (const task of tasks.filter(t => !options.task || t.task_id === options.task)) {
+  for (const task of targets) {
     const own = matches.filter(m => m.round.task_id === task.task_id);
-    if (!own.length || !own.some(m => options.since === undefined || instant(m.round.ts) >= options.since)) continue;
     if (!await allowed()) return reports;
+    if (!own.length) {
+      // No delivery round exists to attach an unresolved entry or snapshot to.
+      reports.push({ task_id: task.task_id, changed: false, reason: 'no_matching_rounds' });
+      continue;
+    }
+    if (!own.some(m => options.since === undefined || instant(m.round.ts) >= options.since)) continue;
     const dir = await taskDir(options.root, task.task_id);
     const previous = await loadUsage(dir);
     const value = merge(previous, own, options.since);
@@ -258,7 +263,7 @@ export async function run(options, deps = {}) {
       // report every pass (~17k lines/day at the default interval): a report
       // emits when it first appears or its content changes, not every pass.
       const visible = options.watch ? reports.filter(v => {
-        if (!(v.changed || v.diagnostic || v.unresolved?.length)) return false;
+        if (!(v.changed || v.diagnostic || v.reason || v.unresolved?.length)) return false;
         const key = v.diagnostic ? `d:${v.diagnostic.agent}:${v.diagnostic.file}` : String(v.task_id);
         const serialized = JSON.stringify(v);
         if (lastReport.get(key) === serialized) return false;
