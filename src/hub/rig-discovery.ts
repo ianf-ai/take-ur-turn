@@ -22,21 +22,25 @@ export function resolveRigRoot(cwd = process.cwd(), env: NodeJS.ProcessEnv = pro
 
 export type HubIdentity = { root?: string };
 export async function probeHub(url: string): Promise<HubIdentity | undefined> {
-  try {
-    const response = await fetch(new URL("/state", url), {
-      signal: AbortSignal.timeout(800), headers: { Connection: "close" }, redirect: "manual",
-    });
-    if (!response.ok) return {};
-    const body: unknown = await response.json();
-    if (body && typeof body === "object" && "hub_root" in body &&
-        typeof body.hub_root === "string" && path.isAbsolute(body.hub_root)) {
-      return { root: canonicalRoot(body.hub_root) };
+  // Retry transport failures once to tolerate cold Hub state folding. Each attempt
+  // stays at 800ms: an unresponsive Hub now costs up to ~1.6s instead of ~800ms.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(new URL("/state", url), {
+        signal: AbortSignal.timeout(800), headers: { Connection: "close" }, redirect: "manual",
+      });
+      if (!response.ok) return {};
+      const body: unknown = await response.json();
+      if (body && typeof body === "object" && "hub_root" in body &&
+          typeof body.hub_root === "string" && path.isAbsolute(body.hub_root)) {
+        return { root: canonicalRoot(body.hub_root) };
+      }
+      return {};
+    } catch (error) {
+      // A responder with invalid JSON is not an offline endpoint.
+      if (error instanceof SyntaxError) return {};
+      if (attempt === 1) return undefined;
     }
-    return {};
-  } catch (error) {
-    // A responder with invalid JSON is not an offline endpoint.
-    if (error instanceof SyntaxError) return {};
-    return undefined;
   }
 }
 

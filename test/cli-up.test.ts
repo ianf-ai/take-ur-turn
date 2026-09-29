@@ -719,7 +719,7 @@ describe("tut up (behavior)", () => {
 
       expect(code).toBe(0);
       expect(existsSync(logPath)).toBe(false); // herdr never ran → no log
-      expect(fetchMock).toHaveBeenCalledTimes(2); // both probes still happened
+      expect(fetchMock).toHaveBeenCalledTimes(3); // Hub retries once; Notifier probes once
       expect(io.out()).toContain("start manually");
       expect(io.out()).toContain(serviceFixture(`up:   cd ${project} && node ${self} serve`));
       expect(io.out()).toContain(serviceFixture(`up:   cd ${project} && node ${self} notify`));
@@ -1229,9 +1229,9 @@ describe("up port-conflict pre-check", () => {
       code = await runUp(["up", "--url", "http://127.0.0.1:3002", "--event-port", "3005", "--dry-run"]);
       expect(code).toBe(0);
       expect(io.err()).not.toContain("cannot share one port");
-      // dry-run still probes: hub state + default event port (double-notifier
+      // dry-run still probes: hub state twice + default event port (double-notifier
       // check) + the moved event port.
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
     } finally {
       io.restore();
     }

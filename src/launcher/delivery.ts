@@ -277,7 +277,7 @@ export interface DeliveryOptions {
   onGiveUp?: (paneId: string, evidence: Readonly<DeliveryEvidenceV2>) => Promise<void>;
   stderr?: (text: string) => void;
 }
-export interface DeliverPromptInput { target: PaneIdentity; prompt: string; branch: 'born' | 'continuation' }
+export interface DeliverPromptInput { target: PaneIdentity; prompt: string; branch: 'born' | 'continuation'; agent?: string }
 export interface Delivery { deliver(input: DeliverPromptInput): Promise<DeliveryOutcome> }
 
 export function createDelivery(options: DeliveryOptions): Delivery {
@@ -422,6 +422,24 @@ export function createDelivery(options: DeliveryOptions): Delivery {
     // text-uncertain retains the uncertain transport contract even when cancelled.
     if (text === 'uncertain') return finish('text-uncertain');
     if (stopped()) return finish(signal.aborted ? 'cancelled' : 'deadline');
+    // Codex can interpret Enter in a rapid plain-text burst as a newline.
+    // Allow its composer to settle; this is pacing, never submission evidence.
+    if ((input.agent ?? target.agentSession?.agent) === 'codex') {
+      // A working baseline starts its flip budget here, before settling, so
+      // Enter cannot acquire a fresh budget after the pause.
+      t0 ??= now();
+      const settleDeadline = Math.min(t0 + knobs.flipMs, totalDeadline);
+      const pauseMs = Math.min(250, Math.max(0, settleDeadline - now()));
+      emit(`input-settle pane=${target.paneId} budget_ms=${pauseMs}`);
+      if (options.sleep) await options.sleep(pauseMs);
+      else await new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+        const timer = setTimeout(done, pauseMs);
+        signal.addEventListener('abort', done, { once: true });
+        if (signal.aborted) done();
+      });
+      if (stopped() || now() >= settleDeadline) return finish(signal.aborted ? 'cancelled' : 'deadline');
+    }
     t0 ??= now();
     const deadline = Math.min(t0 + knobs.flipMs, totalDeadline);
     const entered = await send('enter', call(deadline));

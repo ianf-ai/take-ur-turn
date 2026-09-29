@@ -1,7 +1,7 @@
 /** Controlled, one-shot recovery. A status flip is observation, not consumption proof. */
 import { createHerdrClient } from './launcher/legacy-herdr-client.js';
 import { parseDeliveryV2 } from './launcher/escalation.js';
-import { deliveryStatusWindow, parseDeliveryKnobs, type DeliveryEvidenceV2 } from './launcher/delivery.js';
+import { deliveryStatusWindow, parseDeliveryKnobs, promptTailEvidence, type DeliveryEvidenceV2 } from './launcher/delivery.js';
 import type { CallContext, DeliveryClientV2, PaneIdentity, StatusSample } from './launcher/herdr-client-v2.js';
 
 export const MAX_REMEDIATION_ATTEMPTS = 4096;
@@ -35,15 +35,16 @@ export interface RemediationEvidence {
   status_flip: boolean;
   attribution: 'machine-remediation' | 'unavailable';
   reason: string;
-  /** Gate ② accepted explicit text delivery transport evidence. */
-  staged_basis?: 'text-transport-sent';
+  /** Accepted staging evidence; a viewport match alone never authorizes input. */
+  staged_basis?: 'text-transport-sent' | 'codex-input-tail';
+  reevaluated?: true;
 }
 export interface Remediator {
   remediate(request: RemediationRequest): Promise<RemediationEvidence>;
 }
 export interface EnterRepressOptions {
   client?: Pick<DeliveryClientV2, 'readAgentStatus' | 'sendEnter'>;
-  /** @deprecated Retained for compatibility; screen content no longer authorizes remediation. */
+  /** Visible viewport; used only for the conservative Codex reevaluation gate. */
   readPane?: (id: string) => Promise<string>;
   matchesPane?: (id: string, label: string) => Promise<boolean>;
   env?: NodeJS.ProcessEnv;
@@ -63,12 +64,32 @@ function targetOf(e: DeliveryEvidenceV2, agent: string): PaneIdentity | undefine
 }
 const nonworking = (s: string) => ['idle', 'blocked', 'done'].includes(s);
 
+/** Inspect only the last Codex composer, never a matching historical prompt. */
+export function pendingCodexInput(screen: string, tail: DeliveryEvidenceV2['prompt_tail']): boolean {
+  if (!tail || tail.length < 1 || tail.length > 80 || !/^[a-f0-9]{64}$/.test(tail.sha256)) return false;
+  const lines = screen.split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) if (/^› /u.test(lines[i]!)) start = i;
+  if (start < 0) return false;
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex(line => line.trim() === '');
+  if (end < 0) return false;
+  const footer = rest.slice(end).filter(line => line.trim() !== '');
+  // Anything between the candidate input and footer could be a response to
+  // an already consumed historical prompt, so reject the whole snapshot.
+  if (!footer.length || !footer.every(line => /^ {2}\? for shortcuts\b/u.test(line) || /^ {2}GPT-\S+.* · \S/u.test(line))) return false;
+  const input = [lines[start]!.slice(2), ...rest.slice(0, end)].join('\n');
+  const actual = promptTailEvidence(input);
+  return actual.length === tail.length && actual.sha256 === tail.sha256;
+}
+
 export function createEnterRepress(options: EnterRepressOptions = {}): Remediator {
   const knobs = parseDeliveryKnobs(options.env ?? process.env, message => {
     try { (options.stderr ?? (text => { process.stderr.write(text); }))(`enter-repress: ${message}\n`); } catch { /* diagnostics only */ }
   });
   const herdr = createHerdrClient({ timeoutMs: knobs.callMs });
   const client = options.client ?? herdr.deliveryV2;
+  const readPane = options.readPane ?? (id => herdr.readPane(id, { source: 'visible', lines: 80 }));
   const matchesPane = options.matchesPane ?? (async (id, label) => {
     const rows = (await herdr.listPanes()).panes.filter(p => p.pane_id === id);
     return rows.length === 1 && rows[0]!.label === label;
@@ -87,8 +108,10 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
       enter_transport: 'not-attempted', status_flip: false, attribution: 'unavailable', reason: 'evidence-insufficient' };
     const e = parseDeliveryV2(request.evidence);
     const unknownBaseline = e?.reason === 'baseline-unknown' && e.status_before === 'unknown';
-    if (!e || (!unknownBaseline && (e.reason !== 'deadline' || !nonworking(e.status_before) || !nonworking(e.status_last))) ||
-        e.status_flip || (!unknownBaseline && e.status_error !== null) ||
+    const reevaluate = e?.reason === 'attribution-unavailable' && e.status_flip && e.status_last === 'working' &&
+      nonworking(e.status_before) && request.agent === 'codex';
+    if (!e || (!reevaluate && !unknownBaseline && (e.reason !== 'deadline' || !nonworking(e.status_before) || !nonworking(e.status_last))) ||
+        (!reevaluate && e.status_flip) || (!unknownBaseline && e.status_error !== null) ||
         ['PANE_MISSING', 'PANE_DUPLICATE', 'IDENTITY_CHANGED'].includes(e.status_error ?? '') ||
         e.text_transport !== 'sent' || e.enter_transport !== 'sent' ||
         e.text_error !== null || e.enter_error !== null || e.enter_calls !== 1 || e.last_query_sequence === null) return result;
@@ -116,6 +139,33 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
       return s;
     };
     try {
+      if (reevaluate) {
+        // A historical working observation still vetoes an immediate key. Keep
+        // the same attempt claim while collecting independent current evidence.
+        await request.recordAction?.({ ...result });
+        result.reevaluated = true;
+        const deadline = now() + knobs.readyMs;
+        let idleSince: number | undefined;
+        let idleSamples = 0;
+        let ready = false;
+        for await (const sample of deliveryStatusWindow({ deadline, pollMs: knobs.pollMs, now,
+          signal: controller.signal, read, sleep })) {
+          if (!await request.canAct()) return { ...result, reason: 'lifecycle-changed' };
+          if (now() >= deadline) break;
+          if (sample && ['PANE_MISSING', 'PANE_DUPLICATE', 'IDENTITY_CHANGED'].includes(sample.error ?? ''))
+            return { ...result, reason: `identity-invalid: ${sample.error}` };
+          if (sample?.error !== null || sample.status !== 'idle') {
+            idleSince = undefined; idleSamples = 0; continue;
+          }
+          idleSince ??= now();
+          if (++idleSamples < 3 || now() - idleSince < 2000) continue;
+          if (!await matchesPane(target.paneId, request.pane)) return { ...result, reason: 'pane-mismatch' };
+          if (!pendingCodexInput(await readPane(target.paneId), e.prompt_tail)) continue;
+          if (now() >= deadline) break;
+          ready = true; break;
+        }
+        if (!ready) return { ...result, result: 'give-up', reason: 'reevaluation-deadline' };
+      }
       if (unknownBaseline) {
         const deadline = now() + knobs.readyMs;
         let ready = false;
@@ -130,11 +180,17 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
         if (!ready) return { ...result, result: 'give-up', reason: 'baseline-unknown' };
       }
       if (!await request.canAct() || !await matchesPane(target.paneId, request.pane)) return { ...result, reason: 'pane-mismatch' };
-      // Transport success establishes staged input; screen buffers are not authoritative.
-      result.staged_basis = 'text-transport-sent';
+      // The retry path requires both original sent transport and current input.
+      result.staged_basis = reevaluate ? 'codex-input-tail' : 'text-transport-sent';
+      if (reevaluate && !pendingCodexInput(await readPane(target.paneId), e.prompt_tail))
+        return { ...result, reason: 'input-changed' };
       const before = await read();
-      if (!before || before.error !== null || !nonworking(before.status) || !await request.canAct()) return { ...result, reason: `status-or-lifecycle-changed${lastReadError ? `: ${lastReadError}` : ''}` };
+      if (!before || before.error !== null || !(reevaluate ? before.status === 'idle' : nonworking(before.status)) || !await request.canAct()) return { ...result, reason: `status-or-lifecycle-changed${lastReadError ? `: ${lastReadError}` : ''}` };
       await request.recordAction?.({ ...result, action: 'machine-enter', result: 'attempting', reason: '机器代按 Enter' });
+      if (reevaluate) {
+        const final = await read();
+        if (!final || final.error !== null || final.status !== 'idle') return { ...result, reason: 'status-changed' };
+      }
       if (!await request.canAct()) return { ...result, reason: 'lifecycle-changed' };
       result.action = 'machine-enter'; result.result = 'give-up'; result.reason = 'deadline';
       const deadline = now() + knobs.flipMs;
