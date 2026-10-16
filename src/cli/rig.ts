@@ -2,13 +2,13 @@ import { discoverHub, probeNotifier, notifierMatches, resolveNotifierPort, probe
 import { acquireRigStartLock } from "../hub/rig-lock.js";
 import { rigLabel, rigEnvironment, unscopedLabel } from "../hub/rig.js";
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startServer } from "../hub/server.js";
 import { renderPaneCommand, resolvePaneShellDialect, type PaneCommand, type ShellDialect } from "../launcher/shell-renderer.js";
 import { runNotify } from "../notifier/notifier.js";
-import { autoSectionOf, CONFIG_KEYS, configKeysHint, configPath, parseConfigValue, readConfigFile, writeConfigKey, type Config, type ReadOutcome } from "../common/config.js";
+import { autoSectionOf, CONFIG_KEYS, configKeysHint, configPath, parseConfigValue, parseReviewStandards, readConfigFile, writeConfigKey, type Config, type ReadOutcome } from "../common/config.js";
 import { HerdrClient, type HerdrPane as HerdrClientPane } from "../launcher/legacy-herdr-client.js";
 import { defaultUserConfigDir } from "../common/workspace.js";
 import { hubRead, HubError, type HubReadResult } from "../hub/hub-client.js";
@@ -84,6 +84,27 @@ async function runConfig(parsed: Extract<ParsedArgs, { command: "config" }>): Pr
       return 1;
     }
     switch (parsed.key) {
+      case "review_standards": {
+        const raw = outcome.status === "ok" && "review_standards" in outcome.config ? outcome.config.review_standards : "";
+        const value = parseReviewStandards(raw);
+        if (!value.ok) {
+          process.stderr.write(`tut: config: ${value.error}\n`);
+          return 1;
+        }
+        // Paths belong to the reviewed checkout (cwd), not the Hub config root.
+        for (const file of value.assignment.value.split(",").filter(Boolean)) {
+          try {
+            const info = statSync(path.resolve(file));
+            if (info.isFile() && info.size > 20 * 1024) {
+              process.stderr.write(`tut: warning: review_standards ${file} exceeds 20KB (20480 bytes); consider a digest with on-demand detail\n`);
+            }
+          } catch {
+            // Advisory size check only; the reviewer handles unreadable standards.
+          }
+        }
+        process.stdout.write(`${value.assignment.value}\n`);
+        return 0;
+      }
       case "usage_audit": {
         const value = outcome.status === "ok" && outcome.config.usage_audit !== undefined ? outcome.config.usage_audit : "off";
         if (value !== "off" && value !== "on") {
@@ -144,7 +165,9 @@ async function runConfig(parsed: Extract<ParsedArgs, { command: "config" }>): Pr
     return 1;
   }
   const rendered =
-    parsedValue.assignment.key === "usage_audit"
+    parsedValue.assignment.key === "review_standards"
+      ? config.review_standards
+      : parsedValue.assignment.key === "usage_audit"
       ? config.usage_audit
       : parsedValue.assignment.key === "flow_mode"
       ? config.flow_mode
