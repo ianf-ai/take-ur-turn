@@ -19,16 +19,26 @@ Usage:
   tut config get <key> [--root <dir>]
   tut config set <key> <value> [--root <dir>]
       Read / write project runtime config (.context-hub/config.json — the
-      file serve re-reads every request, so writes take effect on the next
-      poll cycle, no restart; works with the Hub down, same discipline as
+      file serve re-reads every request for runtime settings; works with
+      the Hub down, same discipline as
       tut assign). Keys: flow_mode ("manual"|"auto" — the offline equivalent
       of tut mode), usage_audit (off | on; when on, tut up starts the shipped usage watcher), auto.remediate (off | enter-repress), auto.launch_roles (comma-separated bare role names —
-      e.g. architect,executor,reviewer; "" clears the whitelist). get also
+      e.g. architect,executor,reviewer; "" clears the whitelist), review_standards
+      (comma-separated non-empty file paths, e.g. standards/review.md,/shared/team.txt;
+      missing or "" = disabled; item edges trimmed; no ASCII control characters
+      or empty items; filenames containing commas unsupported). Reviewer loads
+      configured files only at the first full review of a task; Hub does not
+      load their contents.
+      Relative paths resolve from the reviewed checkout's project root (the
+      worktree root for worktree tasks); absolute paths are literal local paths,
+      with no shell/glob/variable/tilde expansion. get also
       reads notify (read-only: an object config,
       edit config.json by hand). Unknown keys and illegal values are
       rejected with the available keys and their value domains. Default
       --root: .context-hub (relative to cwd — run from the project root,
-      the same root tut serve defaults to).
+      the same root tut serve defaults to). For review_standards, select the owning
+      Hub's actual storage directory with --root, even from a worktree;
+      TUT_HUB_ROOT is not automatically used by config.
   tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
       Human-confirmed launch of the next agent. Without task_id: pick the single
       task waiting on an agent (none → list human-waiting tasks; ambiguous →

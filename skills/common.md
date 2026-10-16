@@ -1,50 +1,83 @@
 # Common Rules（全角色共同规则基座）
 
-本文件为全角色共同规则，与各角色 skill 共同生效；各角色 skill 只保留角色差分。
+与各角色 skill 共同使用本文件。worker 指 Architect、Executor、Reviewer；Host 不属于 worker。运行时以本文件的流程判据、任务记录及 CLI 原生约定为依据。
 
 ## 写通道与身份
 
-- 写通道双份：有 MCP 用 MCP 工具（`context.*`）；没有 MCP（纯 bash 环境）用 `tut` CLI，两者等价。
-- role 字段固定写你担任的角色（约定枚举：architect | executor | reviewer | human，精确小写）。
+1. 选择写通道（有 MCP 用 `context.*`；无 MCP 用 `tut`）。
+2. 将 `role` 填为当前担任的角色（`architect | executor | reviewer | human`；Host 的受托记录见 `skills/host.md`）。
 
 ## flow 三态
 
-flow 由发起侧建任务时选定（create 的 `--flow` / MCP `flow` 字段，缺省 `full`），落库后不可变——选错只能 close 重建：
+1. 从任务日志读取 `flow`（建任务后不可变，缺省 `full`）。
+2. 若为 `full`，按当前角色流程接手（已有 design 作为实现与评审依据）。
+3. 若为 `direct`，按 description 的设计指针接手（无需等待或自发补 design 记录）。
+4. 若为 `solo`，按角色流程交付 design 或 code_changes（免 review；reject 后仍交付 code_changes）。
+5. 若发现 flow 选错，将 close 重建方案交人裁决。
 
-- **full**（缺省）：design → 实现 → review → 人审批的完整四阶段。
-- **direct**：repo 已有现成设计，任务从 implementing 开始，日志里的 design 记录只是参考（不转态）。**description 即指针**：direct 单的设计指针在任务 description（如「按 design/X.md 第 N 单元…」），接单即按指针读文档开工，无需等 design 记录、也不必自发发参考 design note。
-- **solo**：小改动免审——code_changes 直接进 pending_approval 由人拍板；被打回（reject）时回到 implementing 重做，重做后仍发 code_changes——solo 里没有 revising，revision 记录属表外。
+## 流程判据
+
+任务状态由记录序列派生；写入自由不代表获准绕过人工审批。status 与 waiting_for 仅作路由建议。full 从 designing 开始：designing 下 design → implementing，implementing 下 code_changes → reviewing；reviewing 下 review 的 pass / blocked_external → pending_approval，fail_code → revising，fail_design → designing。revision 将 revising（或 full 的 implementing）送回 reviewing。pending_approval 下人的 approve → approved，reject → revising；close 在任意状态终止任务，closed 为吸收态。
+
+direct 从 implementing 开始，该状态下 design 仅为参考且不转态（其余状态为表外）；fail_design 和 implementing 下的 revision 属表外记录。solo 从 designing 开始，designing 下 design → implementing，implementing 下 code_changes → pending_approval，pending_approval 下 reject → implementing；review 与 revision 属表外记录。
+
+note 通常不转态；仅 reviewing 下 Executor 的非 ack note 收回交付、转 revising，之后以 revision 重新交付。ack note 不收回交付。表外记录仍落盘但不参与流转，叠加 needs_attention，交人处置；不得通过自由写入规避流程。approved、closed 后仅用 note 汇报，修改另建任务。project scope 无任务状态。
 
 ## 接手读序（三层）
 
-| 层 | 回答的问题 | 怎么读 |
-|----|-----------|--------|
-| 1. git 权威文档 | 现在是什么样、该怎么做 | 直接读仓库文件：`AGENTS.md`（开发约定，含「完成编码后必须运行测试/构建验证」的硬规则）、`design/` 下本任务相关的设计文档（不经 Hub） |
-| 2. project scope 决策流 | 为什么会是这样 | `context.read {"task_id": "project"}`（CLI `tut read project`） |
-| 3. 任务日志 | 这件事进行到哪 | `context.read {"task_id": "<id>"}`（CLI `tut read <id>`） |
+1. 读取 git 中的 `AGENTS.md`（含测试、构建要求）。
+2. 读取 project scope：`context.read {"task_id":"project"}`，或 `tut read project`。
+3. 读取任务完整日志：`context.read {"task_id":"<id>"}`，或 `tut read <id>`。
+4. 按角色 skill 核对项目约束、历史决策及本轮要求。
 
-第 2 层注意项目级约束与不变量（如「零运行时依赖」「schema 只增不改」）——违反约束即问题，实现会被 review 打回。
+运行时角色不主动读取项目设计文档。设计通过 Hub design 记录进入任务；description 明确锚定的设计指针（如 direct 单的 `design/X.md §N`）属于该任务授权读取范围，仅按指定范围读取。`design/<task_id>.md` 是设计交付物的写产物引用，不构成读取其他设计文档的授权。
 
 ## 版本与增量
 
-- 增量读取：read 返回的 versions 数组每条带 version，之后用 `"since_version": N`（CLI `--since-version N`）只取新记录。
-- **expected_version 的正确用法**（两种通道通用）：值 = 你看到的任务当前版本——read 到最新记录 version 是 N 就带 N。带对了能抓住并发写入：别人先写了一手，你的发布会报版本冲突（MCP 返回 isError；CLI 非零退出码、stderr 首行是 VERSION_CONFLICT）——重读日志再发。不带也能写（跳过校验），但带上是更好的习惯。
+1. 记下 read 返回的最新 version。
+2. 需要增量时，以 `since_version` 读取指定版本起的记录（CLI `--since-version N`，含 N）。
+3. 发布时，优先将可选的 `expected_version` 填为已读的当前最新 version。
+4. 若返回 `VERSION_CONFLICT`（MCP `isError` 或 CLI 非零退出），重读任务日志。
+5. 若发生版本冲突，按新日志重新核对待发布内容。
+6. 若冲突核对后仍需发布，用新的 `expected_version` 重试发布。
+
+## 记录信封
+
+前置条件：已准备记录内容；code_changes 或 revision 涉及的代码改动已提交。记录正文保留完整推理过程，供下一个 Agent 与人核对；已有记录不可改删。
+
+1. 填写一句话 `summary`。
+2. 按角色模板填写 Markdown `body`（CLI 长正文用 `--payload-file`；信封与正文均不内联 diff、不列文件明细；关键 hunk 可作解释）。
+3. 若涉及代码改动，填写 `commits`（权威文件明细与 diff 由 `git show <hash>` 获取）。
+4. 若发布 review 或 revision，填写 `ref_version`（review 指向所审交付；revision 指向所回应的 review、人的 decision(reject) 或 Executor 收回 note；fail_design 回路指向打回设计的 review）。
+5. 调用 `context.publish` 或 `tut publish`（字段取自当前角色模板；版本见「版本与增量」）。
+6. 检查返回值（`needs_attention` 不为 true 时结束）。
+7. 若 `needs_attention=true`，读取 warnings。
+8. 用 note 披露 warnings。
+9. 将异常交人处置（已有记录不可改删；ack 入口见 `skills/host.md`）。
 
 ## 工具总则
 
-- MCP 五工具 `context.create / publish / read / list / decide` 与 `tut` CLI 一一对应。CLI 语法以 `tut` 无参打印的 USAGE 为准（`--flag value` 与 `--flag=value` 均可），不发明不存在的 flag。
-- 脚本化消费原始 JSON：`tut read <id> --json`、`tut list --json`。
-- 可选 `--agent` / `--model`（MCP 同名顶层字段）自述身份，供追溯——**不知道就留空，不要猜**，自报字段宁可空、不可错。
-- `decide` 是人工审批入口，worker（architect / executor / reviewer）不调用；host 的代行属受托执行，同样只在人的明确授权下发生。
+1. 按 MCP schema 或 `tut` 无参输出的 USAGE 组织调用（五工具与 CLI 对应；不自造 flag）。
+2. 若脚本消费 CLI 结果，使用 `tut read <id> --json` 或 `tut list --json`。
+3. 若自述 agent 或 model，填写已知身份（可选字段，未知留空）。
+4. 若需人工审批，转交 Host 或人（worker 不调用 `decide`）。
 
 ## 授权基线
 
-**授权基线 = 建任务 description + role=human 的记录**。worker 的 design、交付、review 或 note 只是提案，不能自行扩围；符合设计文档不等于属于当前任务。批准局部修订不等于扩大整体授权。代人行操作的授权必须可回溯到人的原话（会话原文或 Hub 记录位置）；role=human 标签本身不替代人的授权证据。
+1. 从建任务 description 与 human 记录定位人的原始授权（会话原文或 Hub 记录位置）。
+2. 以原始授权核对工作范围（符合设计文档不等于属于当前任务；worker 记录仅为提案；局部批准不扩大整体授权；role=human 标签不替代授权证据）。
+3. 若需扩围，将方案交人裁决。
 
 ## approve 语义
 
-**approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门。
+1. 将 approve 视为工作验收；仓库层质量门不进入任务生命周期，不模拟 PR 循环，不设置或复活 hold 门。
+2. 若 approve 后需修改，转交 Host 发起新任务。
 
 ## 延后流程
 
-Agent 只有建议权或申请权，延后入口随角色（见各角色 skill）。拍板（原任务 note、非 decision）与 project scope 登记都由人自行或明确委托的 Agent 执行——未受托不要代登记，也不由你跟进后续；引用拍板记录的 version，已延后问题按拍板核销。
+前置条件：延后建议与申请不等于批准；有效延后须有人的授权 note，记录问题与理由（不用 decision）；project 登记包含原任务、ref_version 与关闭条件，由人或明确受托的 Agent 发布。
+
+1. 在角色指定小节提出延后建议或申请。
+2. 若尚无人拍板，将延后请求交人处理（未受托不代登记、不代跟进）。
+3. 若已有人的拍板 note，在交付中引用其 version。
+4. 按人的拍板核销已延后问题。

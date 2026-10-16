@@ -263,3 +263,100 @@ describe("config set (validated, key-preserving writes)", () => {
     expect(readFileSync(configFile(), "utf8")).toBe("{ not json");
   });
 });
+
+describe("config review_standards", () => {
+  it.each(["missing directory", "missing file", "missing key", "empty value"])("is disabled with no writes for %s", async (scenario) => {
+    if (scenario === "missing directory") rmSync(root, { recursive: true });
+    if (scenario === "missing key" || scenario === "empty value") {
+      writeFileSync(configFile(), JSON.stringify({ flow_mode: "manual", ...(scenario === "empty value" ? { review_standards: "" } : {}) }));
+    }
+    const before = existsSync(configFile()) ? readFileSync(configFile(), "utf8") : undefined;
+    expect(await main(["config", "get", "review_standards", "--root", root])).toBe(0);
+    expect(io.out()).toBe("\n");
+    expect(io.err()).toBe("");
+    if (before === undefined) expect(existsSync(configFile())).toBe(false);
+    else expect(readFileSync(configFile(), "utf8")).toBe(before);
+    if (scenario === "missing directory") expect(existsSync(root)).toBe(false);
+  });
+
+  it.each([
+    ["not-created.txt", "not-created.txt"],
+    [" standards/评审 标准.md , /shared/team.txt ", "standards/评审 标准.md,/shared/team.txt"],
+    ["", ""], ["   ", ""],
+  ])("sets and gets %j while preserving unrelated configuration", async (raw, normalized) => {
+    const original = { flow_mode: "auto", auto: { launch_roles: ["reviewer"], extra: 1 }, notify: { channels: ["bell"] }, future: true, review_standards: "old.txt" };
+    writeFileSync(configFile(), JSON.stringify(original));
+    expect(await main(["config", "set", "review_standards", raw, "--root", root])).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), "utf8"))).toEqual({ ...original, review_standards: normalized });
+    const setOutput = io.out();
+    expect(setOutput).toContain(`review_standards = ${normalized} (`);
+    expect(await main(["config", "get", "review_standards", "--root", root])).toBe(0);
+    expect(io.out().slice(setOutput.length)).toBe(`${normalized}\n`);
+    expect(io.err()).toBe("");
+  });
+
+  it.each([",a", "a,", "a,,b", "a, ,b", "\ta", "a\n", "a\0b", "a\x1fb", "a\x7fb"])("rejects set %j without creating or changing config", async (raw) => {
+    rmSync(root, { recursive: true });
+    expect(await main(["config", "set", "review_standards", raw, "--root", root])).toBe(1);
+    expect(existsSync(root)).toBe(false);
+    mkdirSync(root);
+    const original = '{"flow_mode":"auto","review_standards":"keep.txt"}\n';
+    writeFileSync(configFile(), original);
+    expect(await main(["config", "set", "review_standards", raw, "--root", root])).toBe(1);
+    expect(readFileSync(configFile(), "utf8")).toBe(original);
+    expect(io.out()).toBe("");
+    expect(io.err()).toContain("review_standards");
+    expect(io.err()).toContain("comma-separated non-empty file paths");
+    expect(io.err()).toContain('"" disables');
+  });
+
+  it.each([null, [], {}, true, 7, ",a", "a,", "a,,b", "a, ,b", "\ta", "a\n", "a\0b", "a\x7fb"])("rejects get of hand-written %j without treating it as disabled", async (raw) => {
+    const original = JSON.stringify({ flow_mode: "auto", review_standards: raw });
+    writeFileSync(configFile(), original);
+    expect(await main(["config", "get", "review_standards", "--root", root])).toBe(1);
+    expect(io.out()).toBe("");
+    expect(io.err()).toContain("invalid value for review_standards");
+    expect(io.err()).toContain("e.g. standards/review.md,/shared/team.txt");
+    expect(io.err()).toContain('"" disables');
+    expect(readFileSync(configFile(), "utf8")).toBe(original);
+    // Only this key's consumer rejects the malformed optional value.
+    expect(await main(["config", "get", "flow_mode", "--root", root])).toBe(0);
+    expect(io.out()).toBe("auto\n");
+  });
+
+  it.each([20479, 20480, 20481])("warns only above 20KB (%i bytes), preserving output and config", async (size) => {
+    const standard = path.join(tmp, "评审 标准.md");
+    writeFileSync(standard, Buffer.alloc(size, "a"));
+    // Relative paths resolve against the checkout cwd, independent of --root.
+    const value = `${path.relative(process.cwd(), standard)},${path.join(tmp, "missing.md")}`;
+    const original = JSON.stringify({ flow_mode: "manual", review_standards: value });
+    writeFileSync(configFile(), original);
+    expect(await main(["config", "get", "review_standards", "--root", root])).toBe(0);
+    expect(io.out()).toBe(`${value}\n`);
+    expect(readFileSync(configFile(), "utf8")).toBe(original);
+    if (size > 20480) {
+      expect(io.err().trim().split("\n")).toHaveLength(1);
+      expect(io.err()).toContain("exceeds 20KB");
+      expect(io.err()).toContain(path.relative(process.cwd(), standard));
+    } else expect(io.err()).toBe("");
+  });
+
+  it("checks absolute standard paths without reading directories as standards", async () => {
+    const standard = path.join(tmp, "large.md");
+    writeFileSync(standard, "大".repeat(7000));
+    const value = `${standard},${tmp}`;
+    writeFileSync(configFile(), JSON.stringify({ flow_mode: "manual", review_standards: value }));
+    expect(await main(["config", "get", "review_standards", "--root", root])).toBe(0);
+    expect(io.out()).toBe(`${value}\n`);
+    expect(io.err().trim().split("\n")).toHaveLength(1);
+    expect(io.err()).toContain(standard);
+  });
+
+  it("normalizes a hand-written list on get without rewriting it", async () => {
+    const original = JSON.stringify({ flow_mode: "manual", review_standards: " a.txt , 评审 标准 " });
+    writeFileSync(configFile(), original);
+    expect(await main(["config", "get", "review_standards", "--root", root])).toBe(0);
+    expect(io.out()).toBe("a.txt,评审 标准\n");
+    expect(readFileSync(configFile(), "utf8")).toBe(original);
+  });
+});

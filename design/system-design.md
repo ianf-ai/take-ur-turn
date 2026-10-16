@@ -342,9 +342,83 @@ skill 是**行为模板而非身份绑定**：任何 Agent 加载相应 skill �
 
 授权基线为建任务 description 与 role=human 的记录；worker 记录只是提案，批准局部修订不等于扩大整体授权。人可授权任一 agent 代行机械操作，但代行的授权必须可回溯到人的原话，role=human 标签不能替代人的授权证据。
 
-Host 的边界是**驱动不代工**：它不是第五个工人角色，role 词表仍为 architect / executor / reviewer / human；不发布工人记录（design / code_changes / review / revision）。Host 的记录足迹仅 decision、ack note、launch note，均以 role=human 记载，`by` / agent 字段标识实际操作者；decision 与异常确认须有人的明确授权，launch note 是启动侧的审计痕迹。Host 与第 7 章承载 Agent 进程的 Agent Host 是不同概念。
+Host 的边界是**驱动不代工**：它不是第五个工人角色，role 词表仍为 architect / executor / reviewer / human；不发布工人记录（design / code_changes / review / revision）。Host 的记录足迹为 decision、受托人工 note（含 ack、延后与规范登记）及系统 launch note，均以 role=human 记载。人工入口的 `by` 记授权人姓名，agent 可标识代行者；系统 launch note 记录 `payload.launch.via`，不保证携带 agent 或 by 姓名。decision 与人工 note 的代行须有人的明确授权，launch note 是启动侧的审计痕迹。Host 与第 7 章承载 Agent 进程的 Agent Host 是不同概念。
 
-状态与发布行为的关系以第 3 节为准；上下文内容模型见 [context-design.md](context-design.md)。skills 自含操作规则与正文模板，不依赖设计文档才能执行角色工作。
+状态与发布行为的关系以第 3 节为准；上下文内容模型见 [context-design.md](context-design.md)。skills 保留执行步骤、正文模板和按需读取的判据指针。系统协议的判据由本设计及 context-design 承载，可配置评审判据由标准文件承载，不在角色步骤中另写一套判据。
+
+### 5.1 可载入评审标准
+
+项目配置顶层 `review_standards` 是逗号分隔的文件路径字符串，通过既有 `tut config get/set review_standards` 读写。未设键、配置文件缺失或显式空字符串均关闭（get 成功输出空行且不写文件）；`set review_standards ""` 清空。非空列表去掉各项首尾空白，保留顺序、内部空格和 Unicode；允许相对/本机绝对路径，不限扩展名、不检查文件存在性。拒绝空项、原始值中的 ASCII 控制字符 U+0000–U+001F/U+007F；逗号无转义，不支持含逗号的文件名。`off/on` 无开关含义。非法 set 不写文件；手写配置中的非字符串或非法列表仅在本键 get 时拒绝并报告值域，不加入全局配置解析、影响其他消费者。
+
+配置来源为任务所属 Hub 的实际存储目录（默认 Hub 根下 `.context-hub`），相对标准路径的基准为被审代码的任务 checkout 根（worktree 根），不是配置目录或 `TUT_PROJECT_ROOT` 路由根。`tut config --root` 接受存储目录且不自动消费 `TUT_HUB_ROOT`，Reviewer skill 给出所属 Hub 的显式读取方式；自定义目录用其实际值。绝对路径可引用仓库外文件，不做 glob、环境变量、波浪号或命令替换展开。 `config get review_standards` 在 cwd（被审 checkout 根）解析标准路径，以文件字节数检查 >20KB（20×1024）：每个超限文件仅 stderr 一行软警告，stdout 与退出码不变；不可 stat 的文件交 Reviewer 处理，不在配置层拒绝。
+
+Reviewer 仅首轮全面审前查询配置，非空则按顺序先读各文件的头部 digest，怀疑命中或写 finding 时读对应全文；无 digest 的标准读全文，重审核销轮不读标准文件；这是 Agent 行为约定，Hub、Notifier、launcher 不加载正文。关闭时除配置查询外零标准相关动作（不隐式扫描、读文件、发布 note 或启动进程）。读取配置/文件失败不得伪装成关闭或完整通过，以 reviewer note 披露路径、原因和未完成核验并交 host/人处理，可继续独立检查，不自动清空配置。
+
+**标准只能收紧、不能放松；lint 仍是权威。** 显式配置仅载入补充判据，不把全部文字升级为硬规则，不豁免既有硬规则、验收、信封/正文要求、授权、人工门或重审关闭条件；后读的放松条款不能覆盖有效硬规则。标准问题引用文件/条款及证据，风格仍用非阻塞 note，重审不因标准变化翻已核销旧账。机制不引入标准 schema、内容校验器、摘要器或默认配置，不改变 lint、MCP 或状态派生。
+
+本节中，标准文件指 `review_standards` 指定的文件，digest 指标准文件头部的评审索引。digest 用于定位待查条款，不能替代全文判据。
+
+标准载入操作采用编号步骤，前置条件与失败分支显式列出，判定语义保留在标准文件中。这样修订判据时只需维护其来源，skill 不再复制一份容易漂移的解释。
+
+信封填写操作集中在 common，字段与正文约束仍由 context-design 承载。代码引用 commit 可使 Hub 保留过程记录，同时避免复制文件明细与 diff。
+
+### 5.2 角色操作依据
+
+角色 skill 按操作文本组织，每个编号步骤承载一个动作，前置条件与条件分支单列。跨角色共用操作放在 common，角色文件保留差分与模板；这样同一协议变化不必在四份角色文本中分别维护。模板节标题保留原名，因为正文 lint 依赖这些标题；编号、模板内提示与正文排版不承担状态派生职责。
+
+全库角色名称固定为 Architect、Executor、Reviewer、Host，协议 role 值沿用小写枚举；文件明细、问题列表与延后登记分别用各自名称。
+
+**任务选择**的既有判据如下。是否采用 TUT 与 flow 分别回答协作必要性和任务重量的问题，避免把一句话查询也变成协作任务。
+
+| 判断 | 判据与选择 |
+|---|---|
+| 使用 TUT | 需要多角色协作、过程记忆或独立 review；一句话可答、纯查询或主会话可直接完成时不建任务；不确定时交人确认 |
+| full | 涉及新语义定义、并发时序或接口级变更 |
+| solo | 不复杂且不涉及高代价核心路径、门禁或公开面 |
+| direct | 已有可引用设计，不复杂但涉及核心路径、门禁或公开面；保留独立 review |
+| 两段式设计 | 多工作单元、接口复杂且值得单独审批设计；小任务保持单任务 |
+| 快版 | 设计已在仓外经人工治理批准，只需验证基线与验收对齐、转正为任务内设计记录并施工，不重写设计 |
+| 完整两段式 | 设计未批或需求方关注设计思路；先交付并审批设计，再按分解表施工 |
+| 轻量设计审查 | 不建设计任务时，以 Reviewer 的设计审查 note 提供意见，由 Host 按授权决定是否继续 |
+| 并行 | 多个独立工作单元值得压缩总耗时；未经人批准拆分方案时默认单开 |
+
+**设计交付物**的分工依据是提前暴露接口与分解错误，避免直到施工结束才发现设计问题。Architect 的 design 记录保留骨架、取舍与工作单元分解表；Executor 在 `design/<task_id>.md` 成文并提交，文档与任务 id 双向引用，Reviewer 和人的审批对象都是这份设计。活文档仍由人维护，Architect 不以直接修改活文档代替 Hub design 交付；任务内设计交付物晋升为活文档由人决定。
+
+需求方的 DECIDED 是已拍板边界、依赖方向、兼容红线与退出标准，Architect 仅转正；SUGGESTED 是可调整的倾向，不作为跑偏依据。
+
+设计交付物的审查判据为：可行性（技术成立且符合项目约束）、接口（完备稳定）、分解（边界稳定、依赖闭合无环、完成定义可验证）、一致性（符合 Architect 设计且偏差有说明）。被否决方案保留选项及理由，供后续角色核对历史约束；翻案需要针对原理由的新证据。design 中的实现要求可由测试或检查证实、证伪，不能仅写「妥善处理错误」等无法核销的表述。
+
+**阵容与会话选择**沿用默认链：项目 workspace.json、用户 workspace.json、内置 codex／pi／codex，逐角色回退。`tut assign` 影响后续无 cast 任务；cast 仅绑定当前任务且建任务后不可变。CLI 可用才是可拉起的候选，仅有 pane 不足以加入 cast；覆盖检查沿用 full 的 architect、executor、reviewer，direct 的 executor、reviewer，solo 的 executor，被 cast 点名者也须核对。缺少现存 pane 不需要预建，轮次现场新生，标签与 rig 规则见第 4.4 节。
+
+Reviewer 优先与 Executor 使用不同 agent，跨模型更能提供独立视角；Architect 与 Executor 同 agent 不受限。同一 agent 承担多个角色合法，但独立会话并不自动形成模型层面的独立视角；full 大任务发起前提示，三角色同 agent 时审批汇报显式披露。
+
+概念性 fail、上下文近满或将 fail 合理化为「其实没问题」是 `--fresh` 的适用情形；同一受判角色连续二次 fail 时，仅 fresh 不足，建议换人并交人裁决。计数对象是受判角色，非发布 verdict 的 Reviewer；可选处置为 close 后重建换 cast、同任务 fresh 或原班再试，Host 不预设人的选择。
+
+**范围冻结与并行授权**以 description 的四段及人的原始记录为基线。验收写明可观察条件，解法留给设计，已有解法用 direct 的设计指针引用；把解法塞进需求会架空 Architect。create 对验收缺节、缺条、空条和明显占位只给 warning，不能替代人的逐项判断。规范登记不扩大范围，也不替代拆分与集成批准。
+
+分解属于设计，授权基线的所有权在人。已有设计时由 Architect 起草分解，Host 按获批表编排；无设计单时 Host 可代笔拆分提案，均须人的批准才批量创建。拆分方案含工作单元、各单元验收及合并集成策略，后者明确单元汇拢、接缝归属和最终仓库交付形态；设计批准可覆盖其中的拆分方案。
+
+每个并行单元以人事先准备的独立 worktree 隔离，Host 全程不执行 Git 操作。单元验收不证明接缝正确，额外集成任务由 Executor 拼装、处理接缝并全量验证，授权来自获批集成策略；单元数、接缝归属或集成形态偏离时重新请人批准。
+
+**范围核查**由新增子系统、数据库迁移、公共接口、设计修订、附加依赖、diff 增长而核心验收未增加或已撤回范围重现触发。Reviewer 以原始授权与累计真实 diff 核对验收归属、依赖必要性、更小实现与明确不做项；已证明必要且获授权时记录证据即可，无额外放行门。必要性未证明的实现为 fail_code，关闭条件为删除越界实现及配套内容且核心验收仍过；确需扩围的提案交人裁决，已夹带内容仍须删除。
+
+争议暂停只作用于扩展部分，不冻结核心工作，不新增 Hub 状态、配置开关或仓库质量门；Host 负责将裁决落实到角色接续与实际结果核对。
+
+**规范与评审结论**按已入册硬规则、风格建议与授权分别处理。project 规范 note 保存内容、性质、适用范围与人的授权来源，硬规则同时落入 AGENTS.md；硬规则违例为 fail_code，纯风格问题只发非阻塞 note，不作为必须核销项，也不替代 review。未入册且未配置的外部标准不追认为本轮依据；经人确认后由 Host 受托登记，文档修改由获授权的 Executor 承载。
+
+同类问题二次出现时，经人确认与授权登记首次打回、入册证据或缺口、本次问题、漏登记或漏执行环节及纠正动作；沿用 note，不新建门。approve 后修改另开任务，仓库层打回不复活原任务。
+
+review 结论的状态语义见第 3.1 节。验证完成且问题已关闭或已获人的延后拍板时为 pass；代码达标、问题已核销而验证受本轮无法完成的真机、部署或跨系统条件阻塞时为 blocked_external。仍有未满足且未批准延后的问题时为 fail_code 或 fail_design，verdict 与问题列表一致；direct 的设计前提错误仍如实报 fail_design，表外交人处理。
+
+重审以原关闭条件核销，不重新裁量已满足的证据；revision 新引入问题可另列。人的 reject 理由与 Executor 收回 note 中的自报问题分别构成对应修订轮的问题列表。
+
+**交付选择**由 flow 与日志历史共同确定，不能只看当前 implementing 状态。full 与 direct 首轮用 code_changes，修订轮用 revision；full 的 fail_design 后 design 使状态回到 implementing，仍用 revision，ref_version 指向打回设计的 review。solo 的 reject 后仍在 implementing，用 code_changes；approved、closed 之后仅用 note 汇报。ref_version 与 commits 的关联约束见 context-design 第 2.5、3.4 节，真实测试证据让下一角色可以核对交付，而不是只接受自述。
+
+**Host 授权与审批**区分启动按键和人工决定。发起时的驱动委托覆盖普通轮次 start-next，无需逐轮再问；approve、reject、close、ack、延后拍板与登记均需要可追溯的明确授权。
+
+auto 白名单内由 Notifier 启动，白名单外无启动也无 launch 记录，Host 凭委托补位；更换 agent 仍继承 role 白名单的信任，收紧时先调整白名单。MCP 是首选通道，因为宿主连接不受命令沙箱同样的网络限制；CLI 被拦时可用等价 MCP 或交人执行，不推定为环境未启动。
+
+审批汇报包含真实 diff 摘要、验证证据、review 结论与 Host 独立抽查意见，solo 也保留抽查，作为人工决定前的技术复核。blocked_external 的 approve 表示人明知验证未决而接受，也可先补验或 reject 指定补验路径。`tut up` 是人的显式环境动作，Host 不代跑、不代管 pane 或布局；存储修复同样归人运维，degraded 不属于可用 ack 消除的表外组合。延后用原任务 note 拍板，并在 project 登记原任务、ref_version 与关闭条件，以便任务结束后继续检索；具体内容约束见 context-design 第 2.4 节。
 
 ## 6. Notifier：通知与流转
 

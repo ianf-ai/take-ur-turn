@@ -251,16 +251,17 @@ export async function writeFlowMode(root: string, mode: FlowMode): Promise<Confi
 // (same discipline as tut assign editing workspace.json directly).
 
 /** Scalar-settable config keys exposed to `tut config set`. */
-export type ConfigKey = "usage_audit" | "flow_mode" | "auto.launch_roles" | "auto.remediate";
+export type ConfigKey = "review_standards" | "usage_audit" | "flow_mode" | "auto.launch_roles" | "auto.remediate";
 
 /** All keys `tut config set` accepts, in hint-listing order. */
-export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles", "auto.remediate", "usage_audit"];
+export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "auto.launch_roles", "auto.remediate", "usage_audit", "review_standards"];
 
 /** One typed key/value pair ready to apply (discriminated so writeConfigKey narrows). */
-export type ConfigKeyAssignment = { key: "usage_audit"; value: "off" | "on" } | { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] } | { key: "auto.remediate"; value: "off" | "enter-repress" };
+export type ConfigKeyAssignment = { key: "review_standards"; value: string } | { key: "usage_audit"; value: "off" | "on" } | { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] } | { key: "auto.remediate"; value: "off" | "enter-repress" };
 
 /** Legal-value domain hint for a key — used by `tut config` error text and help. */
 export function configKeyDomain(key: ConfigKey): string {
+  if (key === "review_standards") return 'comma-separated non-empty file paths, e.g. standards/review.md,/shared/team.txt; "" disables; no ASCII control characters or empty items; filenames containing commas are unsupported';
   if (key === "usage_audit") return '"off" | "on"';
   if (key === "auto.remediate") return '"off" | "enter-repress"';
   return key === "flow_mode"
@@ -284,6 +285,7 @@ export function parseConfigValue(
   key: ConfigKey,
   raw: string,
 ): { ok: true; assignment: ConfigKeyAssignment } | { ok: false; error: string } {
+  if (key === "review_standards") return parseReviewStandards(raw);
   if (key === "usage_audit") {
     if (raw === "off" || raw === "on") return { ok: true, assignment: { key, value: raw } };
     return { ok: false, error: `invalid value for usage_audit: "${raw}" (expected off | on)` };
@@ -316,6 +318,19 @@ export function parseConfigValue(
   return { ok: true, assignment: { key, value: roles } };
 }
 
+/** Local key validation shared by CLI set and get; never loads standard files. */
+export function parseReviewStandards(raw: unknown):
+  | { ok: true; assignment: { key: "review_standards"; value: string } }
+  | { ok: false; error: string } {
+  if (typeof raw === "string" && !/[\u0000-\u001f\u007f]/u.test(raw)) {
+    const items = raw.trim() === "" ? [] : raw.split(",").map((item) => item.trim());
+    if (items.every((item) => item.length > 0)) {
+      return { ok: true, assignment: { key: "review_standards", value: items.join(",") } };
+    }
+  }
+  return { ok: false, error: `invalid value for review_standards (expected ${configKeyDomain("review_standards")})` };
+}
+
 /**
  * Key-preserving write of ONE validated key — the same read-modify-write +
  * atomic temp/rename discipline as writeFlowMode: unknown keys (notify, future
@@ -332,7 +347,9 @@ export async function writeConfigKey(root: string, assignment: ConfigKeyAssignme
       throw new Error(`cannot set ${key}: ${filePath} is unreadable or corrupt`);
     }
     const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
-    if (assignment.key === "usage_audit") {
+    if (assignment.key === "review_standards") {
+      config.review_standards = assignment.value;
+    } else if (assignment.key === "usage_audit") {
       config.usage_audit = assignment.value;
     } else if (assignment.key === "flow_mode") {
       config.flow_mode = assignment.value;

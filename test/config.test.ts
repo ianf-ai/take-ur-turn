@@ -420,3 +420,46 @@ describe('auto.remediate', () => {
     expect(readFileSync(path.join(root, 'config.json'), 'utf8')).toBe(before);
   });
 });
+
+describe("review_standards", () => {
+  it.each([
+    ["review.txt", "review.txt"],
+    [" standards/评审 标准.md , /shared/team.txt ", "standards/评审 标准.md,/shared/team.txt"],
+    ["", ""], ["   ", ""],
+    ["off,on", "off,on"],
+    ["~/literal,$HOME/file,*.md", "~/literal,$HOME/file,*.md"],
+  ])("normalizes and round-trips %j without loading files", async (raw, value) => {
+    const parsed = parseConfigValue("review_standards", raw);
+    expect(parsed).toEqual({ ok: true, assignment: { key: "review_standards", value } });
+    if (!parsed.ok) throw new Error(parsed.error);
+    await writeConfigKey(root, parsed.assignment);
+    expect((await readConfig(root))?.review_standards).toBe(value);
+  });
+
+  it.each([",a", "a,", "a,,b", "a, ,b", "\ta", "a\n", "\r", "a\0b", "a\x1fb", "a\x7fb"])("rejects malformed list %j", (raw) => {
+    const parsed = parseConfigValue("review_standards", raw);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.error).toContain("review_standards");
+      expect(parsed.error).toContain(configKeyDomain("review_standards"));
+    }
+  });
+
+  it("preserves other keys through the shared concurrent write queue", async () => {
+    const original = { flow_mode: "manual", auto: { launch_roles: ["reviewer"], extra: true }, notify: { channels: ["bell"] }, future: 42 };
+    writeFileSync(path.join(root, "config.json"), JSON.stringify(original));
+    await Promise.all([
+      writeConfigKey(root, { key: "review_standards", value: "missing-file.txt" }),
+      writeFlowMode(root, "auto"),
+    ]);
+    expect(await readConfig(root)).toEqual({ ...original, flow_mode: "auto", review_standards: "missing-file.txt" });
+  });
+
+  it.each([null, [], {}, false, 42, "a,,b"])("keeps malformed optional value %j out of global validation", async (value) => {
+    const original = { flow_mode: "auto", review_standards: value };
+    writeFileSync(path.join(root, "config.json"), JSON.stringify(original));
+    expect(await ensureConfig(root)).toEqual(original);
+    expect(await readFlowMode(root)).toBe("auto");
+    expect(await readConfig(root)).toEqual(original);
+  });
+});
