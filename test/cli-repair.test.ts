@@ -35,6 +35,12 @@ describe("tut repair-meta parsing", () => {
     });
   });
 
+  it("accepts a saved state snapshot path in both flag forms", () => {
+    for (const flag of [["--from-snapshot", "/tmp/state.json"], ["--from-snapshot=/tmp/state.json"]]) {
+      expect(parseArgs(["repair-meta", "t", ...flag])).toMatchObject({ command: "repair-meta", fromSnapshot: "/tmp/state.json" });
+    }
+  });
+
   it("accepts every rebuild field in both flag forms, repeatable --cast", () => {
     expect(
       parseArgs([
@@ -158,6 +164,11 @@ describe("repair guidance and verdict vocabulary surfaces", () => {
       const tools = await client.listTools();
       const publish = (tools.tools ?? []).find((t) => t.name === "context.publish");
       expect(publish?.description).toContain('"pass" | "blocked_external" | "fail_code" | "fail_design"');
+      expect(tools.tools).toHaveLength(5);
+      for (const tool of tools.tools) expect(tool.description).toContain("Side effects:");
+      expect(publish?.description).toContain("spawn an agent pane");
+      expect(publish?.description).toContain("launch note");
+      expect(publish?.description).toContain("clean up");
     } finally {
       await client.close();
       rmSync(tmp, { recursive: true, force: true });
@@ -262,6 +273,56 @@ describe("repair-meta / recover-record handlers (real hub)", () => {
     expect(entry?.cast).toEqual({ executor: "pi" });
     expect(entry?.checkout).toEqual({ kind: "current" });
     expect(entry?.title).toBe(taskId); // title unavailable → task_id fallback (system-design 4.3)
+  });
+
+  it("prefills a damaged task from a retained /state snapshot, with explicit overrides per role", async () => {
+    const snapshot = await state();
+    const task = snapshot.tasks.find(t => t.task_id === taskId)!;
+    task.flow = "direct";
+    task.cast = { executor: "pi", reviewer: { agent: "codex", args: ["-m", "example"] } };
+    const file = path.join(tmp, "state.json");
+    writeFileSync(file, JSON.stringify(snapshot));
+    const originalRecord = readFileSync(path.join(taskDir(), recordFiles()[0]!), "utf8");
+    writeFileSync(path.join(taskDir(), "meta.json"), "{ broken");
+    expect(await main(["repair-meta", taskId, "--from-snapshot", file, "--title", "Explicit", "--cast", "executor=codex", "--url", baseUrl])).toBe(0);
+    expect((await state()).tasks.find(t => t.task_id === taskId)).toMatchObject({
+      title: "Explicit", flow: "direct", cast: { executor: "codex", reviewer: { agent: "codex", args: ["-m", "example"] } },
+    });
+    expect(io.err()).toContain("prefilled");
+    expect(readFileSync(path.join(taskDir(), recordFiles()[0]!), "utf8")).toBe(originalRecord);
+  });
+
+  it("uses snapshot title and flow when no flags override them", async () => {
+    const snapshot = await state();
+    snapshot.tasks[0]!.flow = "solo";
+    const file = path.join(tmp, "state.json");
+    writeFileSync(file, JSON.stringify(snapshot));
+    writeFileSync(path.join(taskDir(), "meta.json"), "{ broken");
+    expect(await main(["repair-meta", taskId, "--from-snapshot", file, "--url", baseUrl])).toBe(0);
+    expect((await state()).tasks.find(t => t.task_id === taskId)).toMatchObject({ title: "Repair Task", flow: "solo" });
+  });
+
+  it.each(["missing", "malformed", "unmatched", "duplicate", "bad-flow", "bad-cast"])("warns and retains manual repair on %s snapshot", async kind => {
+    const file = path.join(tmp, "state.json");
+    const entry = { task_id: taskId, title: "Snapshot", flow: "direct", cast: { executor: "pi" } };
+    if (kind === "malformed") writeFileSync(file, "{ bad");
+    else if (kind !== "missing") writeFileSync(file, JSON.stringify({ tasks:
+      kind === "unmatched" ? [] : kind === "duplicate" ? [entry, entry] :
+        [{ ...entry, ...(kind === "bad-flow" ? { flow: "bogus" } : {}), ...(kind === "bad-cast" ? { cast: { boss: "pi" } } : {}) }] }));
+    writeFileSync(path.join(taskDir(), "meta.json"), "{ broken");
+    expect(await main(["repair-meta", taskId, "--from-snapshot", file, "--title", "Manual", "--flow", "direct", "--url", baseUrl])).toBe(0);
+    expect(io.err()).toContain("snapshot unavailable");
+    expect(io.err()).toContain("manual fields");
+    expect((await state()).tasks.find(t => t.task_id === taskId)).toMatchObject({ title: "Manual", flow: "direct" });
+  });
+
+  it("snapshot mode still refuses to overwrite readable meta", async () => {
+    const file = path.join(tmp, "state.json");
+    writeFileSync(file, JSON.stringify(await state()));
+    const before = readFileSync(path.join(taskDir(), "meta.json"), "utf8");
+    expect(await main(["repair-meta", taskId, "--from-snapshot", file, "--url", baseUrl])).toBe(1);
+    expect(io.err()).toContain("readable — nothing to repair");
+    expect(readFileSync(path.join(taskDir(), "meta.json"), "utf8")).toBe(before);
   });
 
   it("repair-meta on a readable meta exits 1 with the HTTP 400 line (repair is not an overwrite path)", async () => {

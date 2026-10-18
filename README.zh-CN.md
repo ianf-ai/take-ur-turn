@@ -108,6 +108,15 @@ tut start-next <task_id>   # manual：投首轮（auto 模式：Notifier 按白�
 
 Notifier 的辅通道（blocked 即时告警、done 交叉验证）依赖 Herdr 把 pane 内 Agent 的状态变化投给 `scripts/on-agent-event.sh`——这是一次性的环境配置（Herdr 插件），见 [Herdr 事件接线](#herdr-事件接线)。
 
+## 本地统计与元数据修复
+
+`tut stats [task_id ...] [--root /path/to/.context-hub] [--json]` 经 Store 读取本地记录与 usage audit sidecar，不启动任何服务、不写任何东西（含临时文件清理）。不带 task_id 时批量 = 全部本地任务，不含 project scope。报告逐任务与整批给出：严格评审通过率、首轮通过率、修订交付次数、当前 waiting 阻塞，以及按记录角色统计的交付分布。这些质量指标只统计推进既有工作流的记录；直接引用的设计与游离的表外记录不计入。`blocked_external` 与已核验的 `pass` 分列；无评审记为 `null`/`n/a`。solo 被拒后的重复交付计入修订，不进评审率分母。
+
+Token 按 agent 分组——Pi 与 Codex 的原生记账不同，不提供跨 agent 合计。用量遵循 audit 的 worker-round 归因，与质量指标相互独立，测量用参照设计的 token 用量照常保留。sidecar 必须满足冻结的 v1 来源、行区间、窗口、计数器与总量约束；缺失、过期、unresolved 或无效的 sidecar 一律记为覆盖缺口，绝不视同零。未知成本保持 `null`。损坏任务单列，不入统计分母。实时读取是尽力而为，不是原子批次快照。归因与原生 token 定义见 [usage measurement](scripts/usage-audit/README.md)；`--json` 内含指标定义。
+
+`tut repair-meta <task_id> --from-snapshot /path/to/state.json` 可从先前留存的 Notifier `/state` JSON 响应预填 `title`、`flow` 与 `cast`。Notifier 目前只在内存保留最新快照；该模式消费的是保存下来的文件，损坏后无法找回内存里的内容，使用前请核对来源与新鲜度。显式参数优先于快照值（cast 按 role 覆盖）；快照缺失或无效时给出警告，手工字段与既有默认值保持生效。修复仍经运行中的 Hub 执行，元数据可正常读取时拒绝（只服务损坏场景）。需要时 description 与 checkout 仍须手工提供。
+
+
 ## 会话驱动（Host 模式）
 
 上面的快速上手是手动路径——其实除了 `tut up` 和 `tut init`，你不必再碰终端：在项目里开一个交互式 coding-agent 会话（任何能读仓库、能跑 shell 命令的 CLI agent），让它担任 TUT Host——它会运行 `tut skill host` 加载 [host skill](skills/host.md) 并按其行事，成为你的 **Host** 驱动者。你负责说话，Host 负责环境检查、把你的诉求磨成任务（`tut create`，需求+验收）、轮次交接代按 `tut start-next`、盯状态，到审批门带着三件套回来找你：改了什么、验证结果、它自己的抽查意见。

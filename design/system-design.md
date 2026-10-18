@@ -67,6 +67,7 @@
 - **流程真相以派生状态为准**：Notifier 不猜测该做什么，而是轮询 /state；Agent 终端状态（done/blocked）只作为辅助信号，用于交叉验证
 - **Hub 只对记忆负责**：写入无条件追加，状态是日志的派生视图而非写入门槛——人为接管、流程异常都不会使记忆不可用
 - **写入自由**：哪个 Agent 在什么时候写什么，由人和 Agent 自主决定；流程约束长在消费侧
+- **不做静默回退**：当一个动作所依赖的事实无法确立（锚点 pane、Hub 身份、任务是否在 /state 在册、shell 方言、pane_id 对应的标签、锁持有者是否存活……）时，TUT 要么 loud fail，要么仅在文档已明确的兼容路径上**可见地降级**（stderr 一行说明原因）——绝不猜测、绝不静默代入默认值、绝不盲目重试/重投。例证见 4.3.1 桥的归属校验、4.4 锚点与 up.lock、7.2 birth 锚定链与「HTTP 200 但任务不在 tasks 中则拒绝启动」、7.2.1 投递不自动重投；legacy 臂的「降级必须可见」（7.2）属可见降级，不是本原则的例外
 
 ## 3. 任务状态（核心机制：派生视图）
 
@@ -120,15 +121,24 @@ stateDiagram-v2
 
 ### 3.2 异常序列的处理
 
+decision(close) 与 ack 一样清除此前累计 warnings（含 lint）；关闭记录自身及关闭后的新异常仍按原规则诊断。重放旧日志同样生效，历史记录不改删。
+
 needs_attention 是**叠加在 status 上的布尔标志，不是状态机的第七个状态**——任何状态都可能与它共存，复位也不改变当前 status。
 
-表外组合（如 designing 状态出现 review）**不拒绝写入**：记录照常落盘，但不参与状态折叠，派生结果记入 warnings 并置 `needs_attention`。publish 的返回暴露 warnings 和 needs_attention——这是 warning 明细唯一的公开读取入口（落盘 meta.json 的派生缓存仅供直接调试）；/state 与 context.list 只暴露 needs_attention 布尔。错过 publish 即时响应时，事后凭 needs_attention 置位经 context.read / `tut read` 查看触发异常的记录定位问题、提醒人处置——warning code 本身不随 read 暴露（read 暴露明细属加法契约，须另立代码任务，不在文档中预支）。
+表外组合（如 designing 状态出现 review）**不拒绝写入**：记录照常落盘，但不参与状态折叠，派生结果记入 warnings 并置 `needs_attention`。publish、/state 与 context.list 暴露 warnings 和 needs_attention；warnings.version 指向触发异常的记录。错过 publish 即时响应时，可据此经 context.read / `tut read` 查看记录正文、定位问题并提醒人处置；context.read 本身仍不返回 warning code。
 
 warnings 词表起始于 `src/common/types.ts` 的五个基础码：`OUT_OF_TABLE`（表外组合，不折叠）、`CLOSED_ABSORB`（closed 后的非 note/close 记录，保持 closed）、`INVALID_VERDICT`（review 缺失/非法 verdict，不转态）、`VERSION_GAP`（版本跳号）与 `VERSION_DUPLICATE`（版本重复，两者折叠照常按版本序进行）——任何 warning 均置 needs_attention，waiting_for 随之为 human。0.8.1 增加记录诊断覆盖层 `src/hub/record-lint.ts`（四个新 WarningCode：REVIEW_EXIT_CONDITIONS_INCOMPLETE、REVIEW_SCOPE_SECTION_MISSING、EXPECTED_REVISION、NON_CANONICAL_ROLE，外加可选 `Warning.message`；create 规格缺失警告为自由文本 warning 字段，非 WarningCode）——**全部非阻断**（不拒收、不改状态折叠），但**会使 needs_attention 置位**，升级后对存量记录是回溯生效的：
 - 覆盖检查与超规格声明检查**仅当 description 带验收场景基线时生效**（无基线的存量任务免疫）；
 - EXPECTED_REVISION **仅当 description 带验收场景基线时武装**（与覆盖/超规格检查同一门控；无基线的存量任务免疫，review 本身是否结构化不影响武装）；
 - NON_CANONICAL_ROLE 无门（role 大小写漂移任何时候都该可见）。
-存量部署升级后，带基线的旧格式 review 记录会亮灯（closed 任务显示 waiting_for=human），清理动作 = `tut ack`；实测影响面见发车说明。
+存量部署升级后，带基线的旧格式 review 记录会亮灯，可追加修复 note 或使用 `tut ack`；已经 close 的任务重放时清除关闭之前的历史警告。
+
+**0.8.4 修复单协议**（只扩展诊断覆盖层，不改 3.1 的状态转换）：四类 lint 保留原 `code / version / message`，加法携带可选 `location: {field, section?}`、`supportedFixes: {field, instruction, example?, record: {role, content_type, ref_version?}}[]` 和 `correction: {root_version, round, limit: 2, exhausted}`。位置指向触发记录的字段/小节；建议描述要**追加的新记录**及其字段形态，绝不修改原记录。
+
+- 同一任务内以 lint code + 小写 role 识别同一问题。首次触发计第 1 轮；同一检查再次失败计第 2 轮，`exhausted=true` 且 message 明写「修正轮耗尽，请人工处置」。中间的无关 note、launch 或其他角色记录不计轮次。needs_attention 始终等于当前 warnings 非空，第一轮照样亮灯、waiting_for 仍为 human；这是修复提示协议，不新增自动启动或人工门的旁路。
+- REVIEW_EXIT_CONDITIONS_INCOMPLETE / REVIEW_SCOPE_SECTION_MISSING：同角色用精确小写 role 追加 note，`payload.ref_version` 引用原始诊断版本或最近失败的修复版本，body 补对应的完整小节，逐项重新检查。只核销引用到的诊断；其余未答项继续亮灯。同角色后续 review 也重新检查两节，成功时清该项，失败时累计轮次。NON_CANONICAL_ROLE：追加同角色小写 note 并引用原始/最近诊断版本，核销角色诊断；普通的无引用记录不能静默核销它。
+- EXPECTED_REVISION：按既有状态表，reviewing 时先追加 executor 非 ack note 收回，再追加 revision 并引用原 fail_design review；有效 revision 才核销该项。错误引用继续亮灯并计轮。旧 fail_design 轮被后续有效 review 结束后不再为其他轮次的 revision 计数。无关的表外/版本 warning 不会随 lint 修复被清掉。
+- 成功修复移除对应活跃 warning，后续复发从第 1 轮开始；ack/close 清掉此前诊断与计数，但该记录自身的新问题照常诊断。耗尽后消费方停止自行重试、交人；人的后续有效修复仍可核销。派生游标持有轮次信息，热增量与冷重放一致；记录保持 append-only。
 
 **closed 是吸收态**：任务派生为 closed 后，note 照常落盘且不改变状态；其他类型的记录同样落盘，但状态保持 closed 并置 needs_attention——例外是 decision(close) **幂等**：重复 close 只落盘，状态不变、不置 needs_attention。
 
@@ -150,7 +160,7 @@ review 的 `pass` / `blocked_external` 派生出 `pending_approval` 后，需要
                                                              部分指定合法（缺的 role 回落默认阵容）；
                                                              checkout ∈ { kind: "current" } | { kind: "worktree", path, ref? }
                                                                   （worktree 必须带 path；ref 仅可随 path 作旁注，ref-only 在 create 即拒。CLI 字符串语法见下）
-输出：{ task_id, status, version: 0, warning? }                status 按 flow 派生：full/solo → "designing"，direct → "implementing"
+输出：{ task_id, status, version: 0, warning?, needs_attention?, warnings? }                status 按 flow 派生：full/solo → "designing"，direct → "implementing"
 ```
 
 flow 与 cast 落 meta 后均不可变（无写入路径，构造性不可变），变更 = 新任务。
@@ -232,13 +242,20 @@ status 为派生结果。
 
 ### 4.3 只读状态接口（给 Notifier 用）
 
+默认 `/state` 的 tasks 仅返回非 closed 任务；显式 `/state?include=closed` 返回包含 closed 的完整视图（GET/HEAD 同义）。仅过滤视图，不删除记录；context.read/list 仍可查询关闭任务。Notifier 与 tut watch 显式使用完整视图，保留关闭沿清理、目录消失检测、终态退出与基线语义。
+
+任务条目新增 `pending_since: string | null`、`round_count: number`、`warnings: {version, code, message?, location?, supportedFixes?, correction?}[]`。pending_since 取当前这次进入 pending_approval 的有效转换记录 timestamp；note/ack 不重置，离开置 null，重入取新时间。round_count 从 0 开始，累计有效 code_changes / revision 交付次数（full/direct 进入 reviewing、solo 进入 pending_approval）；design、review、note、launch marker 与表外交付不计。二者由 Store 增量派生游标维护，冷重放与热缓存一致。warnings.version 沿用原有 derived-from 指针，指向触发该 warning 的记录版本；已被 ack/close 清除的历史警告不出现。这些字段同步加法携带到 context.list。
+
+证据分层：记录 timestamp、版本号与元数据是 observed；pending_since（选择进入审批的记录）、round_count 与 warnings 是 derived；本接口不推测 agent 是否工作或输入是否消费，不加入 inferred 运行态。待审批但时间不可解析或恢复游标缺少时间时，pending_since 返回 `"unknown"`，不得用 updated_at 或当前时刻补造；非待审批的 null 表示不适用。顶层加法字段 `truncated: false` 明示返回所选视图的完整任务与完整 warnings，默认排除 closed 是视图过滤，不是截断；存储不可读仍走 degraded。旧 Hub 无这些加法字段时，消费方须按未知处理，不能视为已知零值。
+
 全部 HTTP 端点要求 Host 为 loopback（127.0.0.1 / localhost / [::1]），否则返回 403；容忍缺 Host 的 HTTP/1.0 客户端。
 
 MCP 之外暴露普通 HTTP 状态接口：`GET /state` 返回 JSON；`HEAD /state` 执行同一状态构建并返回相同状态码与响应头，按 HTTP HEAD 语义不发送响应体。其他方法返回 405（`Allow: GET, HEAD`）。
 
 ```
-GET /state
+GET /state[?include=closed]
 → { hub_root: "/absolute/workspace/root",              // 加法字段：所属存储目录的父目录（realpath）
+    truncated: false,                                  // 所选视图无数量/长度截断
     flow_mode: "manual" | "auto",
     notify?: { channels: [...], webhook_url: "..." },   // 可选，见下注
     auto?: { launch_roles: [...] },                     // 可选，见下注（auto 启动白名单回显，见 6.2）
@@ -246,6 +263,7 @@ GET /state
     tasks: [ { task_id, title, status, updated_at, needs_attention: bool,
                waiting_for: "human" | "agent:<role>" | "none",
                version: number, flow: "full"|"direct"|"solo", cast?: { role → AgentRoute },
+               pending_since: string | null, round_count: number, warnings: [{version, code, message?}],
                checkout?: { kind: "current" } | { kind: "worktree", path?, ref? } } ] }   // 见下注（加法修订）
 ```
 
@@ -426,6 +444,10 @@ Notifier 是通知与流转的中枢：常驻轮询派生状态、按流转模�
 
 ### 6.1 通知逻辑
 
+审批通知按轮询聚合：有新进入 pending_approval 的任务才发一条 Channel 通知，列出当前全部待审批任务、pending_since 算出的停留时长（秒）、新进入标注「新」，保留逐任务 approve/reject 指引。单任务保留原标题与 task_id；多任务保留首个新进入任务的 task_id，并加法提供全部 task_ids。旧 Hub 缺少/非法 pending_since 时显示时长未知。基线不补发、停留不重发、重入可再发、轮询失败保留快照、恢复沿只记日志；Host 转送仍逐任务。
+
+放弃通知沿复用既有 Channel（含配置的 desktop）：正文带 task_id、reason 与接收时间。通知按任务/pane/agent/attempt_id 进程内去重；无有效 v2 时 reason=unknown，按任务版本去重，版本前进可再提醒。仅补通知面，投递 v2 与受控补救机制不变。
+
 `tut notify` 的运行参数契约：
 
 | 旗标 | 含义与缺省值 |
@@ -481,6 +503,10 @@ Notifier 主循环（默认 5s，可配置）
 **反查未命中事件的限频**：事件 pane 反查不到任何任务（用户无标签 pane / 4.4 约定外）时，同源（同 pane + 同 agent）首个事件照常落降级日志与通知（blocked 仍通知人），窗口期（默认 60s）内的后续事件只计数不输出，窗口期满由下一事件或兜底计时器聚合成一行（含各事件类型计数与总数；兜底计时器在窗口到期点触发——距同源最后一次输出整整一个窗口，窗口中途的 burst 不顺延 deadline——触发后即从计时器集合移除自身并淘汰已静默的同源记账条目，长期运行不累积）；能命中任务的事件行为不变，blocked/done 的「立即对比」追加触发也不受限频影响——限频只约束 unmatched 路径的日志与通知量，同源横跳不再逐条刷屏。
 
 ### 6.2 流转模式（auto / manual）
+
+普通 note 唤醒：auto 模式下已在册任务 version 前进、当前 waiting_for=agent:* 时复用既有启动判定的日志读取，检测新增非 ack 且非系统 launch marker 的 note，取新增区间内最大合格版本 N（不以尾部 ack/marker 的版本代替）。与 waiting_for 沿合并同拍至多一次；复用三项门、launch marker 查重与乐观并发。仅携带本次新增 note 上下文的 auto 尝试，将去重边界从最新非 note 版本 C 扩为 max(C, N)：N 前旧同角色痕允许续跑，边界之后已覆盖当前 note 的同角色痕阻止重复启动；候选 N 必须在日志中验证为合格 note，且该版本在日志中唯一。无此上下文的 helper 调用及人工 start-next 保持原语义。门或白名单未过时不额外读日志、不启动；ack、launch 自写痕、基线、恢复沿及 manual 不唤醒。判定日志标注 note 版本与覆盖它的 marker；静默轮不增加读取。
+
+日志读取暂时失败时，普通 /state 快照照常推进，但 note 检测单独保留未处理区间的版本下界（每任务一项），决策日志标记待重试。后续符合条件的轮询读取恢复后补判该区间。落痕前读取推进或 expected_version 竞争若尚无覆盖 N 的同角色痕，保留未完成 note 区间到下一正常轮询重判，不要求再写一条记录、不增加轮询内重试循环；冲突复查使用相同 note 边界，旧痕不能冒充竞态赢家。新痕仍以完整日志当前版本为 base_version；成功落痕即登记此次尝试，后续投递失败不自动重投，其他前置失败不自动重试。任务消失/降级、状态或等待角色改变、人工门/白名单关闭、切换 manual 或版本回退时丢弃待检测区间；恢复和重启仍按原基线语义处理，不重放历史 note。
 
 两模式共用 delivery confirmation v2：单次尝试、有界状态观察；exit 0 不代表输入消费确认，未确认时先按 7.2.2 的开关与证据决定是否补按一次 Enter；其余人工检查，禁止自动重投文本。启动 marker 去重与人工审批门保持不变（7.2.1）。
 
@@ -572,7 +598,7 @@ Notifier 消费 delivery_giveup 后通过最小 `Remediator.remediate(request)` 
 
 补救开启时原 delivery_v2 加法携带冻结目标 `target` 和 `prompt_tail`（规范化尾部最多 80 字符的 SHA-256 与长度，不落正文），常规补救不要求 prompt_tail 存在或有效；下述历史 working 重评额外要求该字段有效；缺少 target 的旧证据仍可解析但不足以补救。三门全过才代按：①精确 pane_id 匹配、当前 pane 唯一存在且 label 与事件 pane 一致；target.agentSession 非空时保持预期 agent 与 session 的 agent/kind/value 强绑定校验，只有显式 null 时允许无 session 绑定。当前 herdr 接口不暴露 session，绑定按 pane 归属 + 角色标签 + 可分类状态（agent_status 非 unknown），仍须通过下述非 working 状态门；②投递证据 `text_transport=sent` 即视为 prompt 已送达（staged），uncertain / not-sent 拒绝；常规路径不读取 pane 缓冲验证尾部，屏幕只作诊断；历史 working 重评路径额外要求当前输入框尾部匹配（见下）；③原证据为已知非 working 基线、无翻转、无错误、text/Enter 均明确 sent、reason=deadline，并在补救前再次读取非 working 状态。无翻转仅是操作授权判据，不声称证明输入未消费；uncertain/缺证据一律升级人工。读取失败或身份改变也拒绝按键。 对 reason=baseline-unknown 且 status_before=unknown 的证据，原基线的暂时读取错误不妨碍等待，但身份错误仍拒绝；保留其余传输与完整性检查，先用单调时钟按同一 `TUT_BASELINE_READY_TIMEOUT_MS` 旋钮有界等待（缺省 90s），直到状态首次可分类；等待期间不按键、不重发文本，身份丢失/改变或生命周期失效立即停止。可分类后重新核验上述身份、文本传输证据与当前非 working 状态三门；仍 unknown 至上限则零按键升级人工。就绪等待独立于代按后的 flip 观察预算，原始证据不改写。等待期每次轮询后及代按前通过 /state 重读任务与补救开关；只允许 waiting_for 仍为本角色且派生状态仍等于事件时的在役轮次状态，无关 note 引起的 version 增长不终止等待。角色/状态变化、needs_attention、降级/缺失任务、读取失败或开关关闭均停止本次补救，停止后不恢复。
 
-加法重评：原证据为 `reason=attribution-unavailable`、已知非 working 基线、`status_flip=true/status_last=working` 且读/传输无错误时，历史 working 仍保留，不作消费证明。首次保守拒绝以 action=none 追加审计后，同一调用内开启一次有界重评（共用 readyMs，默认 90s），不要求第二个事件。仅 Codex 可进入此路径：当前身份/label/生命周期有效，连续至少三次有效 idle 样本且跨度至少 2s，当前可见屏幕最后一个 `›` 输入框的规范化尾部与原 prompt_tail 严格匹配，且候选输入与已识别底栏之间不存在回答正文，才放行；屏幕仅在此路径作为额外保守条件，不能单独授权。working/unknown/读失败打断稳定窗口，身份错误或生命周期失效立即终止；超时零按键升级人工。重新核验输入框、label、idle 和生命周期后才能追加按键意图；意图持久化后再读 idle，工作中状态不按。agentSession=null 不构成假 working 或未消费证明。重评仍占用同一 attempt/pane 去重锁，最多一次机器 Enter，绝不重发文本；按键后失败不再次补按。审计加法标记 `reevaluated=true` 与 `staged_basis=codex-input-tail`，原 delivery_v2 证据不改写。
+加法重评：原证据为 `reason=attribution-unavailable`、已知非 working 基线、`status_flip=true/status_last=working` 且读/传输无错误时，历史 working 仍保留，不作消费证明。首次保守拒绝以 action=none 追加审计后，同一调用内开启一次有界重评（共用 readyMs，默认 90s），不要求第二个事件。仅 Codex 可进入此路径：当前身份/label/生命周期有效，连续至少三次有效 idle 样本且跨度至少 2s，当前可见屏幕最后一个 `›` 输入框的规范化尾部与原 prompt_tail 严格匹配，且候选输入与已识别底栏之间不存在回答正文，才放行；屏幕仅在此路径作为额外保守条件，不能单独授权。working/unknown/读失败打断稳定窗口，身份错误或生命周期失效立即终止；超时零按键升级人工。重新核验输入框、label、idle 和生命周期后才能追加按键意图；意图持久化后再读 idle，工作中状态不按。agentSession=null 不构成假 working 或未消费证明。重评仍占用同一 attempt/pane 去重锁，最多一次机器 Enter，绝不重发文本；按键后失败不再次补按。审计加法标记 `reevaluated=true` 与 `staged_basis=codex-input-tail`，原 delivery_v2 证据不改写。 重评耗尽沿用现有 `reason` 字段：从未达成 idle 稳定窗为 `reevaluation-deadline: stable-window-not-reached`；曾达成稳定窗但输入尾部从未匹配为 `reevaluation-deadline: input-tail-not-matched`（后续 idle 中断不抹去已到达该门的事实）；尾部匹配但读取返回时已耗尽预算保留 `reevaluation-deadline`。此区分仅用于审计，不改变等待预算与按键门。
 按 attempt_id 去重并串行保护 pane；先占用再 await，按键前追加动作意图，完成后追加结果，至多一次 sendEnter，绝不重发文本。复用 7.2.1 的预算旋钮、状态读取与时序校验规则观察到 working 时追加 `remediation` 证据（策略、动作、Enter 结果、状态翻转、机器补救归因）；可选加法字段 `staged_basis=text-transport-sent` 记录 gate ② 的授权依据，保留原 attribution 与 submit_confirmed 不变，归因表示机器代按后观察到翻转，不提升为因果提交证明。未翻转/控制错误追加二次 give-up 并走人工升级，不递归。原日志不覆写。去重为 notifier 进程生命周期内有效；事件无持久重放机制，重启不重放补救。
 
 补救动作/结果属于审计材料，不受 `TUT_DELIVERY_DIAG` 控制：即使该值为 0，仍输出 stderr 并尽力追加 delivery.log；持久 sink 失败不吞 stderr，诊断开关仅控制普通投递诊断。策略异常保留错误消息于 reason 并输出 stderr。观察窗内暂时读失败、未知/迟到/错序样本不判失败，继续到投递 deadline；身份丢失/改变仍立即停止。有合法 working 末样本时，优先按机器补救归因，即使同期任务已前进。

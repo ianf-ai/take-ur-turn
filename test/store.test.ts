@@ -732,18 +732,20 @@ describe("flow (system-design 3.1)", () => {
   // incremental fold — meta persistence and flow passthrough to the
   // fold are both exercised, golden vectors live in state-machine.test.ts.
 
-  it("createTask lands flow in meta and passes it to derive; default create omits the key (absent = full)", async () => {
+  it("createTask lands flow in meta and derives its initial status; default create omits the key (absent = full)", async () => {
     const { store, root } = newStore();
     const direct = await store.createTask({ title: "Direct Task", description: "d", creator: "alice", role: "agent:architect", flow: "direct" });
     expect(direct.task_id).toBe("direct-task");
     expect(readMeta(root, "direct-task").flow).toBe("direct");
-    expect(vi.mocked(derive)).toHaveBeenLastCalledWith("direct-task", [], "direct");
+    expect(direct.status).toBe("implementing");
+    expect(readMeta(root, "direct-task").status).toBe("implementing");
 
     const full = await store.createTask({ title: "Full Task", description: "d", creator: "alice", role: "agent:architect" });
     expect(full.task_id).toBe("full-task");
     const meta = readMeta(root, "full-task");
     expect("flow" in meta).toBe(false); // zero migration: default creates keep the legacy meta shape
-    expect(vi.mocked(derive)).toHaveBeenLastCalledWith("full-task", [], undefined);
+    expect(full.status).toBe("designing");
+    expect(readMeta(root, "full-task").status).toBe("designing");
   });
 
   it("createTask rejects an unknown flow value with VALIDATION_ERROR", async () => {

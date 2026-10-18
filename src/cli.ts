@@ -14,6 +14,7 @@
  */
 
 import { runMcpCommand } from "./cli/bridge.js";
+import { runStats } from "./cli/stats.js";
 import { resolveNotifierPort, resolveRigRoot, resolveCliHubUrl } from "./hub/rig-discovery.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -42,6 +43,7 @@ export const HANDLERS = {
   read: runRead,
   list: runList,
   status: runStatus,
+  stats: runStats,
   doctor: runDoctor,
   repairMeta: runRepairMeta,
   recoverRecord: runRecoverRecord,
@@ -95,6 +97,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     case "read": return HANDLERS.read(parsed);
     case "list": return HANDLERS.list(parsed);
     case "status": return HANDLERS.status(parsed);
+    case "stats": return HANDLERS.stats(parsed);
     case "doctor": return HANDLERS.doctor(parsed);
     case "repair-meta": return HANDLERS.repairMeta(parsed);
     case "recover-record": return HANDLERS.recoverRecord(parsed);

@@ -108,6 +108,41 @@ From there, agents push the task forward by reading and writing the Hub through 
 
 The Notifier's side channels (instant blocked alerts, done cross-checks) rely on Herdr forwarding each pane's agent state changes to `scripts/on-agent-event.sh` — a one-time environment setup (a Herdr plugin); see [Herdr event hookup](#herdr-event-hookup).
 
+## Local statistics and metadata repair
+
+`tut stats [task_id ...] [--root /path/to/.context-hub] [--json]` reads local
+records and usage audit sidecars through Store, without starting a service or
+writing anything (including temp-file cleanup). With no task IDs, the batch is
+all local tasks, excluding project scope. Reports include each task and the
+batch: strict review pass rate, first-review pass rate, revision deliveries,
+current waiting blockers, and deliveries per recorded role. For these quality metrics, only records that
+advance the existing workflow count; direct reference designs and stray
+out-of-table records do not. `blocked_external` stays separate from verified
+`pass`, and no reviews means `null`/`n/a`. Solo repeat deliveries after rejection
+count as revisions and do not enter the review-rate denominator.
+
+Tokens are grouped by agent because Pi and Codex use different native
+accounting; there is no combined cross-agent token total. Usage follows the audit's
+worker-round attribution independently of quality metrics, so measured reference
+designs retain their token usage. Sidecars must satisfy the frozen v1 source,
+line-range, window, counter, and total constraints. Missing, stale,
+unresolved, or invalid sidecars are reported as coverage gaps, never assumed
+zero. Unknown cost remains `null`. Damaged tasks are listed separately from
+the statistical denominator. Live reads are best-effort, not an atomic batch
+snapshot. See [usage measurement](scripts/usage-audit/README.md) for attribution
+and native token definitions; `--json` includes the metric definitions.
+
+`tut repair-meta <task_id> --from-snapshot /path/to/state.json` can prefill
+`title`, `flow`, and `cast` from a previously retained Notifier `/state` JSON
+response. The Notifier currently keeps its latest snapshot in memory; this
+mode consumes a saved file, and cannot retrieve lost memory after corruption.
+Check the source and age before using it. Explicit flags override snapshot
+values (cast overrides per role). Missing or invalid snapshots produce a
+warning and leave manual fields and existing defaults in effect. Repair still
+goes through the running Hub and refuses readable metadata. Description and
+checkout must be supplied manually when needed.
+
+
 ## Host Mode: Drive It from a Conversation
 
 The quick start above was the by-hand path — beyond `tut up` and `tut init`, you never have to touch the terminal again: open an interactive coding-agent session (any CLI agent that can read the repo and run shell commands) in the project and tell it to act as TUT Host — it runs `tut skill host`, picks up the [host skill](skills/host.md), and takes the **Host** role, your driver. You talk; the Host checks the environment, shapes your request into a task (`tut create`, requirement + acceptance), presses `tut start-next` at round handoffs, watches state, and reports at approval gates with the three essentials: what changed, how it was verified, and its own spot-check opinion.

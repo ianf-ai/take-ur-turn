@@ -226,8 +226,8 @@ describe("e2e: full lifecycle over HTTP (end-to-end acceptance walk)", () => {
       ]);
     }
 
-    // --- /state cross-check (frozen shape) -----------------------------
-    const stateRes = await fetch(`${baseUrl}/state`);
+    // Explicit history keeps the closed task queryable after active-view retirement.
+    const stateRes = await fetch(`${baseUrl}/state?include=closed`);
     expect(stateRes.status).toBe(200);
     expect(stateRes.headers.get("content-type")).toBe("application/json");
     const state = (await stateRes.json()) as {

@@ -87,6 +87,8 @@ export interface CreateTaskResult {
   status: Status;
   version: 0;
   warning?: string;
+  needs_attention?: boolean;
+  warnings?: Warning[];
 }
 
 export interface AppendInput {
@@ -131,6 +133,9 @@ export interface TaskListEntry {
   needs_attention?: boolean;
   /** Latest landed record version (meta.version). */
   version: number;
+  pending_since?: string | null;
+  round_count?: number;
+  warnings?: Warning[];
   /** Workflow variant, always present for task scope, normalized to "full". */
   flow?: Flow;
   /** Per-task cast: present only when the task carries one. */
@@ -625,10 +630,26 @@ export class Store {
   private taskTails = new Map<string, Promise<void>>();
   /** Per-task fold cache; see TaskFoldCache for the trust boundary. */
   private foldCache = new Map<string, TaskFoldCache>();
+  private readonly readOnly: boolean;
 
-  constructor(root: string = ".context-hub") {
+  constructor(root: string = ".context-hub", options: { readOnly?: boolean } = {}) {
     this.root = root;
-    this.whenSwept = sweepTempFiles(this.tasksDir());
+    this.readOnly = options.readOnly === true;
+    this.whenSwept = options.readOnly ? Promise.resolve() : sweepTempFiles(this.tasksDir());
+  }
+
+  /** Usage audit sidecar, through the Store boundary; never repairs or writes. */
+  async readUsage(taskId: string): Promise<unknown | null> {
+    requireValidTaskId(taskId);
+    const file = path.join(this.taskDir(taskId), "usage.json");
+    try {
+      const info = await lstat(file);
+      if (!info.isFile() || info.isSymbolicLink()) throw new Error("unsafe usage file");
+      return JSON.parse(await readFile(file, "utf8")) as unknown;
+    } catch (error) {
+      if (isErrnoException(error, "ENOENT")) return null;
+      throw error;
+    }
   }
 
   /** Create a task: writes meta.json only — no record, version 0. */
@@ -660,18 +681,20 @@ export class Store {
         updated_at: now,
         version: 0,
       };
-      this.cacheDerived(meta, derive(taskId, [], flow));
+      const seeded = foldWithLint(initialCursor(flow ?? "full"), [], flow ?? "full", description);
+      this.cacheDerived(meta, seeded);
       // Seed the fold cache: a fresh task's directory holds no
       // fold-relevant names, so the empty token matches the first reader.
       this.foldCache.set(taskId, {
         token: "",
         specKey: JSON.stringify([flow ?? "full", description]),
-        cursor: initialCursor(flow ?? "full"),
+        cursor: seeded,
         probeMaxVersion: 0,
       });
       await this.writeMeta(taskId, meta);
-      const warning = taskSpecWarning(description);
-      return { task_id: taskId, status: meta.status ?? "designing", version: 0 as const, ...(warning ? { warning } : {}) };
+      const warning = [taskSpecWarning(description), ...seeded.warnings.map(w => w.message)].filter(Boolean).join("\n") || undefined;
+      return { task_id: taskId, status: meta.status ?? "designing", version: 0 as const, ...(warning ? { warning } : {}),
+        ...(seeded.warnings.length ? { needs_attention: true, warnings: structuredClone(seeded.warnings) } : {}) };
     });
   }
 
@@ -815,7 +838,7 @@ export class Store {
       if (derived) {
         result.status = derived.status;
         result.needs_attention = derived.needs_attention;
-        if (derived.warnings.length > 0) result.warnings = derived.warnings;
+        if (derived.warnings.length > 0) result.warnings = structuredClone(derived.warnings);
       }
       return result;
     });
@@ -1186,6 +1209,7 @@ export class Store {
    * never queued (unchanged) — atomic rename/link keeps them consistent.
    */
   private enqueue<T>(key: string | null, op: () => Promise<T>): Promise<T> {
+    if (this.readOnly) return Promise.reject(new Error("Store is read-only"));
     const prior = key === null ? this.globalTail : this.taskTails.get(key) ?? Promise.resolve();
     const run = prior.then(op);
     const tail = run.then(
@@ -1267,7 +1291,7 @@ export class Store {
         }
         continue;
       }
-      let derived: ReturnType<typeof derive> | null;
+      let derived: Awaited<ReturnType<Store["derivedFor"]>>;
       try {
         derived = await this.derivedFor(taskId, meta.flow, meta.description, names);
       } catch (e) {
@@ -1283,6 +1307,9 @@ export class Store {
         status: derived.status,
         waiting_for: derived.waiting_for,
         needs_attention: derived.needs_attention,
+        pending_since: derived.pending_since ?? null,
+        round_count: derived.round_count ?? 0,
+        warnings: structuredClone(derived.warnings),
         // Disk-max version, not meta.version alone (system-design 4.3): an
         // out-of-band landed record (the corruption threat model itself)
         // must lift the reported version so version-diff consumers see it
@@ -1530,7 +1557,7 @@ export class Store {
     description: string | undefined,
     names: readonly string[],
     alreadyRead: ReadonlyMap<string, ContextRecord> = new Map(),
-  ): Promise<ReturnType<typeof derive> | null> {
+  ): Promise<(NonNullable<ReturnType<typeof derive>> & Pick<LintCursor, "pending_since" | "round_count">) | null> {
     if (taskId === PROJECT_TASK_ID) return null;
     const cursor = await this.foldCursorFor(taskId, flow ?? "full", description, names, alreadyRead);
     const needsAttention = cursor.warnings.length > 0;
@@ -1539,6 +1566,8 @@ export class Store {
       waiting_for: needsAttention ? "human" : WAITING_FOR_BASE[cursor.status],
       needs_attention: needsAttention,
       warnings: cursor.warnings,
+      pending_since: cursor.pending_since ?? null,
+      round_count: cursor.round_count ?? 0,
     };
   }
 

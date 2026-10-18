@@ -593,3 +593,24 @@ describe('spec lint through MCP', () => {
     expect((await call('context.read', {task_id})).json?.versions).toHaveLength(2);
   });
 });
+
+it("accepts repository-operation descriptions while preserving record repair sheets", async () => {
+  const created = await call("context.create", { title: "advisory", description: "## 验收场景\n1. works\n请 push 分支并开 PR，merge 后 release 发版", creator: "human", role: "human", flow: "direct" });
+  expect(created.isError).toBe(false);
+  expect(created.json).toMatchObject({ version: 0, status: "implementing" });
+  expect(created.json!.needs_attention).not.toBe(true);
+  expect(created.json!.warnings ?? []).toEqual([]);
+  const task_id = created.json!.task_id;
+  const publish = (content_type: string, role: string, payload: Record<string, unknown>) => call("context.publish", { task_id, content_type, role, payload: { summary: "s", body: "b", ...payload } });
+  expect((await publish("code_changes", "executor", {})).json).toMatchObject({ version: 1, status: "reviewing", needs_attention: false });
+  const review = await publish("review", "reviewer", { verdict: "pass" });
+  expect(review.isError).toBe(false);
+  expect(review.json).toMatchObject({ version: 2, status: "pending_approval", warnings: expect.arrayContaining([
+    expect.objectContaining({ code: "REVIEW_EXIT_CONDITIONS_INCOMPLETE", location: { field: "payload.body", section: "退出条件逐条核验" }, supportedFixes: expect.any(Array) }),
+  ]) });
+  const fixed = await publish("note", "reviewer", { ref_version: 2, body: "## 退出条件逐条核验\n1. 满足 — checked\n## 超出规格的改动\n无" });
+  expect(fixed.json).toMatchObject({ version: 3, status: "pending_approval", needs_attention: false });
+  expect(fixed.json!.warnings ?? []).toEqual([]);
+  const read = await call("context.read", { task_id });
+  expect(read.json!.versions).toHaveLength(3);
+});

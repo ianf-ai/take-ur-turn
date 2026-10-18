@@ -42,7 +42,7 @@ import {
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { autoSectionOf, readConfig, writeFlowMode } from "../common/config.js";
 import { createMcpServer } from "../mcp/server.js";
-import { ErrorCode, PROJECT_TASK_ID, type AgentRoute, type Cast, type CheckoutRoute, type Flow } from "../common/types.js";
+import { ErrorCode, PROJECT_TASK_ID, type AgentRoute, type Cast, type CheckoutRoute, type Flow, type Warning } from "../common/types.js";
 import { Store, StoreError, type RecoverRecordInput, type RepairMetaInput } from "./store.js";
 
 export interface RequestHandlerDeps {
@@ -101,6 +101,9 @@ interface StateTaskEntry {
   needs_attention: boolean;
   waiting_for: string;
   version: number;
+  pending_since: string | null;
+  round_count: number;
+  warnings: Warning[];
   flow: string;
   cast?: Record<string, AgentRoute>;
   checkout?: CheckoutRoute;
@@ -142,7 +145,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
   const hubRoot = canonicalRoot(path.dirname(path.resolve(root)));
   const transports = new Set<StreamableHTTPServerTransport>();
 
-  async function handleState(res: ServerResponse): Promise<void> {
+  async function handleState(res: ServerResponse, includeClosed: boolean): Promise<void> {
     // One readConfig call per request: flow_mode is DERIVED from the
     // same snapshot that carries `notify` — one request, one config view.
     const [config, snapshot] = await Promise.all([readConfig(root), store.snapshotTasks()]);
@@ -150,7 +153,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     const tasks: StateTaskEntry[] = [];
     for (const entry of snapshot.tasks) {
       // project scope never appears in /state (system-design 4.3) — it has no derived state
-      if (entry.task_id === PROJECT_TASK_ID) continue;
+      if (entry.task_id === PROJECT_TASK_ID || (!includeClosed && entry.status === "closed")) continue;
       tasks.push({
         task_id: entry.task_id,
         title: entry.title,
@@ -159,6 +162,9 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
         needs_attention: entry.needs_attention ?? false,
         waiting_for: entry.waiting_for ?? "none",
         version: entry.version,
+        pending_since: entry.pending_since ?? null,
+        round_count: entry.round_count ?? 0,
+        warnings: entry.warnings ?? [],
         flow: entry.flow ?? "full",
         ...(entry.cast !== undefined ? { cast: entry.cast } : {}),
         ...(entry.checkout !== undefined ? { checkout: entry.checkout } : {}),
@@ -178,6 +184,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     sendJson(res, 200, {
       hub_root: hubRoot,
       flow_mode: flowMode,
+      truncated: false,
       tasks,
       ...(snapshot.degraded.length > 0 ? { degraded: snapshot.degraded } : {}),
       ...(config !== null && "notify" in config ? { notify: config.notify } : {}),
@@ -326,7 +333,8 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
         sendJson(res, 403, { error: "forbidden: Host header must be a loopback host" });
         return;
       }
-      const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const pathname = url.pathname;
 
       if (pathname === "/mcp") {
         if (req.method === "POST") {
@@ -341,7 +349,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
 
       if (pathname === "/state") {
         if (req.method === "GET" || req.method === "HEAD") {
-          await handleState(res);
+          await handleState(res, url.searchParams.get("include") === "closed");
           return;
         }
         res.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "application/json" });

@@ -59,6 +59,22 @@ describe("launchBlocked", () => {
   it("sorts records by version so an out-of-order log is still deterministic", () => {
     expect(launchBlocked([record(3, "code_changes"), launch(2), record(1, "design")], "executor")).toEqual({ blocked: false });
   });
+
+  it("extends only a verified new-note boundary and ignores markers of other roles", () => {
+    const records = [record(1, "design"), launch(2), record(3, "note"), launch(4, "reviewer")];
+    expect(launchBlocked(records, "executor")).toEqual({ blocked: true, noteVersion: 2 });
+    expect(launchBlocked(records, "executor", { version: 3 })).toEqual({ blocked: false });
+    expect(launchBlocked([...records].reverse(), "executor", { version: 3 })).toEqual({ blocked: false });
+    expect(launchBlocked([...records, launch(5)], "executor", { version: 3 })).toEqual({ blocked: true, noteVersion: 5 });
+    expect(launchBlocked([...records, launch(5)].reverse(), "executor", { version: 3 })).toEqual({ blocked: true, noteVersion: 5 });
+    expect(launchBlocked([...records, launch(3)], "executor", { version: 3 })).toEqual({ blocked: true, noteVersion: 3 });
+  });
+
+  it.each([0, 1, 2, 4, 5, 6, NaN, 3.5])("does not extend dedup for invalid or ineligible note context v%s", version => {
+    const records = [record(1, "design"), launch(2), record(3, "note"), record(4, "note", { ack: true }),
+      record(5, "note", { launch: null })];
+    expect(launchBlocked(records, "executor", { version })).toEqual({ blocked: true, noteVersion: 2 });
+  });
 });
 
 describe("markLaunched", () => {

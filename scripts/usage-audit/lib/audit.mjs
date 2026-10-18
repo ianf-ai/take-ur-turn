@@ -4,8 +4,9 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readConfigFile } from '../../../dist/common/config.js';
-import { hubList, hubRead } from '../../../dist/hub/hub-client.js';
-import { probeHub, canonicalRoot } from '../../../dist/hub/rig-discovery.js';
+import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
+import { source } from './hub.mjs';
+export { source } from './hub.mjs';
 import { extract, attribute } from './rounds.mjs';
 import { files, readSession, vector, instant } from './sessions.mjs';
 
@@ -89,6 +90,23 @@ export async function lock(root) {
   };
 }
 
+async function recoveryLock(root, log) {
+  const file = lockPath(root);
+  let owner, status;
+  try {
+    owner = JSON.parse(await fs.readFile(file, 'utf8'));
+    const alive = pidAlive(owner?.pid);
+    status = alive === false ? 'dead' : alive === true ? 'alive' : 'unknown';
+  } catch (e) { status = e.code === 'ENOENT' ? 'absent' : 'unknown'; }
+  log(JSON.stringify({ event: 'recovery_lock', lock: file, pid: owner?.pid ?? null, status }) + '\n');
+  if (status === 'alive' || status === 'unknown') {
+    throw new Error(`audit_locked:${file}; writer pid=${owner?.pid ?? 'unknown'} is ${status}; inspect the owner and stop it manually if appropriate, then rerun --recover; no process was killed and no lock was removed`);
+  }
+  // Inspection is advisory: lock() rechecks liveness under the existing
+  // reclaim mutex, claims atomically, and retains ownership through backfill.
+  return lock(root);
+}
+
 export async function taskDir(root, id) {
   if (!/^[a-z0-9][a-z0-9._-]*$/.test(id) || id === 'project') throw new Error('unsafe_task_id');
   let current = root;
@@ -164,14 +182,10 @@ export async function writeUsage(root, id, value, mayCommit = async () => true, 
     return true;
   } finally { await fs.unlink(tmp).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
 }
-export async function source(url, root) {
-  if ((await probeHub(url))?.root !== root) throw new Error(`hub_root_mismatch:${url}`);
-  return { list: async () => (await hubList(url)).tasks, read: id => hubRead(url, id) };
-}
 export async function collect(options, deps = {}) {
   const allowed = deps.allowed ?? (() => options.watch ? enabled(options.root) : Promise.resolve(true));
   if (!await allowed()) return [];
-  const hub = deps.hub ?? await source(options.url, options.root);
+  const hub = deps.hub ?? await source(options.url, options.root, options);
   const entries = await hub.list(), tasks = [];
   for (const e of entries.filter(e => e.task_id !== 'project')) {
     if (!await allowed()) return [];
@@ -233,11 +247,20 @@ export async function run(options, deps = {}) {
   const on = deps.enabled ?? enabled;
   const allowed = () => options.signal?.aborted ? Promise.resolve(false) : options.watch ? on(options.root) : Promise.resolve(true);
   if (!await allowed()) return;
-  const release = await (deps.lock ?? lock)(options.root);
+  const log = text => process.stderr.write(text);
+  const release = options.recover ? await recoveryLock(options.root, log) : await (deps.lock ?? lock)(options.root);
   const started = Date.now();
   let failStreak = 0, lastFail = '';
+  // Keep log deduplication's existing counter separate from the heartbeat's
+  // actual consecutive failures (all errors, reset after a successful pass).
+  let consecutiveFailures = 0, lastSuccessfulPass = null, inRequest = false, heartbeat;
+  options.onRequest = value => { inRequest = value; };
   const lastReport = new Map();
   try {
+    if (options.watch) heartbeat = (deps.setInterval ?? setInterval)(() => {
+      log(JSON.stringify({ event: 'heartbeat', timestamp: new Date().toISOString(),
+        last_successful_pass: lastSuccessfulPass, consecutive_failures: consecutiveFailures, in_request: inRequest }) + '\n');
+    }, 60_000);
     do {
       if (options.signal?.aborted || !await allowed()) break;
       let reports;
@@ -249,6 +272,7 @@ export async function run(options, deps = {}) {
         // failure every interval would flood the log (~17k lines/day at the
         // default interval): log the first occurrence, then every 20th.
         if (!options.watch) throw e;
+        consecutiveFailures++;
         failStreak = e.message === lastFail ? failStreak + 1 : 0;
         lastFail = e.message;
         if (failStreak % 20 === 0) {
@@ -271,9 +295,19 @@ export async function run(options, deps = {}) {
         return true;
       }) : reports;
       (deps.report ?? (r => { for (const v of r) process.stdout.write(JSON.stringify(v) + '\n'); }))(visible);
+      // Reporting is part of the pass: a fatal output error (e.g. EPIPE)
+      // must not leave telemetry claiming that the pass completed.
+      lastSuccessfulPass = new Date().toISOString();
+      consecutiveFailures = 0;
       if (!options.watch || options.signal?.aborted || Date.now()-started >= options.timeoutMs || !await allowed()) break;
       try { await (deps.sleep ?? sleep)(Math.min(options.intervalMs, options.timeoutMs-(Date.now()-started)), undefined, { signal: options.signal }); }
       catch (e) { if (e.name !== 'AbortError') throw e; }
     } while (true);
-  } finally { await release(); }
+  } finally {
+    if (heartbeat !== undefined) (deps.clearInterval ?? clearInterval)(heartbeat);
+    await release();
+  }
+  if (options.recover && !options.signal?.aborted) {
+    log('usage-audit: recovery backfill complete; inspect stdout coverage/unresolved diagnostics. To resume monitoring, enable usage_audit if off and rerun --watch with the same --root, --url and session roots.\n');
+  }
 }

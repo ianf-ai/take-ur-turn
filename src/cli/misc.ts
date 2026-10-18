@@ -7,6 +7,7 @@ import { hubList, type HubListEntry, type HubListResult } from "../hub/hub-clien
 import { renderDoctorReport, runDoctor as runDoctorChecks } from "../doctor/index.js";
 import { DEFAULT_HUB_URL, cliFetchInit, isHubUnreachable, hubUnreachableLine, printJson, ATTENTION_MARKER, colWidth, padRow, failWith } from "./shared.js";
 import { type ParsedArgs } from "./args.js";
+import { readRepairSnapshot } from "./repair-snapshot.js";
 
 // --- tut repair-meta / recover-record (storage repair clients, 4.3) ----------------
 
@@ -47,14 +48,25 @@ async function runRepairPost(pathname: string, url: string, body: unknown, comma
 
 /** tut repair-meta — A-class rebuild of a corrupt meta.json (system-design 4.3). */
 async function runRepairMeta(parsed: Extract<ParsedArgs, { command: "repair-meta" }>): Promise<number> {
+  let prefill: Awaited<ReturnType<typeof readRepairSnapshot>> | undefined;
+  if (parsed.fromSnapshot !== undefined) {
+    try {
+      prefill = await readRepairSnapshot(parsed.fromSnapshot, parsed.task_id);
+      process.stderr.write(`tut: repair-meta prefilled title/flow/cast where present from ${parsed.fromSnapshot}; explicit flags take precedence.\n`);
+    } catch (error) {
+      process.stderr.write(`tut: snapshot unavailable: ${(error as Error).message}; continuing with manual fields and existing defaults (use --title/--flow/--cast).\n`);
+    }
+  }
+  const fields = { ...prefill, ...parsed };
+  if (prefill?.cast !== undefined || parsed.cast !== undefined) fields.cast = { ...prefill?.cast, ...parsed.cast };
   return runRepairPost("/repair-meta", parsed.url, {
     task_id: parsed.task_id,
-    ...(parsed.title !== undefined ? { title: parsed.title } : {}),
+    ...(fields.title !== undefined ? { title: fields.title } : {}),
     ...(parsed.description !== undefined ? { description: parsed.description } : {}),
     ...(parsed.creator !== undefined ? { creator: parsed.creator } : {}),
     ...(parsed.createdAt !== undefined ? { created_at: parsed.createdAt } : {}),
-    ...(parsed.flow !== undefined ? { flow: parsed.flow } : {}),
-    ...(parsed.cast !== undefined ? { cast: parsed.cast } : {}),
+    ...(fields.flow !== undefined ? { flow: fields.flow } : {}),
+    ...(fields.cast !== undefined ? { cast: fields.cast } : {}),
     ...(parsed.checkout !== undefined ? { checkout: parsed.checkout } : {}),
   }, "repair-meta");
 }
