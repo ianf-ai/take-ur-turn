@@ -148,6 +148,7 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
         let idleSince: number | undefined;
         let idleSamples = 0;
         let ready = false;
+        let exhaustedReason = 'reevaluation-deadline: stable-window-not-reached';
         for await (const sample of deliveryStatusWindow({ deadline, pollMs: knobs.pollMs, now,
           signal: controller.signal, read, sleep })) {
           if (!await request.canAct()) return { ...result, reason: 'lifecycle-changed' };
@@ -160,11 +161,14 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
           idleSince ??= now();
           if (++idleSamples < 3 || now() - idleSince < 2000) continue;
           if (!await matchesPane(target.paneId, request.pane)) return { ...result, reason: 'pane-mismatch' };
+          // Preserve the furthest gate reached, even if later samples reset idle stability.
+          exhaustedReason = 'reevaluation-deadline: input-tail-not-matched';
           if (!pendingCodexInput(await readPane(target.paneId), e.prompt_tail)) continue;
+          exhaustedReason = 'reevaluation-deadline';
           if (now() >= deadline) break;
           ready = true; break;
         }
-        if (!ready) return { ...result, result: 'give-up', reason: 'reevaluation-deadline' };
+        if (!ready) return { ...result, result: 'give-up', reason: exhaustedReason };
       }
       if (unknownBaseline) {
         const deadline = now() + knobs.readyMs;

@@ -52,8 +52,15 @@ note 通常不转态；仅 reviewing 下 Executor 的非 ack note 收回交付�
 5. 调用 `context.publish` 或 `tut publish`（字段取自当前角色模板；版本见「版本与增量」）。
 6. 检查返回值（`needs_attention` 不为 true 时结束）。
 7. 若 `needs_attention=true`，读取 warnings。
-8. 用 note 披露 warnings。
-9. 将异常交人处置（已有记录不可改删；ack 入口见 `skills/host.md`）。
+8. 若为带 `supportedFixes` 的四类记录 lint，按下节追加修复记录并检查新响应；其余 warning 用 note 披露。
+9. 修正轮耗尽、没有支持的修复或存在其他异常时交人处置（已有记录不可改删；ack 入口见 `skills/host.md`）。
+
+### lint 修复单
+
+- `location` 定位原记录字段/小节，`supportedFixes` 给出新记录的 role、content_type、ref_version 及字段形态。只追加记录，不改删历史，也不把修复建议当作扩大授权。
+- review 两节缺漏或 role 大小写问题：用精确小写的同角色 note，ref_version 指向 warning.version 或 correction.root_version，正文补齐对应内容。核验 note 不重发 review、不重放 verdict；有效修复自动清除对应 lint，其他诊断保留。
+- EXPECTED_REVISION：引用 fail_design review 交 revision；若仍在 reviewing，先用 executor 非 ack note 收回交付。单独的说明 note 不会核销交付类型问题。
+- 首次触发为第 1 轮；同一 lint 再失败为第 2 轮，correction.exhausted=true / message「修正轮耗尽」。看到耗尽就停止自行重试，交人处理。两轮内有效修复会熄灯；无关 note 不计次数，ack/close 清此前计数。
 
 ## 工具总则
 

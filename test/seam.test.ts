@@ -314,13 +314,13 @@ describe("consistency property", () => {
       expect(appendResult.warnings ?? []).toStrictEqual(replay.warnings);
     }
 
-    // Terminal state of this sequence: closed with one surviving warning (v7).
+    // Close retires the warning from v7 while preserving the full record log.
     const final = mustDerive(task_id, await readDiskRecords(root, task_id));
     expect(final).toStrictEqual({
       status: "closed",
-      waiting_for: "human",
-      needs_attention: true,
-      warnings: [{ version: 7, code: "OUT_OF_TABLE" }],
+      waiting_for: "none",
+      needs_attention: false,
+      warnings: [],
     });
   });
 });

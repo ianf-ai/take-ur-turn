@@ -56,7 +56,7 @@ describe("record diagnostic overlay", () => {
     const rs = records(['design', 'code_changes', 'review', 'note', 'design', 'code_changes']);
     rs[3]!.payload.ack = true;
     expect(fold(rs)).toMatchObject({ status: 'reviewing', pendingFailDesign: 3 });
-    expect(fold(rs).warnings).toEqual([{version: 6, code: 'EXPECTED_REVISION', message: '应为 revision，并引用 fail_design review v3'}]);
+    expect(fold(rs).warnings).toMatchObject([{version: 6, code: 'EXPECTED_REVISION', message: '应为 revision，并引用 fail_design review v3'}]);
     rs[5]!.content_type = 'revision'; rs[5]!.payload.ref_version = 3;
     expect(fold(rs).pendingFailDesign).toBeUndefined(); expect(codes(rs)).toEqual([]);
     rs[5]!.payload.ref_version = 1; expect(fold(rs).pendingFailDesign).toBe(3);
@@ -65,7 +65,7 @@ describe("record diagnostic overlay", () => {
     const rs = records(['design', 'code_changes', 'review', 'design', 'revision', 'review', 'design', 'code_changes']);
     rs[4]!.payload.ref_version = 3;
     expect(fold(rs.slice(0, 5)).pendingFailDesign).toBeUndefined();
-    expect(fold(rs).warnings).toEqual([{version: 8, code: 'EXPECTED_REVISION', message: '应为 revision，并引用 fail_design review v6'}]);
+    expect(fold(rs).warnings).toMatchObject([{version: 8, code: 'EXPECTED_REVISION', message: '应为 revision，并引用 fail_design review v6'}]);
   });
   it.each(['full', 'direct', 'solo'] as const)("does not invent debt from out-of-table review in %s", (flow) => {
     expect(codes(records(['review', 'design', 'code_changes']), flow)).not.toContain('EXPECTED_REVISION');
@@ -77,7 +77,7 @@ describe("record diagnostic overlay", () => {
     rs[6]!.payload = { summary: 's', verdict: 'fail_code', body: complete };
     rs[7]!.payload.ref_version = 7;
     rs[8]!.payload = { summary: 's', verdict: 'pass', body: complete, ref_version: 7 };
-    expect(fold(rs).warnings).toEqual([{version: 6, code: 'EXPECTED_REVISION', message: '应为 revision，并引用 fail_design review v3'}]);
+    expect(fold(rs).warnings).toMatchObject([{version: 6, code: 'EXPECTED_REVISION', message: '应为 revision，并引用 fail_design review v3'}]);
     expect(fold(rs).pendingFailDesign).toBeUndefined();
   });
   it("ack clears previous warnings but not its own role typo or pending debt", () => {

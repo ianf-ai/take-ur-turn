@@ -4,7 +4,7 @@ export const EXIT_REVIEW_HEADING = "退出条件逐条核验";
 export const SCOPE_REVIEW_HEADING = "超出规格的改动";
 
 /** Ignore fenced examples and block quotes; keep indentation for top-level lists. */
-function proseLines(text: string): string[] {
+export function proseLines(text: string): string[] {
   let fence: { char: string; length: number } | undefined;
   return text.split(/\r?\n/u).map((line) => {
     const marker = /^ {0,3}(`{3,}|~{3,})/u.exec(line)?.[1];

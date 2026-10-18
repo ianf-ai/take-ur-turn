@@ -56,11 +56,13 @@ import { fileURLToPath } from "node:url";
 import { createChannels, type Channel, type Notification } from "../common/channels.js";
 import {
   launchBlocked,
+  isWakeNote,
   latestRecordVersion,
   markLaunched as appendLaunchMarker,
   readLaunchLog,
   resolveLaunchTargetWithSource,
   type LaunchVia,
+  type NoteWake,
 } from "../launcher/launch.js";
 import { commandHead, commandArgs } from "../common/agent-command.js";
 import type { GiveUpBoxEvidence, GiveUpProbeEvidence } from "../launcher/escalation.js";
@@ -118,6 +120,8 @@ export interface StateTask {
   needs_attention: boolean;
   waiting_for: string;
   version?: number;
+  pending_since?: string | null;
+  round_count?: number;
   /** Task's per-role cast overrides (absent on older hubs/fixtures). */
   cast?: Cast;
   /** Task-frozen checkout route (absent on older hubs/fixtures = current). */
@@ -166,8 +170,10 @@ export interface AgentEvent {
 /** Only a complete v2 block explains the outcome; legacy fields are diagnostic. */
 function deliveryGiveUpHint(evt: Pick<AgentEvent, "delivery_v2">): string {
   const evidence = parseDeliveryV2(evt.delivery_v2);
-  return `${evidence ? `reason=${evidence.reason} — ` : ""}${giveUpGuidance()}`;
+  return `reason=${evidence?.reason ?? "unknown"} — ${giveUpGuidance()}`;
 }
+
+const GIVE_UP_NOTIFICATION_LIMIT = 1024;
 
 /** A pane-list row consumed by the done-event sweep (system-design 4.4). */
 export interface PaneSnapshot {
@@ -745,6 +751,9 @@ export class Notifier {
    * quiet-round skip through, so the worst case is one extra full pull.
    */
   private logCache = new Map<string, LogCacheEntry>();
+  /** Failed scans and pre-marker version races retain their exclusive lower bound independently of
+   * /state snapshots. One interval per task, retried on the next eligible poll. */
+  private pendingNoteScans = new Map<string, { version: number; status: string; waiting_for: string }>();
 
   private snapshot: Map<string, StateTask> | null = null;
   private remediationMode: "off" | "enter-repress" = "off";
@@ -752,8 +761,12 @@ export class Notifier {
   private readonly remediationAttempts = new RemediationAttempts();
   private readonly remediationAudit: (taskId: string, role: string) => DeliveryDiagnostics;
   private closed = false;
-  /** Tasks whose pending_approval entry edge has already been notified. */
+  /** Observed approval edges; Host relay attempts must never be retried. */
   private pendingApprovalTasks = new Set<string>();
+  /** Channel approval edges awaiting an aggregate send, independent of Host relay. */
+  private pendingApprovalNotifications = new Set<string>();
+  /** FIFO-bounded alert deduplication; old attempts may notify again after eviction. */
+  private giveUpNotifications = new Set<string>();
   /** Degraded ids as of the last successful poll (system-design 4.3);
    *  null before the first fetch. */
   private lastDegraded: Set<string> | null = null;
@@ -1047,7 +1060,7 @@ export class Notifier {
   private async compareAndAct(): Promise<void> {
     let state: StateResponse;
     try {
-      state = await this.deps.fetchState(this.stateUrl);
+      state = await this.deps.fetchState(`${this.stateUrl}?include=closed`);
     } catch (e) {
       // Poll failure: one stderr line per consecutive failure RUN, snapshot
       // kept, same interval, no notification, no crash (§3).
@@ -1073,13 +1086,27 @@ export class Notifier {
     const prevDegraded = this.lastDegraded;
     const now = this.deps.now();
     this.snapshot = new Map(state.tasks.map((t) => [t.task_id, t]));
+    // Do not carry a failed scan across a round/gate/mode change or a missing
+    // task. Recovery and startup still establish baselines, never replay notes.
+    for (const [taskId, scan] of this.pendingNoteScans) {
+      const task = this.snapshot.get(taskId);
+      if (state.flow_mode !== "auto" || task === undefined || task.needs_attention ||
+          task.status !== scan.status || task.waiting_for !== scan.waiting_for ||
+          !autoWhitelisted(state.auto, task.waiting_for.slice("agent:".length)) ||
+          task.version === undefined || task.version < (prev?.get(taskId)?.version ?? scan.version)) {
+        this.pendingNoteScans.delete(taskId);
+      }
+    }
     this.remediationMode = state.auto?.remediate ?? (state.flow_mode === "auto" ? "enter-repress" : "off");
     this.lastDegraded = new Set(state.degraded ?? []);
     this.reconcileLogCache(state, prev);
     // A task omitted from /state has left the observable workflow. Forget its
     // approval edge so a later reappearance can notify again.
     for (const taskId of this.pendingApprovalTasks) {
-      if (!this.snapshot.has(taskId)) this.pendingApprovalTasks.delete(taskId);
+      if (!this.snapshot.has(taskId)) {
+        this.pendingApprovalTasks.delete(taskId);
+        this.pendingApprovalNotifications.delete(taskId);
+      }
     }
     await this.retireObsoleteWorkingWatches(this.snapshot);
     // Mode visibility — a switch logs immediately, an unchanged mode
@@ -1117,7 +1144,9 @@ export class Notifier {
       const recoveredThisTick = await this.diffDegraded(prev, prevDegraded, this.lastDegraded, state);
       // Per-poll decision lines precede this poll's acting — the line
       // announces the launch (or the reason there will be none) first.
-      if (state.flow_mode === "auto") await this.logAutoDecisions(prev, state, recoveredThisTick);
+      const noteWakes = state.flow_mode === "auto"
+        ? await this.logAutoDecisions(prev, state, recoveredThisTick) : new Map<string, NoteWake>();
+      const newApprovals = new Set<string>();
       for (const after of state.tasks) {
         // A task that just left degraded or came back from vanished is NOT a
         // new task: prev has no entry for it (it was absent from tasks[]), so
@@ -1140,10 +1169,13 @@ export class Notifier {
           this.markProgress(after.task_id, now);
           continue;
         }
-        await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto, state.notify);
+        await this.diffTask(prev.get(after.task_id), after, state.flow_mode, state.auto, state.notify, noteWakes.get(after.task_id), newApprovals);
       }
+      if (newApprovals.size > 0) await this.notifyPendingApprovals(state, newApprovals);
+      for (const taskId of newApprovals) this.pendingApprovalNotifications.delete(taskId);
       this.checkStalls(state.tasks, now);
     } catch (e) {
+      // Unsent Channel edges remain queued, without resetting observed Host edges.
       // compare/act itself should never throw; if it does, log and survive.
       this.log(`compare failed unexpectedly: ${(e as Error).message}`);
     }
@@ -1235,6 +1267,8 @@ export class Notifier {
     flowMode: string,
     auto: StateAuto | undefined,
     notify: unknown,
+    noteWake: NoteWake | undefined,
+    newApprovals: Set<string>,
   ): Promise<void> {
     // Close-edge pane cleanup (system-design 4.4): `tut decide close`
     // keeps its synchronous cleanup child, but the decision may land through
@@ -1251,6 +1285,7 @@ export class Notifier {
       this.cleanupClosedTask(after.task_id);
     }
     const pendingApprovalEntering = this.updatePendingApprovalEdge(after);
+    if (this.pendingApprovalNotifications.has(after.task_id)) newApprovals.add(after.task_id);
     // A task absent from the previous snapshot counts as waiting_for "none"
     // before, so brand-new tasks notify (absent → agent:* is a change) but a
     // snapshot-miss with waiting_for "none" stays silent.
@@ -1285,26 +1320,22 @@ export class Notifier {
       // task entering pending_approval with needs_attention set in the same
       // poll gets BOTH — the human must still receive the decide guidance,
       // or the approval chain is lost until a restart. Never contains
-      // warnings content — /state has none; the human runs `tut read` for
+      // warnings content; the human runs `tut read` for
       // the cause.
       await this.sendAll({
         title: `TUT ${after.task_id}: needs attention`,
         body: `${after.title} — status: ${after.status}: run \`tut read ${after.task_id}\` for warnings`,
         task_id: after.task_id,
       });
-      if (pendingApprovalEntering) {
-        await this.notifyPendingApproval(after, flowMode);
-      }
       return;
     }
     if (pendingApprovalEntering) {
       // Approval is a first-class state edge rather than a side effect of
       // waiting_for. This also covers snapshots where the task was already
       // waiting for a human before it entered pending_approval.
-      await this.notifyPendingApproval(after, flowMode);
       return;
     }
-    if (!wfChanged) return;
+    if (!wfChanged && !noteWake) return;
     if (after.waiting_for === "none") return; // human closed / wound down — silent (§3)
 
     if (flowMode !== "auto") {
@@ -1350,7 +1381,7 @@ export class Notifier {
       });
       return;
     }
-    await this.autoLaunch(after, role);
+    await this.autoLaunch(after, role, noteWake);
   }
 
   private reportHostStatus(task: StateTask, status: HostStatusReport["status"], notify: unknown): void {
@@ -1386,25 +1417,31 @@ export class Notifier {
   private updatePendingApprovalEdge(task: StateTask): boolean {
     if (task.status !== "pending_approval") {
       this.pendingApprovalTasks.delete(task.task_id);
+      this.pendingApprovalNotifications.delete(task.task_id);
       return false;
     }
     const entering = !this.pendingApprovalTasks.has(task.task_id);
     this.pendingApprovalTasks.add(task.task_id);
+    if (entering) this.pendingApprovalNotifications.add(task.task_id);
     return entering;
   }
 
-  /** Notify through the existing channels and the notifier pane log. */
-  private async notifyPendingApproval(task: StateTask, flowMode: string): Promise<void> {
-    const title = flowMode === "auto"
-      ? `TUT ${task.task_id}: human decision needed`
-      : `TUT ${task.task_id}: waiting for human`;
-    const taskTitle = truncatePendingApprovalTitle(task.title);
-    const command = `tut decide ${task.task_id} --decision approve --by <your-name>`;
-    const approvalHint = `run \`${command}\` (replace \`<your-name>\` with your identity; use \`--decision reject\` to request revisions)`;
-    const body = flowMode === "auto"
-      ? `${taskTitle} — status: ${task.status}; waiting for: ${task.waiting_for}; waiting for approval; auto launch withheld (pending human decision); ${approvalHint}`
-      : `${taskTitle} — status: ${task.status}; waiting for: ${task.waiting_for}; waiting for approval; ${approvalHint}`;
-    await this.sendAll({ title, body, task_id: task.task_id });
+  /** One approval edge notification carries the complete pending queue. */
+  private async notifyPendingApprovals(state: StateResponse, entering: ReadonlySet<string>): Promise<void> {
+    const pending = state.tasks.filter(task => task.status === "pending_approval");
+    const first = pending[0]!;
+    const title = pending.length === 1
+      ? (state.flow_mode === "auto" ? `TUT ${first.task_id}: human decision needed` : `TUT ${first.task_id}: waiting for human`)
+      : `TUT: ${pending.length} tasks waiting for approval`;
+    const body = pending.map(task => {
+      const since = typeof task.pending_since === "string" ? Date.parse(task.pending_since) : NaN;
+      const duration = Number.isFinite(since) ? `${Math.floor(Math.max(0, this.deps.now() - since) / 1000)}s` : "unknown";
+      const marker = entering.has(task.task_id) ? "[\u65b0] " : "";
+      const gate = state.flow_mode === "auto" ? "; auto launch withheld (pending human decision)" : "";
+      return `${marker}${task.task_id}: ${truncatePendingApprovalTitle(task.title)} - status: pending_approval; waiting for: ${task.waiting_for}; waiting for approval; pending: ${duration}${gate}; run \`tut decide ${task.task_id} --decision approve --by <your-name>\` (replace \`<your-name>\` with your identity; use \`--decision reject\` to request revisions)`;
+    }).join("\n");
+    await this.sendAll({ title, body, task_id: pending.find(task => entering.has(task.task_id))!.task_id,
+      ...(pending.length > 1 ? { task_ids: pending.map(task => task.task_id) } : {}) });
   }
 
   /**
@@ -1444,7 +1481,8 @@ export class Notifier {
     prev: ReadonlyMap<string, StateTask> | null,
     state: StateResponse,
     recoveredIntoTasks?: ReadonlySet<string>,
-  ): Promise<void> {
+  ): Promise<Map<string, NoteWake>> {
+    const noteWakes = new Map<string, NoteWake>();
     for (const task of state.tasks) {
       if (!task.waiting_for.startsWith("agent:")) continue;
       const role = task.waiting_for.slice("agent:".length);
@@ -1452,12 +1490,26 @@ export class Notifier {
       const whitelisted = autoWhitelisted(state.auto, role);
       let dedup = gate !== null ? "n/a (gate withheld)" : "n/a (not whitelisted)";
       if (gate === null && whitelisted) {
+        const beforeVersion = this.pendingNoteScans.get(task.task_id)?.version ?? prev?.get(task.task_id)?.version;
+        const afterVersion = task.version;
+        const scanNotes = !recoveredIntoTasks?.has(task.task_id) && beforeVersion !== undefined &&
+          afterVersion !== undefined && afterVersion > beforeVersion;
         try {
           const records = await this.fullLog(task.task_id, task);
-          const blocked = launchBlocked(records, role);
+          this.pendingNoteScans.delete(task.task_id);
+          if (scanNotes) {
+            const version = records.reduce((max, record) =>
+              record.version > beforeVersion && record.version <= afterVersion && isWakeNote(record)
+                ? Math.max(max, record.version) : max, 0);
+            if (version > 0) noteWakes.set(task.task_id, { version });
+          }
+          const blocked = launchBlocked(records, role, noteWakes.get(task.task_id));
           dedup = blocked.blocked ? `launched@v${blocked.noteVersion}` : "fresh";
         } catch (e) {
           dedup = `unreadable (${(e as Error).message})`;
+          if (scanNotes) this.pendingNoteScans.set(task.task_id, {
+            version: beforeVersion, status: task.status, waiting_for: task.waiting_for,
+          });
         }
       }
       // Recovery tick: the first tasks[] sight after a
@@ -1478,7 +1530,7 @@ export class Notifier {
           const beforeWf = prev.get(task.task_id)?.waiting_for ?? "none";
           action = beforeWf !== task.waiting_for
             ? `launch (waiting_for edge ${beforeWf} → ${task.waiting_for})`
-            : "none (no waiting_for edge since last poll)";
+            : noteWakes.has(task.task_id) ? "launch (non-ack note edge)" : "none (no waiting_for edge since last poll)";
         }
       } else if (dedup.startsWith("launched@")) {
         action = `none (already launched; ${dedup})`;
@@ -1487,7 +1539,7 @@ export class Notifier {
         // action is not "none" — autoLaunch re-reads the log inside its own
         // dedup stage and acts on that read, not on this poll's failed one.
         const edge = prev !== null
-          && (prev.get(task.task_id)?.waiting_for ?? "none") !== task.waiting_for;
+          && ((prev.get(task.task_id)?.waiting_for ?? "none") !== task.waiting_for || noteWakes.has(task.task_id));
         action = edge
           ? `launch attempt this poll (dedup re-read inside autoLaunch; poll read ${dedup})`
           : `none this poll; an edge would re-read the log (dedup ${dedup})`;
@@ -1497,9 +1549,11 @@ export class Notifier {
           ` | gate=${gate === null ? "pass" : `blocked (${gate})`}` +
           ` | needs_attention=${task.needs_attention}` +
           ` | whitelist=${whitelisted ? "pass" : `fail ('${role}' not in launch_roles)`}` +
-          ` | dedup=${dedup} | action=${action}`,
+          ` | dedup=${dedup} | action=${action}` + (noteWakes.has(task.task_id) ? ` | trigger=non-ack note edge | note-version=v${noteWakes.get(task.task_id)!.version}` : "") +
+          (this.pendingNoteScans.has(task.task_id) ? ` | note-scan=pending after v${this.pendingNoteScans.get(task.task_id)!.version}; retry next eligible poll` : ""),
       );
     }
+    return noteWakes;
   }
 
   /**
@@ -1527,7 +1581,14 @@ export class Notifier {
     }
   }
 
-  private async autoLaunch(task: StateTask, role: string): Promise<void> {
+  private deferNoteWake(task: StateTask, noteWake: NoteWake, reason = "pre-marker version race"): void {
+    this.pendingNoteScans.set(task.task_id, {
+      version: noteWake.version - 1, status: task.status, waiting_for: task.waiting_for,
+    });
+    this.log(`[${task.task_id}] note wake v${noteWake.version} deferred: ${reason}; retry next eligible poll`);
+  }
+
+  private async autoLaunch(task: StateTask, role: string, noteWake?: NoteWake): Promise<void> {
     const request: LaunchRequest = {
       kind: "round",
       task_id: task.task_id,
@@ -1549,19 +1610,30 @@ export class Notifier {
     try {
       records = await this.fullLog(task.task_id, task);
     } catch (e) {
+      if (noteWake !== undefined) this.deferNoteWake(task, noteWake, "log read failed before marker");
       await this.autoLaunchFailed(task, role, e);
       return;
     }
 
+    const blocked = launchBlocked(records, role, noteWake);
+    // A covering marker can have arrived after /state. It already registered
+    // this note attempt, even though binding the now-stale state would fail.
+    if (noteWake !== undefined && blocked.blocked) {
+      await this.autoLaunchSkipped(task, role, blocked.noteVersion);
+      return;
+    }
     let baseVersion: number;
     try {
       baseVersion = bindLaunchBaseVersion(task.version, latestRecordVersion(records));
     } catch (e) {
+      if (noteWake !== undefined && task.version !== undefined && latestRecordVersion(records) > task.version) {
+        this.deferNoteWake(task, noteWake);
+        return;
+      }
       await this.autoLaunchFailed(task, role, e);
       return;
     }
 
-    const blocked = launchBlocked(records, role);
     if (blocked.blocked) {
       await this.autoLaunchSkipped(task, role, blocked.noteVersion);
       return;
@@ -1670,13 +1742,18 @@ export class Notifier {
       // incremental since cached.version + 1 and therefore sees the marker.
       try {
         const after = await this.fullLog(task.task_id);
-        const afterBlocked = launchBlocked(after, role);
+        const afterBlocked = launchBlocked(after, role, noteWake);
         if (afterBlocked.blocked) {
           await this.autoLaunchSkipped(task, role, afterBlocked.noteVersion);
           return;
         }
       } catch {
         // Keep the original append error as the actionable failure.
+      }
+      if (noteWake !== undefined && e instanceof Error &&
+          (("code" in e && e.code === "VERSION_CONFLICT") || e.message.includes("VERSION_CONFLICT"))) {
+        this.deferNoteWake(task, noteWake);
+        return;
       }
       await this.autoLaunchFailed(task, role, e);
       return;
@@ -1998,6 +2075,7 @@ export class Notifier {
    * working signal still marks progress like any unwatched round.
    */
   private async handleDeliveryGiveUp(evt: AgentEvent, taskId: string | null): Promise<void> {
+    const receivedAt = new Date(this.deps.now()).toISOString();
     if (taskId === null) {
       // Same rate-limited degradation as the other unmatched events.
       const agg = this.rateLimitUnmatched(evt);
@@ -2005,7 +2083,7 @@ export class Notifier {
         this.log(`delivery give-up event pane '${evt.pane}' matches no task (4.4 convention broken)${agg}`);
         void this.sendAll({
           title: `TUT ${evt.pane}: prompt delivery gave up`,
-          body: `Prompt delivery to pane ${evt.pane} gave up — ${deliveryGiveUpHint(evt)}`,
+          body: `Prompt delivery to pane ${evt.pane} gave up — ${deliveryGiveUpHint(evt)}; received_at=${receivedAt}`,
         });
       }
       return;
@@ -2043,7 +2121,7 @@ export class Notifier {
         try {
           // Read through HTTP without running another compare/launch cycle.
           // Notes may advance version while the same role round remains active.
-          const latest = await this.deps.fetchState(this.stateUrl);
+          const latest = await this.deps.fetchState(`${this.stateUrl}?include=closed`);
           const enabled = (latest.auto?.remediate ?? (latest.flow_mode === 'auto' ? 'enter-repress' : 'off')) === 'enter-repress';
           stopped = this.closed || this.remediationMode !== 'enter-repress' || !enabled || (latest.degraded ?? []).includes(taskId) ||
             !eligible(latest.tasks.find(t => t.task_id === taskId)) || !eligible(this.snapshot?.get(taskId));
@@ -2076,6 +2154,13 @@ export class Notifier {
         }
       }
     }
+    const notificationKey = JSON.stringify([taskId, evt.pane, evt.agent,
+      evidence?.attempt_id ?? this.snapshot?.get(taskId)?.version ?? 0]);
+    if (this.giveUpNotifications.has(notificationKey)) return;
+    this.giveUpNotifications.add(notificationKey);
+    if (this.giveUpNotifications.size > GIVE_UP_NOTIFICATION_LIMIT) {
+      this.giveUpNotifications.delete(this.giveUpNotifications.values().next().value!);
+    }
     const roleSeg = paneRole !== undefined ? ` for ${paneRole}` : "";
     const via = taskId !== evt.pane ? ` (pane ${evt.pane})` : "";
     const hint = deliveryGiveUpHint(evt);
@@ -2083,7 +2168,7 @@ export class Notifier {
     const title = this.snapshot?.get(taskId)?.title ?? taskId;
     await this.sendAll({
       title: `TUT ${taskId}: prompt delivery gave up`,
-      body: `${title} — prompt delivery${roleSeg}${via} gave up: ${hint}`,
+      body: `${taskId}: ${title} — prompt delivery${roleSeg}${via} gave up: ${hint}; received_at=${receivedAt}`,
       task_id: taskId,
     });
   }
@@ -2629,6 +2714,9 @@ export class Notifier {
     this.earlyGiveUps.clear();
     this.unresolvedWorkingEvents.clear();
     this.pendingApprovalTasks.clear();
+    this.pendingApprovalNotifications.clear();
+    this.pendingNoteScans.clear();
+    this.giveUpNotifications.clear();
     this.degradedAlerted.clear();
     this.vanishedAlerted.clear();
     this.sweepBarriers.clear();

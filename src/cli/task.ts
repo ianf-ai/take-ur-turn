@@ -31,8 +31,8 @@ interface StateSnapshot {
 }
 
 /** GET <hub>/state and status-check; throws on fetch/HTTP failure (callers own the message). */
-async function fetchStateSnapshot(url: string): Promise<StateSnapshot> {
-  const res = await fetch(new URL("/state", url), cliFetchInit({ headers: { Connection: "close" } }));
+async function fetchStateSnapshot(url: string, includeClosed = false): Promise<StateSnapshot> {
+  const res = await fetch(new URL(includeClosed ? "/state?include=closed" : "/state", url), cliFetchInit({ headers: { Connection: "close" } }));
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as StateSnapshot;
 }
@@ -363,7 +363,7 @@ async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Prom
   const intervalMs = intervalSec * 1000;
   let state: StateSnapshot;
   try {
-    state = await fetchStateSnapshot(parsed.url);
+    state = await fetchStateSnapshot(parsed.url, true);
   } catch (e) {
     process.stderr.write(stateFetchErrorLine(parsed.url, e));
     return WATCH_EXIT_ERROR;
@@ -403,7 +403,7 @@ async function runWatch(parsed: Extract<ParsedArgs, { command: "watch" }>): Prom
     await sleepMs(intervalMs);
     let next: StateSnapshot;
     try {
-      next = await fetchStateSnapshot(parsed.url);
+      next = await fetchStateSnapshot(parsed.url, true);
       fetchOk = true;
     } catch (e) {
       // A dead hub reads as "keep waiting", never as a state change (the

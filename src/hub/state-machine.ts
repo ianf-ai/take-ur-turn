@@ -237,11 +237,12 @@ export function foldOntoCursor(
   let prevVersion = cursor.prevVersion;
 
   for (const record of ordered) {
-    // ack: clears warnings accumulated by PRECEDING records
+    // ack / close: clears warnings accumulated by PRECEDING records
     // only. Evaluated before this record's own structural/fold warnings are
     // pushed, so a note can never clear its own anomalies. No-op on a
     // clean state.
-    if (record.content_type === "note" && record.payload.ack === true) {
+    if ((record.content_type === "note" && record.payload.ack === true) ||
+        (record.content_type === "decision" && record.payload.decision === "close")) {
       warnings.length = 0;
     }
 

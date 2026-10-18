@@ -21,6 +21,16 @@ export interface LaunchDecision {
   noteVersion?: number;
 }
 
+/** Internal auto-only context. The caller establishes that this is a new edge;
+ * the shared helper verifies its record before extending the dedup boundary. */
+export interface NoteWake {
+  version: number;
+}
+
+export function isWakeNote(record: ContextRecord): boolean {
+  return record.content_type === "note" && record.payload.ack !== true && record.payload.launch === undefined;
+}
+
 export interface LaunchMarker {
   role: string;
   base_version: number;
@@ -49,15 +59,20 @@ function launchMarkerOf(record: ContextRecord): LaunchMarker | undefined {
 /**
  * Decide whether a role has already been launched in the current round.
  *
- * A launch note is valid only until the next non-note record.  Sorting by
+ * A launch note is valid until the next non-note record, or a verified new
+ * note supplied by the auto consumer. Without that context behavior is unchanged. Sorting by
  * version keeps this pure helper deterministic even if a caller supplies the
  * records out of order, matching state-machine derivation semantics.
  */
-export function launchBlocked(records: readonly ContextRecord[], role: string): LaunchDecision {
+export function launchBlocked(records: readonly ContextRecord[], role: string, noteWake?: NoteWake): LaunchDecision {
   let lastContentVersion = 0;
   let latestMarkerVersion: number | undefined;
 
   const ordered = [...records].sort((a, b) => a.version - b.version);
+  const candidates = noteWake === undefined ? [] : ordered.filter(record => record.version === noteWake.version);
+  // Duplicate versions are corrupt evidence, not an unambiguous wake boundary.
+  // The real /state attention gate also withholds such tasks.
+  if (candidates.length === 1 && isWakeNote(candidates[0]!)) lastContentVersion = candidates[0]!.version;
   for (const record of ordered) {
     if (record.content_type === "note") {
       if (launchMarkerOf(record)?.role === role) latestMarkerVersion = record.version;

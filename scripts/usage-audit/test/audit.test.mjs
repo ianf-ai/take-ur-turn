@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { Store } from '../../../dist/hub/store.js';
 import { startServer } from '../../../dist/hub/server.js';
 import { readConfigFile, writeConfigKey, parseConfigValue } from '../../../dist/common/config.js';
@@ -258,7 +259,13 @@ test('watch off performs zero measurement calls, no lock; on→off halts before 
   assert.equal(calls,0);assert.equal(released,1);
 });
 async function fixture(t) {
-  const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const root=await temp(t);
+  const lockFile=lockPath(canonicalRoot(root));
+  t.after(async () => {
+    await fs.rm(lockFile,{force:true});
+    await fs.rm(lockFile+'.reclaim',{recursive:true,force:true});
+  });
+  const store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
   const {task_id:id}=await store.createTask({title:'One',description:'test',role:'human',creator:'test',flow:'direct'});
   await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:0,route:{agent:'pi',args:[]}}}});
   await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
@@ -321,6 +328,190 @@ test('watch process owns shared lock; second backfill process fails; SIGTERM rel
 test('CLI rejects bad modes, unknown options and invalid dates',()=>{
   for (const args of [[],['--wat'],['--watch','--backfill'],['--since','yesterday'],['--since','2026-02-30T00:00:00Z'],['--watch','--interval-ms','0']]) assert.throws(()=>parse(args));
   assert.equal(parse(['--since',T(1)]).since,Date.parse(T(1)));
+});
+
+// A minimal HTTP peer lets each wait (including an unfinished response body)
+// fail independently. The rescue closes old-code hangs so red runs finish.
+async function auditPeer(t, root, intercept = () => false) {
+  const server=createServer(async (req,res)=>{
+    if (req.method==='GET' && req.url!=='/state') { res.writeHead(405).end(); return; }
+    let body=''; for await (const chunk of req) body+=chunk;
+    const message=body ? JSON.parse(body) : {};
+    const phase=req.url==='/state' ? 'state' : message.params?.name ?? message.method;
+    if (intercept(phase,res)) return;
+    if (phase==='state') { res.setHeader('Content-Type','application/json');res.end(JSON.stringify({hub_root:root}));return; }
+    if (phase==='notifications/initialized') { res.writeHead(202).end();return; }
+    const result=phase==='initialize'
+      ? {protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'test',version:'1'}}
+      : {content:[{type:'text',text:JSON.stringify(phase==='context.list' ? {tasks:[]} : {task_id:'one',versions:[]})}]};
+    res.setHeader('Content-Type','application/json');res.end(JSON.stringify({jsonrpc:'2.0',id:message.id,result}));
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(()=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve));});
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('audit request timeout defaults to 30s, accepts env override and rejects unsafe timer values',()=>{
+  assert.equal(parse(['--backfill'],{}).requestTimeoutMs,30000);
+  assert.equal(parse(['--watch'],{TUT_USAGE_AUDIT_TIMEOUT_MS:'45'}).requestTimeoutMs,45);
+  for (const value of ['', '0','-1','NaN','1.5','2147483648']) {
+    assert.throws(()=>parse(['--backfill'],{TUT_USAGE_AUDIT_TIMEOUT_MS:value}),/TUT_USAGE_AUDIT_TIMEOUT_MS/);
+  }
+});
+
+for (const phase of ['state','initialize','notifications/initialized','context.list','context.read']) {
+  // Notifications have no reply body: the SDK cancels it without reading.
+  for (const partial of phase==='notifications/initialized' ? [false] : [false,true]) test(`audit timeout aborts ${phase} waiting for ${partial?'body':'headers'}`,async t=>{
+    const root=await temp(t),states=[];
+    const url=await auditPeer(t,root,(current,res)=>{
+      if(current!==phase)return false;
+      if(partial){res.writeHead(200,{'Content-Type':'application/json'});res.write('{');}
+      const rescue=setTimeout(()=>res.destroy(),700);res.on('close',()=>clearTimeout(rescue));
+      return true;
+    });
+    const start=Date.now();
+    await assert.rejects(async()=>{
+      const hub=await source(url,root,{requestTimeoutMs:60,onRequest:value=>states.push(value)});
+      if(phase==='context.read')await hub.read('one');else await hub.list();
+    },/HUB_TIMEOUT.*60ms/);
+    assert.ok(Date.now()-start<500,'request must finish at the audit deadline');
+    assert.equal(states[0],true);assert.equal(states.at(-1),false);
+  });
+}
+
+test('audit timeout aborts an MCP SSE response that never delivers its RPC result',async t=>{
+  const root=await temp(t);
+  const url=await auditPeer(t,root,(phase,res)=>{
+    if(phase!=='context.list')return false;
+    res.writeHead(200,{'Content-Type':'text/event-stream'});res.write(': still waiting\n\n');
+    const rescue=setTimeout(()=>res.destroy(),700);res.on('close',()=>clearTimeout(rescue));return true;
+  });
+  const hub=await source(url,root,{requestTimeoutMs:60});
+  await assert.rejects(hub.list(),/HUB_TIMEOUT.*60ms/);
+});
+
+test('watch survives HTTP timeouts, retries at its interval and later completes a pass',async t=>{
+  const root=await temp(t),ac=new AbortController(),lines=[],waits=[];let attempts=0,passes=0;
+  const url=await auditPeer(t,root,(phase,res)=>{
+    if(phase!=='state'||++attempts>2)return false;
+    const rescue=setTimeout(()=>res.destroy(),700);res.on('close',()=>clearTimeout(rescue));return true;
+  });
+  const original=process.stderr.write;process.stderr.write=b=>{lines.push(String(b));return true;};
+  try {
+    await run({root,url,watch:true,requestTimeoutMs:40,intervalMs:7,timeoutMs:3000,signal:ac.signal},
+      {enabled:async()=>true,sleep:async ms=>{waits.push(ms);},report:()=>{passes++;ac.abort();}});
+  } finally {process.stderr.write=original;}
+  assert.equal(passes,1);assert.equal(attempts,3);assert.deepEqual(waits,[7,7]);
+  assert.equal(lines.filter(l=>l.includes('pass failed')).length,1);
+  assert.match(lines.join(''),/HUB_TIMEOUT/);
+  await assert.rejects(fs.stat(lockPath(root)),{code:'ENOENT'});
+});
+
+test('watch heartbeat runs every 60s during a pending request and reports success and consecutive failures',async t=>{
+  const root=await temp(t),ac=new AbortController(),lines=[];let tick,cleared=0,passes=0;
+  const original=process.stderr.write;process.stderr.write=b=>{lines.push(String(b));return true;};
+  try {
+    await run({root,watch:true,intervalMs:1,timeoutMs:Infinity,signal:ac.signal},{
+      enabled:async()=>true,report:()=>{},
+      setInterval:(fn,ms)=>{assert.equal(ms,60000);tick=fn;return 42;},
+      clearInterval:id=>{assert.equal(id,42);cleared++;},
+      collect:async options=>{
+        assert.equal(typeof tick,'function');
+        options.onRequest(true);tick();await Promise.resolve();options.onRequest(false);
+        if(++passes===1)throw Error('first failure');
+        if(passes===2)throw Error('different failure');
+        return [];
+      },
+      sleep:async()=>{tick();if(passes===3)ac.abort();},
+    });
+  } finally {process.stderr.write=original;}
+  const beats=lines.filter(l=>l.startsWith('{')).map(JSON.parse);
+  assert.equal(beats.length,6);assert.equal(cleared,1);
+  assert.deepEqual(beats.map(b=>b.in_request),[true,false,true,false,true,false]);
+  assert.deepEqual(beats.map(b=>b.consecutive_failures),[0,1,1,2,2,0]);
+  assert.ok(beats.every(b=>b.event==='heartbeat'&&Number.isFinite(Date.parse(b.timestamp))));
+  assert.equal(beats[0].last_successful_pass,null);
+  assert.ok(Number.isFinite(Date.parse(beats.at(-1).last_successful_pass)));
+});
+
+test('report failure does not claim a successful pass or reset failure telemetry; releases heartbeat and lock',async t=>{
+  const root=await temp(t),lines=[];let tick,passes=0,cleared=0;
+  const original=process.stderr.write;process.stderr.write=b=>{lines.push(String(b));return true;};
+  try {
+    await assert.rejects(run({root,watch:true,intervalMs:1,timeoutMs:Infinity},{
+      enabled:async()=>true,
+      setInterval:fn=>{tick=fn;return 42;},
+      clearInterval:id=>{assert.equal(id,42);tick();cleared++;},
+      collect:async()=>{if(++passes===1)throw Error('collect failed');return [];},
+      sleep:async()=>{},
+      report:()=>{throw Error('EPIPE');},
+    }),/EPIPE/);
+  } finally {process.stderr.write=original;}
+  const beat=JSON.parse(lines.find(l=>l.startsWith('{')));
+  assert.equal(beat.last_successful_pass,null);
+  assert.equal(beat.consecutive_failures,1);
+  assert.equal(cleared,1);
+  await assert.rejects(fs.stat(lockPath(root)),{code:'ENOENT'});
+});
+
+test('heartbeat timer is absent outside enabled watch and cleared on fatal configuration failure',async t=>{
+  const root=await temp(t);let timers=0,clears=0,checks=0;
+  const deps={setInterval:()=>++timers,clearInterval:()=>clears++,collect:async()=>[],report:()=>{}};
+  await run({root,watch:false},deps);
+  await run({root,watch:true},{...deps,enabled:async()=>false});
+  assert.equal(timers,0);
+  await assert.rejects(run({root,watch:true},{...deps,enabled:async()=>{if(++checks>1)throw Error('bad config');return true;}}),/bad config/);
+  assert.equal(timers,1);assert.equal(clears,1);
+  await assert.rejects(fs.stat(lockPath(root)),{code:'ENOENT'});
+});
+
+async function auditCommand(args, env={}) {
+  const child=spawn(process.execPath,['scripts/usage-audit/run.mjs',...args],{env:{...process.env,...env},stdio:['ignore','pipe','pipe']});
+  let stdout='',stderr='';child.stdout.on('data',b=>stdout+=b);child.stderr.on('data',b=>stderr+=b);
+  const [code]=await once(child,'close');return {code,stdout,stderr};
+}
+test('recover reports dead owner, backfills selected task while off, then recommends watch; no-lock rerun is stable',async t=>{
+  const f=await fixture(t),server=await startServer({root:path.join(f.root,'.context-hub'),port:0});t.after(()=>server.close());
+  const {task_id:other}=await f.store.createTask({title:'Other',description:'test',role:'human',creator:'test'});
+  const file=lockPath(f.root);t.after(()=>fs.rm(file,{force:true}));
+  await fs.writeFile(file,JSON.stringify({pid:99999999,root:f.root}));
+  const args=['--recover','--task',f.id,'--root',f.root,'--url',server.url,'--pi-root',f.options.piRoot,'--codex-root',f.options.codexRoot];
+  const first=await auditCommand(args);assert.equal(first.code,0,first.stderr);
+  assert.match(first.stderr,/99999999/);assert.match(first.stderr,/dead/);assert.match(first.stderr,/--watch/);
+  assert.deepEqual(first.stdout.trim().split('\n').map(JSON.parse).map(r=>r.task_id),[f.id]);
+  const dir=path.join(f.root,'.context-hub/tasks',f.id),snapshot=await loadUsage(dir);
+  assert.equal(snapshot.schema_version,1);assert.equal(snapshot.total.total_tokens,37);
+  assert.equal(await loadUsage(path.join(f.root,'.context-hub/tasks',other)),null);
+  await assert.rejects(fs.stat(file),{code:'ENOENT'});
+  const mtime=(await fs.stat(path.join(dir,'usage.json'))).mtimeMs;
+  const again=await auditCommand(args);assert.equal(again.code,0,again.stderr);assert.match(again.stderr,/absent/);
+  assert.equal((await fs.stat(path.join(dir,'usage.json'))).mtimeMs,mtime);
+});
+test('recover refuses live and unidentifiable owners without touching lock or reading Hub',async t=>{
+  const root=await temp(t),file=lockPath(root);t.after(()=>fs.rm(file,{force:true}));
+  for(const bytes of [JSON.stringify({pid:process.pid,root}),'{',JSON.stringify({pid:-1})]){
+    await fs.writeFile(file,bytes);
+    const result=await auditCommand(['--recover','--root',root,'--url','http://127.0.0.1:1']);
+    assert.equal(result.code,1);assert.match(result.stderr,/audit_locked/);
+    assert.match(result.stderr,/alive|unknown/);assert.doesNotMatch(result.stderr,/backfill complete/);
+    if(bytes.includes(String(process.pid)))assert.match(result.stderr,new RegExp(String(process.pid)));
+    assert.equal(await fs.readFile(file,'utf8'),bytes);assert.equal(result.stdout,'');
+  }
+});
+test('recover releases its lock and emits no success advice when backfill fails',async t=>{
+  const root=await temp(t),file=lockPath(root);t.after(()=>fs.rm(file,{force:true}));
+  await fs.writeFile(file,JSON.stringify({pid:99999999,root}));
+  const url=await auditPeer(t,root,(_phase,res)=>{
+    const rescue=setTimeout(()=>res.destroy(),700);res.on('close',()=>clearTimeout(rescue));return true;
+  });
+  const result=await auditCommand(['--recover','--root',root,'--url',url],{TUT_USAGE_AUDIT_TIMEOUT_MS:'60'});
+  assert.equal(result.code,1);assert.match(result.stderr,/dead/);assert.doesNotMatch(result.stderr,/backfill complete/);
+  assert.match(result.stderr,/HUB_TIMEOUT.*60ms/);
+  await assert.rejects(fs.stat(file),{code:'ENOENT'});
+});
+test('recover is an exclusive CLI mode and accepts optional task filtering',()=>{
+  const options=parse(['--recover','--task','one']);assert.equal(options.recover,true);assert.equal(options.watch,false);assert.equal(options.task,'one');
+  for(const other of [['--watch'],['--backfill'],['--since',T(1)],['--recover']])assert.throws(()=>parse(['--recover',...other]));
 });
 
 test('on→off during a pass stops measurement reads before session discovery',async t=>{

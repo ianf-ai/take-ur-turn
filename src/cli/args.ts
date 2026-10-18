@@ -52,9 +52,11 @@ export type ParsedArgs =
   | { command: "read"; task_id: string; sinceVersion?: number; json: boolean; url?: string }
   | { command: "list"; status?: string; json: boolean; url?: string }
   | { command: "status"; json: boolean; url?: string }
+  | { command: "stats"; root: string; tasks: string[]; json: boolean }
   | { command: "doctor"; root: string; url: string; json: boolean }
   | {
       command: "repair-meta";
+      fromSnapshot?: string;
       task_id: string;
       title?: string;
       description?: string;
@@ -632,7 +634,7 @@ function parseDoctor(args: readonly string[]): ParsedArgs {
  */
 function parseRepairMeta(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, {
-    values: new Set(["title", "description", "creator", "created-at", "flow", "cast", "checkout", "url"]),
+    values: new Set(["from-snapshot", "title", "description", "creator", "created-at", "flow", "cast", "checkout", "url"]),
     repeatable: new Set(["cast"]),
   });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -659,6 +661,7 @@ function parseRepairMeta(args: readonly string[]): ParsedArgs {
   const url = strFlag(t, "url");
   return {
     command: "repair-meta",
+    ...(strFlag(t, "from-snapshot") !== undefined ? { fromSnapshot: strFlag(t, "from-snapshot")! } : {}),
     task_id: taskId,
     ...(title !== undefined ? { title } : {}),
     ...(description !== undefined ? { description } : {}),
@@ -801,6 +804,13 @@ function parseSkill(args: readonly string[]): ParsedArgs {
   return { command: "skill", role: role as SkillRole };
 }
 
+function parseStats(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(["root"]), bools: JSON_BOOLS });
+  if ("error" in t) return { command: "usage", error: t.error };
+  return { command: "stats", root: strFlag(t, "root") ?? path.join(process.env.TUT_HUB_ROOT ?? ".", ".context-hub"),
+    tasks: t.positionals, json: t.bools.has("json") };
+}
+
 function parseInit(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, { values: new Set(), bools: new Set() });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -839,6 +849,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     case "read": return parseRead(rest);
     case "list": return parseList(rest);
     case "status": return parseStatus(rest);
+    case "stats": return parseStats(rest);
     case "doctor": return parseDoctor(rest);
     case "repair-meta": return parseRepairMeta(rest);
     case "recover-record": return parseRecoverRecord(rest);

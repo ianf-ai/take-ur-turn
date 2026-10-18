@@ -432,9 +432,32 @@ describe('historical working reevaluation', () => {
     const f = retryFixture();
     const read = f.read.getMockImplementation()!;
     f.read.mockImplementation(async (pane, ctx) => ({ ...await read(pane, ctx), status }));
-    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none', reason: 'reevaluation-deadline' });
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none',
+      reason: 'reevaluation-deadline: stable-window-not-reached' });
     expect(f.now()).toBe(5000);
     expect(f.enter).not.toHaveBeenCalled();
+  });
+  it.each(['stable-idle', 'idle-then-working'] as const)('reports unmatched input after %s reached the stable window', async status => {
+    const f = retryFixture();
+    const original = JSON.stringify(f.evidence);
+    f.screen.mockResolvedValue('› unrelated input\n\n  ? for shortcuts');
+    const read = f.read.getMockImplementation()!;
+    if (status === 'idle-then-working') f.read.mockImplementation(async (pane, ctx) => ({ ...await read(pane, ctx),
+      status: f.now() >= 2500 ? 'working' : 'idle' }));
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none', result: 'give-up',
+      reevaluated: true, reason: 'reevaluation-deadline: input-tail-not-matched' });
+    expect(f.screen).toHaveBeenCalled();
+    expect(f.now()).toBe(5000);
+    expect(f.enter).not.toHaveBeenCalled(); expect(f.text).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.evidence)).toBe(original);
+  });
+  it('does not call a matching tail unmatched when its read exhausts the deadline', async () => {
+    const f = retryFixture();
+    f.screen.mockImplementation(async () => { await f.sleep(3000); return viewport; });
+    expect(await f.strategy.remediate(f.request)).toMatchObject({ action: 'none', result: 'give-up',
+      reason: 'reevaluation-deadline' });
+    expect(f.now()).toBe(5000);
+    expect(f.enter).not.toHaveBeenCalled(); expect(f.text).not.toHaveBeenCalled();
   });
   it.each(['working', 'unknown', 'error', 'late', 'sequence'] as const)('resets idle stability after %s', async fault => {
     const f = retryFixture();

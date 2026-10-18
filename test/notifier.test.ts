@@ -34,11 +34,13 @@ vi.mock("../src/common/channels.js", () => ({
   },
 }));
 
-import { Notifier, runNotify, spawnLaunch, type StateResponse, type StateTask } from "../src/notifier/notifier.js";
+import { Notifier, runNotify, spawnLaunch, type NotifierDeps, type StateResponse, type StateTask } from "../src/notifier/notifier.js";
 import { giveUpGuidance, parseDeliveryV2 } from "../src/launcher/escalation.js";
 import { launchBlocked } from "../src/launcher/launch.js";
 import { derive } from "../src/hub/state-machine.js";
 import { Store } from "../src/hub/store.js";
+import { HubError } from "../src/hub/hub-client.js";
+import { writeConfigKey, writeFlowMode } from "../src/common/config.js";
 import { startServer } from "../src/hub/server.js";
 import type { AgentRoute, ContextRecord } from "../src/common/types.js";
 import { HANDLERS, parseArgs } from "../src/cli.js";
@@ -80,6 +82,7 @@ function state(
 }
 
 interface HarnessOpts {
+  markLaunched?: NotifierDeps["markLaunched"];
   remediator?: import("../src/remediator.js").Remediator;
   flowMode?: string;
   notify?: unknown;
@@ -119,6 +122,7 @@ interface HarnessOpts {
   /** Close-edge cleanup seam; default records into `cleanups`. */
   cleanup?: (taskId: string) => Promise<void>;
   relay?: (report: import("../src/notifier/host-relay.js").HostStatusReport, notify: unknown) => Promise<void>;
+  log?: (line: string) => void;
 }
 
 const openNotifiers: Notifier[] = [];
@@ -196,10 +200,10 @@ function makeHarness(opts: HarnessOpts = {}) {
       cleanupPanes: opts.cleanup ?? (async (taskId: string) => {
         cleanups.push(taskId);
       }),
-      markLaunched: async (_taskId: string, _role: string, baseVersion: number, _via: "start-next" | "auto"): Promise<unknown> => {
+      markLaunched: opts.markLaunched ?? (async (_taskId: string, _role: string, baseVersion: number, _via: "start-next" | "auto"): Promise<unknown> => {
         opts.order?.push("marker");
         return { version: baseVersion + 1 };
-      },
+      }),
       // Hermetic event→task mapping: tests that don't declare routing get empty maps
       // (the real default reads the three-level chain — cwd L1 + TUT_USER_CONFIG_DIR L2).
       ...(opts.realRouting === true
@@ -213,6 +217,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       now: () => nowMs,
       log: (line: string) => {
         logs.push(line);
+        opts.log?.(line);
       },
       // Done-event sweep (hermetic: never spawns the real herdr — the pane
       // inventory is a fixture; reads are recorded for scoping assertions).
@@ -2013,6 +2018,7 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
     // Missing evidence fields → conservative hint only, composed from the
     // shared single-source guidance (notifier prefix + giveUpGuidance).
     expect(gaveUp?.msg.body).toContain(`${giveUpGuidance("unknown")}`);
+    expect(gaveUp?.msg.body).toContain("reason=unknown — ");
     expect(gaveUp?.msg.body).not.toContain("sits unconsumed in the input box");
     expect(gaveUp?.msg.body).not.toContain("press Enter there manually to start the round");
     expect(hz.fetchCount()).toBe(baselineFetches); // no compare enqueued
@@ -2798,8 +2804,13 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare(); // baseline
     const sentBaseline = h.sent.length; // h.sent is module-global across tests
-    const post = (body: unknown): Promise<{ status: number; body: string }> =>
-      rawRequest(port, "POST", "/agent-event", JSON.stringify(body));
+    let version = 0;
+    const post = async (body: unknown): Promise<{ status: number; body: string }> => {
+      // Each variant represents a separate legacy delivery round.
+      hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: ++version })]));
+      await hz.notifier.requestCompare();
+      return rawRequest(port, "POST", "/agent-event", JSON.stringify(body));
+    };
     const conservative = `${giveUpGuidance("unknown")}`;
     // half pairs — every one must be conservative:
     const heldNoTransport = await post({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", box: "held" });
@@ -2889,7 +2900,12 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
       })),
     ];
     const spy = vi.spyOn(hz.notifier, "receiveEvent");
-    for (const evidence of [...accepted, ...invalid]) {
+    let version = 0;
+    for (const original of [...accepted, ...invalid]) {
+      hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: ++version })]));
+      await hz.notifier.requestCompare();
+      const isAccepted = accepted.includes(original as typeof valid);
+      const evidence = isAccepted ? { ...(original as typeof valid), attempt_id: `attempt-${version}` } : original;
       const before = h.sent.length;
       const response = await rawRequest(port, "POST", "/agent-event", JSON.stringify({
         event: "delivery_giveup", agent: "pi", pane: "t1.executor", delivery_v2: evidence,
@@ -2900,12 +2916,12 @@ describe("event HTTP listener (loopback Host guard mirrors src/http.ts)", () => 
       const bodies = h.sent.slice(before).filter((entry) => entry.name === "desktop").map((entry) => entry.msg.body);
       expect(bodies).toHaveLength(1);
       expect(bodies[0]).toContain(giveUpGuidance());
-      if (accepted.includes(evidence as typeof valid)) {
+      if (isAccepted) {
         expect(spy.mock.calls.at(-1)?.[0].delivery_v2).toEqual(evidence);
         expect(bodies[0]).toContain(`reason=${(evidence as typeof valid).reason}`);
       } else {
         expect(spy.mock.calls.at(-1)?.[0].delivery_v2).toBeUndefined();
-        expect(bodies[0]).not.toContain("reason=");
+        expect(bodies[0]).toContain("reason=unknown");
       }
     }
   });
@@ -3710,6 +3726,61 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
 });
 
 describe("governed readLog against a REAL hub (integration: real Store, real MCP, real /state)", () => {
+  it("two notifiers racing a new note after an old marker append once through the real Hub", async () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-note-wake-"));
+    const root = path.join(tmp, ".context-hub");
+    await writeFlowMode(root, "auto");
+    await writeConfigKey(root, { key: "auto.launch_roles", value: ["executor"] });
+    const running = await startServer({ root, port: 0 });
+    const notifiers: Notifier[] = [];
+    let spawns = 0;
+    let mcpPosts = 0;
+    running.server.on("request", req => {
+      if (req.url === "/mcp" && req.method === "POST") mcpPosts++;
+    });
+    try {
+      const writer = new Store(root);
+      const created = await writer.createTask({ title: "Real note wake", description: "d", creator: "t", role: "human" });
+      const id = created.task_id;
+      await writer.append(id, { role: "architect", content_type: "design", payload: { summary: "design", body: "design" } });
+      await writer.append(id, { role: "human", content_type: "note", payload: {
+        summary: "old launch", body: "old launch", launch: { role: "executor", base_version: 1, via: "auto" },
+      } });
+      for (let i = 0; i < 2; i++) {
+        const notifier = new Notifier({ url: running.url, interval: 5, eventPort: 3998, stallTimeoutMin: 30 }, {
+          launch: async () => { spawns++; return "launched"; },
+          resolveTarget: async () => "pi",
+          loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
+          listPanes: async () => [],
+          listAnchorPanes: async () => [TEST_ANCHOR],
+          log: () => {},
+        });
+        notifiers.push(notifier);
+        openNotifiers.push(notifier);
+      }
+      await Promise.all(notifiers.map(n => n.requestCompare())); // baseline, no wake
+      expect(spawns).toBe(0);
+      await writer.append(id, { role: "host", content_type: "note", payload: { summary: "implementation clarification", body: "Continue with the clarified implementation." } });
+      await Promise.all(notifiers.map(n => n.requestCompare()));
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      const records = (await writer.readTask(id)).versions;
+      const markers = records.filter(r => r.payload.launch !== undefined);
+      expect(markers).toHaveLength(2); // old v2 + exactly one new v4
+      expect(markers[1]).toMatchObject({ version: 4, payload: { launch: { role: "executor", base_version: 3, via: "auto" } } });
+      expect(spawns).toBe(1);
+      await Promise.all(notifiers.map(n => n.requestCompare())); // observe own/winner marker
+      const posts = mcpPosts;
+      await Promise.all(notifiers.map(n => n.requestCompare()));
+      await Promise.all(notifiers.map(n => n.requestCompare()));
+      expect(spawns).toBe(1);
+      expect(mcpPosts).toBe(posts);
+    } finally {
+      await Promise.all(notifiers.map(n => n.close()));
+      await running.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // No readLog/readLogSince injection here: the notifier runs its DEFAULT
   // wiring — resident HubSession + context.read since_version — against a
   // real startServer with a real Store. This pins the inclusive wire
@@ -4146,4 +4217,513 @@ describe('notifier remediation policy and pluggable interface', () => {
     }
   });
 
+});
+
+describe("0.8.4 note wake and approval aggregation", () => {
+  it.each([undefined, null, "unknown", "not-a-date"])("does not invent approval age for pending_since=%s", async pending_since => {
+    const hz = makeHarness();
+    hz.set(state([]));
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "unknown-age", status: "pending_approval", waiting_for: "human",
+      ...(pending_since !== undefined ? { pending_since } : {}) })]));
+    await hz.notifier.requestCompare();
+    const messages = h.sent.filter(s => s.name === "desktop");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.msg.body).toContain("pending: unknown");
+  });
+
+  const note = (version: number, payload: Partial<ContextRecord["payload"]> = {}): ContextRecord => ({
+    version, task_id: "t1", role: "human", content_type: "note", timestamp: U2,
+    payload: { summary: "clarification", body: "clarification", ...payload },
+  });
+
+  it.each(["human", "host", "architect"])("a new %s note wakes past an old executor marker exactly once", async role => {
+    const records = [
+      { ...note(1), role: "architect", content_type: "design" },
+      note(2, { launch: { role: "executor", base_version: 1, via: "auto" } }),
+    ];
+    const t = task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2 });
+    const opts = { flow_mode: "auto", auto: ALL_ROLES };
+    const markers: number[] = [];
+    const hz = makeHarness({ readLog: async () => [...records], markLaunched: async (_id, markerRole, base, via, projection) => {
+      expect(base).toBe(records.at(-1)!.version);
+      markers.push(base);
+      records.push(note(base + 1, { launch: { role: markerRole, base_version: base, via, ...projection } }));
+      hz.set(state([{ ...t, version: base + 1 }], opts));
+      return { version: base + 1 };
+    } });
+    hz.set(state([t], opts));
+    await hz.notifier.requestCompare();
+    records.push({ ...note(3), role });
+    hz.set(state([{ ...t, version: 3 }], opts));
+    await Promise.all([hz.notifier.requestCompare(), hz.notifier.requestCompare()]);
+    await hz.flush();
+    expect(markers).toEqual([3]);
+    expect(hz.launches).toHaveLength(1);
+    await hz.notifier.requestCompare(); // own launch marker
+    await hz.notifier.requestCompare(); // quiet cycle 1
+    await hz.notifier.requestCompare(); // quiet cycle 2
+    expect(markers).toEqual([3]);
+    records.push({ ...note(5), role });
+    hz.set(state([{ ...t, version: 5 }], opts));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(markers).toEqual([3, 5]);
+    expect(hz.launches).toHaveLength(2);
+  });
+
+  function noteRig(reader = "full", hooks: {
+    read?: (count: number, records: ContextRecord[]) => void;
+    mark?: (records: ContextRecord[]) => void;
+    launch?: HarnessOpts["launch"];
+  } = {}) {
+    const records = [
+      { ...note(1), role: "architect", content_type: "design" },
+      note(2, { launch: { role: "executor", base_version: 1, via: "auto" } }),
+    ];
+    const t = task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2 });
+    const opts = { flow_mode: "auto", auto: ALL_ROLES };
+    let reads = 0;
+    const bases: number[] = [];
+    const read = async (since = 0) => {
+      hooks.read?.(++reads, records);
+      return records.filter(r => r.version >= since);
+    };
+    const hz = makeHarness({
+      ...(reader === "full" ? { readLog: () => read() }
+        : { readLogSince: async (_id: string, since: number) => ({ versions: await read(since) }) }),
+      ...(hooks.launch ? { launch: hooks.launch } : {}),
+      markLaunched: async (_id, role, base, via, projection) => {
+        hooks.mark?.(records);
+        if (base !== records.at(-1)!.version) throw new HubError("VERSION_CONFLICT", "version advanced");
+        bases.push(base);
+        records.push(note(base + 1, { launch: { role, base_version: base, via, ...projection } }));
+        sync();
+        return { version: base + 1 };
+      },
+    });
+    const sync = () => hz.set(state([{ ...t, version: records.at(-1)!.version }], opts));
+    sync();
+    return { ...hz, records, bases, sync, reads: () => reads, t, opts };
+  }
+
+  it.each(["full", "incremental"])("%s read ahead of state defers an uncovered note until the next poll", async reader => {
+    const hz = noteRig(reader, { read: (count, records) => {
+      if (count === 2) records.push(note(4, { ack: true }));
+    } });
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3));
+    hz.sync(); // /state v3; read returns an additional ack at v4
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([]);
+    expect(hz.logs.some(l => l.includes("note wake v3 deferred"))).toBe(true);
+    hz.sync();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.bases).toEqual([4]); // bind full log, not N
+    expect(hz.launches).toHaveLength(1);
+    await hz.notifier.requestCompare();
+    const reads = hz.reads();
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([4]);
+    if (reader === "incremental") expect(hz.reads()).toBe(reads);
+  });
+
+  it.each(["full", "incremental"])("%s failed scan recovers past an old marker without another write", async reader => {
+    const hz = noteRig(reader, { read: count => { if (count === 2) throw new Error("transient read failure"); } });
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3));
+    hz.sync();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([]);
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.bases).toEqual([3]);
+    expect(hz.launches).toHaveLength(1);
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([3]);
+  });
+
+  it.each(["full", "incremental"])("%s scan selects the maximum actual note, excluding ack and marker tails", async reader => {
+    const hz = noteRig(reader);
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3), note(4), note(5, { ack: true }),
+      note(6, { launch: { role: "reviewer", base_version: 5, via: "auto" } }));
+    hz.sync();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.bases).toEqual([6]);
+    expect(hz.logs.find(l => l.includes("trigger=non-ack note edge"))).toContain("note-version=v4");
+    expect(hz.launches).toHaveLength(1);
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([6]);
+  });
+
+  it.each(["ack", "other-role", "winner"])("actual pre-launch recheck handles a concurrent %s", async kind => {
+    const hz = noteRig("full", { read: (count, records) => {
+      if (count === 3) records.push(note(4, kind === "ack" ? { ack: true }
+        : { launch: { role: kind === "winner" ? "executor" : "reviewer", base_version: 3, via: "start-next" } }));
+    } });
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3));
+    hz.sync();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([]);
+    hz.sync();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.bases).toEqual(kind === "winner" ? [] : [4]);
+    expect(hz.launches).toHaveLength(kind === "winner" ? 0 : 1);
+    expect(titlesMatching("auto launch failed")).toHaveLength(0);
+  });
+
+  it.each([
+    ["full", "ack"], ["incremental", "ack"],
+    ["full", "other-role"], ["incremental", "other-role"],
+    ["full", "winner"], ["incremental", "winner"],
+  ])("%s marker conflict with %s uses the note boundary on recheck", async (reader, kind) => {
+    let once = true;
+    const hz = noteRig(reader, { mark: records => {
+      if (!once) return;
+      once = false;
+      records.push(note(4, kind === "ack" ? { ack: true }
+        : { launch: { role: kind === "winner" ? "executor" : "reviewer", base_version: 3, via: "start-next" } }));
+    } });
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3));
+    hz.sync();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([]);
+    expect(hz.launches).toHaveLength(0);
+    hz.sync();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.bases).toEqual(kind === "winner" ? [] : [4]);
+    expect(hz.launches).toHaveLength(kind === "winner" ? 0 : 1);
+    expect(titlesMatching("auto launch failed")).toHaveLength(0);
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual(kind === "winner" ? [] : [4]);
+  });
+
+  it.each(["attention", "whitelist", "manual", "degraded", "vanished", "round", "role", "rewind", "human"])("drops a deferred wake after %s", async change => {
+    let conflict = true;
+    const hz = noteRig("incremental", { mark: records => {
+      if (conflict) { conflict = false; records.push(note(4, { ack: true })); }
+    } });
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3));
+    hz.sync();
+    await hz.notifier.requestCompare();
+    expect(hz.logs.some(l => l.includes("note wake v3 deferred"))).toBe(true);
+    const reads = hz.reads();
+    hz.set(["degraded", "vanished"].includes(change) ? state([], { ...hz.opts, ...(change === "degraded" ? { degraded: ["t1"] } : {}) })
+      : state([{ ...hz.t, version: change === "rewind" ? 2 : 4,
+        ...(change === "attention" ? { needs_attention: true } : {}),
+        ...(change === "round" ? { status: "revising" } : {}),
+        ...(change === "role" ? { waiting_for: "agent:reviewer", status: "reviewing" } : {}),
+        ...(change === "human" ? { waiting_for: "human", status: "pending_approval" } : {}),
+      }], { ...hz.opts, ...(change === "manual" ? { flow_mode: "manual" } : {}),
+        ...(change === "whitelist" ? { auto: { launch_roles: [] } } : {}) }));
+    await hz.notifier.requestCompare();
+    if (["attention", "whitelist", "manual", "degraded", "vanished", "human"].includes(change)) expect(hz.reads()).toBe(reads);
+    // Stay in the new round/role; restoring a role is a real waiting_for edge.
+    if (change === "role" || change === "round" || change === "human") {
+      await hz.notifier.requestCompare();
+    } else {
+      // A rewind stays rewound; otherwise only restore the eligible gates.
+      if (change === "rewind") hz.records.splice(2);
+      hz.sync();
+      await hz.notifier.requestCompare();
+    }
+    await hz.notifier.requestCompare();
+    // A role change legitimately launches the newly waiting reviewer once;
+    // the old executor note must not create any additional attempt.
+    expect(hz.bases).toEqual(change === "role" ? [4] : []);
+    if (change === "role") expect(hz.launches).toEqual([{ taskId: "t1", role: "reviewer", agent: "pi" }]);
+    expect((hz.notifier as unknown as { pendingNoteScans: Map<string, unknown> }).pendingNoteScans.size).toBe(0);
+  });
+
+  it("an appended marker consumes the wake even when the launcher fails", async () => {
+    const launch = vi.fn(async () => { throw new Error("delivery failed"); });
+    const hz = noteRig("incremental", { launch });
+    await hz.notifier.requestCompare();
+    hz.records.push(note(3));
+    hz.sync();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    expect(hz.bases).toEqual([3]);
+    expect(launch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["full", "note"], ["incremental", "note"],
+    ["full", "ack"], ["incremental", "ack"],
+    ["full", "launch"], ["incremental", "launch"],
+  ])("retries a failed %s log scan for %s without another write or duplicate wake", async (reader, kind) => {
+    const records = [note(1)];
+    let failReads = 0;
+    const order: string[] = [];
+    const read = async (since = 0) => {
+      if (failReads > 0) { failReads--; throw new Error("transient log failure"); }
+      return records.filter(record => record.version >= since);
+    };
+    const hz = makeHarness({ order, ...(reader === "full"
+      ? { readLog: () => read() }
+      : { readLogSince: async (_taskId: string, since: number) => ({ versions: await read(since) }) }) });
+    const t = task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 });
+    hz.set(state([t], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    records.push(note(2, kind === "ack" ? { ack: true }
+      : kind === "launch" ? { launch: { role: "executor", base_version: 1, via: "auto" } } : {}));
+    failReads = 1;
+    hz.set(state([{ ...t, version: 2 }], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toHaveLength(0);
+    expect(hz.logs.at(-1)).toContain("note-scan=pending after v1");
+    // No further writes: the normal /state snapshot is already v2 here.
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    const expected = kind === "note" ? 1 : 0;
+    expect(hz.launches).toHaveLength(expected);
+    expect(order.filter(item => item === "marker")).toHaveLength(expected);
+    expect(hz.logs.filter(line => line.includes("trigger=non-ack note edge"))).toHaveLength(expected);
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(expected);
+    expect(order.filter(item => item === "marker")).toHaveLength(expected);
+  });
+
+  it.each(["attention", "whitelist", "manual", "degraded", "round", "rewind"])("drops failed note scans after %s instead of replaying stale notes", async change => {
+    const records = [note(1)];
+    let fail = false;
+    let reads = 0;
+    const hz = makeHarness({ readLog: async () => {
+      reads++;
+      if (fail) throw new Error("transient log failure");
+      return records;
+    } });
+    const opts = { flow_mode: "auto", auto: ALL_ROLES };
+    const t = task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 });
+    hz.set(state([t], opts));
+    await hz.notifier.requestCompare();
+    records.push(note(2));
+    fail = true;
+    hz.set(state([{ ...t, version: 2 }], opts));
+    await hz.notifier.requestCompare();
+    expect(hz.logs.at(-1)).toContain("note-scan=pending after v1");
+    const readCount = reads;
+    // Withholding must discard the retry without reading the log. Same-role
+    // round changes and a rewound version discard the old interval too.
+    hz.set(change === "degraded" ? state([], { ...opts, degraded: ["t1"] })
+      : state([{ ...t, version: change === "rewind" ? 1 : 2,
+        ...(change === "attention" ? { needs_attention: true } : {}),
+        ...(change === "round" ? { status: "revising" } : {}) }],
+        { ...opts, ...(change === "whitelist" ? { auto: { launch_roles: [] } } : {}),
+          ...(change === "manual" ? { flow_mode: "manual" } : {}) }));
+    await hz.notifier.requestCompare();
+    if (!["round", "rewind"].includes(change)) expect(reads).toBe(readCount);
+    fail = false;
+    // Keep the current round/version when restoring eligible conditions.
+    hz.set(state([{ ...t, version: change === "rewind" ? 1 : 2,
+      ...(change === "round" ? { status: "revising" } : {}) }], opts));
+    await hz.notifier.requestCompare();
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(0);
+    expect(hz.logs.filter(line => line.includes("trigger=non-ack note edge"))).toHaveLength(0);
+  });
+
+  it("does not turn a failed baseline read into a historical note wake", async () => {
+    let fail = true;
+    const hz = makeHarness({ readLog: async () => {
+      if (fail) throw new Error("baseline failure");
+      return [note(1), note(2)];
+    } });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 2 })],
+      { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    fail = false;
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(0);
+    expect(hz.logs.some(line => line.includes("note-scan=pending"))).toBe(false);
+  });
+
+  it("a new non-ack note wakes an unchanged agent wait once, before action logs the note edge", async () => {
+    const records = [note(1)];
+    const hz = makeHarness({ readLog: async () => records });
+    const t = task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 });
+    hz.set(state([t], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    expect(hz.launches).toHaveLength(0); // baseline never wakes
+    records.push(note(2));
+    hz.set(state([{ ...t, version: 2 }], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(1);
+    expect(hz.logs.some(line => line.includes("action=launch (non-ack note edge)"))).toBe(true);
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(1);
+  });
+
+  it.each(["ack", "launch", "attention", "whitelist", "manual", "dedup", "non-note", "human"])("does not launch for %s", async kind => {
+    const records = [note(1)];
+    const hz = makeHarness({ readLog: async () => records });
+    const t = task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1,
+      needs_attention: kind === "attention", ...(kind === "human" ? { status: "pending_approval", waiting_for: "human" } : {}) });
+    const opts = { flow_mode: kind === "manual" ? "manual" : "auto", auto: kind === "whitelist" ? { launch_roles: [] } : ALL_ROLES };
+    hz.set(state([t], opts));
+    await hz.notifier.requestCompare();
+    records.push(note(2, kind === "ack" ? { ack: true } : kind === "launch" ? { launch: { role: "executor" } } : {}));
+    if (kind === "dedup") records.push(note(3, { launch: { role: "executor", base_version: 2, via: "auto" } }));
+    if (kind === "non-note") records[1]!.content_type = "design";
+    hz.set(state([{ ...t, version: kind === "dedup" ? 3 : 2 }], opts));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(0);
+    if (["ack", "launch", "non-note"].includes(kind)) expect(hz.logs.some(line => line.includes("trigger=non-ack note edge"))).toBe(false);
+    if (kind === "dedup") expect(hz.logs.some(line => line.includes("trigger=non-ack note edge"))).toBe(true);
+    if (["attention", "whitelist"].includes(kind)) expect(hz.logs.some(line => line.includes("action=withheld"))).toBe(true);
+  });
+
+  it("merges multiple new notes and a waiting_for edge into one launch", async () => {
+    const records: ContextRecord[] = [];
+    const hz = makeHarness({ readLog: async () => records });
+    hz.set(state([task({ task_id: "t1", version: 0 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    records.push({ ...note(1), content_type: "design" }, note(2), note(3));
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 3 })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.launches).toHaveLength(1);
+  });
+
+  it("one notification includes the complete approval queue, original ages and new markers; quiet polls stay silent", async () => {
+    const hz = makeHarness();
+    const old = task({ task_id: "old", status: "pending_approval", waiting_for: "human", pending_since: U1 });
+    hz.set(state([old]));
+    await hz.notifier.requestCompare();
+    hz.at(Date.parse(U3));
+    const next = task({ task_id: "next", status: "pending_approval", waiting_for: "human", pending_since: U2 });
+    const third = task({ task_id: "third", status: "pending_approval", waiting_for: "human", pending_since: U3 });
+    hz.set(state([{ ...old, updated_at: U3 }, next, third]));
+    await hz.notifier.requestCompare();
+    const desktop = h.sent.filter(s => s.name === "desktop");
+    expect(desktop).toHaveLength(1);
+    const msg = desktop[0]!.msg;
+    expect(msg.body).toContain("old: title of old");
+    expect(msg.body).toContain("pending: 600s");
+    expect(msg.body).toContain("pending: 300s");
+    expect(msg.body).toContain("[\u65b0] next:");
+    expect(msg.body).toContain("[\u65b0] third:");
+    expect(msg.body).not.toContain("[\u65b0] old:");
+    expect(msg).toMatchObject({ task_id: "next", task_ids: ["old", "next", "third"] });
+    hz.at(Date.parse(U3) + 1000);
+    await hz.notifier.requestCompare();
+    expect(h.sent.filter(s => s.name === "desktop")).toHaveLength(1);
+  });
+
+  it.each([false, true])("retries an unsent approval batch without repeating Host relay (relay fails=%s)", async (relayFails) => {
+    let failOnce = true;
+    const relay = vi.fn(async () => { if (relayFails) throw new Error("host unavailable"); });
+    const hz = makeHarness({ relay, log: line => {
+      if (failOnce && line.includes("[later] 2 transitions merged")) {
+        failOnce = false;
+        throw new Error("later task output failed");
+      }
+    } });
+    const first = task({ task_id: "first", version: 1 });
+    const later = task({ task_id: "later", version: 1 });
+    hz.set(state([first, later]));
+    await hz.notifier.requestCompare();
+    const pending = { ...first, status: "pending_approval", waiting_for: "human", version: 2, updated_at: U2 };
+    const laterAfter = { ...later, version: 3, updated_at: U2 };
+    hz.set(state([pending, laterAfter]));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(hz.logs.some(line => line.includes("compare failed unexpectedly: later task output failed"))).toBe(true);
+    expect(titlesMatching("waiting for human")).toHaveLength(0);
+    expect(relay).toHaveBeenCalledTimes(1);
+    expect(relay.mock.calls[0]).toEqual([{ task_id: "first", status: "pending_approval", waiting_for: "human" }, undefined]);
+    await hz.notifier.requestCompare(); // same snapshot: the unsent edge still needs delivery
+    await hz.flush();
+    expect(titlesMatching("waiting for human")).toHaveLength(1);
+    expect(relay).toHaveBeenCalledTimes(1);
+    expect(h.sent.find(s => s.msg.title.includes("waiting for human"))!.msg.body).toContain("[新] first:");
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(titlesMatching("waiting for human")).toHaveLength(1);
+    expect(relay).toHaveBeenCalledTimes(1);
+    expect(hz.logs.filter(line => line.includes("host status relay failed"))).toHaveLength(relayFails ? 1 : 0);
+
+    hz.set(state([{ ...pending, status: "reviewing", version: 3, updated_at: U3 }, laterAfter]));
+    await hz.notifier.requestCompare();
+    hz.set(state([{ ...pending, version: 4, updated_at: U3 }, laterAfter]));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(relay).toHaveBeenCalledTimes(2); // a real departure/re-entry is a new Host edge
+    expect(titlesMatching("waiting for human")).toHaveLength(2);
+  });
+
+  function alertEvidence(attemptId: string) {
+    return {
+      schema: 2, attempt_id: attemptId, pane_id: "pane-1", reason: "deadline",
+      status_before: "idle", status_last: "idle", status_error: null, status_flip: false,
+      submit_confirmed: false, attribution: "unavailable", text_transport: "sent", text_error: null,
+      enter_transport: "sent", enter_error: null, text_calls: 1, enter_calls: 1,
+      budget_ms: 10, elapsed_ms: 10, total_elapsed_ms: 10, last_query_sequence: 3,
+      detector_source: null, detector_age_ms: null, server_epoch: null, agent_generation: null,
+    };
+  }
+
+  it("give-up notifies desktop with task/reason/time and suppresses repeated v2 attempts with remediation off", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor", version: 1 })]));
+    hz.at(Date.parse(U2));
+    await hz.notifier.requestCompare();
+    const evidence = alertEvidence("alert-1");
+    expect(parseDeliveryV2(evidence)).not.toBeNull();
+    const event = { event: "delivery_giveup" as const, agent: "pi", pane: "t1.executor", delivery_v2: evidence };
+    hz.notifier.receiveEvent(event);
+    hz.notifier.receiveEvent(event); // simultaneous duplicates too
+    await hz.flush(100);
+    const messages = () => h.sent.filter(s => s.name === "desktop" && s.msg.title.includes("prompt delivery gave up"));
+    expect(messages()).toHaveLength(1);
+    expect(messages()[0]!.msg.body).toContain("t1:");
+    expect(messages()[0]!.msg.body).toContain("reason=deadline");
+    expect(messages()[0]!.msg.body).toContain("reason=deadline — ");
+    expect(messages()[0]!.msg.body).toContain(`received_at=${U2}`);
+    hz.notifier.receiveEvent({ ...event, delivery_v2: { ...evidence, attempt_id: "alert-2" } });
+    await hz.flush(100);
+    expect(messages()).toHaveLength(2);
+  });
+
+  it("bounds give-up deduplication, retains recent duplicates and clears it on close", async () => {
+    const hz = makeHarness();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    const keys = (hz.notifier as unknown as { giveUpNotifications: Set<string> }).giveUpNotifications;
+    const send = async (attemptId: string) => {
+      hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", delivery_v2: alertEvidence(attemptId) });
+      await hz.flush();
+    };
+    for (let i = 0; i < 1025; i++) await send(`alert-${i}`);
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1025);
+    expect(keys.size).toBe(1024);
+    await send("alert-1024"); // recent duplicate is still suppressed
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1025);
+    await send("alert-0"); // oldest attempt was evicted; alerts again
+    expect(titlesMatching("prompt delivery gave up")).toHaveLength(1026);
+    expect(keys.size).toBe(1024);
+    await hz.notifier.close();
+    expect(keys.size).toBe(0);
+  });
 });

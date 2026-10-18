@@ -22,6 +22,7 @@ export interface Notification {
   title: string;
   body: string;
   task_id?: string;
+  task_ids?: string[];
 }
 
 export interface Channel {
@@ -203,11 +204,12 @@ function createWebhookChannel(url: string): Channel {
   return {
     name: "webhook",
     async send(msg: Notification): Promise<void> {
-      const payload: { title: string; body: string; task_id?: string } = {
+      const payload: Notification = {
         title: msg.title,
         body: msg.body,
       };
       if (msg.task_id !== undefined) payload.task_id = msg.task_id;
+      if (msg.task_ids !== undefined) payload.task_ids = msg.task_ids;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
       try {

@@ -335,6 +335,18 @@ describe("webhook channel", () => {
     }
   });
 
+  it("preserves aggregated approval task_ids in webhook JSON", async () => {
+    const cap = await startCapture();
+    try {
+      const webhook = first(createChannels({ channels: ["webhook"], webhook_url: `http://127.0.0.1:${cap.port}/h` }));
+      const message = { title: "approval queue", body: "two pending tasks", task_ids: ["one", "two"] };
+      await webhook.send(message);
+      expect(JSON.parse(cap.requests[0]!.body)).toEqual(message);
+    } finally {
+      await cap.close();
+    }
+  });
+
   it("omits task_id from the payload when absent", async () => {
     const cap = await startCapture();
     try {

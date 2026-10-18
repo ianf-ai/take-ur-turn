@@ -178,6 +178,7 @@ describe("watch handler (three-state exit codes, /state stubbed)", () => {
     const code = await main(["watch", "t1", "--interval", "0"]);
 
     expect(code).toBe(2);
+    expect(vi.mocked(fetch).mock.calls.every(call => String(call[0]).endsWith("/state?include=closed"))).toBe(true);
     expect(io.out()).toContain("terminal state: closed");
   });
 

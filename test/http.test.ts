@@ -70,9 +70,8 @@ describe("GET /state (frozen shape)", () => {
     const body = (await res.json()) as { flow_mode: string; tasks: Record<string, unknown>[] };
 
     expect(body.flow_mode).toBe("manual");
-    // Frozen top-level shape (plus the two additive optional keys):
-    // with no notify/auto configured, flow_mode + tasks + owning hub_root.
-    expect(Object.keys(body).sort()).toEqual(["flow_mode", "hub_root", "tasks"]);
+    // Frozen fields plus explicit completeness; notify/auto remain optional.
+    expect(Object.keys(body).sort()).toEqual(["flow_mode", "hub_root", "tasks", "truncated"]);
     expect(Array.isArray(body.tasks)).toBe(true);
     expect(body.tasks).toHaveLength(1);
 
@@ -81,12 +80,15 @@ describe("GET /state (frozen shape)", () => {
       "cast",
       "flow",
       "needs_attention",
+      "pending_since",
+      "round_count",
       "status",
       "task_id",
       "title",
       "updated_at",
       "version",
       "waiting_for",
+      "warnings",
     ]);
     expect(entry.task_id).toBe("routing-task");
     expect(entry.title).toBe("Routing Task");
@@ -782,4 +784,66 @@ it('built CLI create returns spec and checkout hints through the real Hub with e
   expect(result.warning).toContain('第 1 条为空或占位');
   expect(result.warning).toContain('does not exist yet');
   expect((await store.readTask(result.task_id)).versions).toEqual([]);
+});
+
+describe("state awareness HTTP projection", () => {
+  it("explicitly reports that both active and historical views are untruncated", async () => {
+    for (const suffix of ["", "?include=closed"]) {
+      const response = await fetch(`${baseUrl}/state${suffix}`);
+      expect(await response.json()).toMatchObject({ truncated: false });
+    }
+  });
+
+  const readState = async (suffix = "") => await (await fetch(`${baseUrl}/state${suffix}`)).json() as { tasks: import("../src/hub/store.js").TaskListEntry[] };
+  it("retires closed tasks by default, exposes explicit history and preserves every record", async () => {
+    const before = await store.readTask("routing-task");
+    await store.append("routing-task", { role: "human", content_type: "decision",
+      payload: { summary: "close", body: "retire", decision: "close" } });
+    const active = await readState();
+    expect(active.tasks).toEqual([]);
+    const history = await readState("?include=closed");
+    expect(history.tasks).toHaveLength(1);
+    expect(history.tasks[0]!).toMatchObject({ task_id: "routing-task", status: "closed",
+      needs_attention: false, waiting_for: "none", warnings: [], pending_since: null, round_count: 0 });
+    expect((await store.readTask("routing-task")).versions.slice(0, before.versions.length)).toEqual(before.versions);
+    const head = await fetch(`${baseUrl}/state?include=closed`, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect((await readState("?include=typo")).tasks).toEqual([]);
+  });
+
+  it("projects warning source versions and stable approval timing through warm/cold Store reads", async () => {
+    const warningState = await readState();
+    expect(warningState.tasks[0]!.warnings).toEqual([{ version: 1, code: "OUT_OF_TABLE" }]);
+    const mutable = (await store.snapshotTasks()).tasks.find(t => t.task_id === "routing-task")!;
+    mutable.warnings![0]!.version = 999;
+    mutable.warnings!.length = 0;
+    expect((await store.snapshotTasks()).tasks.find(t => t.task_id === "routing-task")!.warnings)
+      .toEqual([{ version: 1, code: "OUT_OF_TABLE" }]);
+    const { task_id } = await store.createTask({ title: "approval age", description: "test", creator: "test", role: "human", flow: "direct" });
+    await store.append(task_id, { role: "executor", content_type: "code_changes", payload: { summary: "done", body: "done" } });
+    await store.append(task_id, { role: "reviewer", content_type: "review", payload: { summary: "pass", body: "pass", verdict: "pass" } });
+    const readEntry = async () => (await readState()).tasks.find((t: { task_id: string }) => t.task_id === task_id);
+    const pending = await readEntry();
+    expect(pending).toMatchObject({ round_count: 1, pending_since: (await store.readTask(task_id)).versions[1]!.timestamp });
+    await store.append(task_id, { role: "human", content_type: "note", payload: { summary: "info", body: "info" } });
+    expect(await readEntry()).toMatchObject({ pending_since: pending!.pending_since, round_count: 1 });
+    const cold = await new Store(root).snapshotTasks();
+    expect(cold.tasks.find(t => t.task_id === task_id)).toMatchObject({ pending_since: pending!.pending_since, round_count: 1 });
+  });
+});
+
+it("/state ignores repository-operation descriptions and preserves targeted record repair", async () => {
+  const created = await store.createTask({ title: "diagnostic sheets", description: "## 验收场景\n1. works\n开 PR", creator: "human", role: "human", flow: "direct" });
+  const readState = async () => {
+    const body = await (await fetch(`${baseUrl}/state`)).json() as { tasks: Array<Record<string, unknown>> };
+    return body.tasks.find(task => task.task_id === created.task_id)!;
+  };
+  expect(await readState()).toMatchObject({ version: 0, status: "implementing", needs_attention: false, waiting_for: "agent:executor", warnings: [] });
+  await store.append(created.task_id, { role: "Reviewer", content_type: "note", payload: { summary: "s", body: "typo" } });
+  expect(await readState()).toMatchObject({ version: 1, warnings: expect.arrayContaining([
+    expect.objectContaining({ code: "NON_CANONICAL_ROLE", location: { field: "role" }, correction: { root_version: 1, round: 1, limit: 2, exhausted: false }, supportedFixes: expect.any(Array) }),
+  ]) });
+  await store.append(created.task_id, { role: "reviewer", content_type: "note", payload: { summary: "s", body: "correct role", ref_version: 1 } });
+  expect(await readState()).toMatchObject({ needs_attention: false, warnings: [], waiting_for: "agent:executor" });
 });

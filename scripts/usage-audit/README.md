@@ -16,16 +16,17 @@ node scripts/usage-audit/run.mjs --backfill --root /path/to/project --url http:/
 node scripts/usage-audit/run.mjs --since 2026-09-01T00:00:00Z --task task-id --url http://127.0.0.1:3003
 node dist/cli.js config set usage_audit on --root /path/to/project/.context-hub
 node scripts/usage-audit/run.mjs --watch --root /path/to/project --url http://127.0.0.1:3003
+node scripts/usage-audit/run.mjs --recover --root /path/to/project --url http://127.0.0.1:3003 --task task-id
 node dist/cli.js config set usage_audit off --root /path/to/project/.context-hub
 ```
 
-Exactly one of `--watch`, `--since ISO8601`, `--backfill` is required. Unknown
+Exactly one of `--watch`, `--since ISO8601`, `--backfill`, `--recover` is required. Unknown
 or duplicate flags and invalid dates fail. `--root` means **project root** for
 this harness (unlike `tut config --root`, which names `.context-hub`). The
 HTTP Hub must already be running; default URL is `http://127.0.0.1:3001`.
 Specify the correct port: `/state.hub_root` must match the canonical project
 root. No offline fallback or direct meta/record parsing occurs. All task
-lists and full record histories come through the existing Hub MCP client.
+lists and full record histories come through the Hub's existing MCP tools.
 
 Optional flags:
 
@@ -39,10 +40,17 @@ Optional flags:
 - `--interval-ms N`: positive integer, default 5000.
 - `--timeout-ms N`: optional positive integer watch lifetime; default unbounded.
   At the deadline no new pass starts; a pass already in progress completes.
-  Each Hub request has the existing client's bounded timeout.
+
+All modes bound each Hub read (`/state`, MCP list and each task history) to
+30 seconds, including initialization, response headers and response body/SSE.
+Set `TUT_USAGE_AUDIT_TIMEOUT_MS` to an integer in 1..2147483647 to override this
+request deadline; invalid values fail visibly. This is separate from the
+`--timeout-ms` watch lifetime. A timed-out read aborts its HTTP I/O and reports
+`HUB_TIMEOUT` with the endpoint and deadline. Watch uses the existing failure
+logging and interval retry path; one-shot modes exit nonzero and release the lock.
 
 `usage_audit` is a top-level `"off" | "on"` config key, absent means off.
-It controls **only watch**. Explicit since/backfill requests run while off.
+It controls **only watch**. Explicit since/backfill/recover requests run while off.
 Starting watch while off reads configuration once, then returns without Hub,
 private session, usage, lock or timer work. Bad configuration stops visibly.
 Running watch checks the switch each pass, between measurement operations,
@@ -64,6 +72,51 @@ identical pass failures are logged on the first occurrence and then every
 deduplicated: a task or diagnostic re-emits only when its content changes
 (first sight, a changed snapshot, or a different unresolved set), so a
 permanently-unresolved task cannot flood the log either.
+
+While enabled, watch emits a JSON heartbeat to **stderr every 60 seconds**,
+independently of pass completion and retry sleeps:
+
+```json
+{"event":"heartbeat","timestamp":"2026-10-16T00:01:00.000Z","last_successful_pass":null,"consecutive_failures":2,"in_request":true}
+```
+
+`last_successful_pass` is the completion time of the most recent successful
+pass (null until the first); `consecutive_failures` counts all failed passes
+since then and resets on success. `in_request` covers the current Hub read,
+including its MCP handshake and body consumption. The heartbeat timer is
+removed when watch ends; disabled watch and one-shot modes emit no heartbeat.
+Missing heartbeats indicate that the watcher is no longer responding. A
+pending HTTP read still emits heartbeats: detect lack of progress using the
+success time, failure count and request flag as well as missing heartbeats.
+
+## Recovery and diagnosis
+
+If usage stops advancing, inspect `.context-hub/usage-audit.log` (for watchers
+started by `tut up`) or the manual watcher's stderr for heartbeats and
+`HUB_TIMEOUT` / pass failures. Verify that the Hub is running at the specified
+URL and belongs to the project root, then run:
+
+```sh
+node scripts/usage-audit/run.mjs --recover --root /path/to/project --url http://127.0.0.1:3003
+# Optional: add --task TASK_ID to limit repaired snapshots.
+```
+
+Recovery reports the lock path, recorded pid and status (`dead`, `alive`,
+`unknown`, or `absent`) as a JSON line on stderr. Only a provably dead owner
+(ESRCH) permits automatic stale-lock removal; recovery reuses the normal
+reclaim mutex and liveness rechecks, then holds the lock throughout backfill.
+A live or unidentifiable owner is refused before Hub/session reads. Inspect
+the reported process and stop it manually if appropriate, then retry;
+**recovery never kills a process or clears a live lock**. Unknown owners and
+interrupted `.reclaim` recovery require manual inspection as described below.
+
+With no live writer, recovery runs the same backfill as `--backfill`, including
+optional `--task` filtering and cross-task ambiguity checks. It runs while
+`usage_audit` is off. Reports stay on stdout; after successful backfill and lock
+release, stderr recommends inspecting coverage and rerunning `--watch` with
+the same root, URL and session roots (enable `usage_audit` first if off).
+Backfill failure releases the acquired lock and exits nonzero without success
+advice. Recovery does not start watch automatically or change configuration.
 
 ## Attribution and measurement
 

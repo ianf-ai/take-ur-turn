@@ -134,8 +134,19 @@ Usage:
       check; --json prints the machine-readable DoctorReport (the same
       report the text rendering draws from). Defaults: --root .context-hub
       (relative to cwd), --url the default hub.
+  tut stats [task_id ...] [--root <dir>] [--json]
+      Offline, read-only statistics from local records and usage sidecars via
+      Store. Default batch = all tasks; task IDs select a batch. Project scope
+      is excluded. --root names the .context-hub directory (default under
+      TUT_HUB_ROOT or cwd). No sweeping, writes, launches, or Hub required.
+      Reports strict review pass rate, first-review pass rate, revisions,
+      current waiting blockers, per-role deliveries, and tokens BY AGENT.
+      Missing/incomplete/invalid usage and degraded tasks are explicit; no
+      reviews = null/n/a. Pi and Codex token totals use different native
+      accounting. --json includes metric definitions and coverage.
   tut repair-meta <task_id> [--title <t>] [--description <d>] [--creator <c>] [--created-at <iso>]
                   [--flow <full|direct|solo>] [--cast <role=command>]... [--checkout <current|worktree:path>] [--url <u>]
+                  [--from-snapshot <file>]
       A-class storage repair (system-design 4.3): rebuild a corrupt/missing
       meta.json through the RUNNING hub (POST /repair-meta, its single-writer
       queue — same discipline as tut mode; a second process writing meta
@@ -146,6 +157,13 @@ Usage:
       full. A readable meta is refused (repair is not an overwrite path),
       records are never touched, and the repair itself does not close the
       task — decide close afterwards if that was the intent.
+      --from-snapshot reads a previously saved Notifier /state JSON response
+      and prefills title/flow/cast for this task. Explicit flags override
+      snapshot fields (cast overrides per role). An unavailable/invalid or
+      unmatched snapshot warns and keeps manual fields/defaults. The Notifier
+      currently keeps its snapshot in memory; this flag requires a retained
+      file, not a live /state fetch after corruption. Check its provenance
+      and age before repair; snapshots do not supply description or checkout.
   tut recover-record <task_id> <record_file> --from <path> [--source <text>] [--url <u>]
       B-class recovery registration (system-design 4.3): register the
       recovered ORIGINAL bytes of a corrupt record file. Fetch them from an

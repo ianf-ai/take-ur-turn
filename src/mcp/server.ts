@@ -108,7 +108,8 @@ export function createMcpServer(store: Store): McpServer {
         "{kind: \"current\"} preserves the anchor checkout; {kind: \"worktree\", path, ref?} points at a " +
         "pre-created worktree (path required — ref alone never launches, it may only annotate a path). " +
         "TUT does not create or remove git worktrees automatically; create warns (non-blocking) when the " +
-        "path does not exist yet.",
+        "path does not exist yet. Side effects: writes task metadata; the Notifier may subsequently spawn an " +
+        "agent pane and append a launch note in auto mode. Creation itself does not launch or clean up panes.",
       inputSchema: {
         title: z.string(),
         description: z.string(),
@@ -159,7 +160,8 @@ export function createMcpServer(store: Store): McpServer {
         "\"fail_code\" | \"fail_design\" (blocked_external: code fine, verification blocked on external conditions " +
         "— derives like pass) — these exact strings drive the state machine; any other value still lands but sets " +
         "needs_attention. Returns { task_id, version, status, needs_attention, warnings? } for task scope, or " +
-        "{ task_id, version } for the project scope.",
+        "{ task_id, version } for the project scope. Side effects: appends an immutable record and updates metadata; " +
+        "the derived change may cause the Notifier to notify, spawn an agent pane, append a launch note, or clean up round panes.",
       inputSchema: {
         task_id: z.string(),
         role: z.string(),
@@ -192,7 +194,8 @@ export function createMcpServer(store: Store): McpServer {
         "after that version for incremental sync. Returns { task_id, title, description, flow, cast?, status, versions } — " +
         "description is the task's requirement text from creation; flow is always present for task scope (normalized to " +
         "\"full\"), cast and checkout appear only when the task was created with them; the project scope has no " +
-        "status/flow/cast/checkout keys.",
+        "status/flow/cast/checkout keys. Side effects: read-only; no record or metadata writes, pane spawning, " +
+        "launch notes, or cleanup.",
       inputSchema: {
         task_id: z.string(),
         // Deliberately tighter than the Store contract (>= 0): record versions start at 1, so 0 is meaningless as a filter.
@@ -214,7 +217,8 @@ export function createMcpServer(store: Store): McpServer {
         "List all tasks with their derived status (optionally filtered by status). Returns { tasks: [...] } where " +
         "each entry carries task_id/title/updated_at/status/waiting_for/needs_attention/version plus flow (normalized " +
         "\"full\"), cast? and checkout? when present; the project scope entry carries scope \"project\" instead of " +
-        "a status and is only shown unfiltered.",
+        "a status and is only shown unfiltered. Side effects: read-only; no record or metadata writes, pane spawning, " +
+        "launch notes, or cleanup.",
       inputSchema: {
         status: STATUS_ENUM.optional(),
       },
@@ -231,7 +235,9 @@ export function createMcpServer(store: Store): McpServer {
       description:
         "Record a human decision — approve, reject, or close — on a task; this is the manual approval gate. " +
         "Appends a decision record (role \"human\", by as agent) and returns { task_id, status }; close is valid " +
-        "from any state, approve/reject apply at pending_approval.",
+        "from any state, approve/reject apply at pending_approval. Side effects: appends an immutable human decision " +
+        "and updates metadata; the Notifier may notify, spawn an agent pane and append a launch note after reject, " +
+        "or clean up round panes on handoff/closure.",
       inputSchema: {
         task_id: z.string(),
         decision: z.enum(["approve", "reject", "close"]),

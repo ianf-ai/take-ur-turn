@@ -162,8 +162,8 @@ interface StateView {
   notify?: unknown;
 }
 
-async function getState(baseUrl: string): Promise<StateView> {
-  const res = await fetch(`${baseUrl}/state`);
+async function getState(baseUrl: string, includeClosed = false): Promise<StateView> {
+  const res = await fetch(`${baseUrl}/state${includeClosed ? "?include=closed" : ""}`);
   expect(res.ok).toBe(true);
   return (await res.json()) as StateView;
 }
@@ -351,7 +351,8 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
       // close: waiting_for → "none" (human pressed the key) — NO notification.
       const closed = await hubDecide(stack.baseUrl, { task_id: id, decision: "close", by: "alice", reason: "merged" });
       expect(closed.status).toBe("closed");
-      const final = await stateEntry(stack.baseUrl, id);
+      expect((await getState(stack.baseUrl)).tasks.some(t => t.task_id === id)).toBe(false);
+      const final = (await getState(stack.baseUrl, true)).tasks.find(t => t.task_id === id);
       expect(final).toMatchObject({ status: "closed", waiting_for: "none", needs_attention: false });
 
       // One poll cycle margin past the final write: still exactly four posts.

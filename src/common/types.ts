@@ -221,11 +221,24 @@ export type WarningCode =
   | "NON_CANONICAL_ROLE"
   | "VERSION_DUPLICATE"; // repeated version: fold by version order anyway
 
+/** Append-only repair suggestion; fields describe the NEW record, never an edit. */
+export interface SupportedFix {
+  field: string;
+  instruction: string;
+  example?: string | number;
+  record: { role: string; content_type: string; ref_version?: number };
+}
+
 export interface Warning {
   /** Version of the record responsible for the warning. */
   version: number;
   code: WarningCode;
   message?: string;
+  /** Field/section in the triggering record. */
+  location?: { field: string; section?: string };
+  supportedFixes?: SupportedFix[];
+  /** Consecutive failed evaluations of this lint, unrelated records do not count. */
+  correction?: { root_version: number; round: number; limit: 2; exhausted: boolean };
 }
 
 /** Derivation output, system-design 3.1/3.2. needs_attention is an overlay flag, not an 8th status. */
