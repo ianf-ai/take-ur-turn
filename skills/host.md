@@ -19,16 +19,16 @@
 | CLI-only | 使用条件或降级入口 |
 |---|---|
 | `tut start-next <id> [--force\|--fresh]` | auto 白名单内由 Notifier 投递；manual 或白名单外且 CLI 被拦时交人执行 |
+| `tut up` | 探活失败时的电源操作，Host 可代行；现状需 herdr 锚点（见「herdr 工位操作」），会话不具备时交人 |
 | `tut watch <id>` | 不可用时依靠通知与人唤起，再用 context.read 增量核对 |
 | `tut status` | 可用 context.list 代替 |
 | `tut config get/set` | 本地配置入口，Hub 未起也可用 |
 | `tut mode` | Hub 在线时经 POST /mode 修改模式 |
 | `tut assign <role> <agent>` | 本地项目级 workspace.json 入口 |
-| `tut up` | 仅由人执行 |
 
 ## 驱动循环
 
-前置条件：人的驱动委托已明确。发起时的驱动委托覆盖普通轮次 start-next；approve、reject、close、ack、延后拍板与登记仍须可追溯的明确授权。
+前置条件：人的驱动委托已明确。发起时的驱动委托覆盖普通轮次 start-next；approve、reject、close、ack、延后拍板与登记仍须可追溯的明确授权。探活、配置读取、状态核对、start-next、汇报整理等机械环节默认由 Host 代行。
 
 1. 按①检查环境。
 2. 按②发起任务。
@@ -40,15 +40,14 @@
 ### ① 环境检查
 
 1. 用 `context.list` 或 `tut list` 探活 Hub。
-2. 若探活失败，请人执行 `tut up`（Host 不代跑；环境恢复前不进入②）。
+2. 若探活失败，Host 先尝试代行 `tut up`（机械操作；现状约束见「herdr 工位操作」——当前需 herdr 锚点，会话不具备时代行失败）；仍不可用时向人报告，恢复前不进入②。
 3. 读取 `tut config get flow_mode`。
 4. 读取 `tut config get auto.launch_roles`。
-5. 核对 Notifier 专属 pane 与通知到达情况。
-6. 若存在 pane 布局问题，向人转述（不代管 pane 或布局）。
+5. 核对通知到达情况。
 
 ### ② 发起任务
 
-前置条件：环境可用；范围冻结、flow、阵容、大设计与并行选择按以下判据。以下各流程按所列条件进入。
+前置条件：环境可用；需求、并行度、退出标准已按「开工盘点与范围冻结」与人显式对齐；flow、阵容、大设计与并行选择按以下判据。以下各流程按所列条件进入。
 
 选择判据：
 
@@ -79,13 +78,13 @@
 1. 按本节「选择判据」判断是否需要 TUT。
 2. 若判断不确定，交人确认。
 3. 若无需 TUT，结束建任务流程。
-4. 按「开工范围冻结」起草 title 与 description（验收明确，解法以既有设计指针引用；flow、cast 不进入 description）。
+4. 按「开工盘点与范围冻结」与人盘点三件事，起草 title 与 description（验收明确，解法以既有设计指针引用；flow、cast 不进入 description）。
 5. 按本节「选择判据」选择 flow。
 6. 与人商定本任务 cast（不指定时沿用默认阵容）。
 7. 若需 `tut assign`，向人说明对后续无 cast 任务的影响。
 8. 用 `command -v <agent>` 核对候选 CLI 的可拉起性。
-9. 若人点名的 agent 仅有 pane、无 CLI，向人说明可拉起性差异（在场性可用 `herdr pane list` 核对）。
-10. 若候选缺失，与人商定替代阵容（换将，或由人自管该 pane；full 覆盖 architect、executor、reviewer，direct 覆盖 executor、reviewer，solo 覆盖 executor；cast 点名者也须核对；未补齐不创建）。
+9. 若人点名的 agent 仅有在场会话、无 CLI，向人说明可拉起性差异。
+10. 若候选缺失，与人商定替代阵容（换将，或由人自管该会话；full 覆盖 architect、executor、reviewer，direct 覆盖 executor、reviewer，solo 覆盖 executor；cast 点名者也须核对；未补齐不创建）。
 11. 若 full 大任务的三角色为同一 agent，披露独立视角缺失。
 12. 核对 checkout 指向已准备的工作区（worktree 由人事先准备，Host 不执行 Git）。
 13. 创建任务（`role=human`、creator 为人名；授权来源为人的驱动委托）。
@@ -124,9 +123,23 @@ tut create --title "<title>" --description "<四段范围冻结正文>" --creato
 8. 按正常交付与评审流程推进集成任务。
 9. 将最终集成结果交仓库层处理（Host 不建、合并、提交或推送分支）。
 
-### 开工范围冻结
+### 开工盘点与范围冻结
 
-前置条件：每次 create 均使用以下四段；没有非目标或依赖时填「无」。四段 description 与人的原始记录构成范围基线，worker 记录只是提案，局部批准不扩大整体授权。
+前置条件：每次 create 前与人显式对齐盘点三件事，未对齐不创建；对齐结果按四段 description 冻结，没有非目标或依赖时填「无」。四段 description 与人的原始记录构成范围基线，worker 记录只是提案，局部批准不扩大整体授权。
+
+盘点三件事：
+
+1. 需求：对齐要改变的行为（当前问题、目标行为；既有解法以设计指针引用）。
+2. 并行度：对齐任务并行与依赖先后（单开或拆分并行、各单元先后顺序与隔离方式；拆分与集成按「并行开发与集成编排」获批后执行）。
+3. 退出标准：对齐验收场景与完成判据（场景可观察、判据可判定）。
+
+危险操作问清：
+
+1. 盘点时问清本任务涉及的危险操作；Host 不内置危险操作清单。
+2. 问清结果写入 description「明确不做」段（「不经人授权不得执行的操作」属于不做项）——description 是全部角色接手必读、验收核对持续引用的范围基线；不得写入任何执行时无人查阅的登记处。
+3. Host 与 worker 执行中碰到清单内操作，先向人请示；未获同意不执行（worker 经 note 请示）。
+
+范围冻结：
 
 1. 按模板填写 description（既有设计用指针引用；flow、cast 使用建任务参数）。
 2. 逐项核对验收场景的可判定性（create warning 不替代人工核验）。
@@ -176,7 +189,7 @@ tut create --title "<title>" --description "<四段范围冻结正文>" --creato
 2. 若同一受判角色连续二次 fail（计数对象为受判角色，不是发布 verdict 的 Reviewer），向人呈现历史轮次、两轮卡点及处置选项（close 后重建换 cast、同任务 `--fresh`、原班再试）。
 3. 若人选重建，在新 description「要改变的行为」段首引用「承接 <原 task_id>，完整档案 `tut read <原 task_id>`」（仅单向指针）。
 4. 获明确同意后，执行人选定的处置（重建按②；不预设新任务 flow 或阵容）。
-5. 若启动失败且 pane 问题已处理，执行 `tut start-next <task_id> --force`（ALREADY_LAUNCHED 的启动锚点不由 ack 解除）。
+5. 若启动失败且阻碍已处理，执行 `tut start-next <task_id> --force`（ALREADY_LAUNCHED 的启动锚点不由 ack 解除）。
 
 状态观察：
 
@@ -201,7 +214,7 @@ tut create --title "<title>" --description "<四段范围冻结正文>" --creato
 5. 若 cast 三角色为同一 agent，披露「三角色同一 agent（同一模型），review 为同模型自查、缺独立视角」。
 6. 若尚无明确决定，等待人表态（不代答、不默认通过、不绕道 publish decision）。
 7. 获明确同意后，调用 `context.decide` 或 `tut decide <task_id> --decision <approve|reject|close> --by <人名>`（reject 的 reason 为人的理由）。
-8. approve 后，提示 close 可回收任务 pane（close 仍须另获同意）。
+8. approve 后，提示人可 close 收尾（close 仍须另获同意）。
 
 延后手续：
 
@@ -240,6 +253,18 @@ needs_attention：
 2. 若需在原任务汇报进展，仅发布 note。
 3. 若角色卡住或质量可疑，呈请人裁决（换阵容、打回或 close；Host 不代写 design、code_changes、review、revision）。
 4. 代行人工操作前，核对人的明确授权（decision、ack、延后拍板及登记均在此列）。
-5. 仅通过获授权的 CLI 或 MCP 入口执行编排（Host 不执行 Git，不代管 pane、布局或 `tut up`；launch note 由系统写入）。
+5. 仅通过获授权的 CLI 或 MCP 入口执行编排（Host 不执行 Git；launch note 由系统写入）。
+
+## herdr 工位操作
+
+本节收纳 herdr 工位的 pane、tab 操作与现状约束；其余正文不依赖本节内容。
+
+1. 启动锚点与 `tut up`：`tut up` 当前需 herdr 锚点（在交互 herdr pane 内执行，或设 `HERDR_PANE_ID` 为有效 pane id）。具备该条件的会话（含被委托的 Host）可代行；不具备时交人执行。
+2. tab 落位：`tut up` 的系统 tab 锚定锚点 pane 所在 workspace；锚点缺失或无法解析时回落聚焦 workspace（stderr 提示）。任务 pane 由启动器在锚点 workspace 的新 tab 诞生，不抢焦点。
+3. pane 标签约定：任务工作 pane 标签为 `<task_id>.<role>`，一律追加 hub 根摘要后缀（`-` 加 8 位十六进制摘要，单 rig 同样带后缀）；tab 标签由命名模板渲染（含 task、role、agent）；系统 pane 标签为 `tut-hub`、`tut-notify`，同带该后缀；不带后缀的裸标签仅见于旧布局兼容情形；轮次反查按含后缀标签定位 pane。
+4. pane 核对与转述：agent 在场性用 `herdr pane list` 核对；通知经 Notifier 专属 pane 到达，核对 pane 与通知到达情况；pane 布局问题向人转述，Host 不代管 pane 或布局；人自管该会话即人自管该 pane。
+5. launch note 的 pane 细节：launch note 由系统写入、不可改删，在启动前记录轮次启动意图与路由（role、base_version、via、route、target_kind 等）供审计；它不记录 pane id，实际投递的 pane 按第 3 条标签约定用 `herdr pane list` 核对。
+6. close 回收：任务 close 时启动器回收该任务 pane。
+7. 启动补位前置：`tut start-next --force` 补位前，先核对先前的 pane 阻碍（如标签冲突、落位不符）已处理。
 
 按本文件执行 Host 工作。

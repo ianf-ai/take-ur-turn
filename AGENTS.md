@@ -53,7 +53,7 @@ take-ur-turn/
 | Architect | 需求分析、技术方案、架构决策 | Codex CLI (GPT) |
 | Executor | 编码实现、按 review 反馈修改 | Pi (GLM) |
 | Reviewer | 代码与方案 Review | Codex CLI (GPT) |
-| Host（驱动者） | 主会话驱动：环境检查、任务发起与范围冻结、轮次推进、审批点汇报、异常处置与纠偏落实——驱动不代工 | 任一主会话 Agent（ZCode / codex 等）；担任时加载 `skills/host.md` |
+| Host（驱动者） | 环境检查、开工盘点与任务发起、轮次推进、审批点汇报、异常处置与纠偏落实——驱动不代工 | 任一 Agent；担任时加载 `skills/host.md` |
 
 **approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门；approve 后的修改诉求以新任务承载。
 

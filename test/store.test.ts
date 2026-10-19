@@ -1641,7 +1641,7 @@ describe("spec diagnostic contract", () => {
   });
   it("uses all four headings from the actual host freeze template (each mutation breaks parity)", () => {
     const host = readFileSync(new URL('../skills/host.md', import.meta.url), 'utf8');
-    const template = host.split('### 开工范围冻结')[1]!.match(/```markdown\n([\s\S]*?)```/u)![1]!;
+    const template = host.split('### 开工盘点与范围冻结')[1]!.match(/```markdown\n([\s\S]*?)```/u)![1]!;
     const headings = (text: string) => [...text.matchAll(/^## (.+)$/gmu)].map(m => m[1]);
     expect(headings(template)).toEqual([...TASK_SPEC_HEADINGS]);
     for (const heading of TASK_SPEC_HEADINGS) {
