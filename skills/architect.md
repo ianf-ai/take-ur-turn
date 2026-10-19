@@ -77,8 +77,6 @@ tut publish <id> --role architect --content-type design --summary "…" --payloa
 | 增量读 | `"since_version": N` | `--since-version N` |
 | 发布 design、note | `context.publish {…}` | `tut publish <id> --role architect --content-type design\|note --summary "…" (--body …\|--payload-file …) [--expected-version N]` |
 
-建任务入口见 `skills/host.md`。
-
 ## 关闭条件
 
 1. 检查「对实现的要求」是否均可由测试或检查证实、证伪（不能仅写「妥善处理错误」等无法核销的表述）。
