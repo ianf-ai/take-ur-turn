@@ -689,6 +689,30 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
 // like they do against the default 3001 — no mocks of our own code (the file's
 // standing rule).
 describe("--url real chain (context commands against an ephemeral-port hub)", () => {
+  it("solo create starts implementing and supports delivery and reject/rework without a design round", async () => {
+    const baseUrl = await startHubOnly();
+    const io = captureIo();
+    cleanups.push(() => io.restore());
+    expect(await main(["create", "--title", "solo direct start", "--description", "d", "--creator", "t", "--role", "human", "--flow", "solo", "--url", baseUrl])).toBe(0);
+    const created = JSON.parse(io.out().trim()) as { task_id: string; status: string; version: number };
+    expect(created).toMatchObject({ status: "implementing", version: 0 });
+    const taskId = created.task_id;
+    expect(await stateEntry(baseUrl, taskId)).toMatchObject({ status: "implementing", waiting_for: "agent:executor", pending_since: null, round_count: 0 });
+
+    await publish(baseUrl, taskId, "executor", "code_changes", { summary: "first delivery", body: "verified" });
+    expect(await stateEntry(baseUrl, taskId)).toMatchObject({ status: "pending_approval", round_count: 1, pending_since: expect.any(String) });
+    await hubDecide(baseUrl, { task_id: taskId, decision: "reject", by: "tester" });
+    expect(await stateEntry(baseUrl, taskId)).toMatchObject({ status: "implementing", pending_since: null, round_count: 1 });
+
+    await publish(baseUrl, taskId, "architect", "design", { summary: "reference", body: "optional rework guidance" });
+    expect(await stateEntry(baseUrl, taskId)).toMatchObject({ status: "implementing", needs_attention: false, pending_since: null, round_count: 1 });
+    expect((await hubRead(baseUrl, taskId)).versions.map(record => record.content_type)).toEqual(["code_changes", "decision", "design"]);
+    await publish(baseUrl, taskId, "executor", "code_changes", { summary: "rework delivery", body: "verified again" });
+    expect(await stateEntry(baseUrl, taskId)).toMatchObject({ status: "pending_approval", needs_attention: false, round_count: 2, pending_since: expect.any(String) });
+    await hubDecide(baseUrl, { task_id: taskId, decision: "approve", by: "tester" });
+    expect((await hubRead(baseUrl, taskId)).status).toBe("approved");
+  });
+
   it("create → read → list round-trip via --url", async () => {
     const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-urlchain-"));
     const root = path.join(tmp, ".context-hub");

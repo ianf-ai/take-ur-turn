@@ -208,7 +208,8 @@ describe("context.create flow (system-design 4.1)", () => {
       flow: "solo",
     });
     const soloId = solo.json?.task_id as string;
-    await call("context.publish", { task_id: soloId, role: "architect", content_type: "design", payload: { summary: "d", body: "d" } });
+    expect(solo.isError).toBe(false);
+    expect(solo.json?.status).toBe("implementing");
     const pub = await call("context.publish", { task_id: soloId, role: "executor", content_type: "code_changes", payload: { summary: "c", body: "c" } });
     expect(pub.isError).toBe(false);
     expect(pub.json?.status).toBe("pending_approval"); // review phase skipped
@@ -216,6 +217,17 @@ describe("context.create flow (system-design 4.1)", () => {
     const plain = await call("context.create", { title: "Plain MCP Task", description: "d", creator: "tester", role: "architect" });
     expect(plain.isError).toBe(false);
     expect(plain.json?.status).toBe("designing");
+  });
+
+  it("flow solo: design is a reference record retained in the log without a transition or warning", async () => {
+    const created = await call("context.create", { title: "Solo reference", description: "d", creator: "tester", role: "human", flow: "solo" });
+    const task_id = created.json?.task_id as string;
+    const published = await call("context.publish", { task_id, role: "architect", content_type: "design", payload: { summary: "reference", body: "optional guidance" } });
+    expect(published.isError).toBe(false);
+    expect(published.json).toMatchObject({ version: 1, status: "implementing", needs_attention: false });
+    const read = await call("context.read", { task_id });
+    expect(read.json?.status).toBe("implementing");
+    expect(read.json?.versions).toMatchObject([{ content_type: "design", payload: { body: "optional guidance" } }]);
   });
 
   it("rejects an out-of-enum flow as an input-validation tool error", async () => {

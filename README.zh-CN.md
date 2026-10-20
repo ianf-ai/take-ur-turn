@@ -21,7 +21,7 @@ TUT 的答案：把过程记忆放进 Hub（写入永不因流程被拒），把
 - **Append-only 记录**：Agent 经 5 个 MCP 工具（create / publish / read / list / decide）往任务日志追加记录——design、code_changes、review、revision、note、decision。记录永不删除，任何零参与者凭日志可复原全部决策与理由
 - **派生状态**：任务状态（走到哪、该谁动）不存储、不执法，是记录序列经纯函数算出的视图。表外组合（如 solo 流程里发 review）照样落盘，但会置 `needs_attention` 提醒人处置
 - **审批门**：review pass 后派生为 `pending_approval`，需要**人**发一条 decision 记录（approve / reject）才继续。close 在任意状态有效——人有权随时终止任务
-- **流程变体**：建任务时选 `--flow full|direct|solo`——full 走完整循环；solo 小改动免审不免批（跳过 review，直达审批）；direct 面向「简单但触风险面（核心路径/门禁/公开面，错了贵）」的改动——给 solo 加一轮 review
+- **流程变体**：建任务时选 `--flow full|direct|solo`——full 走完整循环；solo 小改动免设计轮与 review（create 即 implementing，直达审批，免审不免批）；direct 面向「简单但触风险面（核心路径/门禁/公开面，错了贵）」的改动——给 solo 加一轮 review
 - **manual / auto 流转**：manual（默认）该谁动时通知人，人按键启动下一个；auto 模式 Notifier 经启动器直接拉起下一个 Agent（按 role 白名单分级信任），人只做 decide；无论哪档，都可由 coding-agent Host 会话代你跑全程（见下文会话驱动）
 
 ## 架构
@@ -249,8 +249,8 @@ Reviewer 读上下文 → Review（每条问题带关闭条件）→ 发布 revi
 
 上图是默认流程 **full**。建任务时可选变体（create 时确定、落库后不可变）：
 
-- **solo**：小改动免审——跳过 review，code_changes 直接派生 pending_approval 由人 approve / reject。免审不免批：approve 仍是人的门
-- **direct**：简单改动触及风险面（核心路径/门禁/公开面，错了贵）时，给 solo 加一轮 review——建任务即 implementing（repo 已有现成设计可供施工），review 与人审批照常
+- **solo**：小改动免设计轮与 review——create 即 implementing，design 记录仅作参考（不转态），code_changes 直接派生 pending_approval 由人 approve / reject。免审不免批：approve 仍是人的门
+- **direct**：简单改动触及风险面（核心路径/门禁/公开面，错了贵）时，给 solo 加一轮 review——与 solo 同样建任务即 implementing（repo 已有现成设计可供施工），review 与人审批照常
 
 ## 配置
 

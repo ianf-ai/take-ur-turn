@@ -18,7 +18,7 @@
 1. 从任务日志读取 `flow`（建任务后不可变，缺省 `full`）。
 2. 若为 `full`，按当前角色流程接手（已有 design 作为实现与评审依据）。
 3. 若为 `direct`，按 description 的设计指针接手（无需等待或自发补 design 记录）。
-4. 若为 `solo`，按角色流程交付 design 或 code_changes（免 review；reject 后仍交付 code_changes）。
+4. 若为 `solo`，Executor 按 description 接手并交付 code_changes。
 5. 若发现 flow 选错，将 close 重建方案交人裁决。
 
 ### 流程与状态

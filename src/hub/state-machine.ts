@@ -33,11 +33,11 @@ export const WAITING_FOR_BASE: Record<Status, WaitingFor> = {
   closed: "none",
 };
 
-/** Initial status of an empty sequence per flow (direct starts implementing). */
+/** Initial status of an empty sequence per flow (direct/solo start implementing). */
 const INITIAL_STATUS: Record<Flow, Status> = {
   full: "designing",
   direct: "implementing",
-  solo: "designing",
+  solo: "implementing",
 };
 
 /**
@@ -94,10 +94,10 @@ function fold(status: Status, record: ContextRecord, flow: Flow): { status: Stat
 
   switch (record.content_type) {
     case "design":
-      // direct: design in implementing is an in-table REFERENCE record — no
+      // direct/solo: design in implementing is an in-table REFERENCE record — no
       // transition, no warning; in every other state it is out-of-table (the
       // same out-of-table semantics as full's non-designing states).
-      if (flow === "direct") {
+      if (flow === "direct" || flow === "solo") {
         return status === "implementing"
           ? { status, warning: null }
           : { status, warning: "OUT_OF_TABLE" };
@@ -211,7 +211,7 @@ export interface FoldCursor {
   warnings: Warning[];
 }
 
-/** Cursor of an empty sequence per flow (direct starts implementing). */
+/** Cursor of an empty sequence per flow (direct/solo start implementing). */
 export function initialCursor(flow: Flow): FoldCursor {
   return { status: INITIAL_STATUS[flow], prevVersion: 0, warnings: [] };
 }

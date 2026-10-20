@@ -60,7 +60,7 @@ const STATUS_ENUM = z.enum([
  * Workflow variant enum (system-design 3.1): full = design → implement →
  * review → human approval; direct = design already exists, start at
  * implementing (design records become reference notes); solo = small change,
- * review phase skipped (code_changes goes straight to human approval).
+ * starts implementing, design/review phases skipped (code_changes goes straight to human approval).
  */
 const FLOW_ENUM = z.enum(["full", "direct", "solo"]);
 
@@ -94,11 +94,12 @@ export function createMcpServer(store: Store): McpServer {
       description:
         "Create a new task in the shared Context Hub and get its task_id — call this before publishing any " +
         "context for a unit of work. Returns { task_id, status, version } with version 0 (creation writes no " +
-        "record); the returned status follows the flow: \"designing\" for full/solo, \"implementing\" for direct. " +
+        "record); the returned status follows the flow: \"designing\" for full, \"implementing\" for direct/solo. " +
         "flow picks the transition table and is immutable after creation (change = a new task): full = design → " +
         "implement → review → human approval (default); direct = the design already exists, work starts at " +
-        "implementing (later design records are reference notes, no transition); solo = small change exempt from " +
-        "review — code_changes goes straight to pending_approval (a review record in solo is a visible out-of-table " +
+        "implementing (later design records are reference notes, no transition); solo = small change, starts " +
+        "implementing (design records are reference notes), exempt from review — code_changes goes straight to " +
+        "pending_approval (a review record in solo is a visible out-of-table " +
         "anomaly). role is the creator's role label (convention: \"architect\" | \"executor\" | \"reviewer\" | " +
         "\"human\"). cast optionally overrides the agent command each role routes to for THIS task (role → route, " +
         "e.g. {executor: \"pi\"}); it is a routing parameter only — it never restricts who may publish — and is " +

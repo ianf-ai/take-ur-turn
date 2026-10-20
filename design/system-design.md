@@ -103,8 +103,8 @@ stateDiagram-v2
 
 | 记录 | full（上图） | direct（repo 已有设计） | solo（小改动免审） |
 |------|------------|----------------------|-------------------|
-| create（空序列） | → designing | → **implementing** | → designing |
-| design | designing → implementing | **implementing → implementing**（参考记录，不转态）；其余态表外 | designing → implementing（保留） |
+| create（空序列） | → designing | → **implementing** | → **implementing** |
+| design | designing → implementing | **implementing → implementing**（参考记录，不转态）；其余态表外 | 同 direct（参考记录，不转态） |
 | code_changes | implementing → reviewing | 同 full | implementing → **pending_approval** |
 | review(pass / blocked_external / fail_code) | reviewing → pending_approval（pass、blocked_external 同目标）/ revising（fail_code） | 同 full | **表外**（落盘 + needs_attention——免审流程里发 review 是越轨，应当可见） |
 | review(fail_design) | reviewing → designing | **表外**（direct 无 designing 态；免设计流程中设计前提被推翻由人裁决） | 表外（同上） |
@@ -160,7 +160,7 @@ review 的 `pass` / `blocked_external` 派生出 `pending_approval` 后，需要
                                                              部分指定合法（缺的 role 回落默认阵容）；
                                                              checkout ∈ { kind: "current" } | { kind: "worktree", path, ref? }
                                                                   （worktree 必须带 path；ref 仅可随 path 作旁注，ref-only 在 create 即拒。CLI 字符串语法见下）
-输出：{ task_id, status, version: 0, warning?, needs_attention?, warnings? }                status 按 flow 派生：full/solo → "designing"，direct → "implementing"
+输出：{ task_id, status, version: 0, warning?, needs_attention?, warnings? }                status 按 flow 派生：full → "designing"，direct/solo → "implementing"
 ```
 
 flow 与 cast 落 meta 后均不可变（无写入路径，构造性不可变），变更 = 新任务。

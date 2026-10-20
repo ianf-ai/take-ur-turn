@@ -21,7 +21,7 @@ TUT's answer: put the process memory into the Hub (writes are never rejected on 
 - **Append-only records**: agents append records to the task log via 5 MCP tools (create / publish / read / list / decide) — design, code_changes, review, revision, note, decision. Records are never deleted; anyone starting from zero can reconstruct every decision and its rationale from the log alone
 - **Derived state**: task state (where things stand, whose move it is) is not stored and not enforced — it is a view computed from the record sequence by a pure function. Combinations outside the state table (e.g. publishing a review in a solo task) still land on disk, but set `needs_attention` so a human can deal with it
 - **Approval gate**: once a review passes, the derived state becomes `pending_approval`, and a **human** must publish a decision record (approve / reject) before anything continues. close is valid in any state — humans retain the authority to end a task at any time
-- **Flow variants**: pick `--flow full|direct|solo` when creating a task — full runs the complete loop; solo skips review for small changes (review-free but not approval-free — straight to the approval gate); direct adds one review round to solo for simple changes that touch a risk surface (core paths / gates / public surface — expensive when wrong)
+- **Flow variants**: pick `--flow full|direct|solo` when creating a task — full runs the complete loop; solo skips the design round and review for small changes (starts implementing; review-free but not approval-free — straight to the approval gate); direct adds one review round to solo for simple changes that touch a risk surface (core paths / gates / public surface — expensive when wrong)
 - **manual / auto progression**: in manual (the default), the human is notified when it is someone's turn and starts the next step; in auto, the Notifier launches the next agent directly through the launcher (with graded trust via the role whitelist), and humans only make decide calls; in either mode, a coding-agent Host session can run the whole loop on your behalf ([Host Mode](#host-mode-drive-it-from-a-conversation))
 
 ## Architecture
@@ -276,8 +276,8 @@ Reviewer reads context → reviews (each finding carries a closing condition) �
 
 The diagram above is the default flow, **full**. Variants are chosen when the task is created (fixed at create time, immutable once persisted):
 
-- **solo**: small changes skip review — code_changes derives pending_approval directly for a human approve / reject. Review-free, but not approval-free: approve is still the human's gate
-- **direct**: for simple changes that touch a risk surface (core paths / gates / public surface — expensive when wrong), solo gets one review round added — the task starts in implementing (the repo already carries the design it works from) and proceeds through review and human approval as usual
+- **solo**: small changes skip the design round and review — the task starts in implementing, design records are reference notes (no transition), and code_changes derives pending_approval directly for a human approve / reject. Review-free, but not approval-free: approve is still the human's gate
+- **direct**: for simple changes that touch a risk surface (core paths / gates / public surface — expensive when wrong), solo gets one review round added — like solo, it starts in implementing (the repo already carries the design it works from) and proceeds through review and human approval as usual
 
 ## Configuration
 

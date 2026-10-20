@@ -24,7 +24,7 @@ describe("state awareness projections", () => {
     const records: ContextRecord[] = [];
     const add = (kind: string, payload?: Partial<ContextRecord["payload"]>) => records.push(record(++version, kind, payload));
     const fold = () => foldWithLint(initialCursor(flow), records, flow);
-    if (flow !== "direct") add("design");
+    if (flow === "full") add("design");
     expect(fold()).toMatchObject({ round_count: 0, pending_since: null });
     add("code_changes");
     if (flow !== "solo") add("review", { verdict: "pass" });
