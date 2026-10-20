@@ -79,6 +79,7 @@ describe("local read-only stats", () => {
     await delivery(first, "executor", "code_changes");
     await delivery(first, "reviewer", "review", "pi", { verdict: "pass" });
     const solo = await task("solo", "solo");
+    // Solo design is a reference record, not an architect workflow delivery.
     await delivery(solo, "architect", "design");
     await delivery(solo, "executor", "code_changes");
     await append(solo, "human", "decision", { decision: "reject" });
@@ -89,7 +90,7 @@ describe("local read-only stats", () => {
     expect(report.batch.review_pass_rate).toBe(0.5);
     expect(report.batch.first_review_pass_rate).toBeCloseTo(1 / 3);
     expect(report.batch.revision_rounds).toBe(2);
-    expect(report.batch.per_role).toEqual({ executor: 6, reviewer: 4, architect: 1 });
+    expect(report.batch.per_role).toEqual({ executor: 6, reviewer: 4 });
     expect(report.batch.blockers).toEqual({ "pending_approval:human": 3 });
     expect(report.batch.usage).toMatchObject({ complete: false, coverage: { missing: 4 } });
     expect(report.tasks.find(t => t.task_id === solo)?.review_pass_rate).toBeNull();

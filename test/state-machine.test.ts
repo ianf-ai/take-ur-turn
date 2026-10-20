@@ -181,10 +181,8 @@ describe("derive: unit properties beyond the fixtures", () => {
     } satisfies DerivedState);
   });
 
-  it("solo keeps an architect code_changes record out of table while designing", () => {
-    // Regression case from an observed solo validation run: the launch note
-    // leaves a new solo task in designing, so an architect's direct delivery
-    // cannot skip the design-to-implementing transition.
+  it("solo accepts code_changes after a launch note without a design record", () => {
+    // Solo starts implementing; role is a label, not a derivation gate.
     const records: ContextRecord[] = [
       {
         version: 1,
@@ -205,10 +203,10 @@ describe("derive: unit properties beyond the fixtures", () => {
     ];
 
     expect(derive("solo-architect-direct-delivery", records, "solo")).toStrictEqual({
-      status: "designing",
+      status: "pending_approval",
       waiting_for: "human",
-      needs_attention: true,
-      warnings: [{ version: 2, code: "OUT_OF_TABLE" }],
+      needs_attention: false,
+      warnings: [],
     } satisfies DerivedState);
   });
 });

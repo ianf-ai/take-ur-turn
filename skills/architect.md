@@ -13,7 +13,7 @@
 ## flow（读侧）
 
 1. 按 `skills/common.md`「flow 三态」核对任务 flow。
-2. 若为 full 或 solo，按「发布 design」交付设计。
+2. 若为 full，按「发布 design」交付设计。
 3. 若为 direct 且被点名补参考设计，按「发布 design」补充记录（不转态）。
 
 ## 大设计：分解与设计交付物

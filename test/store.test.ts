@@ -759,13 +759,14 @@ describe("flow (system-design 3.1)", () => {
 
   it("append and listTasks fold with the meta flow and never rewrite it", async () => {
     const { store, root } = newStore();
-    const { task_id } = await store.createTask({ title: "Solo Task", description: "d", creator: "alice", role: "agent:architect", flow: "solo" });
+    const { task_id, status } = await store.createTask({ title: "Solo Task", description: "d", creator: "alice", role: "agent:architect", flow: "solo" });
+    expect(status).toBe("implementing");
     await store.append(task_id, { role: "agent:architect", content_type: "design", payload: validPayload() });
 
     const meta = readMeta(root, task_id);
     expect(meta.flow).toBe("solo"); // append does not touch flow (immutability by construction)
     expect(meta.version).toBe(1);
-    expect(meta.status).toBe("implementing"); // real fold: solo design → implementing
+    expect(meta.status).toBe("implementing"); // solo design is a reference record
 
     // solo skips the review phase — code_changes goes straight to the human
     // approval gate. This is the flow reaching the FOLD (append pre-write and

@@ -68,7 +68,8 @@ Usage:
       Create a task; prints task_id, status, version. flow picks the workflow
       (immutable after creation, default full): full = design → implement →
       review → approval; direct = design already exists, starts implementing;
-      solo = small change, review skipped (code_changes → approval directly).
+      solo = small change, starts implementing, no design round (design =
+      reference note), review skipped (code_changes → approval directly).
       cast routes individual roles of THIS task to other agents (e.g.
       --cast executor=pi --cast 'reviewer=codex --model gpt-5.6'); routing
       only, immutable like flow. The legacy comma form remains supported;

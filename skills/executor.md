@@ -13,7 +13,7 @@
 
 1. 按 `skills/common.md`「接手读序（三层）」读取上下文。
 2. 若 project scope 为空，按 description 接手（首次确认空态即可；full 仍遵循 design）。
-3. 若为 implementing，读取 design 的「对实现的要求」或 direct 的 description 指针。
+3. 若为 implementing，full 读取 design 的「对实现的要求」，direct 读取 description 指针，solo 直接按 description 接手（无需等待 design）。
 4. 若日志存在 fail_design 后的新 design，读取打回设计的 review。
 5. 若为 revising，定位进入修订的记录（排除 ack note 与表外记录；来源为 fail_code review、人的 decision(reject) 或自己的收回 note）。
 6. 若为修订轮，读取所回应记录的问题与关闭条件（reject 理由、自报问题分别作为本轮问题列表）。
