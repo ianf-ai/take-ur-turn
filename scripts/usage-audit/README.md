@@ -125,8 +125,40 @@ launches (gaps are meaningful). Marker role, frozen route agent, launch time,
 delivery version/time and task checkout cwd define a candidate. Legacy markers
 may use the delivery's recorded agent, never today's workspace cast. Only
 architect/design, executor/code_changes|revision, reviewer/review pair.
-Repeated outstanding launches are diagnosed; missing markers, missing route,
-identity conflicts and unsupported agents cannot produce numbers.
+Repeated outstanding launches are diagnosed (mode-split: see dispositions
+below). Missing markers, missing route, identity conflicts and unsupported
+agents cannot produce numbers.
+
+### Unresolved-shape dispositions (2026-10-18 headless findings)
+
+The write path is never gated on coverage: a task with any delivery round
+writes its snapshot (resolved rounds plus an honest `unresolved[]`), and
+unresolved rounds never drop the rest of the ledger (a task with zero
+resolved rounds still lands a rounds=0 snapshot; only a task with no delivery
+round at all writes nothing). The three headless-era unattributed shapes and
+their dispositions:
+
+- `superseded_launch` — a re-launch replaced an outstanding launch before any
+  delivery. Tui markers keep the conservative whole-round diagnostic. Headless
+  markers (`launch_mode: "headless"`) split the accounting: the delivering
+  (rescue) round measures its own session normally; every launch it replaced
+  stays unaccounted and is anchored as an `unresolved[]` entry
+  (`{delivery_version, launch_version, reason}`, all existing schema-v1
+  fields; the disclosure also survives `--since` replays that preserve the
+  delivering round's measurement). Usage is never merged from a replaced
+  launch into the round; whether to account replaced launches' burned usage
+  at all is an open human decision.
+- `overlapping_rounds` (including `ambiguous_sessions`) — concurrent rounds
+  sharing one cwd (the 0.9.0 default `launch.checkout: "rig"` mode runs all
+  headless agents in the rig root, so a parallel task batch's sessions become
+  candidates for each other's rounds). Cwd+time cannot distinguish genuinely
+  concurrent work; no assignment is fabricated and both rounds stay
+  unresolved (a headless rescue delivery that newly collides absorbs the
+  conflict alone, preserving other rounds' attribution). Per-task cwd
+  isolation (anchored checkout) prevents the shape at
+  the source; the audit side only reports it honestly.
+- `missing_session_or_end` — no native end covering the delivery (for example
+  an executor that exited early). Retried every pass, never zero-filled.
 
 Pi discovery uses `--<cwd without leading slash, slash replaced by hyphen>--`
 (POSIX-path shaped; on Windows pi's own directory naming differs and pi
@@ -191,7 +223,10 @@ Upsert key is launch_version within task; output is ordered by that version.
 Totals always recompute. Since preserves earlier successes; missing excluded
 history is `not_selected`. Backfill corrects re-verifiable values but preserves
 old successes when evidence disappears, marking `preserved:true` and incomplete.
-No selected delivery means no new file. Unchanged content leaves mtime unchanged.
+A `superseded_launch` unresolved entry anchors a launch replaced before the
+delivery named by its `delivery_version` (headless markers only; see
+dispositions). No selected delivery means no new file. Unchanged content
+leaves mtime unchanged.
 Invalid existing JSON/schema/totals or symlinks fail without overwriting originals.
 Only Hub-confirmed task directories are eligible; worktree cwd never changes
 which Hub task owns the output.

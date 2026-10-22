@@ -28,8 +28,9 @@ async function makeRoot(files: Record<string, string>): Promise<string> {
 
 /** Complete, healthy fixture — individual cases delete/shrink one entry. */
 const HEALTHY_FILES: Record<string, string> = {
+  "dist/core/cli.js": `export {};\n${"x".repeat(2_001)}`,
   "dist/cli.js": `#!/usr/bin/env node\n${"x".repeat(10_001)}`,
-  "dist/launcher/pane-runner.js": "export {};\n",
+  "dist/herdr/launcher/pane-runner.js": "export {};\n",
   "skills/architect.md": "# architect\n",
   "skills/executor.md": "# executor\n",
   "skills/reviewer.md": "# reviewer\n",
@@ -76,9 +77,18 @@ describe("scripts/assert-release.js release gate", () => {
     expect(result.stderr).toContain("dist/cli.js");
   });
 
-  it("fails when dist/launcher/pane-runner.js is missing (absolute-path pane contract)", async () => {
+  it.each(['', 'truncated'])("rejects a missing/undersized core dispatcher (%s)", async content => {
     const files = { ...HEALTHY_FILES };
-    delete files["dist/launcher/pane-runner.js"];
+    if (content) files['dist/core/cli.js'] = content;
+    else delete files['dist/core/cli.js'];
+    const result = await runGate(await freshRoot(files));
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('dist/core/cli.js');
+  });
+
+  it("fails when dist/herdr/launcher/pane-runner.js is missing (absolute-path pane contract)", async () => {
+    const files = { ...HEALTHY_FILES };
+    delete files["dist/herdr/launcher/pane-runner.js"];
     const root = await freshRoot(files);
     const result = await runGate(root);
     expect(result.code).toBe(1);
@@ -95,6 +105,13 @@ describe("scripts/assert-release.js release gate", () => {
     expect(result.stderr).toContain(`retired artifact dist/launcher/${name}`);
   });
 
+  it('rejects a retired probe in the new herdr zone too', async () => {
+    const root = await freshRoot({ ...HEALTHY_FILES, 'dist/herdr/launcher/probe-runner.js': 'stale' });
+    const result = await runGate(root);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('retired artifact dist/herdr/launcher/probe-runner.js');
+  });
+
   it("fails when a skills role file is missing (kickoff prompt contract)", async () => {
     const files = { ...HEALTHY_FILES };
     delete files["skills/executor.md"];
@@ -105,7 +122,7 @@ describe("scripts/assert-release.js release gate", () => {
   });
 
   it("fails when a runner exists but is empty (non-empty assertion)", async () => {
-    const root = await freshRoot({ ...HEALTHY_FILES, "dist/launcher/pane-runner.js": "" });
+    const root = await freshRoot({ ...HEALTHY_FILES, "dist/herdr/launcher/pane-runner.js": "" });
     const result = await runGate(root);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("pane-runner.js");
@@ -114,7 +131,7 @@ describe("scripts/assert-release.js release gate", () => {
 
   it("fails when a runner path is a directory (its nonzero size would pass a bare non-empty check)", async () => {
     const root = await freshRoot(HEALTHY_FILES);
-    const runner = path.join(root, "dist", "launcher", "pane-runner.js");
+    const runner = path.join(root, "dist", "herdr", "launcher", "pane-runner.js");
     await rm(runner);
     await mkdir(runner);
     await writeFile(path.join(runner, "placeholder.js"), "export {};\n"); // non-empty directory content
@@ -126,7 +143,7 @@ describe("scripts/assert-release.js release gate", () => {
 
   it("accepts a symlink pointing at a regular file (statSync follows links)", async () => {
     const root = await freshRoot(HEALTHY_FILES);
-    const launcher = path.join(root, "dist", "launcher");
+    const launcher = path.join(root, "dist", "herdr", "launcher");
     await copyFile(path.join(launcher, "pane-runner.js"), path.join(launcher, "pane-runner.real.js"));
     await rm(path.join(launcher, "pane-runner.js"));
     await symlink(path.join(launcher, "pane-runner.real.js"), path.join(launcher, "pane-runner.js"));
@@ -145,7 +162,7 @@ describe("scripts/assert-release.js release gate", () => {
 
   it("names every missing entry in one run instead of stopping at the first", async () => {
     const files = { ...HEALTHY_FILES };
-    delete files["dist/launcher/pane-runner.js"];
+    delete files["dist/herdr/launcher/pane-runner.js"];
     delete files["skills/host.md"];
     const root = await freshRoot(files);
     const result = await runGate(root);

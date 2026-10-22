@@ -53,8 +53,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-import { Store } from "../src/hub/store.js";
-import type { ContextRecord } from "../src/common/types.js";
+import { Store } from "../src/core/hub/store.js";
+import type { ContextRecord } from "../src/core/common/types.js";
 
 const payload = { summary: "s", body: "b" };
 
@@ -260,7 +260,7 @@ describe("cache protocol: readTask since_version", () => {
     expect(fsm.recordReads).toBe(3);
   });
 
-  it("P1-1 (store leg): since_version = last+1 with nothing new reads ZERO record files and returns empty versions", async () => {
+  it("(store leg): since_version = last+1 with nothing new reads ZERO record files and returns empty versions", async () => {
     // The notifier's governed pull passes cached.version + 1 against the
     // INCLUSIVE wire contract — with no new records that reads and returns
     // nothing (the old protocol passed the cached max itself and re-read
@@ -284,7 +284,7 @@ describe("cache protocol: readTask since_version", () => {
     expect(fsm.recordReads).toBe(1);
   });
 
-  it("P2-2: alias record file names fold by their REAL name — versions, warnings shape, and status match a name-blind cold fold", async () => {
+  it("alias record file names fold by their REAL name — versions, warnings shape, and status match a name-blind cold fold", async () => {
     // recordFileVersion accepts ANY v<digits>.<type>.json — v1.foreign.json is
     // a legal alias of v001.…: same version, and the file-name type segment
     // need not match the record's content_type. The cold readTask reuses the
@@ -331,7 +331,7 @@ describe("cache protocol: readTask since_version", () => {
     expect(again.versions).toEqual(read.versions);
   });
 
-  it("P2-2 (read-count leg): canonical since_version reads keep their optimization with the real-name reuse", async () => {
+  it("(read-count leg): canonical since_version reads keep their optimization with the real-name reuse", async () => {
     const store = new Store(root);
     await store.createTask({ title: "Alias Since", description: "d", creator: "a", role: "human" });
     externalRecord("alias-since", 1, "design");

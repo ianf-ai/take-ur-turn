@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { foldWithLint } from "../src/hub/record-lint.js";
-import { derive, initialCursor } from "../src/hub/state-machine.js";
-import type { ContextRecord, Flow } from "../src/common/types.js";
+import { foldWithLint } from "../src/core/hub/record-lint.js";
+import { derive, initialCursor } from "../src/core/hub/state-machine.js";
+import type { ContextRecord, Flow } from "../src/core/common/types.js";
 
 function record(version: number, content_type: string, payload: Partial<ContextRecord["payload"]> = {}): ContextRecord {
   return { version, task_id: "awareness", content_type, role: "human",

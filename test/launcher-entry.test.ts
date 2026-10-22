@@ -1,4 +1,4 @@
-import { rigLabel } from "../src/hub/rig.js";
+import { rigLabel } from "../src/core/hub/rig.js";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -15,12 +15,12 @@ import {
   serializeLaunchInvocation,
   targetDigest,
   validateLaunchInvocation,
-} from "../src/launcher/invocation.js";
-import { parseLaunchEntry, runLaunchEntry } from "../src/launcher/entry.js";
-import { privateDigestOf } from "../src/launcher/compat.js";
-import { cliEntryPath, DEFAULT_CHILD_TIMEOUT_MS, runInternalLaunchInvocation, runNodeCommand, type DirectSpawn } from "../src/launcher/process.js";
-import { Notifier } from "../src/notifier/notifier.js";
-import type { ContextRecord, LaunchInvocation } from "../src/common/types.js";
+} from "../src/core/launcher/invocation.js";
+import { parseLaunchEntry, runLaunchEntry } from "../src/core/launcher/entry.js";
+import { privateDigestOf } from "../src/herdr/launcher/compat.js";
+import { cliEntryPath, DEFAULT_CHILD_TIMEOUT_MS, runInternalLaunchInvocation, runNodeCommand, type DirectSpawn } from "../src/herdr/launcher/process.js";
+import { Notifier } from "../src/core/notifier/notifier.js";
+import type { ContextRecord, LaunchInvocation } from "../src/core/common/types.js";
 
 function invocation(): LaunchInvocation {
   return buildLaunchInvocation({
@@ -356,6 +356,8 @@ describe("Notifier canonical launch hand-off", () => {
     const notifier = new Notifier(
       { url: "http://hub.test", interval: 5, eventPort: 0, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
+        readLaunchCatchup: async () => "off" as const,
         fetchState: async () => current,
         readLog: async (): Promise<ContextRecord[]> => [],
         resolveTargetWithSource: async () => ({ route: { agent: "codex", args: ["--model", "gpt-5.6"] }, source: "task-cast" }),

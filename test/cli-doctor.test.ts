@@ -1,6 +1,6 @@
 // This suite isolates doctor rendering; endpoint identity is covered separately.
-vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
   resolveCliHubUrl: vi.fn(async (url: string) => url),
   resolveRigRoot: vi.fn(() => "/owning/rig"),
 }));
@@ -17,14 +17,14 @@ vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../src/doctor/index.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/doctor/index.js")>()),
+vi.mock("../src/core/doctor/index.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/doctor/index.js")>()),
   runDoctor: vi.fn(),
 }));
 
-import { resolveCliHubUrl } from "../src/hub/rig-discovery.js";
+import { resolveCliHubUrl } from "../src/core/hub/rig-discovery.js";
 import { DEFAULT_HUB_URL, USAGE, main, parseArgs } from "../src/cli.js";
-import { renderDoctorReport, runDoctor, type DoctorReport } from "../src/doctor/index.js";
+import { renderDoctorReport, runDoctor, type DoctorReport } from "../src/core/doctor/index.js";
 
 function captureIo(): { out: () => string; err: () => string; restore: () => void } {
   let outText = "";
@@ -40,7 +40,7 @@ function captureIo(): { out: () => string; err: () => string; restore: () => voi
   return { out: () => outText, err: () => errText, restore: () => { out.mockRestore(); err.mockRestore(); } };
 }
 
-/** The canonical eight checks, in runner order, with a controlled status. */
+/** The canonical checks, in runner order, with a controlled status. */
 function fixtureReport(statuses: Partial<Record<string, "ok" | "warn" | "fail">> = {}): DoctorReport {
   const titles: Array<[name: string, title: string]> = [
     ["hub", "hub reachable"],
@@ -51,6 +51,7 @@ function fixtureReport(statuses: Partial<Record<string, "ok" | "warn" | "fail">>
     ["paths", "path safety & probe endpoints"],
     ["platform", "platform info"],
     ["agent-channel", "agent channel network"],
+    ["preflight", "checkout preflight"],
   ];
   const checks = titles.map(([name, title]) => ({
     name,
@@ -72,6 +73,8 @@ describe("tut doctor parsing", () => {
       root: ".context-hub",
       url: DEFAULT_HUB_URL,
       json: false,
+      checkout: process.cwd(),
+      fixPreflight: false,
     });
   });
 
@@ -81,12 +84,16 @@ describe("tut doctor parsing", () => {
       root: "/tmp/hub-x",
       url: "http://127.0.0.1:3999",
       json: true,
+      checkout: process.cwd(),
+      fixPreflight: false,
     });
-    expect(parseArgs(["doctor", "--root=/tmp/hub-y", "--url=http://127.0.0.1:4001"])).toEqual({
+    expect(parseArgs(["doctor", "--root=/tmp/hub-y", "--url=http://127.0.0.1:4001", "--checkout", "/tmp/co", "--fix-preflight"])).toEqual({
       command: "doctor",
       root: "/tmp/hub-y",
       url: "http://127.0.0.1:4001",
       json: false,
+      checkout: "/tmp/co",
+      fixPreflight: true,
     });
   });
 
@@ -101,7 +108,7 @@ describe("tut doctor parsing", () => {
   });
 
   it("USAGE documents the command", () => {
-    expect(USAGE).toContain("tut doctor [--root <dir>] [--url <u>] [--json]");
+    expect(USAGE).toContain("tut doctor [--root <dir>] [--url <u>] [--checkout <dir>] [--fix-preflight] [--json]");
   });
 });
 
@@ -126,7 +133,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
     const code = await main(["doctor", "--root", "/tmp/hub-x", "--url", "http://127.0.0.1:3999"]);
 
     expect(code).toBe(0);
-    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ hubRoot: "/owning/rig", root: "/tmp/hub-x", url: "http://127.0.0.1:3999" });
+    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ hubRoot: "/owning/rig", root: "/tmp/hub-x", url: "http://127.0.0.1:3999", checkout: process.cwd() });
     expect(io.out()).toBe(`${renderDoctorReport(report)}\n`);
   });
 
@@ -135,7 +142,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
     vi.mocked(runDoctor).mockResolvedValue(fixtureReport());
     await main(["doctor"]);
     expect(resolveCliHubUrl).toHaveBeenLastCalledWith(DEFAULT_HUB_URL, false, "/owning/rig");
-    expect(runDoctor).toHaveBeenCalledWith({ root: ".context-hub", hubRoot: "/owning/rig", url: "http://127.0.0.1:3003" });
+    expect(runDoctor).toHaveBeenCalledWith({ root: ".context-hub", hubRoot: "/owning/rig", url: "http://127.0.0.1:3003", checkout: process.cwd() });
   });
 
   it("preserves offline reporting when the Hub identity handshake fails", async () => {
@@ -146,7 +153,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
     const options = vi.mocked(runDoctor).mock.calls[0]![0]!;
     expect(options.hubRoot).toBe("/owning/rig");
     await expect(options.fetchImpl!("http://127.0.0.1:3001/state")).rejects.toBe(error);
-    expect(JSON.parse(io.out()).checks).toHaveLength(8);
+    expect(JSON.parse(io.out()).checks).toHaveLength(9);
   });
 
   it("defaults to .context-hub and the default hub URL", async () => {
@@ -154,7 +161,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
 
     await main(["doctor"]);
 
-    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ hubRoot: "/owning/rig", root: ".context-hub", url: DEFAULT_HUB_URL });
+    expect(vi.mocked(runDoctor)).toHaveBeenCalledWith({ hubRoot: "/owning/rig", root: ".context-hub", url: DEFAULT_HUB_URL, checkout: process.cwd() });
   });
 
   it("maps report.ok=false to exit 1 while still rendering the FULL report", async () => {
@@ -165,7 +172,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
 
     expect(code).toBe(1);
     const out = io.out();
-    // every one of the eight checks is still rendered, fail included
+    // every one of the checks is still rendered, fail included
     for (const line of renderDoctorReport(report).split("\n")) expect(out).toContain(line);
     expect(out).toContain("result: FAIL");
   });
@@ -178,9 +185,9 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
 
     expect(code).toBe(0); // a warn does not flip the exit code
     expect(JSON.parse(io.out())).toEqual(report);
-    // the eight check names, in runner order, are the machine surface
+    // the check names, in runner order, are the machine surface
     expect((JSON.parse(io.out()) as DoctorReport).checks.map((c) => c.name)).toEqual([
-      "hub", "notifier", "config", "agents", "storage", "paths", "platform", "agent-channel",
+      "hub", "notifier", "config", "agents", "storage", "paths", "platform", "agent-channel", "preflight",
     ]);
   });
 

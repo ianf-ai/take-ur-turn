@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createEnterRepress, pendingCodexInput, RemediationAttempts, MAX_REMEDIATION_ATTEMPTS, MAX_CONCURRENT_REMEDIATIONS, type Remediator, type RemediationRequest } from '../src/remediator.js';
-import { createDelivery, promptTailEvidence, type DeliveryEvidenceV2 } from '../src/launcher/delivery.js';
-import type { DeliveryClientV2, PaneIdentity, StatusSample } from '../src/launcher/herdr-client-v2.js';
+import { createEnterRepress, pendingCodexInput, RemediationAttempts, MAX_REMEDIATION_ATTEMPTS, MAX_CONCURRENT_REMEDIATIONS, type Remediator, type RemediationRequest } from '../src/core/remediator.js';
+import { createDelivery, promptTailEvidence, type DeliveryEvidenceV2 } from '../src/herdr/launcher/delivery.js';
+import type { DeliveryClientV2, PaneIdentity, StatusSample } from '../src/herdr/launcher/herdr-client-v2.js';
 
 const target: PaneIdentity = { paneId: 'p1', terminalId: 'term', workspaceId: 'w1',
   agentSession: { agent: 'codex', kind: 'session', value: 's1' }, serverEpoch: null, agentGeneration: null };

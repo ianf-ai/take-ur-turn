@@ -156,6 +156,31 @@ describe("config get (effective values)", () => {
 });
 
 describe("config set (validated, key-preserving writes)", () => {
+  it("launch_mode defaults without writes, validates set and preserves siblings", async () => {
+    expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
+    expect(io.out()).toBe("tui\n");
+    expect(existsSync(configFile())).toBe(false);
+    writeFileSync(configFile(), JSON.stringify({ flow_mode: "auto", auto: { launch_roles: ["executor"], keep: true }, future: 3 }));
+    expect(await main(["config", "set", "launch_mode", "tui", "--root", root])).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), "utf8"))).toMatchObject({ launch_mode: "tui", future: 3, auto: { keep: true } });
+    const before = readFileSync(configFile(), "utf8");
+    expect(await main(["config", "set", "launch_mode", "bad", "--root", root])).toBe(1);
+    expect(readFileSync(configFile(), "utf8")).toBe(before);
+    writeFileSync(configFile(), JSON.stringify({ flow_mode: "auto", launch_mode: null }));
+    expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(1);
+  });
+
+  it("launch_mode get echoes explicit tui and headless round-trips", async () => {
+    writeFileSync(configFile(), JSON.stringify({ flow_mode: "manual", launch_mode: "tui" }));
+    expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
+    expect(io.out()).toBe("tui\n");
+    expect(await main(["config", "set", "launch_mode", "headless", "--root", root])).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), "utf8"))).toEqual({ flow_mode: "manual", launch_mode: "headless" });
+    expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
+    expect(io.out()).toContain("config: launch_mode = headless");
+    expect(io.out().endsWith("headless\n")).toBe(true);
+  });
+
   it("usage_audit defaults off without writing and round-trips on/off without losing keys", async () => {
     expect(await main(["config", "get", "usage_audit", "--root", root])).toBe(0);
     expect(io.out()).toBe("off\n");

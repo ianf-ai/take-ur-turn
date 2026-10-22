@@ -1,6 +1,6 @@
-import * as rig from "../src/hub/rig.js";
-import { probeNotifierEvidence } from "../src/hub/rig-discovery.js";
-import { HerdrClient } from "../src/launcher/legacy-herdr-client.js";
+import * as rig from "../src/core/hub/rig.js";
+import { probeNotifierEvidence } from "../src/core/hub/rig-discovery.js";
+import { HerdrClient } from "../src/herdr/launcher/legacy-herdr-client.js";
 // tut doctor (0.7.0) — report-only environment & assembly self-check.
 // Module-stage discipline: the doctor module is exercised through runDoctor
 // with injected seams (fetchImpl / resolveTarget) against real temp-dir
@@ -15,8 +15,8 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, wr
 import os from "node:os";
 import path from "node:path";
 
-import { AgentTargetError } from "../src/launcher/target-resolver.js";
-import { Store } from "../src/hub/store.js";
+import { AgentTargetError } from "../src/core/launcher/target-resolver.js";
+import { Store } from "../src/core/hub/store.js";
 import {
   renderDoctorReport,
   runDoctor,
@@ -24,7 +24,7 @@ import {
   type DoctorCheck,
   type DoctorOptions,
   type DoctorReport,
-} from "../src/doctor/index.js";
+} from "../src/core/doctor/index.js";
 
 // --- fixture helpers -------------------------------------------------------------
 
@@ -154,7 +154,7 @@ function baseOptions(root: string): DoctorOptions & { environment: NodeJS.Proces
 // --- healthy assembly ------------------------------------------------------------
 
 describe("tut doctor (healthy assembly)", () => {
-  it("reports ok with all eight checks green", async () => {
+  it("reports ok with all nine checks green", async () => {
     const root = healthyRoot();
     const report = await runDoctor(baseOptions(root));
     expect(report.ok).toBe(true);
@@ -167,6 +167,7 @@ describe("tut doctor (healthy assembly)", () => {
       "paths",
       "platform",
       "agent-channel",
+      "preflight",
     ]);
     for (const c of report.checks) expect(c.status, c.name).toBe("ok");
     expect(check(report, "hub").summary).toContain("flow_mode=manual");
@@ -1194,7 +1195,7 @@ describe("notifier ownership discovery", () => {
     const report = await runDoctor(opts);
     expect(check(report, "hub").status).toBe("fail");
     expect(check(report, "notifier").status).toBe("fail");
-    expect(report.checks).toHaveLength(8);
+    expect(report.checks).toHaveLength(9);
   });
 
   it("never pairs a notifier when Hub is offline", async () => {

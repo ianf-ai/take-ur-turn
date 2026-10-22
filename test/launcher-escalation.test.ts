@@ -10,7 +10,7 @@ import {
   giveUpGuidance,
   postAgentEvent,
   type GiveUpEvidence,
-} from "../src/launcher/escalation.js";
+} from "../src/herdr/launcher/escalation.js";
 
 describe("event port URL resolution", () => {
   it("defaults to the local notifier event endpoint", () => {

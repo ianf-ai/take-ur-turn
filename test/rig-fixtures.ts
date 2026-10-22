@@ -1,4 +1,4 @@
-import { rigLabel } from "../src/hub/rig.js";
+import { rigLabel } from "../src/core/hub/rig.js";
 
 /** Upgrade older behavior fixtures to the rig addressing convention. */
 export function scopedFixture(text: string, root: string): string {

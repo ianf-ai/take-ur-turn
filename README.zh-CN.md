@@ -59,7 +59,7 @@ designing → implementing → reviewing ─┬─ pass       → pending_approv
 
 ## 快速上手
 
-前置：Node.js ≥ 20、Herdr（Agent Host，承载各 Agent 的终端 pane；macOS/Linux 用 `brew install herdr`，Windows 从 [Herdr releases](https://github.com/herdrdev/herdr/releases) 取原生二进制）、至少一个 coding agent CLI。**平台：macOS、Linux、Windows**（Windows 为 0.5.0 新增支持——安装边界见 [Windows 说明](#windows-说明)）。
+前置：Node.js ≥ 20、Herdr（Agent Host，承载各 Agent 的终端 pane；macOS/Linux 用 `brew install herdr`，Windows 从 [Herdr releases](https://github.com/herdrdev/herdr/releases) 取原生二进制）、至少一个 coding agent CLI。**平台：macOS、Linux、Windows**（安装边界见 [Windows 说明](#windows-说明)）。
 
 **安装**——npm 包自带运行所需的一切（构建好的 CLI、角色 skill、启动器脚本）：
 
@@ -84,13 +84,15 @@ npm run build
 tut up
 ```
 
+机器上没有 Herdr？先切电源实现：`tut config set power.mode standalone`，随后 `tut up` 以 detached 进程拉起同一套服务（进程事实落 `.context-hub/power.json`），`tut down` 关停。见[命令总览](#命令速览)。
+
 **一次性接线**——把 TUT 标记块注入项目 `AGENTS.md`（幂等：无文件则创建，已有标记块只刷新不重复追加）：
 
 ```bash
 tut init
 ```
 
-**Delivery confirmation v2 投递**：新生与延续 pane 均最多发送一次原 prompt、一次 Enter，并有界观察状态。即使翻转到 working，也无法归因到本轮输入（`attribution-unavailable`）；exit 0 不代表提交确认，不自动重投。仅在人工确认目标仍是预期 Agent、提示仍在输入框且没有尚待执行的控制调用后，才可按一次 Enter；输入框已空或工作已开始时先核查本轮。`TUT_STATUS_FLIP_TIMEOUT_MS` 默认 30000（1–60000ms）；`TUT_STATUS_POLL_MS` 默认 min(250, flip 预算)，范围 1–flip 预算。单次 v2 调用最多 10s，并裁剪到剩余 deadline。详见 [投递合同](design/system-design.md#721-投递机制delivery-confirmation-v2-单次尝试与有界观察)。
+Herdr 的终端投递与 Enter 补救见 [Herdr 宿主协议](design/herdr-host.md#32-单次投递)。
 
 **发起一个任务**（发起侧两步——任务先于投递存在，首轮即普通轮）：
 
@@ -162,7 +164,7 @@ TUT_HUB_ROOT = "/absolute/path/to/workspace"
 
 填 workspace 目录，不是 `.context-hub` 子目录。全局钉根意味着明确选择一个 workspace，切换项目时须移除或修改。`TUT_HUB_URL` 可提供首选本机 Hub 基础 URL；归属仍须匹配 `TUT_HUB_ROOT` 或 cwd 推导出的根，否则沿 CLI 同源的 3001–3199 奇数 Hub 端口有界扫描。
 
-**从固定 HTTP URL 迁移**：将旧 `url = "http://127.0.0.1:3001/mcp"` 替换为上面的 command / args（不要同时保留），按需设置根，再重启客户端 MCP 连接。固定 URL 仍可供 HTTP 客户端使用，但绕过 workspace discovery，多 rig 时可能静默把写入路由到另一 workspace。TUT 不自动修改用户配置。
+**MCP 连接配置**：使用上面的 command / args，按需设置根，再重启客户端 MCP 连接；同一 server 不同时配置固定 url。固定 URL 可供 HTTP 客户端使用，但绕过 workspace discovery，多 rig 时可能静默把写入路由到另一 workspace。TUT 不自动修改用户配置。
 
 桥在每次 HTTP 请求前复验归属，断线后按 250/500/1000/2000/4000ms 五次有界退避重新发现，支持同根 Hub 重启换端口。中断的工具调用不重放：写入可能已落盘，重试前先 read 核实。诊断只写 stderr，stdout 专用于 MCP。退出码：0 = stdin EOF，1 = 参数/内部错误，2 = 初始连接/归属验证失败，3 = 重连耗尽；SIGINT/SIGTERM 为 130/143。失败后启动正确 Hub，再重启 MCP 连接。
 
@@ -202,6 +204,12 @@ herdr plugin list
 
 若使用 `tut notify --event-port <p>`，须在 Herdr 插件与启动器继承的环境中设置 `TUT_EVENT_PORT_URL=http://127.0.0.1:<p>/agent-event`；未设置时生产者向默认端口 3002 投递。
 
+## 只读看板
+
+在运行中的 Hub 地址打开 `/board`（如 `http://127.0.0.1:3001/board`）。页面每 5 秒独立读取 `/state` 与 `/runs`，失败后有界退避。待审批任务置顶，展示告警、交付轮数与显式 cast；运行卡片并列展示记录状态、PID 存在性观察及最多 20 行 / 64 KiB 的日志尾部。运行退出不代表任务已交付。
+
+运行数据来自 Hub 配置的存储根下 `runs/`，文件缺失或损坏时如实标 degraded。断连保留旧快照并标过期，同根 Hub 重启后自动恢复；`hub_root` 改变时需要重新载入。页面无写操作入口，停止与审批沿用既有 CLI / 人工流程，无需前端构建或新增依赖。 运行预览在 macOS 11+ 使用内核全路径拒绝链接、在 Linux 使用 `/proc/self/fd` 目录锚定；无法安全打开时标 `unsafe_path`/degraded，不回退到无保护读取。
+
 ## 命令速览
 
 `tut` 不带参数打印完整 USAGE。语法一字不差摘录如下：
@@ -223,14 +231,55 @@ tut read <task_id> [--since-version <n>] [--json] [--url <u>]
 tut list [--status <s>] [--json] [--url <u>]
 tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
 tut assign <role> <command...>
-tut up [--url <u>] [--event-port <p>] [--dry-run]
+tut up [--url <u>] [--event-port <p>] [--root <dir>] [--dry-run]
+tut down [--root <dir>]
 tut skill <host|architect|executor|reviewer>
 tut init
 tut ack <task_id> [--note <text>] [--url <u>]
 tut status [--json] [--url <u>]
+tut run [--task <id>] [--fix-preflight] -- <command...>
+tut ps [--json]
+tut attach <run-id>
+tut stop <run-id>
+tut resume <run-id> [instruction] [--fix-preflight]
+tut live-view --layout <json-file>
+tut doctor [--root <dir>] [--url <u>] [--checkout <dir>] [--fix-preflight] [--json]
 ```
 
 Agent 侧的等价通道是 5 个 MCP 工具（`context.create` / `context.publish` / `context.read` / `context.list` / `context.decide`），CLI 子命令与之一一对应。
+
+### 续跑已停止的 run
+
+`tut resume <run-id> [instruction]` 在一个新 run 里继续某个已完成 run 的精确原生
+agent 会话——旧 run 的日志、身份与停止证据原样保留。codex 经由运行日志观测到的
+session id 续跑；pi 只恢复已存储且在本项目会话库中核验过的身份（pi 的
+`--session-id` 在会话缺失时会静默新建，因此不可核验的 id 会被拒绝而不是伪造恢复）。
+跨进程准入：同一会话（受管 run 还包括同一任务）仍被未完成的 run 或 pending 启动
+意图占用时拒绝 spawn。受管（headless 归属）续跑额外要求同根 Hub 在线、任务在 /state 与日志两处
+仍等待该角色、无 needs_attention、非 pending_approval/approved/closed，并在
+spawn 前追加人工启动 marker，避免 auto 双启动。stdout 只输出新 run-id；退出 0
+表示启动确认，不是任务成功。
+
+### 只读座位视图
+
+`tut live-view --layout <file>` 渲染只读终端座位网格。布局声明 `schema:1`、`rows`、
+`columns` 与座位 selector——`{task_id, role}`（仅匹配明确 headless 归属；运行中的
+run 占据座位，多个未完成显示冲突，全部结束则显示最近完成者）或 `{run_id}`（固定）。
+每个窗格都是本包 `tut attach` 子进程且 stdin 忽略：无键入通道，不做 stop/resume/
+decide。Ctrl-C 只关闭视图及其 attach 子进程；被观察的 run 继续运行，可被另一个
+attach 围观。
+
+### checkout preflight 与 close 审计
+
+`tut run` / `tut resume` / auto headless 启动在 spawn 前检查执行 checkout：声明了
+依赖的 Node checkout 需要可读的 `node_modules`，TUT 源码 checkout 需要 `dist/`。
+缺失项以精确绝对路径与修复指引拒绝启动；无 Node manifest 的目录永不受门禁。
+`--fix-preflight`（run/resume/doctor）只执行受支持修复——锁文件下 `npm ci`、TUT
+dist 的 `npm run build`——有界、可见（输出走 stderr，stdout 保持单行结果）、限
+被查目录内；修复步骤失败时即使半途产物已存在也一律拒绝。`tut doctor` 新增第九
+项检查与 `--checkout <dir>`（被查目录；`--root` 保持存储目录含义）。关闭任务现在
+还会向已关闭任务追加 `close-stop` 审计 note，记录协作停止的实际结果（系统操作
+审计，不是人工授权）。
 
 ## 典型工作流
 
@@ -265,6 +314,7 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 | `flow_mode` | `"manual"` / `"auto"`——轮次交接时谁按启动键（人 / Notifier 经启动器自动启动）。推荐用 `tut mode <manual\|auto>` 切换 | `manual` |
 | `notify` | 通知渠道：`channels`（desktop / webhook 等）与 `webhook_url` | 未配置 = 终端 bell 与 notify pane 日志 |
 | `auto.launch_roles` | auto 模式的启动白名单（按 role 键控，如 `["executor","reviewer"]`）。**缺省空 = 全部回落通知人**——不在白名单的轮次不自动启动、不落启动痕，人的手动启动不受影响 | `[]` |
+| `power.mode` | `tut up` 的电源实现：`"herdr"`（pane 供给，行为不变）或 `"standalone"`——`tut up` 自行拉起 detached 进程组（pid/pgid/port 事实落 `.context-hub/power.json`），`tut down` 关停。停机信号身份门控且按组作用域：leader 已亡的残留组仅在有存活成员通过本 rig 的电源成员登记（会话标记 `TUT_POWER_SESSION` 绑定存活服务实例，复用服务在重复 up 后保留原会话，并随服务自身的 launch 子进程继承）核验时才清理；陈旧或无法归属的组永不发信号。非法值（或配置不可读）会让 up/down 在任何供给动作前显式失败 | `herdr` |
 
 `flow_mode` 与 `auto.launch_roles` 无需手编 JSON：`tut config get <key>` / `tut config set <key> <value>`（键与值域均校验；`tut config set flow_mode auto` 即 `tut mode` 的离线等价，Hub 未起也能用——与 `tut assign` 同纪律）。Hub 每次请求现读此文件，写入下个轮询周期即生效，无需重启。
 
@@ -293,9 +343,9 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 
 `naming.tab_label` 渲染**tab** 标签（人读侧）：占位符 `{role}` / `{task}` / `{agent}`，未知占位符原样保留，默认 `TUT {role}`。**pane** 标签是机器寻址键、不可模板化：轮次 pane 恒为 `<task_id>.<role>`（事件反查直接命中）。双字段各司其职。
 
-仓库内 `scripts/workspace.json` 退役为**种子**（形状示例）——运行时零读取。`tut up` 检测 L1/L2 均缺时打印一次性迁移提示。
+仓库内 `scripts/workspace.json` 是**种子**（形状示例），运行时不读取。`tut up` 检测 L1/L2 均缺时打印配置指引。
 
-**从旧分发文件迁移**：`cp scripts/workspace.json .context-hub/workspace.json`（或放 `~/.config/tut/`，先 `mkdir -p`）→ `label` 字段可留可删（读侧容忍）→ `scripts/routes.json` 直接删（已无人读）→ 此后 `tut assign` 改项目级文件。
+**工作区配置**：用 `cp scripts/workspace.json .context-hub/workspace.json` 复制种子，也可放到 `~/.config/tut/`（先 `mkdir -p`）。读取时忽略 `label` 字段，运行时不读取 `scripts/routes.json`；`tut assign` 修改项目级 workspace 文件。
 
 ### ③ 调用参数 — CLI flags 与环境变量
 
@@ -305,8 +355,8 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 | `--url <u>` | Hub 地址覆盖（`tut up` 与上下文/审批命令；仅接受 loopback + 显式端口的地址） | `http://127.0.0.1:3001` |
 | `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | `tut notify` 的轮询间隔 / Agent 事件端口 / stall 超时（`--event-port` 同时决定 `tut up` 探测与供给的端口；轮询间隔下限 1s） | `5s` / `3002` / `30min` |
 | `--working-timeout <s>` | `tut notify` 的 launch → working 短引信；超时未收到 working 信号时告警 | `300s` |
-| `--root <dir>` | `tut serve` 的存储根目录 | 当前目录 |
-| env `TUT_UP_CLI_SELF` | `tut up` 供给 panes 时用的自身 CLI 路径 | 自动解析（dist 布局） |
+| `--root <dir>` | `tut serve` 的存储根目录；`tut up` / `tut down` 的 rig 根目录（拥有 `.context-hub` 的目录），缺省取 cwd 所在 rig | 当前目录 |
+| env `TUT_UP_CLI_SELF` | `tut up` 供给 panes 或 standalone 服务时用的自身 CLI 路径 | 自动解析（dist 布局） |
 | env `TUT_SPLIT_BASE` | birth 锚定逃生舱：无 tut-hub/tut-notify pane 可达时，以该 pane 的（workspace, cwd）锚定新 pane 诞生 | 自动解析 |
 | env `TUT_PROJECT_ROOT` | 工作区链 L1 根覆盖：指定启动器读哪个项目的 `.context-hub/workspace.json`（缺省取锚点 pane 的 cwd） | 自动解析 |
 | env `TUT_USER_CONFIG_DIR` | 工作区链 L2 目录覆盖（缺省 `~/.config/tut`） | 自动解析 |
@@ -328,8 +378,10 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 
 ## 文档
 
-- [design/system-design.md](design/system-design.md) — **系统设计（当前有效）**：架构、状态派生规则、MCP 工具 schema、模块契约、技术选型
+- [design/system-design.md](design/system-design.md) — **系统设计（根文档）**：宿主无关核心与宿主契约
 - [design/context-design.md](design/context-design.md) — **上下文设计**：放什么（scope / 记录类型 / 正文内容要求）、怎么管理
+- [design/herdr-host.md](design/herdr-host.md) — **Herdr 宿主**：pane、电源、hook、终端投递与 Enter 补救
+- [design/standalone-host.md](design/standalone-host.md) — **Standalone 宿主**：服务电源、run、headless、续跑、座位与 preflight
 
 ## 故障排查与已知限制
 
@@ -339,7 +391,7 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 
 - **npm 安装的 agent CLI 以 `.cmd` shim 形态存在**，TUT 出于加固考虑不执行 shim。请将角色指向 direct Node entry 路由，例如 `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`，或使用带原生可执行文件的 agent
 - 若 PowerShell 执行策略拦截 script block（`tut up` 通过向 pane 键入命令来供给），先执行一次 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-- `tut up` 需要存在当前 pane 上下文（交互式 Herdr pane 内运行，或 `HERDR_PANE_ID` 指向有效 pane id）；无头运行会失败，报错中会点名原因
+- `tut up` 需要存在当前 pane 上下文（交互式 Herdr pane 内运行，或 `HERDR_PANE_ID` 指向有效 pane id）；无头运行会失败，报错中会点名原因，并给出 standalone 逃生口（`tut config set power.mode standalone` 改为供给 detached 进程，不依赖 herdr，`tut down` 关停）
 - Windows 桌面通知通过 PowerShell 使用原生 toast；若 PowerShell 或 toast API 不可用，TUT 会降级为终端响铃。已知边界：系统通知被抑制时（如专注助手/勿扰模式），toast 静默不显示——Windows 不会向 TUT 报错
 - 每次尝试发送 toast 时，TUT 都会刷新 `HKCU` 下的用户级 AppUserModelID 注册；无需管理员安装步骤
 - Herdr 的 Windows zip 依赖 VC++ 运行库（`vc_redist.x64`）——缺失时二进制静默退出
@@ -347,9 +399,9 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 **排障**：
 
 - **Agent 说看不到 context.* 工具**：在目标 workspace 执行 `tut status` 确认所属 Hub 可达；确认 MCP 配置在正确 workspace 运行 `tut mcp`（或钉定 `TUT_HUB_ROOT`）；个别 CLI 会话可能被沙箱挡住 localhost 回连——此时让该 Agent 改用 CLI 通道（`tut read` / `tut publish`），行为完全等价
-- **3001 端口被占用（EADDRINUSE）**：在目标 workspace 运行 `tut up`。它会验证 Hub 归属，发现该 workspace 的既有本地 Hub；默认端口对被占用时，从 3003/3004 起选择空闲端口对供给自己的 Hub/notifier。普通 CLI 也会发现所属 Hub；显式 `--url` 指向 foreign Hub 会被拒绝。手工指定地址可用 `tut serve --port <n>` 与 `--url`，挪事件端口用 `--event-port`（Hub 与事件端口不能相同）。复用 Hub 不代表 notifier 在相邻端口：`up` 通过 notifier 的 `hub_root` 与 `hub_url` 确认归属，保留 3101/3002 及自动分配的端口对。缺少身份字段的旧 notifier 需升级/重启；移动事件端口前先停止已有 notifier。
+- **3001 端口被占用（EADDRINUSE）**：在目标 workspace 运行 `tut up`。它会验证 Hub 归属，发现该 workspace 的既有本地 Hub；默认端口对被占用时，从 3003/3004 起选择空闲端口对供给自己的 Hub/notifier。普通 CLI 也会发现所属 Hub；显式 `--url` 指向 foreign Hub 会被拒绝。手工指定地址可用 `tut serve --port <n>` 与 `--url`，挪事件端口用 `--event-port`（Hub 与事件端口不能相同）。复用 Hub 不代表 notifier 在相邻端口：`up` 通过 notifier 的 `hub_root` 与 `hub_url` 确认归属，保留 3101/3002 及自动分配的端口对。复用 notifier 要求其报告身份字段；移动事件端口前先停止已有 notifier。
 - **启动锁错误**：`another up (pid N) is provisioning` 表示应等待该次启动完成；只有确认没有其它 `tut up` 实例在运行后，才可删除提示中的 `.context-hub/up.lock` 并重试。`cannot verify startup lock` 可能是锁文件损坏，也可能撞上初次写入的竞态：先重试；若持续失败，检查锁内容并确认没有其它 `tut up` 在运行后再删除。`startup lock recovery in progress` 表示另一个实例正在接管陈旧锁：先重试；若接管已中断，检查提示中的 `.context-hub/up.lock.reclaim` 目录，仅在确认没有其它 `tut up` 在运行后删除该目录。
-- **`npm i -g` 后自定义的阵容丢了**——已解决：阵容存于项目（`.context-hub/workspace.json`）或用户级（`~/.config/tut/`），升级不动它们。迁移步骤见[配置 ②](#-工作区阵容--三级解析链项目--用户--内置)
+- **工作区阵容存储**：阵容存于项目（`.context-hub/workspace.json`）或用户级（`~/.config/tut/`），升级不动它们。工作区解析链见[配置](#配置)
 
 **已知限制**（设计取舍，非 bug）：
 

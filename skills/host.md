@@ -87,9 +87,10 @@
 10. 若候选缺失，与人商定替代阵容（换将，或由人自管该会话；full 覆盖 architect、executor、reviewer，direct 覆盖 executor、reviewer，solo 覆盖 executor；cast 点名者也须核对；未补齐不创建）。
 11. 若 full 大任务的三角色为同一 agent，披露独立视角缺失。
 12. 核对 checkout 指向已准备的工作区（worktree 由人事先准备，Host 不执行 Git）。
-13. 创建任务（`role=human`、creator 为人名；授权来源为人的驱动委托）。
-14. 核对返回的 flow、cast 与 checkout（cast 可经 read 或 /state 核对）。
-15. 按③投递首轮。
+13. 将工作区声明行「工作区：<绝对路径>（分支 <分支名>）」写入 description（anchored 启动按此行解析与校验）。
+14. 创建任务（`role=human`、creator 为人名；授权来源为人的驱动委托）。
+15. 核对返回的 flow、cast 与 checkout（cast 可经 read 或 /state 核对）。
+16. 按③投递首轮。
 
 创建示例：
 

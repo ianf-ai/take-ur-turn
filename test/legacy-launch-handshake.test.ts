@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { taskLaunchMetadata } from "../src/launcher/compat.js";
+import { taskLaunchMetadata } from "../src/herdr/launcher/compat.js";
 
 const TASK = { task_id: "t1", checkout: { kind: "current" as const } };
 

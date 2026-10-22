@@ -9,18 +9,18 @@ import path from "node:path";
  * tables; state-machine golden vectors live in state-machine.test.ts.
  * DerivedState is returned; real integration happens in seam.test.ts.
  */
-vi.mock("../src/hub/state-machine.js", async (importOriginal) => {
+vi.mock("../src/core/hub/state-machine.js", async (importOriginal) => {
   // derive stays spied (call passthrough assertions) but REAL — the store's
   // folds run through the real incremental fold exports, so meta
   // and list entries carry true derived state in this file.
-  const actual = await importOriginal<typeof import("../src/hub/state-machine.js")>();
+  const actual = await importOriginal<typeof import("../src/core/hub/state-machine.js")>();
   return { ...actual, derive: vi.fn(actual.derive) };
 });
 
-import { Store, StoreError } from "../src/hub/store.js";
-import { TASK_SPEC_HEADINGS } from "../src/common/task-spec.js";
-import { derive } from "../src/hub/state-machine.js";
-import { ErrorCode, type ContextRecord, type Flow, type Payload } from "../src/common/types.js";
+import { Store, StoreError } from "../src/core/hub/store.js";
+import { TASK_SPEC_HEADINGS } from "../src/core/common/task-spec.js";
+import { derive } from "../src/core/hub/state-machine.js";
+import { ErrorCode, type ContextRecord, type Flow, type Payload } from "../src/core/common/types.js";
 import { createHash } from "node:crypto";
 
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -560,7 +560,7 @@ describe("atomic writes", () => {
    * exclusive create.
    */
   function blindReconciliation(store: Store): void {
-    (store as unknown as { taskDirNames: () => Promise<string[]> }).taskDirNames = async () => [];
+   (store as unknown as { taskDirNames: () => Promise<string[]> }).taskDirNames = async () => [];
   }
 
   it("an existing same-name record file still yields VERSION_CONFLICT (link-based exclusive create)", async () => {
@@ -982,7 +982,7 @@ describe("structural artifact validation", () => {
   /** Create a task with one healthy record (landed directly on disk — never
    *  folded through this store, so the damage below is what the FIRST fold
    *  sees), then overwrite v001 with structurally-broken content — the exact
-   *  damage class P1-2 targets (syntactically-valid JSON that must never
+   *  damage class  targets (syntactically-valid JSON that must never
    *  reach derive). */
   async function malformedRecordTask(store: Store, root: string, title: string, build: (taskId: string) => string): Promise<string> {
     const { task_id } = await store.createTask({ title, description: "d", creator: "alice", role: "agent:architect" });
@@ -997,30 +997,30 @@ describe("structural artifact validation", () => {
     ["array", () => "[1,2,3]"],
     [
       "string version",
-      (taskId) => JSON.stringify({ version: "1", task_id: taskId, role: "r", content_type: "note", timestamp: "t", payload: { summary: "s", body: "b" } }),
+     (taskId) => JSON.stringify({ version: "1", task_id: taskId, role: "r", content_type: "note", timestamp: "t", payload: { summary: "s", body: "b" } }),
     ],
     [
       "payload without summary",
-      (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: "r", content_type: "note", timestamp: "t", payload: { body: "b" } }),
+     (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: "r", content_type: "note", timestamp: "t", payload: { body: "b" } }),
     ],
     // Whitespace-only fields: the write door's
     // requireNonEmptyString uses trim() — the read side must not legalize
     // what append refuses.
     [
       "whitespace role",
-      (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: " ", content_type: "note", timestamp: "t", payload: { summary: "s", body: "b" } }),
+     (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: " ", content_type: "note", timestamp: "t", payload: { summary: "s", body: "b" } }),
     ],
     [
       "whitespace content_type",
-      (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: "r", content_type: "\t", timestamp: "t", payload: { summary: "s", body: "b" } }),
+     (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: "r", content_type: "\t", timestamp: "t", payload: { summary: "s", body: "b" } }),
     ],
     [
       "whitespace timestamp",
-      (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: "r", content_type: "note", timestamp: " \t ", payload: { summary: "s", body: "b" } }),
+     (taskId) => JSON.stringify({ version: 1, task_id: taskId, role: "r", content_type: "note", timestamp: " \t ", payload: { summary: "s", body: "b" } }),
     ],
     [
       "whitespace task_id",
-      () => JSON.stringify({ version: 1, task_id: " ", role: "r", content_type: "note", timestamp: "t", payload: { summary: "s", body: "b" } }),
+     () => JSON.stringify({ version: 1, task_id: " ", role: "r", content_type: "note", timestamp: "t", payload: { summary: "s", body: "b" } }),
     ],
   ];
 
@@ -1073,14 +1073,14 @@ describe("structural artifact validation", () => {
       const base = readMeta(root, task_id);
 
       for (const mutate of [
-        (m: Record<string, unknown>) => { m.flow = "bogus"; },
-        (m: Record<string, unknown>) => { m.version = "3"; },
-        (m: Record<string, unknown>) => { delete m.title; },
+       (m: Record<string, unknown>) => { m.flow = "bogus"; },
+       (m: Record<string, unknown>) => { m.version = "3"; },
+       (m: Record<string, unknown>) => { delete m.title; },
         // Whitespace timestamps: meta's created_at /
         // updated_at use the same trim() emptiness definition as repairMeta's
         // write-side validation — read and write domains cannot drift apart.
-        (m: Record<string, unknown>) => { m.created_at = "   "; },
-        (m: Record<string, unknown>) => { m.updated_at = " \t "; },
+       (m: Record<string, unknown>) => { m.created_at = "   "; },
+       (m: Record<string, unknown>) => { m.updated_at = " \t "; },
       ]) {
         const mutated = { ...base };
         mutate(mutated);
@@ -1089,7 +1089,7 @@ describe("structural artifact validation", () => {
         expect(snap.degraded).toEqual([task_id]);
         expect(snap.tasks.map((t) => t.task_id)).not.toContain(task_id);
 
-        // The A-class door heals it every time: rebuild → back in tasks[].
+        // The meta-rebuild door heals it every time: rebuild → back in tasks[].
         const repaired = await store.repairMeta(task_id, { title: "Bad Meta Shape" });
         expect(repaired.version).toBe(1);
         expect((await store.snapshotTasks()).degraded).toEqual([]);
@@ -1168,7 +1168,7 @@ describe("structural artifact validation", () => {
   });
 });
 
-describe("repairMeta (A-class, system-design 4.3)", () => {
+describe("repairMeta (meta-rebuild, system-design 4.3)", () => {
   const frozenDescription = ["要改变的行为", "验收场景", "明确不做", "必要依赖及理由"]
     .map((heading) => `## ${heading}\nScope text`).join("\n\n");
 
@@ -1246,7 +1246,7 @@ describe("repairMeta (A-class, system-design 4.3)", () => {
     await expectCode(store.repairMeta("no-such-task", { title: "x" }), ErrorCode.TASK_NOT_FOUND);
   });
 
-  it("meta rebuild on a task whose records are ALSO corrupt: repair lands, no status, stays degraded (B-class pending)", async () => {
+  it("meta rebuild on a task whose records are ALSO corrupt: repair lands, no status, stays degraded (record-recovery pending)", async () => {
     const stderrWrite = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     try {
       const { store, root } = newStore();
@@ -1301,7 +1301,7 @@ describe("repairMeta (A-class, system-design 4.3)", () => {
   });
 });
 
-describe("recoverRecord (B-class, system-design 4.3)", () => {
+describe("recoverRecord (record-recovery, system-design 4.3)", () => {
   async function corruptOneRecord(store: Store, root: string, title: string): Promise<{ task_id: string; recordFile: string; original: Buffer }> {
     // Healthy record lands DIRECTLY on disk (never folded through this
     // store) so the corruption below is what every fold of this directory
@@ -1346,7 +1346,7 @@ describe("recoverRecord (B-class, system-design 4.3)", () => {
     expect(appended.version).toBe(2);
   });
 
-  it("cross-task identity damage (P1-2 round 2): a JSON-valid original belonging to ANOTHER task is corruption — the right snapshot recovers it, bytes pinned, wrong-task source still refused", async () => {
+  it("cross-task identity damage : a JSON-valid original belonging to ANOTHER task is corruption — the right snapshot recovers it, bytes pinned, wrong-task source still refused", async () => {
     const { store, root } = newStore();
     const { task_id } = await store.createTask({ title: "Identity Damage", description: "d", creator: "alice", role: "agent:architect" });
     // Healthy record lands directly (uncached) — the squat below is the
@@ -1446,7 +1446,7 @@ describe("recoverRecord (B-class, system-design 4.3)", () => {
     await expectCode(store.recoverRecord(task_id, { record_file: "v001.design.json", from_path: wrongSnap }), ErrorCode.VALIDATION_ERROR);
   });
 
-  it("two-phase commit (P1-1): a manifest-write failure after the copy lands leaves a RETRYABLE orphan — the retry adopts the copy and completes the registration", async () => {
+  it("two-phase commit : a manifest-write failure after the copy lands leaves a RETRYABLE orphan — the retry adopts the copy and completes the registration", async () => {
     const { store, root } = newStore();
     const { task_id, recordFile, original } = await corruptOneRecord(store, root, "Orphan Retry");
     const snapshotPath = path.join(tmp, "orphan-snap.json");
@@ -1496,7 +1496,7 @@ describe("recoverRecord (B-class, system-design 4.3)", () => {
     expect(readFileSync(path.join(dir, recordFile), "utf8")).toBe("{ broken beyond parse");
   });
 
-  it("an unregistered orphan copy with DIFFERENT bytes is refused with a clear conflict — never overwritten, never a second copy (P1-1)", async () => {
+  it("an unregistered orphan copy with DIFFERENT bytes is refused with a clear conflict — never overwritten, never a second copy ", async () => {
     const { store, root } = newStore();
     const { task_id, recordFile, original } = await corruptOneRecord(store, root, "Orphan Mismatch");
     // Hand-placed orphan from an interrupted registration, holding other bytes.
@@ -1560,7 +1560,7 @@ describe("post-write degradation and close boundaries", () => {
     );
   });
 
-  it("decide close is unavailable while records are corrupt (B-class pending) and available again after recovery", async () => {
+  it("decide close is unavailable while records are corrupt (record-recovery pending) and available again after recovery", async () => {
     const { store, root } = newStore();
     const { task_id } = await store.createTask({ title: "Close Gate", description: "d", creator: "alice", role: "agent:architect" });
     writeRecordDirect(root, task_id, directDesignRecord(task_id));
@@ -1637,7 +1637,7 @@ describe("task ID dot hygiene", () => {
 
 describe("spec diagnostic contract", () => {
   beforeEach(async () => {
-    const actual = await vi.importActual<typeof import("../src/hub/state-machine.js")>("../src/hub/state-machine.js");
+    const actual = await vi.importActual<typeof import("../src/core/hub/state-machine.js")>("../src/core/hub/state-machine.js");
     vi.mocked(derive).mockImplementation(actual.derive);
   });
   it("uses all four headings from the actual host freeze template (each mutation breaks parity)", () => {

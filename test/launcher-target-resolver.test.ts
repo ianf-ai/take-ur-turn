@@ -1,11 +1,11 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
 }));
 
 import { agentFixture } from "./rig-fixtures.js";
-import { rigLabel } from "../src/hub/rig.js";
+import { rigLabel } from "../src/core/hub/rig.js";
 /**
  * Platform target resolution (launcher port design §3) — the unit-3 seam.
  *
@@ -28,14 +28,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // The start-next wiring test mocks the Hub client the same way as
 // test/cli-start-next.test.ts: the door must fail its Windows target pre-check
 // BEFORE the launch marker (hubPublish must never fire).
-vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
+vi.mock("../src/core/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/hub-client.js")>()),
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
 }));
 
 import { main } from "../src/cli.js";
-import { hubPublish, hubRead } from "../src/hub/hub-client.js";
+import { hubPublish, hubRead } from "../src/core/hub/hub-client.js";
 
 import {
   AgentTargetError,
@@ -52,10 +52,10 @@ import {
   type FactProbeExit,
   type ProbeResult,
   type WindowsTargetDeps,
-} from "../src/launcher/target-resolver.js";
-import { buildLaunchInvocation, deserializeLaunchInvocation, serializeLaunchInvocation, targetDigest } from "../src/launcher/invocation.js";
-import { runLaunchEntry } from "../src/launcher/entry.js";
-import type { AgentCommand, LaunchInvocation } from "../src/common/types.js";
+} from "../src/core/launcher/target-resolver.js";
+import { buildLaunchInvocation, deserializeLaunchInvocation, serializeLaunchInvocation, targetDigest } from "../src/core/launcher/invocation.js";
+import { runLaunchEntry } from "../src/core/launcher/entry.js";
+import type { AgentCommand, LaunchInvocation } from "../src/core/common/types.js";
 
 // --- Windows fixtures --------------------------------------------------------------
 
@@ -517,7 +517,7 @@ describe("Windows filesystem probe budget (dead-UNC stat/header cannot stall the
   });
 });
 
-// --- streaming fact-probe isolation (review v8 P1) --------------------------------
+// --- streaming fact-probe isolation --------------------------------
 
 describe("streaming fact-probe isolation (a stalled candidate cannot sink its batch-mates)", () => {
   /** Scripted fact-probe transport: emits `rows` (one NDJSON line each) at
@@ -1171,6 +1171,9 @@ describe("start-next Windows target pre-check (before the marker)", () => {
     // to cwd) plus PATH="C:\npm" reproduces the npm-shim install layout
     // with no where.exe stand-in.
     const bin = mkdtempSync(path.join(os.tmpdir(), "tut-pathtext-shim-"));
+    // tui-side pin of the start-next launch_mode switch (these are the pane-door pre-checks).
+    mkdirSync(path.join(bin, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(bin, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
     for (const key of ["PATH", "TUT_DRY_RUN", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR"]) {
       savedEnv[key] = process.env[key];
     }
@@ -1222,6 +1225,9 @@ describe("start-next Windows target pre-check (before the marker)", () => {
 
   it("real extensionless MZ file passes the default pre-check, THEN the marker; the child renders the Windows plan (dry-run, no mutation)", async () => {
     const mzDir = mkdtempSync(path.join(os.tmpdir(), "tut-mz-wiring-"));
+    // tui-side pin of the start-next launch_mode switch (these are the pane-door pre-checks).
+    mkdirSync(path.join(mzDir, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(mzDir, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
     for (const key of ["PATH", "TUT_DRY_RUN", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HERDR_LOG", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR", "TUT_DELIVERY_DIAG"]) {
       savedEnv[key] = process.env[key];
     }
@@ -1297,6 +1303,9 @@ describe("start-next Windows target pre-check (before the marker)", () => {
 
   it("a non-MZ extensionless file fails the default pre-check BEFORE the marker", async () => {
     const elfDir = mkdtempSync(path.join(os.tmpdir(), "tut-elf-wiring-"));
+    // tui-side pin of the start-next launch_mode switch (these are the pane-door pre-checks).
+    mkdirSync(path.join(elfDir, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(elfDir, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
     for (const key of ["PATH", "TUT_DRY_RUN", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR"]) {
       savedEnv[key] = process.env[key];
     }

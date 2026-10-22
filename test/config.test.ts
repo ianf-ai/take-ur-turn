@@ -6,15 +6,18 @@ import path from "node:path";
 import {
   autoSectionOf,
   configKeyDomain,
+  CONFIG_KEYS,
   ensureConfig,
   parseConfigValue,
   readConfig,
   readConfigFile,
   readFlowMode,
+  readPowerMode,
+  readPowerModeForSwitch,
   writeConfigKey,
   writeFlowMode,
   type Config,
-} from "../src/common/config.js";
+} from "../src/core/common/config.js";
 
 let tmp: string;
 let root: string;
@@ -461,5 +464,77 @@ describe("review_standards", () => {
     expect(await ensureConfig(root)).toEqual(original);
     expect(await readFlowMode(root)).toBe("auto");
     expect(await readConfig(root)).toEqual(original);
+  });
+});
+
+describe("power.mode", () => {
+  it("parseConfigValue accepts both modes and rejects illegal values with the domain", () => {
+    expect(parseConfigValue("power.mode", "herdr")).toEqual({ ok: true, assignment: { key: "power.mode", value: "herdr" } });
+    expect(parseConfigValue("power.mode", "standalone")).toEqual({ ok: true, assignment: { key: "power.mode", value: "standalone" } });
+    const rejected = parseConfigValue("power.mode", "both");
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.error).toContain('"herdr" | "standalone"');
+    expect(CONFIG_KEYS).toContain("power.mode");
+  });
+
+  it("readPowerMode defaults to herdr (missing file, missing key, empty section)", async () => {
+    expect(await readPowerMode(root)).toBe("herdr");
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual" }));
+    expect(await readPowerMode(root)).toBe("herdr");
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", power: {} }));
+    expect(await readPowerMode(root)).toBe("herdr");
+  });
+
+  it("readPowerMode reads standalone and fails visibly on illegal values (never a silent default)", async () => {
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", power: { mode: "standalone" } }));
+    expect(await readPowerMode(root)).toBe("standalone");
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", power: { mode: "both" } }));
+    await expect(readPowerMode(root)).rejects.toThrow('invalid power.mode: "both" (expected "herdr" | "standalone")');
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", power: "standalone" }));
+    await expect(readPowerMode(root)).rejects.toThrow("invalid power.mode");
+    writeFileSync(path.join(root, "config.json"), "{corrupt");
+    await expect(readPowerMode(root)).rejects.toThrow("unreadable or corrupt");
+  });
+
+  it("writeConfigKey nests power.mode key-preservingly (siblings inside power survive)", async () => {
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "auto", power: { note: "keep" }, future: 1 }));
+    const config = await writeConfigKey(root, { key: "power.mode", value: "standalone" });
+    expect((config.power as { mode: string }).mode).toBe("standalone");
+    expect(JSON.parse(readFileSync(path.join(root, "config.json"), "utf8"))).toEqual({
+      flow_mode: "auto",
+      power: { note: "keep", mode: "standalone" },
+      future: 1,
+    });
+  });
+
+  it("configKeyDomain spells the two legal values", () => {
+    expect(configKeyDomain("power.mode")).toBe('"herdr" | "standalone"');
+  });
+
+  it("readPowerModeForSwitch (the up/down reader) ignores unrelated config damage", async () => {
+    // Missing file, corrupt JSON, non-object JSON: the herdr default, silently
+    // (the pre-power up behavior; the usage step still warns on its own).
+    expect(await readPowerModeForSwitch(root)).toBe("herdr");
+    writeFileSync(path.join(root, "config.json"), "{corrupt");
+    expect(await readPowerModeForSwitch(root)).toBe("herdr");
+    writeFileSync(path.join(root, "config.json"), "[1, 2]");
+    expect(await readPowerModeForSwitch(root)).toBe("herdr");
+    // An illegal flow_mode with the power key absent: NOT a power problem.
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "bogus" }));
+    expect(await readPowerModeForSwitch(root)).toBe("herdr");
+    // Explicit herdr under the same damage stays herdr.
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "bogus", power: { mode: "herdr" } }));
+    expect(await readPowerModeForSwitch(root)).toBe("herdr");
+    // Legal power values win regardless of sibling damage.
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "bogus", power: { mode: "standalone" } }));
+    expect(await readPowerModeForSwitch(root)).toBe("standalone");
+    // Only a present-but-illegal POWER section throws — the fail-visible branch.
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "bogus", power: { mode: "both" } }));
+    await expect(readPowerModeForSwitch(root)).rejects.toThrow('invalid power.mode: "both" (expected "herdr" | "standalone")');
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", power: "standalone" }));
+    await expect(readPowerModeForSwitch(root)).rejects.toThrow("invalid power.mode");
+    // Contrast: the STRICT reader (tut config get) still refuses unrelated damage.
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "bogus" }));
+    await expect(readPowerMode(root)).rejects.toThrow("unreadable or corrupt");
   });
 });

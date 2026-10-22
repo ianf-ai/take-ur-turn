@@ -18,7 +18,7 @@ import {
   DEFAULT_TAB_LABEL,
   resolveAgent,
   resolveTabLabelTemplate,
-} from "../src/common/workspace.js";
+} from "../src/core/common/workspace.js";
 
 const run = promisify(execFile);
 const SCRIPTS_DIR = path.resolve(import.meta.dirname, "../scripts");
@@ -355,7 +355,7 @@ describe("repo seed & retired artifacts", () => {
   });
 
   it("workspace.ts exports no label concept (resolveRole / WorkspaceRole retired)", async () => {
-    const ws = (await import("../src/common/workspace.js")) as unknown as Record<string, unknown>;
+    const ws = (await import("../src/core/common/workspace.js")) as unknown as Record<string, unknown>;
     expect(ws.resolveRole).toBeUndefined();
     expect(ws.KNOWN_ROLES).toBeDefined();
     // DEFAULT_ROLES slimmed to role → agent (string values, no seat objects)

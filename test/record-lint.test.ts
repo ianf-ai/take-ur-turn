@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { ContextRecord, Flow } from "../src/common/types.js";
-import { foldWithLint } from "../src/hub/record-lint.js";
-import { initialCursor } from "../src/hub/state-machine.js";
+import type { ContextRecord, Flow } from "../src/core/common/types.js";
+import { foldWithLint } from "../src/core/hub/record-lint.js";
+import { initialCursor } from "../src/core/hub/state-machine.js";
 const spec = "## 验收场景\n1. first\n2. second";
 const scope = "\n## 超出规格的改动\n无";
 const complete = "## 退出条件逐条核验\n1. 满足 — first; evidence test\n2. 外部阻塞 — second; unavailable" + scope;
@@ -87,7 +87,7 @@ describe("record diagnostic overlay", () => {
   });
 });
 
-it("legacy old-format review on a frozen description: lint warns but records land and state advances (P1 back-compat)", () => {
+it("legacy old-format review on a frozen description: lint warns but records land and state advances (back-compat)", () => {
   const oldFormatReview: ContextRecord = { task_id: "t", version: 4, timestamp: "t", role: "reviewer", content_type: "review",
     payload: { summary: "ok", body: "old-format body without structured sections", verdict: "pass", ref_version: 2 } };
   const out = foldWithLint(initialCursor("full"), records(["note", "design", "note"]), "full", spec)

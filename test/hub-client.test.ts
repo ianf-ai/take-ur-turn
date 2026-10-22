@@ -12,8 +12,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { startServer, type RunningServer } from "../src/hub/server.js";
-import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError, HubSession, hubReadVia } from "../src/hub/hub-client.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
+import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError, HubSession, hubReadVia } from "../src/core/hub/hub-client.js";
 
 let tmp: string;
 let running: RunningServer;
@@ -267,7 +267,7 @@ describe("transport shape", () => {
 });
 
 describe("HubSession — resident connection reuse", () => {
-  it("P2-1: close() racing the handshake discards the connection — no resurrection, no later calls, close is repeatable", async () => {
+  it("close() racing the handshake discards the connection — no resurrection, no later calls, close is repeatable", async () => {
     // Deferred-handshake shape: the stub accepts the initialize POST but parks
     // the response; close() runs while the handshake is in flight; releasing
     // the gate must NOT resurrect the session (the old code published the

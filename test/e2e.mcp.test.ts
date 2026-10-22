@@ -18,7 +18,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-import { startServer, type RunningServer } from "../src/hub/server.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
 
 let tmp: string;
 let root: string;
@@ -92,6 +92,56 @@ async function readStatus(client: Client, taskId: string): Promise<string> {
   expect(out.isError).toBe(false);
   return out.json?.status as string;
 }
+
+describe("e2e: direct fail_design human gate", () => {
+  it.each(["approve", "reject", "close"])("publishes the anomaly, preserves it across ack/restart, then handles %s", async decision => {
+    let client = await connectClient();
+    const created = await call(client, "context.create", { title: "Direct review gate", description: "review routing acceptance",
+      creator: "tester", role: "human", flow: "direct" });
+    const task_id = created.json?.task_id as string;
+    const publish = (content_type: string, payload: Record<string, unknown>, role = "human") =>
+      call(client, "context.publish", { task_id, role, content_type, payload: { summary: content_type, body: "gate acceptance", ...payload } });
+    expect((await publish("code_changes", {}, "executor")).json?.status).toBe("reviewing");
+    const review = await publish("review", { verdict: "fail_design", ref_version: 1 }, "reviewer");
+    expect(review.isError).toBe(false);
+    expect(review.json).toMatchObject({ version: 2, status: "pending_approval", needs_attention: true,
+      warnings: [{ version: 2, code: "OUT_OF_TABLE" }] });
+    for (const payload of [{}, { ack: true }]) {
+      expect((await publish("note", payload)).json).toMatchObject({ status: "pending_approval", needs_attention: true,
+        warnings: [{ version: 2, code: "OUT_OF_TABLE" }] });
+    }
+    const assertGate = async () => {
+      expect(await readStatus(client, task_id)).toBe("pending_approval");
+      const listed = await call(client, "context.list", {});
+      expect((listed.json?.tasks as Array<Record<string, unknown>>).find(t => t.task_id === task_id)).toMatchObject({
+        status: "pending_approval", waiting_for: "human", needs_attention: true, warnings: [{ version: 2, code: "OUT_OF_TABLE" }] });
+      const state = await (await fetch(`${baseUrl}/state`)).json() as { tasks: Array<Record<string, unknown>> };
+      expect(state.tasks.find(t => t.task_id === task_id)).toMatchObject({ status: "pending_approval", waiting_for: "human",
+        needs_attention: true, warnings: [{ version: 2, code: "OUT_OF_TABLE" }], round_count: 1 });
+      expect(JSON.stringify(state)).not.toContain("reviewGateWarnings");
+    };
+    await assertGate();
+    await client.close();
+    await running.close();
+    running = await startServer({ root, port: 0 });
+    baseUrl = running.url;
+    client = await connectClient();
+    await assertGate(); // cold replay must preserve the same warning and gate
+    expect((await call(client, "context.decide", { task_id, decision, by: "tester" })).json?.status)
+      .toBe(decision === "approve" ? "approved" : decision === "reject" ? "revising" : "closed");
+    if (decision === "reject") {
+      expect((await publish("revision", { ref_version: 5 }, "executor")).json?.status).toBe("reviewing");
+      expect((await publish("review", { verdict: "pass", ref_version: 6 }, "reviewer")).json?.status).toBe("pending_approval");
+      expect((await call(client, "context.decide", { task_id, decision: "approve", by: "tester" })).json?.status).toBe("approved");
+    }
+    if (decision !== "close") await call(client, "context.decide", { task_id, decision: "close", by: "tester" });
+    const state = await (await fetch(`${baseUrl}/state?include=closed`)).json() as { tasks: Array<Record<string, unknown>> };
+    expect(state.tasks.find(t => t.task_id === task_id)).toMatchObject({ status: "closed", waiting_for: "none", needs_attention: false });
+    const read = await call(client, "context.read", { task_id });
+    expect((read.json?.versions as Array<{ version: number; payload: { verdict?: string } }>).find(r => r.version === 2)?.payload.verdict)
+      .toBe("fail_design"); // decisions clear the warning, never the immutable review
+  });
+});
 
 describe("e2e: full lifecycle over HTTP (end-to-end acceptance walk)", () => {
   it("walks create → publish → read → … → decide(close) with the derived status at every step", async () => {

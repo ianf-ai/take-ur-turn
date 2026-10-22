@@ -4,8 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { hubCreate } from "../src/hub/hub-client.js";
-import { startServer, type RunningServer } from "../src/hub/server.js";
+import { hubCreate } from "../src/core/hub/hub-client.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
 
 const CLI = path.resolve(import.meta.dirname, "../dist/cli.js");
 

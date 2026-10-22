@@ -9,7 +9,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 import { execFile } from "node:child_process";
-import { buildWindowsToastPowerShellScript, createChannels, type Channel } from "../src/common/channels.js";
+import { buildWindowsToastPowerShellScript, createChannels, type Channel } from "../src/core/common/channels.js";
 
 const execFileMock = execFile as unknown as Mock;
 

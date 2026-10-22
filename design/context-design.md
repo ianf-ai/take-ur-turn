@@ -151,7 +151,7 @@ git 后端与 Hub 机制的能力映射：
 ### 3.2 生命周期
 
 - 记录**永不删除**——完整历史本身就是审计与复盘的素材，这是「替代文件中转」的价值来源之一
-- task scope 的 closed 是吸收态（主设计 3.2）；project scope 没有结束状态
+- task scope 的 closed 是吸收态（主设计 3.1）；project scope 没有结束状态
 
 ### 3.3 访问通道
 

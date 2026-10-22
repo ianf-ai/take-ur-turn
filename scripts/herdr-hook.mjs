@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 /**
  * Canonical Herdr plugin hook — pane.agent_status_changed → on-agent-event.mjs
- * (system-design 7.2 signal-source contract).
  *
  * Empirical payload (herdr 0.8, delivered on stdin here): the JSON envelope
  *   {"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1",

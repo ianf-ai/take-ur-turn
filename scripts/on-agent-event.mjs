@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Canonical agent-event entry — system-design 7.2 signal-source contract.
+ * Canonical agent-event entry — validates arguments and posts loopback events.
  *
  * Usage: on-agent-event.mjs <event> <agent> <pane>   event ∈ working | blocked | done | delivery_giveup
  *

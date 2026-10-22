@@ -6,10 +6,10 @@
 // Every entry below is a runtime contract artifact, not a build extra: missing
 // ones do NOT fail at install time — they fail later, at every use. The
 // launcher runners are rendered into pane commands by absolute path
-// (src/launcher/shell-renderer.ts defaultPaneRuntime), so a missing runner
+// (src/herdr/launcher/shell-renderer.ts defaultPaneRuntime), so a missing runner
 // flash-crashes each agent pane at birth; skills role files are rendered into
-// kickoff prompts by absolute path (src/launcher/compat.ts promptFor) and read
-// by the notifier (src/notifier.ts), so a missing file launches agents without
+// kickoff prompts by absolute path (src/herdr/launcher/compat.ts promptFor) and read
+// by the notifier (src/core/notifier/notifier.ts), so a missing file launches agents without
 // their role skill. That is the same packaging-risk class as 0.5.0, so the
 // gate enumerates all of them explicitly.
 import { existsSync, statSync, readdirSync } from "node:fs";
@@ -18,25 +18,30 @@ import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// dist/cli.js: the 10KB heuristic from the 0.5.0 incident assumed the
-// pre-reorganization monolith; cli.ts is now a thin dispatcher (~6KB compiled), so the
-// guard only needs to catch empty/truncated builds. The runners still only
+// The public bin is a compatibility shim; core/cli.js contains the dispatcher.
+// Both must exist and be substantial enough to catch empty/truncated builds.
+// The runners still only
 // need to exist, be regular files (symlinks to regular files count —
 // statSync follows them; a directory passes neither test), and be non-empty.
 const RUNTIME_ENTRIES = [
   {
     rel: path.join("dist", "cli.js"),
     why: "bin entry (package.json bin)",
-    minBytes: 2_000,
+    minBytes: 200,
   },
   {
-    rel: path.join("dist", "launcher", "pane-runner.js"),
-    why: "rendered into pane commands by absolute path (src/launcher/shell-renderer.ts defaultPaneRuntime) — missing means every pane birth flash-crashes",
+    rel: path.join("dist", "herdr", "launcher", "pane-runner.js"),
+    why: "rendered into pane commands by absolute path (src/herdr/launcher/shell-renderer.ts defaultPaneRuntime) — missing means every pane birth flash-crashes",
     minBytes: 1,
+  },
+  {
+    rel: path.join("dist", "core", "cli.js"),
+    why: "core CLI dispatcher loaded by the public bin entry",
+    minBytes: 2_000,
   },
   ...["architect", "executor", "reviewer", "host"].map((role) => ({
     rel: path.join("skills", `${role}.md`),
-    why: `role skill rendered into ${role} kickoff prompts by absolute path (src/launcher/compat.ts promptFor)`,
+    why: `role skill rendered into ${role} kickoff prompts by absolute path (src/herdr/launcher/compat.ts promptFor)`,
     minBytes: 1,
   })),
 ];
@@ -64,11 +69,12 @@ for (const { rel, why, minBytes } of RUNTIME_ENTRIES) {
   }
 }
 // Retirement regression gate: tsc does not remove stale build products.
-for (const name of existsSync(path.join(root, "dist", "launcher"))
-  ? readdirSync(path.join(root, "dist", "launcher")) : []) {
-  if (/^probe-(runner|channel)\.(?:js|d\.ts|map|js\.map|d\.ts\.map)$/.test(name)) {
-    console.error(`assert-release: retired artifact dist/launcher/${name} must not enter the package; remove stale build products and rebuild.`);
-    failed = true;
+for (const dir of ["dist/launcher", "dist/herdr/launcher"]) {
+  for (const name of existsSync(path.join(root, dir)) ? readdirSync(path.join(root, dir)) : []) {
+    if (/^probe-(runner|channel)\.(?:js|d\.ts|map|js\.map|d\.ts\.map)$/.test(name)) {
+      console.error(`assert-release: retired artifact ${dir}/${name} must not enter the package; remove stale build products and rebuild.`);
+      failed = true;
+    }
   }
 }
 if (failed) process.exit(1);

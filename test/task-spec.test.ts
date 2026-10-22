@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { exitConditions, sections, taskSpecWarning } from "../src/common/task-spec.js";
+import { exitConditions, sections, taskSpecWarning } from "../src/core/common/task-spec.js";
 
 describe("finite task spec grammar", () => {
   it.each(["1. first\n2) second", "- first\n- second", "① first；② second"])("extracts %s", (items) => {

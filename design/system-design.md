@@ -2,80 +2,44 @@
 
 ## 1. 概述
 
-### 1.1 要解决的问题
+TUT（Take Ur Turn）让多个 coding agent 围绕同一任务协作。Context Hub 保存追加式过程记录，纯函数从记录序列派生任务状态，Notifier 观察状态并通知或启动下一角色，人负责关键审批。
 
-让多个 coding agent（不同模型、不同工具）在同一项目中协作时，存在三个痛点：
+本文是宿主无关的系统根文档；设计文档反映当前行为，决策理由与验证经过保存在 Context Hub。
 
-- **上下文靠文件中转**：design.md / review.md 只传结论，推理过程和被放弃的方案全部丢失
-- **流程靠手动驱动**：Review-修改循环通常 2-3 轮，每轮人工触发、手动调 prompt
-- **工具之间隔离**：各 Agent session 互相看不到，没有统一的状态和编排入口
-
-### 1.2 解决方案
-
-**TUT（Take Ur Turn）**：以 Context Hub 为核心的多 Agent 协作系统——
-
-- **Context Hub**：本地 MCP Server，Agent 间的共享记忆。上下文按任务、按版本 append-only 累积，**写入永不因流程原因被拒绝**，替代文件中转
-- **状态投影**：任务状态（走到哪、该谁动）由版本序列经纯函数**派生**，Hub 不执法——流程规则不约束写入
-- **人工审批**：review 通过后由人发布 decision 记录（approve / reject），人只做关键节点介入
-- **Notifier**：轮询派生状态，该谁动时通知人，并交叉验证 Agent 是否真的交差
-
-贯穿全文的架构原则：**Hub 只对记忆负责**。流程的执行（谁按下启动键、审批是否放行）属于消费侧——manual 模式的门是人，auto 模式的门是 Notifier 的启动检查。
-
-各关键取舍已在相应章节就地陈述。
+- [上下文内容与管理](context-design.md)。
+- [Herdr 宿主实现](herdr-host.md)。
+- [Standalone 宿主实现](standalone-host.md)。
 
 ## 2. 整体架构
 
-### 2.1 模块视图
+| 模块 | 职责 |
+|---|---|
+| Context Hub | 本地 MCP / HTTP 服务、追加式任务记忆、状态投影 |
+| Coding agent | 加载角色 skill，读取上下文、工作并发布交付 |
+| Notifier | 轮询状态、消费辅助证据、通知、执行消费侧启动检查 |
+| Agent Host | 提供可插拔信号源与启动器，见第 7 章 |
+| Channel | 将 Notifier 生成的文案投递给人 |
 
-系统五个模块：
-
-| 模块 | 职责 | 展开 |
-|------|------|------|
-| **Context Hub** | 共享记忆（append-only 日志）+ 状态投影（派生视图）。对 Agent 暴露 MCP 工具，对 Notifier 暴露 GET /state | 第 3、4 节 |
-| **coding agent** | 若干个，角色分三种：Architect、Executor、Reviewer——哪个 agent 担任哪个角色是指派而非固定绑定 | 第 5 节 |
-| **Agent Host** | 承载本机 Agent 进程的宿主环境，履行两个可插拔角色——**信号源**（Agent 状态事件）+ **启动器**（拉起 Agent）；具体实现可替换（当前选型见第 8 章） | 第 7 节 |
-| **Notifier** | 通知与流转中枢：常驻轮询派生状态，按 auto/manual 模式决定「谁按下启动键」，交叉验证 Agent 是否交差 | 第 6 节 |
-| **Channel** | 通知输出端（本机桌面提醒 / webhook），触达人 | 8.3 |
-
-### 2.2 数据流
-
-三条流，对应「写、看、动」；部署形态单机团队同构：
-
-```
-┌───────────────── 本机 ×N（团队时每台机器结构相同）─────────────────┐
-│                                                                  │
-│  coding agent ──MCP 读写──► Context Hub ──► 存储（可插拔）         │
-│       ▲                   （记忆 + 状态投影）  ├─ 本地 JSON（单机） │
-│       │ 启动                      ▲           └─ 共享 repo（团队） │
-│  Agent Host ──状态事件──► Notifier ─┘                             │
-│  （信号源 + 启动器，可插拔）        │ 读取派生状态（GET /state）    │
-│                                  │                               │
-└──────────────────────────────────┼───────────────────────────────┘
-                                   ▼ 通知
-                              Channel ──► 人
-         manual：人启动下一个 ｜ auto：Notifier 经启动器启动
+```text
+Agent ── MCP 读写 ──► Context Hub ──► 本地 JSON
+  ▲                        │
+  │ 启动                   │ GET /state、任务日志
+Agent Host ── 运行证据 ──► Notifier ──► Channel ──► 人
 ```
 
-- **写（记录）**：coding agent 经 MCP 往 Hub 追加记录——append-only，写入自由。协议用现成的开放标准（主流 Agent CLI 原生支持，工具 schema 即集成契约，不自研协议）；通知侧不走 MCP，读取只读的 GET /state 足够（见 4.3）
-- **看（感知）**：Notifier 读取派生状态是主通道——人工 decision 等不产生事件的流转只有它能发现；信号源事件做追加触发与交叉验证。感知机制（轮询）及其理由见 6.1
-- **动（行动）**：manual 模式人自己启动下一个 Agent，auto 模式 Notifier 经启动器（TS launcher，`scripts/launch.sh` 为兼容 shim，见 7.2）拉起——无论哪种，都先经 Channel 通知人
+Hub 只对记忆负责：写入不因流程、角色或时序被拒，基本合法性仍校验。流程规则约束消费侧，写入自由不构成绕过人工审批的许可。所有存储读写经 Store / HTTP 接口进行。
 
-**部署形态**：单机时存储为本地 JSON，Hub 即事实源；团队时存储指向共享 context repo（仓库拓扑见 context-design.md 1.2），每台机器的 Hub 是远端事实源的本地视图——派生是纯函数，各机对同一份日志算出同一状态，不会分叉。两种形态下本机结构完全相同，Notifier 与 coding agent 无感知。启动方式为本地两条命令：`tut serve` 拉起 Hub（MCP + /state），`tut notify` 在专属 pane 常驻运行 Notifier（见 8.2）——不启动则没有任何常驻进程。
+任务流程以派生状态为准，终端状态、进程退出和日志输出仅为辅助证据。依赖事实无法确认时明确失败，只有明确规定的兼容入口允许可见降级；不猜身份、不静默代入、不盲目重试。
 
-### 2.3 关键原则
+多个 Hub 对相同的记录序列和任务元数据按相同规则派生时，得到相同状态视图。当前 Store 通过本地 JSON 读写记录，记录如何在机器之间共享不改变该纯函数一致性。
 
-- **流程真相以派生状态为准**：Notifier 不猜测该做什么，而是轮询 /state；Agent 终端状态（done/blocked）只作为辅助信号，用于交叉验证
-- **Hub 只对记忆负责**：写入无条件追加，状态是日志的派生视图而非写入门槛——人为接管、流程异常都不会使记忆不可用
-- **写入自由**：哪个 Agent 在什么时候写什么，由人和 Agent 自主决定；流程约束长在消费侧
-- **不做静默回退**：当一个动作所依赖的事实无法确立（锚点 pane、Hub 身份、任务是否在 /state 在册、shell 方言、pane_id 对应的标签、锁持有者是否存活……）时，TUT 要么 loud fail，要么仅在文档已明确的兼容路径上**可见地降级**（stderr 一行说明原因）——绝不猜测、绝不静默代入默认值、绝不盲目重试/重投。例证见 4.3.1 桥的归属校验、4.4 锚点与 up.lock、7.2 birth 锚定链与「HTTP 200 但任务不在 tasks 中则拒绝启动」、7.2.1 投递不自动重投；legacy 臂的「降级必须可见」（7.2）属可见降级，不是本原则的例外
+## 3. 任务状态
 
-## 3. 任务状态（核心机制：派生视图）
-
-任务状态**不存储、不执法**，而是版本序列的派生视图：一个纯函数读任务的全量记录序列，输出 status、waiting_for 和 warnings。每次追加记录后重算（可缓存），随时可从日志全量重放。
+任务状态是记录序列的派生视图。`derive(taskId, records, flow?)` 按版本顺序折叠全量记录，输出 status、waiting_for、warnings；缓存可由同一输入重放恢复。
 
 ### 3.1 派生规则
 
-序列中依次出现以下记录时，派生状态按图流转（与状态机转换表同构，但语义是「计算」而非「放行」）：
+flow 在 create 时冻结，缺省为 full。full 路径如下，三种 flow 的差异见转换表：
 
 ```mermaid
 stateDiagram-v2
@@ -93,614 +57,365 @@ stateDiagram-v2
     approved --> closed : decision (close)
 ```
 
-此外，`decision(close)` 在**任意状态**都派生为 closed——人工有权随时终止任务，不需要先走完审批链。note 原则上不改变状态，**唯一例外**：`reviewing` 态下 role=executor 的 note 派生回 `revising`——executor 在评审等待期开口（发现自己交付的问题、要补充材料或先行修改），工人直觉上就是收回回合。约束四条：仅 `reviewing` 态生效（其余态的 note 照旧不转态——implementing 中的中途补充是常态）；仅 role=executor（reviewer 的补充说明、architect 与人的记录不走此门）；ack note（`payload.ack=true`）一律不转态——异常处置确认的语义优先于回合收回；closed 吸收态优先，例外在 closed 下不生效。收回后照常以 revision 交付（无需改代码时 revision 说明即可），回到 reviewing 由 Reviewer 重审。role 是自述标签，照常被信任——与 verdict / decision 同一信任模型（Hub 不执法，见 2.3）。规则对全部日志统一生效：派生是记录序列的纯函数，重放按同一规则逐条折叠。
-
-`review` 的 verdict 词表为四档：`pass`（达标且验证完成）｜`blocked_external`（**代码达标、验证卡在外部条件**——真机 / 部署 / 跨系统依赖等 review 回合内无法完成的验证）｜`fail_code`（代码问题，打回修）｜`fail_design`（设计问题，打回重设计）。`blocked_external` 与 `pass` 派生同路进 `pending_approval`：外部验证的执行、委托或豁免正是审批节点上人的职责——approve 即明知外部验证未决而接受（或人先完成验证再拍板），reject 可把补验路径写进理由。两档差别在通知语义与人的决策依据，不在派生路径；词表外的值仍走 `INVALID_VERDICT`（3.2）。
-
-派生函数只消费影响状态折叠的字段（verdict / decision / ack / flow，外加 note 例外行的 role）。**cast 不参与状态派生**：它是路由参数（告诉启动器为各 role 拉谁），不是状态参数，也不约束谁能写记录——任务不维护角色名册的原则不变（见 4.1）。
-
-**转换表按任务的 flow 选择**（flow 在 create 时确定、落 meta 后不可变，缺省 `full`）。full 即上图；direct 与 solo 的差异：
-
 | 记录 | full（上图） | direct（repo 已有设计） | solo（小改动免审） |
 |------|------------|----------------------|-------------------|
 | create（空序列） | → designing | → **implementing** | → **implementing** |
 | design | designing → implementing | **implementing → implementing**（参考记录，不转态）；其余态表外 | 同 direct（参考记录，不转态） |
 | code_changes | implementing → reviewing | 同 full | implementing → **pending_approval** |
-| review(pass / blocked_external / fail_code) | reviewing → pending_approval（pass、blocked_external 同目标）/ revising（fail_code） | 同 full | **表外**（落盘 + needs_attention——免审流程里发 review 是越轨，应当可见） |
-| review(fail_design) | reviewing → designing | **表外**（direct 无 designing 态；免设计流程中设计前提被推翻由人裁决） | 表外（同上） |
+| review(pass / blocked_external / fail_code) | reviewing → pending_approval（pass、blocked_external 同目标）/ revising（fail_code） | 同 full | **表外 → pending_approval + needs_attention**（免审流程里发 review 由人裁决） |
+| review(fail_design) | reviewing → designing | **表外 → pending_approval + needs_attention**（direct 无 designing 态；设计前提被推翻由人裁决） | 表外 → pending_approval + needs_attention |
+| review（四档合法 verdict 的表外 catch-all） | 非 closed 状态无对应转换行时 → pending_approval + needs_attention，保留 OUT_OF_TABLE(version) | 同 full | 同 full |
 | note（reviewing 态，role=executor，非 ack） | reviewing → revising | 同 full | 行不可达（solo 无 reviewing 态；其余 note 照旧不转态） |
 | revision | revising → reviewing；implementing → reviewing（典型场景是 fail_design 修订回路：设计打回重设计落地后，executor 按信封纪律（修订轮以 revision 交付）以 revision 交付修订；派生无历史，implementing 收 revision 一律入行，不以回路前史为门） | revising → reviewing；implementing 下**表外**（fail_design 回路不存在） | **表外**（revising 不可达，无 review 修订回路） |
 | decision(reject) | pending_approval → revising | 同 full | pending_approval → **implementing**（打回重做） |
 | 其余（approve/close/note/ack/异常） | 现行语义（note 默认不转态，唯一例外见 note 行） | 同 full | 同 full |
 
-派生函数签名相应扩展为 `derive(taskId, records, flow?)`——纯函数性质不变，flow 缺省即 full（存量任务零影响）。
+`decision(close)` 在任意状态进入 closed；closed 是吸收态。重复 close 幂等，note 在 closed 下仍可追加而不转态，其他记录保持 closed 并产生诊断。close 和 `payload.ack=true` 的 note 清除此前累计 warnings，但表外合法 review 的 OUT_OF_TABLE 警告不被 note（含 ack）清除，须由有效 decision(approve / reject / close) 核销；其他警告仍按原规则处理。该记录自身及之后的新异常仍诊断。
 
-`waiting_for` 同为派生：`pending_approval / approved / needs_attention` → human（approved 后 close 与否仍等人拍板），`closed` → none，其余 → 对应的下一角色（如 implementing → agent:executor）。注意这只是**路由建议**，不是指令——人可以让任何 Agent 接任何一手。
+合法 review 的表外 catch-all 只作用于 review，不改变其他记录的表外语义，也不覆盖 closed 吸收态或非法 verdict 的现行诊断。进入的人工门复用 pending_approval：approve → approved，reject 按 flow 原行返回 revising（full / direct）或 implementing（solo），close → closed；不新增状态或审批动作。表外 review 警告核销前 needs_attention 持续为真。
 
-**project scope 是派生的例外**（scope 模型见 context-design 2.1）：派生函数跳过它——它没有 status 与 waiting_for，也不出现在 /state。
+note 默认不转态；唯一例外是 reviewing 下 role=executor 的非 ack note，它将任务收回 revising。其余角色、其余状态与 ack note 不走此例外。full 在 fail_design 后回到 implementing，仍以 revision 交付；该转换不依赖回路前史。
 
-### 3.2 异常序列的处理
+review verdict 只接受四档：pass 表示达标且验证完成，blocked_external 表示代码达标而验证受外部条件阻塞，fail_code 表示实现问题、打回修订，fail_design 表示设计问题、打回重设计。词表外值产生 INVALID_VERDICT，不转态。
 
-decision(close) 与 ack 一样清除此前累计 warnings（含 lint）；关闭记录自身及关闭后的新异常仍按原规则诊断。重放旧日志同样生效，历史记录不改删。
+blocked_external 与 pass 一同进入 pending_approval，差别在通知文案与人的决策依据。外部验证的执行、委托或接受由人决定，reject 的理由可指定补验路径。
 
-needs_attention 是**叠加在 status 上的布尔标志，不是状态机的第七个状态**——任何状态都可能与它共存，复位也不改变当前 status。
+派生消费 flow、verdict、decision、ack，以及 note 例外所需的 role。cast 是路由元数据，不参与派生，也不限制谁能发布。project scope 不参与派生，无 status / waiting_for，不进入 `/state`。
 
-表外组合（如 designing 状态出现 review）**不拒绝写入**：记录照常落盘，但不参与状态折叠，派生结果记入 warnings 并置 `needs_attention`。publish、/state 与 context.list 暴露 warnings 和 needs_attention；warnings.version 指向触发异常的记录。错过 publish 即时响应时，可据此经 context.read / `tut read` 查看记录正文、定位问题并提醒人处置；context.read 本身仍不返回 warning code。
+`waiting_for` 的取值为 `human | agent:<role> | none`，是路由建议：needs_attention 优先 → human；无异常时 closed → none，pending_approval / approved → human，其他状态 → 下一角色。approved 后是否 close 仍由人决定。
 
-warnings 词表起始于 `src/common/types.ts` 的五个基础码：`OUT_OF_TABLE`（表外组合，不折叠）、`CLOSED_ABSORB`（closed 后的非 note/close 记录，保持 closed）、`INVALID_VERDICT`（review 缺失/非法 verdict，不转态）、`VERSION_GAP`（版本跳号）与 `VERSION_DUPLICATE`（版本重复，两者折叠照常按版本序进行）——任何 warning 均置 needs_attention，waiting_for 随之为 human。0.8.1 增加记录诊断覆盖层 `src/hub/record-lint.ts`（四个新 WarningCode：REVIEW_EXIT_CONDITIONS_INCOMPLETE、REVIEW_SCOPE_SECTION_MISSING、EXPECTED_REVISION、NON_CANONICAL_ROLE，外加可选 `Warning.message`；create 规格缺失警告为自由文本 warning 字段，非 WarningCode）——**全部非阻断**（不拒收、不改状态折叠），但**会使 needs_attention 置位**，升级后对存量记录是回溯生效的：
-- 覆盖检查与超规格声明检查**仅当 description 带验收场景基线时生效**（无基线的存量任务免疫）；
-- EXPECTED_REVISION **仅当 description 带验收场景基线时武装**（与覆盖/超规格检查同一门控；无基线的存量任务免疫，review 本身是否结构化不影响武装）；
-- NON_CANONICAL_ROLE 无门（role 大小写漂移任何时候都该可见）。
-存量部署升级后，带基线的旧格式 review 记录会亮灯，可追加修复 note 或使用 `tut ack`；已经 close 的任务重放时清除关闭之前的历史警告。
+### 3.2 异常与记录诊断
 
-**0.8.4 修复单协议**（只扩展诊断覆盖层，不改 3.1 的状态转换）：四类 lint 保留原 `code / version / message`，加法携带可选 `location: {field, section?}`、`supportedFixes: {field, instruction, example?, record: {role, content_type, ref_version?}}[]` 和 `correction: {root_version, round, limit: 2, exhausted}`。位置指向触发记录的字段/小节；建议描述要**追加的新记录**及其字段形态，绝不修改原记录。
+表外记录照常落盘并产生 warning；四档合法 review 走第 3.1 节的人工门 catch-all，其余表外记录不参与状态转换。needs_attention 是叠加标志，等于当前 warnings 非空，复位不改变 status；复位本身必须来自记录。
 
-- 同一任务内以 lint code + 小写 role 识别同一问题。首次触发计第 1 轮；同一检查再次失败计第 2 轮，`exhausted=true` 且 message 明写「修正轮耗尽，请人工处置」。中间的无关 note、launch 或其他角色记录不计轮次。needs_attention 始终等于当前 warnings 非空，第一轮照样亮灯、waiting_for 仍为 human；这是修复提示协议，不新增自动启动或人工门的旁路。
-- REVIEW_EXIT_CONDITIONS_INCOMPLETE / REVIEW_SCOPE_SECTION_MISSING：同角色用精确小写 role 追加 note，`payload.ref_version` 引用原始诊断版本或最近失败的修复版本，body 补对应的完整小节，逐项重新检查。只核销引用到的诊断；其余未答项继续亮灯。同角色后续 review 也重新检查两节，成功时清该项，失败时累计轮次。NON_CANONICAL_ROLE：追加同角色小写 note 并引用原始/最近诊断版本，核销角色诊断；普通的无引用记录不能静默核销它。
-- EXPECTED_REVISION：按既有状态表，reviewing 时先追加 executor 非 ack note 收回，再追加 revision 并引用原 fail_design review；有效 revision 才核销该项。错误引用继续亮灯并计轮。旧 fail_design 轮被后续有效 review 结束后不再为其他轮次的 revision 计数。无关的表外/版本 warning 不会随 lint 修复被清掉。
-- 成功修复移除对应活跃 warning，后续复发从第 1 轮开始；ack/close 清掉此前诊断与计数，但该记录自身的新问题照常诊断。耗尽后消费方停止自行重试、交人；人的后续有效修复仍可核销。派生游标持有轮次信息，热增量与冷重放一致；记录保持 append-only。
+closed 的吸收与重复 close 的幂等规则见第 3.1 节。
 
-**closed 是吸收态**：任务派生为 closed 后，note 照常落盘且不改变状态；其他类型的记录同样落盘，但状态保持 closed 并置 needs_attention——例外是 decision(close) **幂等**：重复 close 只落盘，状态不变、不置 needs_attention。
+| WarningCode | 含义 |
+|---|---|
+| OUT_OF_TABLE | 当前 flow / 状态下的表外组合 |
+| CLOSED_ABSORB | closed 下的非 note、非 close 记录 |
+| INVALID_VERDICT | review 缺失或使用非法 verdict |
+| VERSION_GAP / VERSION_DUPLICATE | 版本跳号 / 重复；仍按版本折叠 |
+| REVIEW_EXIT_CONDITIONS_INCOMPLETE | 评审未覆盖验收关闭条件 |
+| REVIEW_SCOPE_SECTION_MISSING | 缺少范围核查小节 |
+| EXPECTED_REVISION | full 的 fail_design 修订未按 revision 交付 |
+| NON_CANONICAL_ROLE | role 大小写不符合小写约定 |
 
-needs_attention 的复位机制属于实现细节，但有一条硬约束：**复位动作本身必须是一条日志记录**（如带确认标记的 note 或 decision）——派生函数只认日志，任何进程内的「已确认」标志重算时都会丢失。
+覆盖、范围及 EXPECTED_REVISION 检查仅在 description 有验收场景基线时启用，NON_CANONICAL_ROLE 无此门。create 的规格缺失提示是自由文本 warning，不属于 WarningCode。诊断不拒收、不改变转换规则；publish、list、`/state` 暴露 warnings，read 提供原记录正文。
+
+四类记录 lint 可附 `location:{field,section?}`、`supportedFixes:[{field,instruction,example?,record:{role,content_type,ref_version?}}]` 与 `correction:{root_version,round,limit:2,exhausted}`。修复只能追加记录，不能改删原记录。
+
+同一任务按 lint code + 小写 role 计轮，初次为第 1 轮，再次失败为第 2 轮并提示人工处置。无关 note、launch 和其他角色记录不计轮；成功清对应 warning，复发重新计轮。ack / close 清除此前诊断与计数；其他异常不因局部修复消失。
+
+缺正文小节时，同角色用精确小写 role 的 note，ref_version 指向根诊断或最近失败修复，补齐对应小节；后续同角色 review 也可重新检查。NON_CANONICAL_ROLE 以同角色小写 note 加正确引用核销。
+
+EXPECTED_REVISION 必须由引用原 fail_design review 的有效 revision 核销；若仍在 reviewing，先以 executor 非 ack note 收回。对在役 EXPECTED_REVISION 的错误引用继续亮灯并计轮。旧 fail_design 轮被后续有效 review 结束后，不再为其他轮次的 revision 计数。耗尽后消费方停止自行重试，人的有效修复仍可核销；热增量与冷重放结果一致。
 
 ### 3.3 人工审批
 
-review 的 `pass` / `blocked_external` 派生出 `pending_approval` 后，需要一条**人**发布的 decision 记录（approve / reject）才能继续派生——两档同门同责：`blocked_external` 与 `pass` 一样以 human decision 为唯一放行条件，无 decision 不启动，差别只在通知文案与人的决策依据（外部验证未决，见 3.1）；close 则在任意状态有效（见 3.1）。decision 是记录不是硬门——放行的实际约束在消费侧：auto 模式下 Notifier 检查「无 decision 不启动」（两档 verdict 一并拦，见 6.2），manual 模式下人本身就是门。
+pending_approval 必须等人的 approve / reject；close 可随时终止任务。decision 是受信任的记录，Hub 不验证操作者是否为人，授权保证在调用方和消费侧。approve 是工作验收，approve 后的修改另开任务；仓库质量门不进入任务生命周期。
 
-## 4. Context Hub 设计
+## 4. Context Hub
 
-### 4.1 MCP 工具（5 个）
+### 4.1 MCP 工具
 
-**context.create**
+Hub 通过 SDK 的 Streamable HTTP 在 `/mcp` 暴露五个工具，CLI 为相同协议提供入口：
 
-```
-输入：{ title, description, creator, role, flow?, cast?, checkout? }   flow ∈ "full" | "direct" | "solo"，缺省 full；
-                                                             cast ∈ { architect? / executor? / reviewer? → AgentRoute }，
-                                                             部分指定合法（缺的 role 回落默认阵容）；
-                                                             checkout ∈ { kind: "current" } | { kind: "worktree", path, ref? }
-                                                                  （worktree 必须带 path；ref 仅可随 path 作旁注，ref-only 在 create 即拒。CLI 字符串语法见下）
-输出：{ task_id, status, version: 0, warning?, needs_attention?, warnings? }                status 按 flow 派生：full → "designing"，direct/solo → "implementing"
-```
+| 工具 | 输入 | 输出 |
+|---|---|---|
+| context.create | `{title,description,creator,role,flow?,cast?,checkout?}` | `{task_id,status,version:0,warning?,needs_attention?,warnings?}` |
+| context.publish | `{task_id,role,content_type,payload,agent?,model?,expected_version?}` | `{task_id,version,status,needs_attention?,warnings?}` |
+| context.read | `{task_id,since_version?}` | `{task_id,title,description,flow,cast?,checkout?,status,versions}` |
+| context.list | `{status?}` | `{tasks:[...]}` |
+| context.decide | `{task_id,decision,by,reason?}` | `{task_id,status}`；project scope 为 `{task_id,version}` |
 
-flow 与 cast 落 meta 后均不可变（无写入路径，构造性不可变），变更 = 新任务。
+task_id 由服务端将 title slug 化并按需加后缀生成，字符集为 `[a-z0-9-]`。role、agent、model 是自述元数据；任务不维护参与角色名册，list 不按 role 过滤。publish 接受任意 content_type，仅校验 task 存在与必填字段；expected_version 提供乐观并发。since_version 包含指定版本。
 
-**CLI checkout 语法**：`tut create` 将下列形式规范化为同一 checkout 对象，均不创建 worktree：
+flow 为 full / direct / solo。cast 按 architect / executor / reviewer 部分指定 AgentRoute，checkout 为 `{kind:"current"}` 或 `{kind:"worktree",path,ref?}`；三者写入 TaskMeta 后无修改入口。description 随 read 返回，四段规格冻结为任务授权基线；变更范围通过新任务承载。
 
-- `--checkout current`；worktree 可用 `--checkout worktree:<path>`、`--checkout worktree=<path>` 或 `--checkout '<JSON 对象>'`（kind 为 current / worktree，后者带 path、可带 ref）。
-- 路径简写：`--checkout <path>` 接受绝对路径、以 `./` / `../` 开头的相对路径、Windows 盘符路径与 UNC 路径；普通裸相对路径使用带 `worktree:` 前缀的明确形式。
-- 分字段形式：`--checkout worktree --checkout-path <path> [--checkout-ref <ref>]`；只给 `--checkout-path` 也推定 worktree。`--checkout-kind current|worktree` 可显式指定 kind；`--worktree`、`--worktree-path`、`--worktree-ref` 分别是 checkout、checkout-path、checkout-ref 的别名，各对别名互斥。
-- kind 冲突、path/ref 重复指定、current 搭配独立 path/ref 参数均拒绝；worktree 始终要求非空 path，ref 仅作旁注，不能独立启动。`repair-meta --checkout` 接受同一单值语法，不提供 create 的分字段旗标。
+`AgentRoute = string | {agent:string,args:string[]}`。参数按顺序和值保留；人类命令值按空白分词，拒绝引号、反斜杠、变量、管道、重定向、glob、命令替换等 shell 语法。`--cast <role=command>` 可重复；逗号简写仅在逗号后紧跟已知 `role=` 时分项。`assign` 的 role 后剩余 argv 是同一命令值。
 
-**checkout 语义**：`checkout` 是**建任务时冻结**的 TaskMeta 字段（同 flow/cast 不可变；缺省 `current`——字段不出现即沿用 Hub 所在 checkout）。MCP 输入是对象：`{ kind: "current" }`（沿用锚点 checkout）或 `{ kind: "worktree", path, ref? }`（指名一个**已建好**的 worktree，**必须带 path**；ref 仅可随 path 作旁注，ref-only 在 create 三面——store/MCP/CLI——即拒，因为启动器只能解析已存在的路径）；CLI 通道 `tut create --checkout current` / `--checkout worktree:<path>` 解析为同一对象落库（path 不存在时 create 给非阻断警告）。它是**元数据而非 git 生命周期指令**：TUT 只记录并消费它，绝不代跑 `git worktree`——建 worktree 是调用方的事。它也**不分裂 hubRoot**：记录仍写同一个 `.context-hub/`（四根分离见 7.2）——worktree 分支只切 checkoutRoot（轮次 pane 的 cwd），role→agent / naming 解析链的 L1 项目根仍取 `TUT_PROJECT_ROOT` ?? hubRoot。解析链的两级合并保持声明式：routingRoot 上的本地 `workspace.json` 值优先，缺失/损坏字段逐键回落 Hub 根声明（launch worktree 任务时 Hub 根作补充 L1 接入，见 6.2）。注意未显式设 `TUT_PROJECT_ROOT` 时 routingRoot 与 hubRoot 同根——实际生效的 L1 就是 Hub 根的 `workspace.json`；任务 worktree 自带的声明要参与 L1，须显式把 `TUT_PROJECT_ROOT` 指向它。
+checkout 是元数据，TUT 不创建 worktree。worktree 必须有 path，ref 只作旁注；缺 path 在 Store / MCP / CLI 均拒绝，不存在的 path 在 create 给非阻断警告。current 不带 path / ref。
 
-task_id 由 Server 生成（slug 化 title + 必要时加短后缀）。role 是创建者自述标签，任务不维护参与角色名册。**cast 是路由参数不是参与名册**：只影响启动器为各 role 拉谁（消费侧解析链见 6.2），不约束谁能写记录（写入自由不变）——CLI 通道为 `tut create --cast executor=pi --cast 'reviewer=codex --model <reviewer-model>'`。
+CLI 支持 `--checkout current`、`worktree:<path>`、`worktree=<path>`、JSON 对象、显式路径及 `--checkout worktree --checkout-path <path> [--checkout-ref <ref>]`；仅给 checkout-path 推定 worktree，kind / path / ref 冲突或重复即拒绝。`--checkout-kind` 和 `--worktree` / `--worktree-path` / `--worktree-ref` 提供对应显式形式及别名，别名互斥；repair-meta 仅接受单值 checkout 语法。
 
-`AgentRoute = string | AgentCommand`，其中 `AgentCommand = { agent: string, args: string[] }`。裸 agent 名继续按旧字符串落库；带参命令规范化为对象，args 顺序和值逐项保留。人类命令值只支持一个非空可执行词和若干非空参数词，TUT 只按空白分词并拒绝引号、反斜杠、变量、管道、重定向、glob、命令替换等 shell 语法；TUT 不解释命令内的 shell。`assign` 的 role 后剩余 argv 也按同一规则作为命令值。
+路径简写接受绝对路径、以 `./` / `../` 开头的相对路径、Windows 盘符路径及 UNC 路径；普通裸相对路径须用 `worktree:` 前缀明确指定。
 
-**context.publish**
+read / list 对任务总返回规范化 flow，cast / checkout 有才返回。project scope 无这些任务字段、无 status；list 以 `scope:"project"` 标识它。decide 追加 role=human 的 decision，decision 值为 approve / reject / close，by 记录操作者。
 
-```
-输入：{ task_id, role, content_type, payload, agent?, model?, expected_version? }
-输出：{ task_id, version, status, needs_attention?, warnings? }
-```
-
-任何 content_type 都接受，无条件追加。「无条件」指不做流程、角色、时序校验；基本合法性（task 存在、必填字段完整）仍校验并返回错误。role / agent / model 都是自述元数据（谁、以什么身份写的），供追溯与路由建议——agent / model 均可缺省（Hub 以 stateless HTTP 服务，无会话身份可记，agent 缺省时字段留空）。expected_version 用于乐观并发（见 4.2）。
-
-**context.read**
-
-```
-输入：{ task_id, since_version? }
-输出：{ task_id, title, description, flow, cast?, checkout?, status, versions: [...] }
-```
-
-description 随 read 暴露（加法修订）——direct/solo 流程里任务要求不经 design 记录承载，executor 读日志即见需求。`flow` 总出现且缺省规范化为 `"full"`、`cast?` / `checkout?` 有才出现（加法修订）；project scope 两者皆不出现。
-
-status 为派生结果。
-
-**context.list**
-
-```
-输入：{ status? }
-输出：{ tasks: [...] }
-```
-
-结果包含 project scope（带 `scope: "project"` 标识，无 status——它是派生函数跳过的特殊 scope，见 context-design 2.1）。任务条目另携 `flow`（总现、规范化 `"full"`）与 `cast?` / `checkout?`（有才现），与 context.read 同形。不提供 role 过滤——role 只是记录级标签，任务没有角色名册，没有可过滤的对象；需要按「某角色参与过」筛选时，消费方拿全量列表后按记录元数据自查。
-
-**context.decide**
-
-```
-输入：{ task_id, decision, by, reason? }
-  decision: "approve" | "reject" | "close"
-输出：{ task_id, status }   project scope 返回 { task_id, version }
-```
-
-人工审批/关闭的入口，效果等于追加一条 decision 记录（role 固定为 `human`，`by` 记录实际操作者）。可以通过任意 MCP 客户端调用（命令行或所在 IDE 的 Agent）；也因此 decision 无法验证「确实来自人」，这层保证在消费侧——manual 模式人本身就是门，auto 模式 Notifier 检查「无 decision 不启动」（见 3.3）。
+payload 的字段定义与内容要求见 [上下文信封](context-design.md#23-payload-信封schema)。
 
 ### 4.2 存储
 
-文件结构，零依赖：
-
-```
+```text
 .context-hub/
-├── config.json                  # 全局配置（含 flow_mode，见 6.2）
-├── workspace.json               # 项目级 role→agent / naming 声明（解析链 L1，见 6.2）
-├── delivery.log                 # 启动投递分步诊断日志（见 7.2.1）
-└── tasks/
-    └── auth-refactor/
-        ├── meta.json            # 标题、创建者、版本号（status 是派生缓存，可随时重算）
-        ├── v001.design.json
-        ├── v002.code_changes.json
-        ├── ...                  # 记录文件（append 独占创建，此后不改写不删除——不变量辖区）
-        ├── recovery.jsonl       # B 类恢复登记，append-only（仅记录损坏并登记恢复后存在，见 4.3）
-        └── *.json.recovered     # 恢复内容副本，与坏原件并存（恢复时创建，登记中断可留孤儿副本，见 4.3）
+├── config.json
+├── workspace.json
+└── tasks/<task_id>/
+    ├── meta.json
+    ├── v001.design.json
+    ├── v002.code_changes.json
+    ├── recovery.jsonl
+    └── *.json.recovered
 ```
 
-单条记录 schema：version / task_id / role / agent? / model? / content_type / timestamp / payload；agent / model 为可选的自述元数据，来源见 4.1，payload 结构见 4.5。落盘时由 Store 统一追加 **`tut_version?`**（本构建 `package.json` 的 `version`——serve 与 CLI 同一写入口，manifest 不可得时字段缺省、不编造）；可选字段：旧记录与恢复副本（字节原样保留）缺此字段，读取与状态派生不消费它、缺失即兼容；开发分支态它只近似构建身份——同一 manifest 版本不区分未提交改动，不承诺 git 级精度。
+记录外层为 `version / task_id / role / agent? / model? / content_type / timestamp / payload / tut_version?`。Store 写入时取本包 manifest version 作为 tut_version；manifest 不可得则省略。它近似构建身份，不保证提交级精度，读取与派生不依赖它。
 
-**并发控制**：meta.json 读写走单写者队列（进程内 async mutex）+ 版本号乐观校验（publish 时携带 expected_version 可选参数）。单进程运行，不做跨进程文件锁。
+记录、恢复登记行和恢复副本为不可变审计材料。meta 是可变操作状态，包含版本计数器、派生缓存和创建时冻结字段。追加与 meta 修复共用进程内单写者队列，meta 经 temp + rename 原子更新；单进程存储不做跨进程文件锁。publish 可校验 expected_version，新版本从 meta 与目录记录最大版本取 max 后递增，崩溃窗口的孤儿记录不会被覆写。
 
-### 4.3 只读状态接口（给 Notifier 用）
+### 4.3 只读接口与存储恢复
 
-默认 `/state` 的 tasks 仅返回非 closed 任务；显式 `/state?include=closed` 返回包含 closed 的完整视图（GET/HEAD 同义）。仅过滤视图，不删除记录；context.read/list 仍可查询关闭任务。Notifier 与 tut watch 显式使用完整视图，保留关闭沿清理、目录消失检测、终态退出与基线语义。
+`GET /state` 默认只在 tasks 中返回非 closed 任务，显式 `?include=closed` 返回包含 closed 的完整任务视图。Notifier 与 `tut watch` 显式使用完整视图，以观测关闭转变和终态；Notifier 不需要 MCP 客户端能力。
 
-任务条目新增 `pending_since: string | null`、`round_count: number`、`warnings: {version, code, message?, location?, supportedFixes?, correction?}[]`。pending_since 取当前这次进入 pending_approval 的有效转换记录 timestamp；note/ack 不重置，离开置 null，重入取新时间。round_count 从 0 开始，累计有效 code_changes / revision 交付次数（full/direct 进入 reviewing、solo 进入 pending_approval）；design、review、note、launch marker 与表外交付不计。二者由 Store 增量派生游标维护，冷重放与热缓存一致。warnings.version 沿用原有 derived-from 指针，指向触发该 warning 的记录版本；已被 ack/close 清除的历史警告不出现。这些字段同步加法携带到 context.list。
-
-证据分层：记录 timestamp、版本号与元数据是 observed；pending_since（选择进入审批的记录）、round_count 与 warnings 是 derived；本接口不推测 agent 是否工作或输入是否消费，不加入 inferred 运行态。待审批但时间不可解析或恢复游标缺少时间时，pending_since 返回 `"unknown"`，不得用 updated_at 或当前时刻补造；非待审批的 null 表示不适用。顶层加法字段 `truncated: false` 明示返回所选视图的完整任务与完整 warnings，默认排除 closed 是视图过滤，不是截断；存储不可读仍走 degraded。旧 Hub 无这些加法字段时，消费方须按未知处理，不能视为已知零值。
-
-全部 HTTP 端点要求 Host 为 loopback（127.0.0.1 / localhost / [::1]），否则返回 403；容忍缺 Host 的 HTTP/1.0 客户端。
-
-MCP 之外暴露普通 HTTP 状态接口：`GET /state` 返回 JSON；`HEAD /state` 执行同一状态构建并返回相同状态码与响应头，按 HTTP HEAD 语义不发送响应体。其他方法返回 405（`Allow: GET, HEAD`）。
-
-```
-GET /state[?include=closed]
-→ { hub_root: "/absolute/workspace/root",              // 加法字段：所属存储目录的父目录（realpath）
-    truncated: false,                                  // 所选视图无数量/长度截断
-    flow_mode: "manual" | "auto",
-    notify?: { channels: [...], webhook_url: "..." },   // 可选，见下注
-    auto?: { launch_roles: [...] },                     // 可选，见下注（auto 启动白名单回显，见 6.2）
-    degraded?: [task_id, ...],                          // 可选，见下注（加法修订：存储损坏任务的降级可见）
-    tasks: [ { task_id, title, status, updated_at, needs_attention: bool,
-               waiting_for: "human" | "agent:<role>" | "none",
-               version: number, flow: "full"|"direct"|"solo", cast?: { role → AgentRoute },
-               pending_since: string | null, round_count: number, warnings: [{version, code, message?}],
-               checkout?: { kind: "current" } | { kind: "worktree", path?, ref? } } ] }   // 见下注（加法修订）
+```text
+{ hub_root, flow_mode, truncated: false, notify?, auto?, degraded?: [task_id],
+  tasks: [{ task_id,title,status,updated_at,needs_attention,waiting_for,
+            version,flow,cast?,checkout?,pending_since,round_count,
+            warnings: [{version,code,message?}] }] }
 ```
 
-status / waiting_for / needs_attention 为派生结果（见第 3 节；project scope 不出现在 /state——它没有可派生的状态）。任务条目原六字段形状冻结，`version`、`flow`（总现、规范化 `"full"`）、`cast?` / `checkout?`（有才现）均为**加法修订**，同时外泄到 context.read / context.list 的 MCP 输出面（条目同名字段，schema 只增不改）；`version` 取 `max(meta.version, 磁盘记录文件名的最大版本)`——外部落盘的记录（绕过 Hub 的写入，即 4.3 的损坏威胁模型本身）也抬升 version，消费方的版本差分（Notifier 治理拉取）下一轮即看到该记录，不增加静默轮的任何读取；Hub 只暴露原始 cast，不替消费方解析路由（解析链在消费侧，见 6.2）。顶层 `notify` 键同为**加法修订**：回显 config.json 的 `notify` 字段（Channel 配置，见 8.3），config 缺省或损坏时键不出现、接口不报错——Notifier 每轮轮询随取随用，配置变更下个周期生效，不为读配置增加文件依赖。
+hub_root 为服务所属根。version 取 meta 与目录记录文件名最大版本；flow 总出现并规范化为 full，cast / checkout 有才出现。notify / auto 回显当前配置，缺省或损坏配置不使接口报错。pending_since 是本次进入 pending_approval 的起点，离开后清空。
 
-顶层 `degraded` 同为**加法修订**：/state 构建时逐任务读盘派生，读取或解析层面失败的任务（meta 损坏、记录文件不可读 / 不可解析）不再从 /state 无声消失——派生不出条目，task_id 就列入 `degraded`（键有才现、出现即非空，消费方视缺席为健康）。边界：凡能折叠出结果的任务照常进 `tasks[]`，哪怕带 warning 置 needs_attention（那是 3.2 的异常序列语义）；`degraded` 只收存储层损坏，不收流程异常。目录整体消失的任务 /state 自身不可见（存储只有任务目录、无索引），由消费侧兜底：Notifier 快照差分发现「上一快照在册、本快照 `tasks` 与 `degraded` 均缺席」判为消失并告警（沿语义见 6.1）。`degraded` 的移出判据与三类故障（meta 损坏 / 记录损坏 / 目录消失）各自的 append-only 处置协议见下段——**`decide close` 并非对所有降级任务可用**，Notifier 文案与该能力逐一对应。
+round_count 从 0 开始，对每条有效 code_changes / revision 累计一次，即实际使任务从 implementing / revising 进入 reviewing 或 pending_approval 的交付。design、review、note、launch marker 及表外交付不计。warnings.version 指向触发该警告的记录版本；被 ack / close 清除的历史警告不再出现在当前 warnings 中。warning 可附第 3.2 节定义的修复单字段。
 
-**degraded 三类故障的处置协议（append-only 语义的诚实边界）**。先立两条判据。其一（不变量辖区）：AGENTS.md 不变量「记录永不删除」保护的是**记录文件**（`vNNN.*.json`——append 通道独占创建，此后不改写、不删除），以及 B 类新增的**恢复登记物**（`recovery.jsonl` 登记行与 `*.json.recovered` 副本——同以独占创建落盘，此后同样不改写、不删除）；`meta.json` 不在其列——它是每次 append 都被 temp+rename 整体重写的**可变操作状态**（版本计数器 + 派生缓存 + create 冻结字段），重建它不是改记录。其二（写通道）：AGENTS.md 约束「全部读写经 Store/HTTP 接口」，存储损坏的修复也不例外——修复面是运行中 Hub HTTP 上的两个**运维端点**（`POST /repair-meta` 与 `POST /recover-record`，CLI `tut repair-meta` / `tut recover-record` 为其客户端，纪律同 `tut mode`），不作为 MCP 工具暴露（五个工作流工具不动——修操作状态是人的运维动作，不是 Agent 工作流）、也不产生任务记录；修复必须经 Hub 而非第二进程直写文件，因为 meta 写入与 append 共享单写者队列（进程内 async mutex）——旁路直写会与并发 append 竞态（丢更新 / 版本覆写）。两个修复入口均遵守**健康即拒**：`repair-meta` 在 meta 可读且通过结构校验时拒绝，不能借修复改写 create 冻结字段；`recover-record` 在原记录通过 JSON、结构与所属任务校验时拒绝。拒绝均为 `VALIDATION_ERROR`（HTTP 400）。恢复登记还要求原件字节存在且可读，缺失或无法读取的原件不能登记，因为无从固定损坏证据。据此三类：
+truncated 固定为 false，表示所选任务视图未按数量截断，默认排除 closed 是视图过滤。接口只作兼容的字段加法；消费者忽略未知字段，未提供的可选加法字段视为未知，不据此编造运行事实。
 
-- **A · meta.json 损坏（记录完好）**：审计材料完好，坏的是操作状态。修复走受支持入口 `tut repair-meta <task_id> [--title …] [--flow …] [--cast …] [--checkout …]`（HTTP `POST /repair-meta`，经 Hub 单写者队列）：`version` **由服务端计算**——取目录内最大记录版本号（与 append 的 crash-window 对账同源，不接受调用方输入；下一版本本就从 max(meta.version, 磁盘最大记录版本) 推导，重建值偏低也不会覆写孤儿记录）、`updated_at` 取修复时刻、`title` / `flow` / `cast` / `checkout` 以调用方回填值为准（人从可得档案取值：Notifier 上一快照、read 响应、备忘），`title` 不可得回落 task_id、`flow` 不可得回落缺省 full、`description` / `creator` / `created_at` 等展示字段同样可回填、不可得则缺省（由此可能的口径变迁由人评估——created_at 失真是展示性失真，不伤派生）。**description 的冻结豁免**：修复读取残存 meta 中可解析的原 description，若其含「要改变的行为 / 验收场景 / 明确不做 / 必要依赖及理由」四个 `## ` 小节标题行（形状同四段冻结模板；存在额外小节不影响判定），则视为冻结范围——回填不同 description 被拒（`VALIDATION_ERROR`，提示范围变更请新建任务），省略或相同则原样保留；缺省/非四段形态的 description 不受此门。该守卫在「健康即拒」检查**之前**运行：健康的冻结 meta + 异议 description 报冻结错而非「无可修复」（同为 400）。该守卫是范围冻结在 repair 面的延伸，防止借修复改写授权基线；标题清单与 `skills/host.md` 的冻结模板同源，模板措辞修订时须同步（实现内为显式清单）。写入走 writeMeta 同一条 temp+rename 原子路径，修复后立即重算派生缓存。`repair-meta` 在路径安全校验后，仅对已确认存在的带点旧目录回退使用 `LEGACY_TASK_ID_PATTERN`；不存在的带点 ID 仍被新 pattern 拒绝，不创建目录，也不放宽新任务 ID 约束。修复前 append（含 `decide close`）不可用——append 前置可解析 meta；**修复本身不关闭任务**，要关闭须修复后再 `decide close`（close 记录落在完好的日志上）。下轮 /state 构建折叠成功即移出 `degraded`、回 `tasks[]`；修复后仍折叠失败则转 B 口径。审计边界：修复**不触碰任何记录文件**、不追加任务记录（append 当时不可用）——它是运维动作不是工作流交付；其效果可见于降级解除与 Notifier 恢复日志行，事故经过由人修复后补一条说明 note（任务或 project scope）留档；诊断（哪类损坏、哪个文件）走 `tut doctor` 存储健康检查（report-only——只诊断不修复）。
-- **B · 记录文件不可读 / 不可解析**：坏记录不可修改、不可删除，Hub 也不提供「绕过坏记录折叠」的通道（派生是全序列纯函数，容忍坏记录等于伪造状态）。唯一合法处置是**恢复登记**——坏件字节原样保留钉死证据，恢复内容以 append-only 方式另行登记，折叠时确定性替代。机制三件（登记入口 `tut recover-record <task_id> <record-file> --from <path>`，HTTP `POST /recover-record`；恢复内容**由人**从外部快照〔备份 / 共享 repo / 纳管 .context-hub 的团队 git〕取回原始字节后提交，Hub 不自行取备份）：
-    1. **登记行**：任务目录内 `recovery.jsonl` 追加一行 `{seq, file, corrupt_sha256, recovered_sha256, recovered_file, source, registered_at}`（`source` 记恢复内容来源，供审计）——append-only，永不改写、永不删除；
-    2. **恢复副本**：`<原文件名>.recovered` 独占创建（temp + link；两阶段提交中，已存在的孤儿副本若与提交字节 sha256 一致且无登记行，则采纳并完成登记；仅字节不同或已登记才拒绝），此后不改写、不删除；坏原件 `vNNN.*.json` 字节原样保留；
-    3. **消费规则（readRecords / derive）**：逐文件解析 `v*.json`，解析失败时查登记——当且仅当 ①该文件有登记行、②坏件当前字节 sha256 == `corrupt_sha256`（事后改动坏件即该登记作废——「损坏材料未被覆写」由 digest 钉死、随时可核验）、③`.recovered` 副本存在且 sha256 == `recovered_sha256`、④副本解析成功且 version 与文件名一致，折叠以副本内容替代坏件参与序列；任一不满足则坏件仍不可用、任务留驻 `degraded`。派生仍是目录内容的纯函数（记录 + 登记行 + 副本同属输入面），同目录同输出。
+可折叠的任务进入 tasks，流程异常以 needs_attention 展示。存储不可读或不可解析的任务进入非空 degraded 名单，故障类别和文件定位由 stderr 与 `tut doctor` 提供。目录整体消失无法由 Hub 自行发现，由 Notifier 比较快照发现 tasks 与 degraded 双缺席。
 
-    为什么登记不做成任务日志记录：append 前置可解析 meta 且折叠成功，而坏记录在序列里时两者皆不成立（鸡生蛋）——恢复登记因此落在记录序列之外的操作层，形状 append-only（与 meta 的可变重写不同类）。诚实边界：digest 链证明的是**内部一致性**（登记什么就用什么、坏证据未被动手），不证明恢复内容确为原始字节——来源正确性由人对外部快照负责，登记行 `source` 留审计线索。登记后下轮折叠成功即移出 `degraded`，append 与 `decide close` 恢复可用；**无法取得可信原始内容则无从登记、任务留驻 `degraded`**——append 与 `decide close` 都不可用（重放必然命中坏文件，close 是记录追加）。「记录永不删除」的直接代价是该任务无法被任何 append-only 动作关闭，设计如实接受这个边界：任务在 `degraded` 保持可见（告警只在进入沿一次，不重复打扰），处置由人在 project scope 补一条说明 note 留档（何时损坏、人如何处置）。
-- **C · 任务目录消失**：存储无名册（任务发现仅靠目录扫描），Hub 无从得知消失的任务曾存在；`decide close` **不适用**——没有可追加的日志。Notifier 差分告警一次（消失多为误删 / 误移，指引指向备份 / git 恢复目录）。恢复目录后任务重现 `tasks[]`（目录内含损坏文件则转 A / B 口径）；不恢复则其从快照退场——差分告警已留痕，人可在 project scope 补说明 note 留档处置。
+修复经运行中 Hub 的 `POST /repair-meta`、`POST /recover-record`，对应 `tut repair-meta`、`tut recover-record`；不增加 MCP 工具，不旁路存储，不追加任务记录。两入口对健康目标返回 VALIDATION_ERROR（400），不能借修复修改健康数据。doctor 只诊断，不修复存储。
 
-移出 / 重现的统一判据：下轮 /state 构建该任务**成功折叠出 `tasks[]` 条目**（A / B 移出 `degraded`、C 重现）——通知只在进入沿告警一次，恢复沿留通知日志行（6.1）。/state 的 `degraded` 只报名单（形状保持最小：task_id 数组），故障类别与文件定位不在 /state 展开——诊断走构建期 stderr 告警与 `tut doctor`。
+**meta 损坏。** repair-meta 从目录最大记录版本重建 version，不接受调用者指定版本；updated_at 取修复时刻。title / flow / cast / checkout 等由人从档案回填，title 缺省为 task_id、flow 缺省 full，其他展示字段可省略；重算派生缓存。路径校验仅对已存在的带点目录容忍旧 ID，不创建或放宽新 ID。
 
-**launch 状态投影是可选加法，本包仅登记预留、不落实现**：把 auto 门查重所需的 launch 痕迹投影进 /state（省掉每轮对任务日志的整条 readLog）是读路径治理的可选扩展层，仅当进程内增量缓存与增量拉取 + 常驻复用连接不足以达成绩效门槛时才启用；启用前先在本节以加法修订补齐字段与语义，再动代码——schema 形状此处不预支。
+若残存 description 可解析且含「要改变的行为 / 验收场景 / 明确不做 / 必要依赖及理由」四个二级标题，则省略或相同值原样保留，异议值拒绝。此冻结检查先于健康检查，额外标题不影响判定。修复不触碰记录，修复前 append / close 不可用；修复后需要关闭仍须另发 close。
 
-Notifier 常驻轮询这个接口（默认间隔 5s，可配置，见 6.1），对比上一次快照，发现 `waiting_for` 变化、`needs_attention` 置位或 `degraded` 转变沿即发通知。一个只读 HTTP 接口就够了，Notifier 不需要 MCP 客户端能力。
+四段标题清单与 skills/host.md 的冻结模板同源，模板修订时须同步。
+
+**记录损坏。** 人从可信外部快照取得原始内容，执行 `tut recover-record <task_id> <record-file> --from <path>`。原件字节必须存在且可读，坏件保持原样；恢复副本以 temp + link 独占创建，已存在且字节一致的孤儿副本可完成登记，字节不同或已登记则拒绝。
+
+recovery.jsonl 追加 `{seq,file,corrupt_sha256,recovered_sha256,recovered_file,source,registered_at}`。消费时仅在坏件 digest 匹配、副本存在且 digest 匹配、解析成功且 version 与文件名一致时替代坏件参与折叠；任一失败仍降级。digest 固定内部一致性，来源真实性由人负责，source 留线索。无法取得可信原始内容时任务继续可见于 degraded，append / close 均不可用，不删坏记录。
+
+**目录消失。** 通过备份或 git 恢复目录；没有可追加日志时 close 不适用。下一轮成功折叠进 tasks 才算恢复，仍有损坏则按对应协议处理。Notifier 进入故障沿告警一次、恢复沿只记日志；事故经过由人补 note 留档。
 
 ### 4.3.1 Agent stdio 接入桥
 
-`tut mcp` 是常驻 stdio ↔ Streamable HTTP 桥，复用 CLI discovery 与 SDK；Hub 的五工具与 schema 不变。启动冻结所属根（`TUT_HUB_ROOT` 优先，否则 cwd 向上寻找 `.context-hub`），候选 URL 取 `TUT_HUB_URL` 或默认 3001，再沿既有 3001–3199 奇数端口扫描。仅允许本机 HTTP loopback；`/state.hub_root` 规范化后必须相等才可发送 MCP，缺失身份也拒绝。HTTP 不跟随重定向，每次 MCP HTTP 请求前再验证身份，防止端口被另一 workspace 接管。
+`tut mcp` 是 SDK stdio ↔ Streamable HTTP 桥，启动时冻结所属根。根定位与 Hub 发现使用第 7.2 节的共享契约，桥的候选 URL 取 TUT_HUB_URL 或缺省；不跟随重定向，每次 MCP HTTP 请求前重新校验归属。
 
-桥通过 SDK 终结两端 initialize 并转发请求/结果，工具列表由上游提供，不复制工具 schema。下游 initialize 的 `serverInfo` 保留上游既有字段，并附加 `hubUrl`（发现、归属校验并成功连接的 Hub base URL）与 `hubRoot`（已校验的规范绝对根路径），供客户端识别所属 Hub；这是首次握手的连接快照，同根换端口重连不会向下游重新发送 initialize。stdout 只写 MCP，诊断只写 stderr。每 2 秒检查归属/可达性；传输失败或归属变化后关闭旧连接，按 250/500/1000/2000/4000ms 五次退避重新 discovery 和 initialize，支持同根 Hub 换端口。恢复时仅重建协议连接，**绝不重放已发送的业务请求**（断线时写入结果可能未知）；失败请求返回协议错误，调用者先 read 核实再决定是否重试。恢复期间新请求等待同一个有界恢复过程。
+桥终结两端 initialize 并转发请求与结果，工具列表由上游提供，不复制 schema。下游 serverInfo 保留上游字段并附 hubUrl / hubRoot，表示首次握手快照；重连不再次向下游 initialize。stdout 只写 MCP，诊断写 stderr，每 2 秒检查归属和可达性。
 
-退出码：0 = stdin EOF / 正常关闭；1 = 参数或桥内部错误；2 = 初始归属验证/连接失败（含不支持的 URL）；3 = 重连次数耗尽；SIGINT/SIGTERM 分别为 130/143。Hub 身份探测每次尝试沿用 800ms 上限，超时或连接失败立即重试一次（最多两次，约 1.6s）；HTTP 沿用 hub-client 的 10 秒超时。启动不代开 Hub，指引用户在所属 workspace 执行 `tut up`。配置推荐 `command = "tut"`、`args = ["mcp"]`；客户端不保证 cwd 时用 server 级 env 钉 `TUT_HUB_ROOT`。固定 `/mcp` URL 绕过发现与归属检查，多 rig 有误路由风险，迁移需移除旧 url 并重启客户端连接。
+传输失败或归属变化时关闭旧连接，按 250 / 500 / 1000 / 2000 / 4000ms 五次退避重新 discovery / initialize，支持同根换端口。只恢复连接，不重放业务请求；断线写入结果未知时返回协议错误，调用者先 read 核实。恢复期间新请求等待同一个有界过程。
 
-### 4.4 pane ↔ task 映射与生命周期（fresh session 的精确辖区）
+MCP HTTP 请求限时 10 秒。退出码为 0（EOF / 正常关闭）、1（参数或内部错误）、2（初始验证或连接失败）、3（重连耗尽）、130 / 143（SIGINT / SIGTERM）。桥不代开 Hub；推荐 command=tut、args=[mcp]，客户端 cwd 不可靠时显式设 TUT_HUB_ROOT。
 
-**跨角色必 fresh、同角色连续轮默认延续**（决策存档于 project scope 决策流）：角色变更（architect→executor→reviewer）一律现场诞生全新 pane/session——未记录的上下文不得跨角色泄漏，Hub 是唯一记忆；同任务同角色连续轮（executor→revision、reviewer→re-review）默认**延续现存 pane**——同角色会话不越过角色边界，清单作者核自己的单、代码作者修自己的 bug，免全量重读。「同角色想要外部视角」是显式选择：`--fresh` force-close 同角色 pane 后照常新生（见 7.2）。pane 是工位——跨角色短命、同角色任务内长存，记录才是交付物。
+### 4.3.2 Kibitz board
 
+`/board` 是本机只读观测页，采用左侧状态轨、中间任务表、右侧详情的深色布局，不提供审批或进程操作。以下 GET / HEAD 端点共用 Host guard，其他方法 405，响应 no-store：
 
+| 端点 | 数据 |
+|---|---|
+| /board | 内嵌 HTML / CSS / JS，无外部资源 |
+| /hubs | `[{url,hub_root,port,is_self}]`，本机 workspace 发现 |
+| /state?include=closed | 全任务、状态计数与 Activity |
+| /runs | 最新 run 的命令路由、进程和日志可用性观察 |
+| /runs/:run_id/log?from=N&limit=65536 | Base64 字节块与 next 游标 |
+| /tasks/:id/versions | 全量记录 |
+| /tasks/:id/usage | schema v1 用量原文；缺失 404 |
 
-**多 workspace / 多 rig 隔离**：Herdr 的 pane 标签在同一实例内跨 workspace 唯一，不能把 workspace 当作标签命名空间。系统 pane 使用 `tut-hub-<rig>` / `tut-notify-<rig>`，任务 pane 使用 `<task_id>.<role>-<rig>`；`rig` 是所属 Hub 根目录规范绝对路径（存在时 realpath）的 SHA-256 前 8 位。routingRoot 与任务 worktree 均不改变此摘要。以下生命周期表中的 `<T>.<role>` / `<T>.*` 是逻辑键简写，实际匹配必须限定本 rig 后缀；复用、fresh、清理及 done sweep 不跨 rig。
+/hubs 扫描 3001–3199 奇数端口，单次身份探测 800ms，传输失败重试一次，不跟随重定向；只接受绝对根身份，并按 socket 本地端口加入自身。并发扫描复用在途结果，发现异常返回空数组。workspace tabs 高亮自身，其他项整页跳转目标 /board，不开放 CORS、不代理跨 Hub 请求；失败时只显示自身，根路径保留在 title。加载与 BFCache 恢复重新发现。
 
-`tut up` 与 CLI 优先沿用 `TUT_HUB_ROOT`（任务 worktree 仍共享所属 Hub）；否则从 cwd 向上查找含 `.context-hub` 的最近目录，无匹配时取 cwd。由此确定 Hub 根，系统服务命令显式携带 `TUT_HUB_ROOT`、`TUT_HUB_URL` 和 `TUT_EVENT_PORT_URL`（后者取 `--event-port`，默认 3002）；worker 的 pane run 经统一 renderer 注入相同环境，fallback split 同时用 Herdr `--env KEY=VALUE` 传入。run 没有独立 env 旗标，环境放进命令或跨平台 runner payload；不会假定 Herdr 服务端继承 launcher 进程的环境。Notifier auto 使用自身实际 Hub URL / 事件端口。CLI 的候选 URL 优先取显式 `--url`，其次 `TUT_HUB_URL`，最后默认 3001。复用前经 `/state.hub_root` 握手，双方根目录规范化为绝对路径（存在时 realpath）后必须一致；身份缺失也不允许复用。显式 `--url` 不匹配时 loud fail，指引在正确 workspace 不带 URL 执行 `tut up` 或修正 URL。缺省连接在本机 3001–3199 奇数 Hub 端口有界发现本 workspace 的服务；普通 CLI 找不到则提示 `tut up`，不隐式启动进程。`up` 找不到匹配 Hub 时从 3001/3002、3003/3004 起检查端口对，选择首对空闲端口启动自己的 serve/notify；显式 `--event-port` 保留指定值。每次探测有 800ms 超时；Hub 身份握手超时或连接失败立即重试一次（最多两次、无退避，持续无响应时约 1.6s），有效响应的身份不匹配、缺失身份、无效 JSON 或非成功 HTTP 状态仍按原语义处理，不重试；不写端口配置文件。缺省 `up` 在端口选择前取得 `.context-hub/up.lock`（pid + started_at），直到供给结束由 finally 清理；活 pid 持锁时响亮拒绝并报告 pid 与 workspace，确认 pid 已死才接管。stale 锁的删除以短暂 `.reclaim` 目录互斥，避免两个接管者删除彼此的新锁；无法确认锁内容或接管中断时拒绝并提示检查，不猜测死亡。选定端口后、任何 pane 供给前再次广播既有 Hub 端口集；发现同 root Hub 则记录归属与复用说明，并重新解析其 notifier 端口。最终唯一性重读在任何错误（包括 listing 失败）时非零退出。显式 `--url` 与 dry-run 不取得锁。双端口预检不是端口预留，不同 workspace 的端口竞争仍由 serve 绑定失败和启动后身份复验可见地失败。事件入口继续按 `TUT_EVENT_PORT_URL` 路由；Notifier 忽略带外 rig 后缀的事件。
+状态轨采用五桶投影：designing → designing，implementing / revising → implementing，reviewing → reviewing，pending_approval ∨ needs_attention（任何底态）→ needs-human，approved / closed → done。needs_attention 的 join 优先，异常任务即使底态为 approved / closed 也进入 needs-human；无异常的 approved 未 close 归 done。点击桶筛选，未知源状态保留原值进入 Unmapped，不因枚举遗漏丢任务。rail spine 使用裸箭头，implementing 与 reviewing 间 junction 单行标注「↓ ↑ fail_code」。
 
-`up` 收尾重新读取 pane 列表，检查本 rig 的系统与任务标签唯一性；同标签有多个 pane 时列出标签和 pane ID 并非零退出，不自动清理。此检查不提供同 root 启动互斥。新建 `tut-sys` 时，`HERDR_PANE_ID` 缺失或无法解析 workspace 会在 stderr 提示钉定降级；`up` 输出期望的 `tut-host-<rig>` 标签，供 `host_pane_label` 配置迁移参照。`doctor` 在路径诊断中扫描系统 pane 的标签后缀与根 cwd，报告不同规范根路径产生的 rigHash 碰撞；task pane 的 worktree cwd 不作为根证据，Herdr 不可用时注明扫描不可用。
+任务表为状态 dot、Task、第 3 列、第 4 列、Age。Task 取 title，Age 取 updated_at，不逐行读 versions。按投影桶决定列语义：working 三桶（designing / implementing / reviewing）第 3 列为 Activity，仅由 round_count / warnings / pending_since 合成，第 4 列为 Agent · Model；needs-human 第 3 列为 Status、第 4 列为 Tokens；done 第 4 列为 flow。
 
-锚点优先选所属根摘要的系统标签（`TUT_HUB_ROOT`，未设时 cwd）；有本 rig 系统标签但缺必需元数据时 fail closed。迁移兼容：没有任何新式系统标签时保留旧单 rig 锚点链；新旧并存时旧系统标签只在目标根下可用。旧无后缀任务 pane 不被新式生命周期接管，可由人手动处置；新生任务 pane 全部采用后缀。tab 标签仍为人读模板，不承担机器寻址。
+Agent · Model 从最新 run 的 argv_summary 提取，不用 cast 猜运行事实；支持 --model / -m 及附值形式，缺失或截断显示未知。Tokens 求 usage 各轮 total_tokens 之和，缺失、非法或 unresolved 显示未知或部分值，不补零。
 
-标签命名空间与所有权（零机制约定，声明优先级）：
+LIVE 为 designing / implementing / reviewing / revising，LATE 为 pending_approval / approved / closed，详情读取仍按底态选择。
 
-| 标签 | 归属 | 诞生 / 处置 |
-|------|------|------------|
-| `<task_id>.<role>` | TUT 轮次 pane | 启动器在轮次交接时诞生；executor/reviewer（延续角色，`TUT_CONTINUITY_ROLES`）的活工位任务内长存——同角色连续轮只投递不收割，跨角色交接按收窄规则回收、任务关闭时无条件回收（见下）；建任务（`tut create`）后的首轮即普通轮次交接，pane 自第一轮即得任务名标签 |
-| `tut-hub` / `tut-notify` | TUT 系统 pane | `tut up` 供给；启动器读作锚点（7.2），不改动 |
-| 无标签 | 人的 pane | 任何 TUT 机制不得触碰 |
+usage 按任务缓存，全页最多两个并发请求；优先从未请求的可见 LATE 行，再按最久未请求排序。成功五秒后可刷新，失败十秒后可重试，版本变化可提前触发；旁车更新不依赖任务版本，公平队列避免后部任务饥饿。
 
-task_id 字母表为 `[a-z0-9-]`（不含点，store slugify 构造保证），标签中第一个 `.` 即 task/role 分隔——无歧义。
+LIVE 详情每秒串行读取选中任务最新 run_id 的日志，用流式 UTF-8 解码。窗口有界但游标继续前进，向上滚动暂停跟随、回到底部恢复；416 / 409 LOG_CHANGED 显示错误，不重置游标，切换任务或 run 取消旧读取。`last write Ns ago` 只表示页面观察到新增字节后的间隔，首次存量不算新写入，未观察到时显示 unknown。
 
-**tab / pane 双标签**：人读的 tab 标签与机器寻址的 pane 标签是两个字段、各司其职——
+LATE 详情按版本倒序显示全量记录，waiting_for=human 时最新项琥珀色，一次展开一条 payload；任务版本变化刷新记录。错误保留上次快照并标过期，旧响应不能覆盖新选择。state / runs 独立五秒轮询，失败有界退避；Hub 根变化冻结并提示重载，页面隐藏或退出停止轮询，BFCache 恢复重验归属。页脚注明状态、进程与日志采样边界。
 
-| 场景 | tab 标签（模板渲染，人读） | pane 标签（固定，机器寻址） |
-|------|--------------------------|------------------------------|
-| 轮次 pane | `naming.tab_label` 模板渲染，默认 `TUT {role}` | `<task_id>.<role>`（逐字节，**不可模板化**——前缀反查直接命中） |
-| 系统 pane | `tut-sys`（现状不变） | `tut-hub` / `tut-notify`（锚点，不动） |
+### 4.4 用量数据与投影
 
-占位符 `{role}` / `{task}` / `{agent}`；未知占位符原样保留；模板链与阵容链同构（L1 → L2 → 默认 `TUT {role}`）。Notifier 事件反查只消费 pane 标签（herdr 事件 payload 带 pane 标签、从不带 tab 标签）——模板永不进入反查输入，自定义模板下前缀反查直接命中不变。事件反查两级新增优先级：标签形如 `<task_id>.<role>` → 前缀对照快照直接命中（不依赖 cast 解析）；未命中 → agent 身份链（legacy 兜底：覆盖人手开的裸名 agent pane 与 legacy 标签——TUT 自身不再诞生裸名 pane，命中概率随发起侧建任务落地下降）。撞名边缘：agent 名恰等于某在役 task_id 时，task 直查优先（声明优先级，不做防撞）。
+用量旁车 `tasks/<id>/usage.json` 不是记录，不参与派生、不进入 meta，fold / sweep / repair 不处理它。schema v1 的字段、来源、行区间、窗口和计数器契约以 [usage audit 数据定义](../scripts/usage-audit/README.md#snapshot-schema-version-1) 为准。
 
-**生命周期**（收/留/归谁管：启动器是唯一执行手，人不承担例行收 pane）：
+轮次以 launch → delivery 归集 token 四元组与原生成本。使用 marker 冻结的 agent route 匹配原生会话；歧义、缺失或损坏均记 unresolved，不补零。Pi / Codex 原生记账分组展示，未知成本为 null；统计缺失、过期或非法旁车为覆盖缺口，损坏任务不入分母。看板读取方式见 4.3.2。
 
-| 钩子 | 动作 |
-|------|------|
-| 轮次交接（启动器） | 三分支：①**同角色延续**——pane list 存在 label 精确等于 `<T>.<role>` 的活 pane（活 = `agent_status ∈ {idle, working, blocked, done}`；缺失/`unknown` = 死。`done` 是回合完成——agent 进程仍在、TUI 在场等待下一提示词，恰是延续分支的目标座位）且角色在延续集合（脚本内 `CONTINUITY_ROLES` 默认 `executor reviewer`，env `TUT_CONTINUITY_ROLES` 空格分隔可覆盖，空串回落全收割）→ 只投递不收割不新生（首次可分类即放行，working 不等待；与 born 分支共享状态就绪门和单次尝试 + 有界状态观察——当前无法确认输入消费，见 7.2.1）；②**新生**（角色变更/首轮/死 pane）——先收后生，收割条件收窄为「`<T>.*` ∧ 非 working ∧ ¬(延续角色 ∧ 活)」（working 跳过并警告照旧——交接前置是记录已发布，working 多为收尾；architect 等非延续角色闲置即收，旧行为保留；死 pane 不受延续保护），然后锚定诞生 `<T>.<role>` 新 pane；收割后若仍存在活的 `<T>.<role>` pane → loud abort（寻址键唯一性守卫，绝不诞生同标签第二个 pane）；③**`--fresh`**——显式外部视角：force-close 该任务全部 `<T>.<role>` pane（含 working——显式选择授权杀活会话）后走②新生；`tut start-next --fresh` 透传，auto 模式永不传（fresh 是人的显式选择） |
-| 任务关闭（decision(close) 落库，入口不限） | 触发启动器 `--cleanup <T>`：无条件 close `<T>.*`。触发挂在 **close 语义本身**而非入口形态（4.1：decide 可经任意 MCP 客户端调用）：`tut decide close` 保留同步触发沿（覆盖 Notifier 停机窗口），Notifier 在 /state 对比中捕捉「进入 closed」转变沿再触发一次（消费侧执法，与 auto-launch 调启动器同构——decision 无论从哪条路径落库都收口）。两沿有意并存互为冗余覆盖：cleanup 幂等（无匹配 pane 即空手而归），双沿同拍至多多一次空跑。仅转变沿触发——上一快照在册且非 closed → 本轮 closed 才算；基线快照（Notifier 首轮 / 重启后首见）已 closed 的任务不触发（含 Notifier 停机期间发生的 close），否则每次重启都会为每个历史 closed 任务空跑一个 launcher 子进程。best-effort——herdr/子进程失败仅一行 stderr 告警（不发桌面通知、不写 Hub 记录、不阻断轮询），decide 本身照常成功（审批权不因终端容器故障受阻） |
-| approve（未 close） | 不动——人可能还要翻看会话；close 才是确定终点 |
-
-孤儿 pane（任务被放弃、未跑 decide close）无自动回收；机器上遗留的裸名 agent pane（历史 kickoff / 人手开）为人视角 pane，一次性手工关闭即可——TUT 机制不再触碰它们。
-
-### 4.5 上下文（payload）结构
-
-payload 采用**薄信封 + Markdown 正文**：结构化字段只保留系统必需的（summary / body / verdict——其中 verdict 是派生函数消费的唯一字段）和读者高频使用的（commits / ref_version），完整推理过程保留在 Markdown body 里。核心原则：**外层结构化（谁、何时、什么类型、第几版、针对谁），内层完整叙述**——payload 的读者是下一个 Agent 和人，不是 Server。
-
-字段定义、内容模型（task / project 两种 scope）、正文内容要求、管理方式和演进策略见 [context-design.md](context-design.md)。
+用量 watcher 的进程、开关和隐私边界见 [Standalone 用量 watcher](standalone-host.md#8-用量-watcher)。
 
 ## 5. Agent Skills
 
-skill 是**行为模板而非身份绑定**：任何 Agent 加载相应 skill 后均可担任该角色。角色模型与职责边界如下；接单、读写 Hub、验证、交付和复审的操作指引由 `skills/` 各角色文件独立承载。
+skill 是行为模板，不绑定 agent 身份。操作步骤与正文模板由 [common](../skills/common.md)、[Architect](../skills/architect.md)、[Executor](../skills/executor.md)、[Reviewer](../skills/reviewer.md)、[Host](../skills/host.md) 分别维护；系统规则不在步骤中另写一套。
 
-| 角色 | 职责 | 行为模板 |
-|------|------|----------|
-| Architect | 需求分析、方案设计、架构决策 | [architect.md](../skills/architect.md) |
-| Executor | 实现与验证、修订与问题回应 | [executor.md](../skills/executor.md) |
-| Reviewer | 独立评审、问题关闭条件与评审结论 | [reviewer.md](../skills/reviewer.md) |
-| Host | 主会话驱动：环境检查、任务发起与范围冻结、轮次推进、审批点汇报、异常处置与纠偏落实——驱动不代工 | [host.md](../skills/host.md) |
-
-**approve = 工作验收**。仓库层质量门不属于任务生命周期，任务层不模拟 PR 循环，不设置或复活 hold 门等仓库层质量门；approve 后的修改诉求以新任务承载。
-
-授权基线为建任务 description 与 role=human 的记录；worker 记录只是提案，批准局部修订不等于扩大整体授权。人可授权任一 agent 代行机械操作，但代行的授权必须可回溯到人的原话，role=human 标签不能替代人的授权证据。
-
-Host 的边界是**驱动不代工**：它不是第五个工人角色，role 词表仍为 architect / executor / reviewer / human；不发布工人记录（design / code_changes / review / revision）。Host 的记录足迹为 decision、受托人工 note（含 ack、延后与规范登记）及系统 launch note，均以 role=human 记载。人工入口的 `by` 记授权人姓名，agent 可标识代行者；系统 launch note 记录 `payload.launch.via`，不保证携带 agent 或 by 姓名。decision 与人工 note 的代行须有人的明确授权，launch note 是启动侧的审计痕迹。Host 与第 7 章承载 Agent 进程的 Agent Host 是不同概念。
-
-状态与发布行为的关系以第 3 节为准；上下文内容模型见 [context-design.md](context-design.md)。skills 保留执行步骤、正文模板和按需读取的判据指针。系统协议的判据由本设计及 context-design 承载，可配置评审判据由标准文件承载，不在角色步骤中另写一套判据。
+Architect 制定方案，Executor 实现与验证，Reviewer 独立评审；Host 驱动环境检查、需求冻结、轮次接续、审批汇报和异常处置，不代工。Host 与承载进程的 Agent Host 是不同概念。协议 role 仍为 architect / executor / reviewer / human；Host 不发工人交付，受托人工记录与系统 launch 痕使用 human，人工代行必须可追溯到人的原始授权。
 
 ### 5.1 可载入评审标准
 
-项目配置顶层 `review_standards` 是逗号分隔的文件路径字符串，通过既有 `tut config get/set review_standards` 读写。未设键、配置文件缺失或显式空字符串均关闭（get 成功输出空行且不写文件）；`set review_standards ""` 清空。非空列表去掉各项首尾空白，保留顺序、内部空格和 Unicode；允许相对/本机绝对路径，不限扩展名、不检查文件存在性。拒绝空项、原始值中的 ASCII 控制字符 U+0000–U+001F/U+007F；逗号无转义，不支持含逗号的文件名。`off/on` 无开关含义。非法 set 不写文件；手写配置中的非字符串或非法列表仅在本键 get 时拒绝并报告值域，不加入全局配置解析、影响其他消费者。
+`review_standards` 是逗号分隔的文件路径字符串，经 `tut config get/set` 读写。缺省或空字符串关闭，get 输出空行且不写文件，空 set 清空；off / on 是普通路径词。列表去各项首尾空白，保留顺序、内部空格与 Unicode，允许相对及本机绝对路径，不限扩展名、不预验存在性；拒绝空项和 ASCII 控制字符，逗号不可转义。
 
-配置来源为任务所属 Hub 的实际存储目录（默认 Hub 根下 `.context-hub`），相对标准路径的基准为被审代码的任务 checkout 根（worktree 根），不是配置目录或 `TUT_PROJECT_ROOT` 路由根。`tut config --root` 接受存储目录且不自动消费 `TUT_HUB_ROOT`，Reviewer skill 给出所属 Hub 的显式读取方式；自定义目录用其实际值。绝对路径可引用仓库外文件，不做 glob、环境变量、波浪号或命令替换展开。 `config get review_standards` 在 cwd（被审 checkout 根）解析标准路径，以文件字节数检查 >20KB（20×1024）：每个超限文件仅 stderr 一行软警告，stdout 与退出码不变；不可 stat 的文件交 Reviewer 处理，不在配置层拒绝。
+配置取任务所属 Hub 的实际存储目录，`config --root` 指存储目录且不自动消费 TUT_HUB_ROOT；相对标准路径以被审 checkout 为基准。无 glob、环境变量、波浪号或命令替换展开；get 时对大于 20×1024 字节的文件仅 stderr 软警告，不可 stat 留给 Reviewer。非法 set 不写盘，非法手写值只使本键 get 失败，不拖累其他消费者。
 
-Reviewer 仅首轮全面审前查询配置，非空则按顺序先读各文件的头部 digest，怀疑命中或写 finding 时读对应全文；无 digest 的标准读全文，重审核销轮不读标准文件；这是 Agent 行为约定，Hub、Notifier、launcher 不加载正文。关闭时除配置查询外零标准相关动作（不隐式扫描、读文件、发布 note 或启动进程）。读取配置/文件失败不得伪装成关闭或完整通过，以 reviewer note 披露路径、原因和未完成核验并交 host/人处理，可继续独立检查，不自动清空配置。
+Reviewer 首轮全面审按顺序读头部 digest，疑似命中或写 finding 时读全文；无 digest 读全文，重审核销轮不读标准。关闭时除配置查询无其他动作，Hub / Notifier / launcher 不加载标准正文。读取失败用 reviewer note 披露路径、原因和未完成项，继续独立检查并交 Host / 人处理，不伪装关闭或完整通过。
 
-**标准只能收紧、不能放松；lint 仍是权威。** 显式配置仅载入补充判据，不把全部文字升级为硬规则，不豁免既有硬规则、验收、信封/正文要求、授权、人工门或重审关闭条件；后读的放松条款不能覆盖有效硬规则。标准问题引用文件/条款及证据，风格仍用非阻塞 note，重审不因标准变化翻已核销旧账。机制不引入标准 schema、内容校验器、摘要器或默认配置，不改变 lint、MCP 或状态派生。
+标准只能收紧，不能豁免有效硬规则、授权、验收、信封、人工门或重审关闭条件，lint 仍权威。finding 引用标准条款和证据，纯风格用非阻塞 note。配置不引入标准 schema 或默认标准，也不改变派生。
 
-本节中，标准文件指 `review_standards` 指定的文件，digest 指标准文件头部的评审索引。digest 用于定位待查条款，不能替代全文判据。
+### 5.2 协作与授权
 
-标准载入操作采用编号步骤，前置条件与失败分支显式列出，判定语义保留在标准文件中。这样修订判据时只需维护其来源，skill 不再复制一份容易漂移的解释。
+需要多角色、过程记忆或独立 review 时使用 TUT；纯查询和主会话可直接完成的小事不建任务。新语义、并发时序、接口变更选 full；已有明确设计且涉及核心路径、门禁或公开面选 direct；简单且不涉及高代价核心路径、门禁或公开面选 solo。
 
-信封填写操作集中在 common，字段与正文约束仍由 context-design 承载。代码引用 commit 可使 Hub 保留过程记录，同时避免复制文件明细与 diff。
+多工作单元可先审批设计与分解再实施；已在仓外获批的设计可验证基线后转正为任务 design。分解表包含各单元验收、接缝归属和最终集成形态，未经人批准不批量拆分或并行。独立单元使用人准备的 worktree，Host 不执行 Git 操作；集成由获授权的 Executor 承担并全量验证。
 
-### 5.2 角色操作依据
+不建设计任务时，可由 Reviewer 以设计审查 note 提供轻量意见，Host 按授权决定是否继续。发起前的阵容覆盖检查按 flow 选择角色：full 检查 Architect / Executor / Reviewer，direct 检查 Executor / Reviewer，solo 检查 Executor；cast 点名的 agent 同样须确认 CLI 可用。
 
-角色 skill 按操作文本组织，每个编号步骤承载一个动作，前置条件与条件分支单列。跨角色共用操作放在 common，角色文件保留差分与模板；这样同一协议变化不必在四份角色文本中分别维护。模板节标题保留原名，因为正文 lint 依赖这些标题；编号、模板内提示与正文排版不承担状态派生职责。
+Architect 的 Hub design 提供方案、取舍、可验证实现要求与工作单元分解；获授权的 Executor 负责成文与提交。需求方 DECIDED 是已拍板约束，SUGGESTED 是倾向；活文档由人维护或明确委托修订，过程理由留 Hub。
 
-全库角色名称固定为 Architect、Executor、Reviewer、Host，协议 role 值沿用小写枚举；文件明细、问题列表与延后登记分别用各自名称。
+被否决的方案及其理由保留在 Hub 记录，翻案须提供针对原理由的新证据。
 
-**任务选择**的既有判据如下。是否采用 TUT 与 flow 分别回答协作必要性和任务重量的问题，避免把一句话查询也变成协作任务。
+授权基线是 description 与人的原始记录，worker 记录只是提案，局部批准不扩大范围。Reviewer 以累计真实 diff 核对验收归属、必要依赖与明确不做项；未经授权的附加实现必须删除，申请扩围不核销已越界内容。争议只暂停扩展部分，不冻结核心工作、不增加状态或质量门。
 
-| 判断 | 判据与选择 |
+硬规则经人确认进入 project 记录及 AGENTS，违例为 fail_code；风格建议不阻塞，外部标准未经登记或配置不追认为本轮依据。重审核销原关闭条件，不重裁已满足证据，revision 新问题可另列。交付必须有真实测试证据，交付类型按 flow 和历史选择；批准后的修改另开任务。
+
+同类问题第二次出现时，经人确认与授权登记首次打回、规范入册证据或缺口、本次问题、漏登记或漏执行环节及纠正动作。登记沿用 note，不新增审批门。
+
+Reviewer 优先使用与 Executor 不同的 agent；同 agent 多角色合法但会话独立不保证模型视角独立，full 大任务与审批汇报须披露三角色同 agent。需外部视角时由人选择 fresh；同一受判角色连续两次 fail 时建议换人并交人裁决，计数对象是受判角色，而非发布 verdict 的 Reviewer。会话执行策略由宿主定义。
+
+发起时驱动委托可覆盖普通轮次启动，approve / reject / close / ack / 延后与登记须明确授权。Host 审批汇报包含实际 diff、验证、review 和独立抽查；solo 仍抽查。延后由原任务人的 note 拍板，并登记 project 以继续检索；电源实现选择与存储修复归人，电源执行受托代理。
+
+## 6. Notifier
+
+### 6.1 轮询与通知
+
+`tut notify` 常驻轮询 `/state` 并比较快照，辅助事件可提前触发同一比较。waiting_for 变化通知下一角色，needs_attention 上升通知异常；进入 closed 调宿主清理，基线已 closed 不补清理，失败只记日志，不阻断轮询或改记录。degraded / 消失进入沿告警一次，恢复沿只留日志；读取失败保留快照。
+
+有新进入 pending_approval 的任务时，每轮聚合为一条通知，列出当前全部待审批任务、pending_since 时长与新项标记，保留逐任务 approve / reject 指引。单任务保留标题和 task_id，多任务保留首个新项 task_id 并带 task_ids；无有效起点显示未知。基线不补发、停留不重发、重入可再发。
+
+| 参数 | 缺省与边界 |
 |---|---|
-| 使用 TUT | 需要多角色协作、过程记忆或独立 review；一句话可答、纯查询或主会话可直接完成时不建任务；不确定时交人确认 |
-| full | 涉及新语义定义、并发时序或接口级变更 |
-| solo | 不复杂且不涉及高代价核心路径、门禁或公开面 |
-| direct | 已有可引用设计，不复杂但涉及核心路径、门禁或公开面；保留独立 review |
-| 两段式设计 | 多工作单元、接口复杂且值得单独审批设计；小任务保持单任务 |
-| 快版 | 设计已在仓外经人工治理批准，只需验证基线与验收对齐、转正为任务内设计记录并施工，不重写设计 |
-| 完整两段式 | 设计未批或需求方关注设计思路；先交付并审批设计，再按分解表施工 |
-| 轻量设计审查 | 不建设计任务时，以 Reviewer 的设计审查 note 提供意见，由 Host 按授权决定是否继续 |
-| 并行 | 多个独立工作单元值得压缩总耗时；未经人批准拆分方案时默认单开 |
+| --url | http://127.0.0.1:3001 |
+| --interval | 整数秒，缺省 5，下限 1 |
+| --event-port | 正整数，缺省 3002 |
+| --stall-timeout | 整数分钟，缺省 30，非正按 0 |
+| --working-timeout | 整数秒，缺省 300，非正按 0；--launch-working-timeout / --launch-timeout 为互斥别名 |
 
-**设计交付物**的分工依据是提前暴露接口与分解错误，避免直到施工结束才发现设计问题。Architect 的 design 记录保留骨架、取舍与工作单元分解表；Executor 在 `design/<task_id>.md` 成文并提交，文档与任务 id 双向引用，Reviewer 和人的审批对象都是这份设计。活文档仍由人维护，Architect 不以直接修改活文档代替 Hub design 交付；任务内设计交付物晋升为活文档由人决定。
+Channel 只投递 Notifier 已生成的文案，可配置一个或多个 desktop / webhook。桌面实现为 macOS osascript、Windows PowerShell + WinRT toast、Linux notify-send，终端 bell 作公共兜底；Windows 注册 TUT.Notifier 身份并折叠换行，系统关闭通知时 toast 可静默失败。不同 Channel 的证据与指引一致。
 
-需求方的 DECIDED 是已拍板边界、依赖方向、兼容红线与退出标准，Architect 仅转正；SUGGESTED 是可调整的倾向，不作为跑偏依据。
+### 6.2 流转与启动标记
 
-设计交付物的审查判据为：可行性（技术成立且符合项目约束）、接口（完备稳定）、分解（边界稳定、依赖闭合无环、完成定义可验证）、一致性（符合 Architect 设计且偏差有说明）。被否决方案保留选项及理由，供后续角色核对历史约束；翻案需要针对原理由的新证据。design 中的实现要求可由测试或检查证实、证伪，不能仅写「妥善处理错误」等无法核销的表述。
+`tut mode <manual|auto>` 经 `POST /mode` 保键读改写 config.json 并 temp + rename；非法值 400，Hub 每次 state 现读，下一轮生效。manual 只通知，由人启动；auto 走启动器，同时通知人。启动顺序为判人工门 / needs_attention → role 白名单 → marker 查重 → 预检 → 乐观落痕 → 执行。
 
-**阵容与会话选择**沿用默认链：项目 workspace.json、用户 workspace.json、内置 codex／pi／codex，逐角色回退。`tut assign` 影响后续无 cast 任务；cast 仅绑定当前任务且建任务后不可变。CLI 可用才是可拉起的候选，仅有 pane 不足以加入 cast；覆盖检查沿用 full 的 architect、executor、reviewer，direct 的 executor、reviewer，solo 的 executor，被 cast 点名者也须核对。缺少现存 pane 不需要预建，轮次现场新生，标签与 rig 规则见第 4.4 节。
+pending_approval / approved 不自动启动，pass 与 blocked_external 同受人工门约束。`auto.launch_roles` 以 role 而非 agent 授信，缺省空；不在白名单不落 marker，预检失败也无痕。已落痕后的执行失败不盲重投；人工 `tut start-next [task_id] [--fresh]` 走同一计划与路由入口，--force 是显式去重旁路，--fresh 的支持与含义由宿主定义，auto 不传 fresh。
 
-Reviewer 优先与 Executor 使用不同 agent，跨模型更能提供独立视角；Architect 与 Executor 同 agent 不受限。同一 agent 承担多个角色合法，但独立会话并不自动形成模型层面的独立视角；full 大任务发起前提示，三角色同 agent 时审批汇报显式披露。
+LaunchMarker 位于系统 note 的 payload.launch，保存 protocol_version、role、base_version、via、冻结 route / route_source、target_kind / target_digest；可选 attempt_id、trigger_version、launch_mode 和 resume_from_run_id 记录具体执行归属。marker 是启动痕迹，不是交付或授权。受管轮次启动通过既有人工门、查重与预检后，以 expected_version 乐观 publish marker，再执行；冲突须重读判定，不以过期计划启动。marker 永不删除。
 
-概念性 fail、上下文近满或将 fail 合理化为「其实没问题」是 `--fresh` 的适用情形；同一受判角色连续二次 fail 时，仅 fresh 不足，建议换人并交人裁决。计数对象是受判角色，非发布 verdict 的 Reviewer；可选处置为 close 后重建换 cast、同任务 fresh 或原班再试，Host 不预设人的选择。
+普通 note 唤醒仅在 auto、在线在册且 version 前进、waiting_for=agent:* 时检测。取新增非 ack、非系统 launch note 的最大合格版本 N，与状态沿合拍至多一次，复用门、查重和乐观并发；非 note 边界 C 扩为 max(C,N)，N 必须在日志中唯一且合格。宿主进一步限定可唤醒的 note 来源。
 
-**范围冻结与并行授权**以 description 的四段及人的原始记录为基线。验收写明可观察条件，解法留给设计，已有解法用 direct 的设计指针引用；把解法塞进需求会架空 Architect。create 对验收缺节、缺条、空条和明显占位只给 warning，不能替代人的逐项判断。规范登记不扩大范围，也不替代拆分与集成批准。
+读取失败保留每任务未处理版本下界，后续轮询补判；落痕前推进或竞争而无覆盖 N 的同角色痕时仍保留，不要求再写记录、不做轮内循环重试。落痕成功即消费此次尝试，后续失败不重投。任务消失、降级、等待角色 / 状态改变、人工门 / 白名单关闭、切 manual 或版本回退时丢弃区间；基线和恢复不重放旧 note。
 
-分解属于设计，授权基线的所有权在人。已有设计时由 Architect 起草分解，Host 按获批表编排；无设计单时 Host 可代笔拆分提案，均须人的批准才批量创建。拆分方案含工作单元、各单元验收及合并集成策略，后者明确单元汇拢、接缝归属和最终仓库交付形态；设计批准可覆盖其中的拆分方案。
+auto 每轮对候选记等待角色、门、白名单、查重、最终动作与原因，决策行先于动作。日志按缓存和增量读取合并，静默轮不重复读全历史；mode 切换记旧值 → 新值，默认每五分钟回显。落痕后的执行在 task + role 链上脱离 compare 队列，控制调用必须有界，单任务故障不拖住其他任务。
 
-每个并行单元以人事先准备的独立 worktree 隔离，Host 全程不执行 Git 操作。单元验收不证明接缝正确，额外集成任务由 Executor 拼装、处理接缝并全量验证，授权来自获批集成策略；单元数、接缝归属或集成形态偏离时重新请人批准。
+### 6.3 状态观察
 
-**范围核查**由新增子系统、数据库迁移、公共接口、设计修订、附加依赖、diff 增长而核心验收未增加或已撤回范围重现触发。Reviewer 以原始授权与累计真实 diff 核对验收归属、依赖必要性、更小实现与明确不做项；已证明必要且获授权时记录证据即可，无额外放行门。必要性未证明的实现为 fail_code，关闭条件为删除越界实现及配套内容且核心验收仍过；确需扩围的提案交人裁决，已夹带内容仍须删除。
+观察只生成 Channel / 日志诊断，不改变派生、授权或停止协议。任务记录经 Hub / Store，运行与日志元信息经 RunStore；不扫描进程表，不增加逐 run 常驻 timer 或持久告警账本。以下 run 核对消费明确 headless 归属证据。
 
-争议暂停只作用于扩展部分，不冻结核心工作，不新增 Hub 状态、配置开关或仓库质量门；Host 负责将裁决落实到角色接续与实际结果核对。
+运行证据的生产协议见 [Standalone run](standalone-host.md#2-run-协议)。
 
-**规范与评审结论**按已入册硬规则、风格建议与授权分别处理。project 规范 note 保存内容、性质、适用范围与人的授权来源，硬规则同时落入 AGENTS.md；硬规则违例为 fail_code，纯风格问题只发非阻塞 note，不作为必须核销项，也不替代 review。未入册且未配置的外部标准不追认为本轮依据；经人确认后由 Host 受托登记，文档修改由获授权的 Executor 承载。
+#### 成功退出但没有交付
 
-同类问题二次出现时，经人确认与授权登记首次打回、入册证据或缺口、本次问题、漏登记或漏执行环节及纠正动作；沿用 note，不新建门。approve 后修改另开任务，仓库层打回不复活原任务。
+运行观察只对本 rig 中具有合法 task_id/headless 身份、因而 `knows(task)` 的 run 对账。`complete(meta)`、无 stop_request、exit_code=0 且无退出信号才入候选。根进程退出但原组未完成、主动停止、非零退出、启动未确认和无归属的手动 run 不产生此告警；既有 give-up 语义保留。
 
-review 结论的状态语义见第 3.1 节。验证完成且问题已关闭或已获人的延后拍板时为 pass；代码达标、问题已核销而验证受本轮无法完成的真机、部署或跨系统条件阻塞时为 blocked_external。仍有未满足且未批准延后的问题时为 fail_code 或 fail_design，verdict 与问题列表一致；direct 的设计前提错误仍如实报 fail_design，表外交人处理。
+交付是同 task、同 role 的 design / code_changes / revision / review，版本严格大于 run 的 base_version。下一次同角色合法 launch marker 的 base_version 为前一轮的包含上界，防止后轮交付掩盖前轮缺交付。note、decision、launch marker、其他角色及启动前记录不算交付。关联依据为角色和版本，不证明发布进程身份。
 
-重审以原关闭条件核销，不重新裁量已满足的证据；revision 新引入问题可另列。人的 reject 理由与 Executor 收回 note 中的自报问题分别构成对应修订轮的问题列表。
+在线退出与 restore 使用同一个完成候选队列。restore 将已完成成功 run 加入待判集合，不放回 occupied；冷启动首次成功观察也会补判 Notifier 停机窗口中的退出，但不重放旧 note、不补播历史 give-up、不启动下一轮。Hub 读取失败保留候选，下次既有轮询重试；同任务多个候选复用一次读取。核对有交付或尝试告警后消费候选，静止轮不重复读历史。
 
-**交付选择**由 flow 与日志历史共同确定，不能只看当前 implementing 状态。full 与 direct 首轮用 code_changes，修订轮用 revision；full 的 fail_design 后 design 使状态回到 implementing，仍用 revision，ref_version 指向打回设计的 review。solo 的 reject 后仍在 implementing，用 code_changes；approved、closed 之后仅用 note 汇报。ref_version 与 commits 的关联约束见 context-design 第 2.5、3.4 节，真实测试证据让下一角色可以核对交付，而不是只接受自述。
+原因名为 `stopped-without-publish`，沿用 attempt 级有界通知去重，先登记 key 再 await 发送。发送失败只记日志，不重投。去重只在 Notifier 生命周期内有效：再次重启可再次提醒仍未交付的历史成功 run；可恢复补判不等于跨重启永久 exactly-once。
 
-**Host 授权与审批**区分启动按键和人工决定。发起时的驱动委托覆盖普通轮次 start-next，无需逐轮再问；approve、reject、close、ack、延后拍板与登记均需要可追溯的明确授权。
+#### 新增交付的运行时间线核对
 
-auto 白名单内由 Notifier 启动，白名单外无启动也无 launch 记录，Host 凭委托补位；更换 agent 仍继承 role 白名单的信任，收紧时先调整白名单。MCP 是首选通道，因为宿主连接不受命令沙箱同样的网络限制；CLI 被拦时可用等价 MCP 或交人执行，不推定为环境未启动。
+仅在本次有效 `launch_mode=headless` 且 task 归属明确时核对新增 worker 交付。manual flow 不等于 TUI，观察不受 auto 白名单约束，也不赋予启动权限。human note/decision/ack、普通 worker note、系统 launch note 均排除。
 
-审批汇报包含真实 diff 摘要、验证证据、review 结论与 Host 独立抽查意见，solo 也保留抽查，作为人工决定前的技术复核。blocked_external 的 approve 表示人明知验证未决而接受，也可先补验或 reject 指定补验路径。`tut up` 是人的显式环境动作，Host 不代跑、不代管 pane 或布局；存储修复同样归人运维，degraded 不属于可用 ack 消除的表外组合。延后用原任务 note 拍板，并在 project 登记原任务、ref_version 与关闭条件，以便任务结束后继续检索；具体内容约束见 context-design 第 2.4 节。
+按记录之前最近的合法 launch marker 定位轮次；必须明确 headless，且 attempt、role、base_version 与本地可信 run 对应。TUI/legacy marker、无 marker、跨 rig 或身份不明不推定为 headless。
 
-## 6. Notifier：通知与流转
+仍 occupied 的任务（含 starting/uncertain/未完成 stop，以及在线 meta 读取失败后尚未确认的完成）暂缓核对，保留交付区间；仅在确实完成核对时推进已处理版本，等待期间不重复拉取 Hub 历史。只有新交付沿才刷新 run 元数据；清单读取失败或不完整按 unknown 诊断，不能当成空清单。
 
-Notifier 是通知与流转的中枢：常驻轮询派生状态、按流转模式行动。Agent Host（第 7 章）的信号源事件是它的追加输入。
+用交付 timestamp 与 run 的 started_at/ended_at 区间核对，边界相等视为覆盖。publish 与退出在同一轮询窗口被看到时，已完成 run 仍提供时间证据。仅能确认无归属 run 覆盖记录时间才产生 `ghost-delivery`。时间非法、时序矛盾按 unknown，不作肯定诊断。正文包括 task、role、版本、attempt/run、记录与观察时间、无覆盖依据及 `tut read` / `tut ps` / `tut attach` 指引。
 
-### 6.1 通知逻辑
+Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。Hub 读取偶然看到更高版本，不提前消费。读取失败保留下界，下轮无需新增版本即可重试。首见、冷启动、版本回退、任务消失/降级后恢复、切入 headless 均先建基线，不追报历史新增；切出 headless 清理边界。
 
-审批通知按轮询聚合：有新进入 pending_approval 的任务才发一条 Channel 通知，列出当前全部待审批任务、pending_since 算出的停留时长（秒）、新进入标注「新」，保留逐任务 approve/reject 指引。单任务保留原标题与 task_id；多任务保留首个新进入任务的 task_id，并加法提供全部 task_ids。旧 Hub 缺少/非法 pending_since 时显示时长未知。基线不补发、停留不重发、重入可再发、轮询失败保留快照、恢复沿只记日志；Host 转送仍逐任务。
+通知按 task_id + record.version 去重，同一静止版本不重报。此路径不写 Hub 记录、不执行 stop/resume/重投。
 
-放弃通知沿复用既有 Channel（含配置的 desktop）：正文带 task_id、reason 与接收时间。通知按任务/pane/agent/attempt_id 进程内去重；无有效 v2 时 reason=unknown，按任务版本去重，版本前进可再提醒。仅补通知面，投递 v2 与受控补救机制不变。
+#### 两个独立的时钟
 
-`tut notify` 的运行参数契约：
+| 观察 | 续期证据 | 超时含义 |
+|---|---|---|
+| 既有 stall | `/state.updated_at` / version 的进展，以及既有匹配 launch working 规则 | Hub 长时间无进展 |
+| log mtime 静默 | 归属明确且仍运行的 headless run 的 log mtime 变化 | 长时间未观察到输出，可能在思考或等待 |
 
-| 旗标 | 含义与缺省值 |
-|------|----------------|
-| `--url <u>` | Hub 地址，缺省 `http://127.0.0.1:3001` |
-| `--interval <s>` | 轮询间隔，整数秒，缺省 5；运行时下限 1 秒 |
-| `--event-port <p>` | 本机事件监听端口，正整数，缺省 3002 |
-| `--stall-timeout <m>` | Hub 无进展超时，整数分钟，缺省 30；非正值按 0 分钟阈值运行 |
-| `--working-timeout <s>` | launch 到首个 working 的短引信，整数秒，缺省 300；非正值按 0 秒定时器运行 |
+两者共用 `--stall-timeout`，默认 30 分钟，内部归一化为非负毫秒阈值。0 表示立即到期：静默首次有效采样建基线，下一次有效比较即可触发；不是禁用开关。写 note 不清除日志静默，输出日志不冒充 Hub 进展，两类通知可以分别出现。
 
-`--launch-working-timeout` 与 `--launch-timeout` 是 `--working-timeout` 的别名，三者一次只允许指定一个。事件监听是独立于 Hub 的辅通道，其 HTTP 契约见 7.2。
+每个合格 run 每轮至多一次 RunStore.logInfo；仅取安全只读的文件元信息，不读取正文或阻塞轮询。首次有效采样、mtime 变化、新 run、重启、读取故障恢复都建立新时钟。一个连续静默段只提醒一次；恢复输出后，必须再次走完阈值才能提醒。
 
-Notifier 是**常驻轮询进程**，信号源事件只是追加的触发——轮询是主通道，因为人工 decision、一切不经过本机 Agent 的流转都不产生事件，只有轮询能发现：
+不可读、缺失或非法文件只记诊断，不把不可观测时间累计为静默。starting/uncertain、root_exited、complete、主动 stop、已关闭或不在当前可见任务集的 run 不武装静默告警。
 
-```
-Notifier 主循环（默认 5s，可配置）
-  → GET http://localhost:3001/state，与本地快照对比
-  → waiting_for 变了 → 按 6.2 的流转模式处理
-  → 任务「进入 closed」转变沿（上一快照在册且非 closed → 本轮 closed）→ 消费侧触发 launch --cleanup 收割 `<T>.*`（4.4 关闭钩子；
-      仅限观测到的转变沿——基线快照已 closed 不触发（含 Notifier 停机期间发生的 close），否则每次重启都为历史 closed 任务空跑子进程；
-      失败仅一行 stderr 告警，不发桌面通知、不写 Hub 记录）
-  → needs_attention 置位 → 通知异常序列，提示人工处置
-  → degraded 转变沿 → 告警一次：任务新进 degraded（存储损坏——处置按 4.3 三类协议，均走受支持修复入口：meta 损坏用 tut repair-meta 重建、
-      记录损坏从外部快照取回原始内容经 tut recover-record 登记〔坏件字节原样保留〕、目录消失按备份恢复目录；
-      修复前 decide close 不可用——close 是记录追加，前置是存储链路可解析；绝不删记录，见 AGENTS.md 不变量；类别定位诊断走 tut doctor）
-  → 快照差分发现任务在 `tasks` 与 `degraded` 双缺席（目录消失）→ 同样告警一次，文案与损坏降级区分
-      （decide close 不适用——无可追加的日志；指引指向备份 / git 恢复目录，见 4.3）
-  → 任务移出 degraded 或重现 tasks[]（修复成功 / 目录恢复）→ 通知日志留行即可，不再打扰
+内部原因 `suspected-blocked/silent` 不是线上事件。它只提示可能性，不断言 blocked/失败，不修改 status/needs_attention，不自动补救。
 
-信号源事件 agent.done / agent.blocked（追加触发，见第 7 章）
-  → 立即执行一次上述对比（提前于下个轮询周期）
-  → 并做交叉验证：Agent 终端状态与 Hub 不一致时（Agent 说 done 但没 publish）
-      → 通知 "Agent X 停止但未发布上下文"，提示人工检查
+## 7. 宿主契约
 
-启动器事件 delivery_giveup（追加触发，见 7.2.1；冻结三字段上加法携带 delivery_v2）
-  → pane 标签反查任务后立即经 Channel 告警；有效 v2 优先解释原因，旧证据仅兼容解析。
-  → 一态人工检查指引来自 giveUpGuidance；目标/输入框/尚待执行调用经人工核实后才可按一次 Enter，禁止盲按与自动重投。
-  → 不刷新 stall 计时（放弃不是进展，看门狗时钟照走作为后续兜底提醒）
-  → 命中在役 working 短引信则解除之（give-up 告警已覆盖其职责，避免双重报警）
+### 7.1 角色与三个开关
 
-信号源事件 agent.done（pane 补收 sweep，先于上述对比执行）
-  → 列 pane list，筛出该任务全部 `<T>.*` 轮次 pane
-  → 逐个读可见屏（`pane read --source visible`，尾部 40 行）落入通知日志
-      → 每行带时间戳与 pane 标签；非本任务 pane 绝不误收
-      → 「Agent 做了但没发布」的屏幕证据在下一轮收割前留档，best-effort
-      → sweep 与该任务下一轮 auto launch 之间设按任务屏障（barrier）：launch 的 marker/spawn 前置等待该任务 sweep 落定（成功或已记录失败），防轮询竞争抢跑收割
-```
+信号源提供本机 Agent 状态或运行生命周期证据，启动器消费冻结计划执行下一轮；Hub 给出 waiting_for，不负责拉进程。终端工作态与运行退出事实不能互相冒充。
 
-**Host 状态转送**：复用 `pending_approval` 进入沿与 `needs_attention` 上升沿，每个沿仅尝试一次 `herdr pane send-text`，两沿同轮出现则各发一条；基线不补发、停留不重复、离开后再次进入可再发。JSON 正文仅含 `task_id`、`status`（报告沿名：`pending_approval` / `needs_attention`，后者仍是叠加标志而非新增状态）、`waiting_for`，不含标题、指令或授权语。目标由 config.json 的 `notify.host_pane_label` 指定精确标签，经既有 `/state.notify` 每轮读取；缺省/空值按**本 rig 的 `tut-host-<rig>` 标签**精确匹配（rig 后缀即 hub-root 指纹——跨 workspace 共享 herdr 时，裸前缀会把审批信号投进别的 rig 的 host 会话，故不按前缀扫）。仅唯一匹配才发送，零个或多个匹配及发送失败只记一行日志；I/O 不阻塞比较队列，不做重试、持久去重或补提交。Host 收到仅视为知悉信号，仍按既有协议行动。
+| 开关 | 选择 | 缺省 |
+|---|---|---|
+| power.mode | herdr / standalone：服务电源实现 | herdr |
+| launch_mode | tui / headless：Notifier 发车后端 | tui |
+| flow_mode | manual / auto：谁按启动键 | manual |
 
-交叉验证：**用 Hub 状态验证 Agent 是否真的交差了**（子 Agent 偷懒问题的兜底）。
+三者互不替代：切电源不切发车，切发车不产生轮次，auto 不越过审批。power / launch 的配置 set 保键原子写，非法 set 不落盘；launch_mode 缺文件 / 缺键用缺省，损坏或非法值拒绝本次启动。up / down 的 power 读取只验证出现的 power 节；缺失、不可读或坏 JSON 按 herdr 缺省，显式非法 power 节失败；config get power.mode 使用严格读取并报告坏文件。
 
-**反查未命中事件的限频**：事件 pane 反查不到任何任务（用户无标签 pane / 4.4 约定外）时，同源（同 pane + 同 agent）首个事件照常落降级日志与通知（blocked 仍通知人），窗口期（默认 60s）内的后续事件只计数不输出，窗口期满由下一事件或兜底计时器聚合成一行（含各事件类型计数与总数；兜底计时器在窗口到期点触发——距同源最后一次输出整整一个窗口，窗口中途的 burst 不顺延 deadline——触发后即从计时器集合移除自身并淘汰已静默的同源记账条目，长期运行不累积）；能命中任务的事件行为不变，blocked/done 的「立即对比」追加触发也不受限频影响——限频只约束 unmatched 路径的日志与通知量，同源横跳不再逐条刷屏。
+实现边界：Herdr 负责 pane 生命周期、rig 标签、终端发车、hook、投递与 Enter；Standalone 负责 detached 服务、run / stop / resume、headless 发车、只读座位、checkout preflight 和 watcher 进程。各实现负责身份、互斥、有界控制、失败证据与清理，不改共享状态和授权规则。
 
-### 6.2 流转模式（auto / manual）
+两种电源的 up 均调用同一用量 watcher 启动辅助函数；watcher 进程协议见 [Standalone 用量 watcher](standalone-host.md#8-用量-watcher)。
 
-普通 note 唤醒：auto 模式下已在册任务 version 前进、当前 waiting_for=agent:* 时复用既有启动判定的日志读取，检测新增非 ack 且非系统 launch marker 的 note，取新增区间内最大合格版本 N（不以尾部 ack/marker 的版本代替）。与 waiting_for 沿合并同拍至多一次；复用三项门、launch marker 查重与乐观并发。仅携带本次新增 note 上下文的 auto 尝试，将去重边界从最新非 note 版本 C 扩为 max(C, N)：N 前旧同角色痕允许续跑，边界之后已覆盖当前 note 的同角色痕阻止重复启动；候选 N 必须在日志中验证为合格 note，且该版本在日志中唯一。无此上下文的 helper 调用及人工 start-next 保持原语义。门或白名单未过时不额外读日志、不启动；ack、launch 自写痕、基线、恢复沿及 manual 不唤醒。判定日志标注 note 版本与覆盖它的 marker；静默轮不增加读取。
+### 7.2 冻结计划与路由
 
-日志读取暂时失败时，普通 /state 快照照常推进，但 note 检测单独保留未处理区间的版本下界（每任务一项），决策日志标记待重试。后续符合条件的轮询读取恢复后补判该区间。落痕前读取推进或 expected_version 竞争若尚无覆盖 N 的同角色痕，保留未完成 note 区间到下一正常轮询重判，不要求再写一条记录、不增加轮询内重试循环；冲突复查使用相同 note 边界，旧痕不能冒充竞态赢家。新痕仍以完整日志当前版本为 base_version；成功落痕即登记此次尝试，后续投递失败不自动重投，其他前置失败不自动重试。任务消失/降级、状态或等待角色改变、人工门/白名单关闭、切换 manual 或版本回退时丢弃待检测区间；恢复和重启仍按原基线语义处理，不重放历史 note。
+启动计划冻结 role、AgentRoute 及来源、根目录、Hub URL、prompt、版本和平台执行目标；子执行者消费计划，不二次解析配置。prompt 是要求读取完整 context.read、加载同包绝对 role skill 并 context.publish 的门铃，不复制任务正文。
 
-两模式共用 delivery confirmation v2：单次尝试、有界状态观察；exit 0 不代表输入消费确认，未确认时先按 7.2.2 的开关与证据决定是否补按一次 Enter；其余人工检查，禁止自动重投文本。启动 marker 去重与人工审批门保持不变（7.2.1）。
+hubRoot 是所属 Hub / 共享存储根；routingRoot 为 TUT_PROJECT_ROOT 或 hubRoot；checkoutRoot 为 Agent 实际 cwd；安装根用于同包 CLI / skill / 监护绝对定位。worktree 只改变执行根，不分裂 Hub。任务 checkout current / 缺省取 hubRoot，worktree 路径相对 hubRoot 解析且须可进入，ref 不替代 path。
 
-「事件驱动下一个 Agent 开工」有全局开关，由 Hub 配置（config.json 的 `flow_mode`），通过 /state 暴露给 Notifier。**切换入口是 `tut mode <manual|auto>` 子命令**：经 `POST /mode` 由 Hub 完成**保键读改写**（未知键如 `notify` 全保留）后 temp+rename 原子落盘 config.json，非法值 400；Hub 每次响应 /state 时现读当前值——切换在下个轮询周期生效，无需重启。此通路要求 Hub 在运行（`tut mode` 是 HTTP 客户端；6.1 本就假设 serve 常驻）。
+所属根由入口的显式 --root、TUT_HUB_ROOT 或 cwd 向上最近 .context-hub 确定，无匹配取 cwd。共享 Hub 发现优先显式 --url，其次 TUT_HUB_URL，最后 http://127.0.0.1:3001；无显式 URL 时有界扫描本机 3001–3199 奇数端口。仅接受 loopback HTTP，/state.hub_root 规范化为绝对路径（存在时 realpath）后必须匹配，身份缺失也拒绝；显式外根 URL 不回落其他服务，普通客户端发现失败提示 tut up，不隐式启动。
 
-| 模式 | waiting_for 变化时 Notifier 的行为 |
-|------|---------------------------|
-| **manual**（默认） | 只经 Channel 通知人（含 task、状态、该谁动），**人同意后**下一个 Agent 才开始：人可以直接去目标 pane 发 prompt，或用 `tut start-next <task_id>` 一键经启动器启动下一个 |
-| **auto** | Notifier 经启动器（TS launcher 内部入口 `launch`，见 7.2）投递轮次 prompt——同任务同角色连续轮延续现存 pane 只投递，角色变更现场诞生全新 pane（三分支见 4.4），同时发通知告知；auto 永不传 `--fresh`（显式外部视角是人的选择） |
+身份探测每次 800ms，超时或连接失败立即重试一次；身份不匹配 / 缺失、坏 JSON 和非成功 HTTP 不重试。电源入口负责可用端口供给与启动后身份复验，端口探测不授予进程控制权。
 
-auto 模式启动前的检查是流程执法的唯一所在（三项）：**① review `pass` / `blocked_external`（凡派生到 `pending_approval` 的 verdict）但没有 decision 记录、② needs_attention 置位、③ 目标 role 不在启动白名单**（config.json 的 `auto.launch_roles`，经 /state 的 `auto` 键暴露，缺省空 = 全部回落）——任一命中则 Notifier 不自动启动，转通知人。检查顺序：判门 → 白名单 → 查重（launch note）→ 前置检查 → 落痕 → 启动；**白名单未过不落 launch 痕**（不阻碍人的 `tut start-next`），**前置检查失败也无痕**（解析不出目标 agent / agent 不在 PATH → 报错退出，重试自然、无需 --force；herdr 层失败仍发生在落痕后 → 恢复用 `--force`）。manual 模式下人本身就是门。
+route 按 task cast → 项目 workspace → 用户 workspace → 内置逐 role 回退。项目声明为 `<routingRoot>/.context-hub/workspace.json`，缺失 / 损坏字段由 Hub 根声明补充；用户文件为 `~/.config/tut/workspace.json`，TUT_USER_CONFIG_DIR 可改目录。内置 architect=codex、executor=pi、reviewer=codex，未知 role 回落 codex；参数原样保序。
 
-**子进程活性兜底**：Notifier/启动器派生的子进程永不无限挂起——herdr 单命令（读屏、pane 操作等短命控制调用）生产默认约 10s（`TUT_HERDR_TIMEOUT_MS` 逃生口）；launcher 编排子进程（完整投递状态机：send-text / 至多一次 Enter / 有界状态观察 / birth 各相位）生产默认 180s（高于内部总预算 170s，保留 10s 余量，健康启动不被误杀）。超时 SIGKILL 后按既有失败路径处置：herdr 命令失败返回、调用方走既有诚实降级（读屏降空串、status 观察不可用时升级人工检查）；launcher 超时翻译为明确错误进 `autoLaunchFailed` 告警。落痕后的启动子进程在 per task+role 链上脱离 compare 串行队列执行，单次挂起最多拖该任务。
+读侧缺失 / 损坏文件视该级缺席，逐字段回退；`{label,agent}` 仅消费 agent，`{agent,args}` 保留参数。TS resolveAgentRoute 是权威解析，resolveAgent 提供显示字符串；scripts/tut-resolve.mjs 供旧消费者和 parity fixture，scripts/workspace.json 是运行时不读取的种子。assign 修改项目声明，缺文件时以当前有效三角色初始化；只影响未被 task cast 固定的后续任务。
 
-**auto 门可观测**：auto 模式下每个轮询周期对每个 agent:\* 等待任务向通知日志打一行决策记录——等谁、三项检查各自结果（decision 门 / needs_attention / 白名单）、查重结果、该轮最终动作与原因（决策行先于该轮动作落盘）。行动语义不变（仍是边沿触发），但「应启动而零 marker 零动作」类失灵可凭日志重建时间线定性；查重观察意味着每个候选任务每轮多一次任务日志读取（本地 HTTP，可接受）。**flow_mode 可见性**：切换即打一行（旧值 → 新值），另周期性（默认 5 分钟）echo 当前值——看通知日志尾部即可回答「现在是什么模式」，mode 位静默漂移不再需要从行为反推。
+启动环境显式注入 TUT_HUB_ROOT / TUT_HUB_URL / TUT_EVENT_PORT_URL，不假设服务端继承启动者环境，不改全局 process.env、不保存完整环境。
 
-manual 模式下 Notifier 同样持有启动能力但不使用——auto/manual 切换只改 Notifier 的一个分支，不改 Hub；流程真相仍在派生状态，模式只决定「谁来按下启动键」。**role → agent 的路由解析链**（单一链、两个启动门共用）：**task cast（/state 条目）→ 三级 workspace 链逐 role 回退——L1 项目级 `<项目根>/.context-hub/workspace.json` → L2 用户级 `~/.config/tut/workspace.json`（`TUT_USER_CONFIG_DIR` 可覆盖目录）→ 内置 DEFAULT_ROLES（architect=codex / executor=pi / reviewer=codex，值冻结）；链外未知 role 一律回落 codex（workspace.ts `UNKNOWN_ROLE_AGENT`）**。中间层传递 `AgentRoute`，不得 split 后只取首词或改变 args 顺序；TS 侧 `resolveAgent` 保留旧的显示字符串包装，`resolveAgentRoute` 给启动消费者返回 `{agent,args}`。读侧 never-throw（缺失/损坏文件 = 该级缺席），per-field 逐键回退（L1 只写 executor 时 architect 取 L2/L3）；旧形 `{label, agent}` 条目读侧容忍（只读 `.agent`），新形 `{agent,args}` 逐项读取；label 字段与 routes.json 已**概念退役**（物理删除，统一收敛于此）。仓库内 `scripts/workspace.json` 退役为种子（运行时零读取），`tut assign` 改写**项目级**文件（不存在时从当前有效阵容初始化三 role 全量落盘）；「一 Agent 多帽」是一等表达。解析链的权威与兼容边界：TS 侧 workspace.ts `resolveAgentRoute` 是 canonical 解析链（tut start-next、Notifier auto 门与 TS launcher planner 共用）；`scripts/tut-resolve.mjs` 保留给旧消费者/parity fixture，不再位于启动器运行时路径——同链同输出由 parity 测试钉死。
+### 7.3 辅助事件接口
 
-命令值的 CLI 语法是 `--cast <role=command>` 可重复；旧的 `--cast executor=pi,reviewer=codex` 逗号简写继续可读，只有逗号后紧跟已知 `role=` 才是下一项边界，参数 token 内的普通逗号不截断。`tut assign <role> <command...>` 将 role 后的剩余 argv 作为同一命令值。命令首词才进入 `command -v`；参数化示例：`--cast 'executor=codex --model <executor-model> --sandbox workspace-write --search'`。
+Notifier 在 loopback 监听 `POST /agent-event`，核心 JSON 字段为字符串 `{event,agent,pane}`，词表为 working / blocked / done / delivery_giveup。有效事件 200 `{ok:true}`，未知词 200 `{ok:true,ignored:true}`；坏 JSON / 字段类型 400，其他路径 404，其他方法 405（Allow: POST）。Host 仅允 127.0.0.1 / localhost / [::1]，否则 403，容忍缺 Host；body 上限 64 KiB。监听失败是启动错误。
 
-`tut start-next [<task_id>] [--fresh]` 子命令是人工确认入口：读当前 waiting_for → 前置检查（解析目标 command 首词 + PATH）→ 经启动器内部入口投递轮次 prompt（参数形状与历史一致，见 7.2）——三分支：同角色延续 / 角色变更新生 / `--fresh` 显式新生（见 4.4）；`--fresh` 与 `--force` 正交（前者 pane 策略、后者去重旁路）。它和 auto 模式走同一条启动通路与解析链，只是按键者是人。**`tut up` 已退化为电源开关**：只供给 hub + notify pane（兼作 birth 锚点，见 7.2），不再预供 role pane——agent pane 由启动器在轮次交接时诞生、随生命周期钩子回收（见 4.4/7.2），「多开 agent = 闲置零成本」由此成立。
+生产者以非空 TUT_EVENT_PORT_URL 指完整接收 URL，缺省 http://127.0.0.1:3002/agent-event；它不改变监听端口，部署须与 --event-port 一致。可选证据由对应宿主定义，内部推断原因不是新线上事件。
 
-## 7. Agent Host：信号源与启动器
+新线上词须同时具备兼容 schema、Notifier 消费与去重 / 降级语义、canonical on-agent-event.mjs 的 EVENTS 同步、旧消费者 ignored 与主轮询兜底。未知词不能承载唯一必需语义。
 
-Agent Host 是承载本机 Agent 进程的宿主环境。架构对它的依赖是**两个角色**，不是任何具体组件——角色是结构性需求，实现是可替换的选择（当前选型见第 8 章）。
+## 8. 工程约定
 
-### 7.1 两个角色
+TypeScript、Node.js ≥ 20；运行时依赖为 MCP SDK 与显式声明以保单实例的 zod，不引入数据库或其他运行时依赖。单端口同时服务 MCP、state 与看板。
 
-**Agent 状态信号源**：working / blocked / done 事件的唯一来源。Hub 原理上看不见 Agent 的运行态——Agent 卡在权限确认、说 done 但没交差、进程崩了，在 /state 里全都表现为「waiting_for 不变」，只能靠超时兜底且分不清原因。要完整的协作体验（blocked 检测、交叉验证、低延迟交接），必须有一个能观测本机 Agent 终端状态的信号源。
-
-**启动器**：auto 模式与 start-next 的执行手——在指定上下文里拉起 Agent。Hub 只出判据（waiting_for），不出手。
-
-### 7.2 契约（可插拔边界）
-
-两个角色各对应一个极简契约，粘合脚本就是边界的物化：
-
-| 角色 | 契约 | 当前绑定 |
-|------|------|---------|
-| 信号源（in） | 事件投给统一入口：`node scripts/on-agent-event.mjs <event> <agent> <pane>`，event ∈ working / blocked / done / delivery_giveup（前三者为 Herdr 状态事件；delivery_giveup 由启动器自身在单次投递与有界观察放弃时经同一 POST 契约直发，事件体在冻结三字段上加法携带 delivery_v2 证据，见 7.2.1）；`on-agent-event.sh` 为 POSIX 兼容薄 shim（只转发同包 Node 入口） | Herdr 插件投递（herdr-hook.mjs 经 stdin 收 payload 后调用本入口） |
-| 启动器（out） | **主实现为 TypeScript**（`src/launcher/**`，经内部入口 `node dist/cli.js launch [--fresh] <task_id> <role> [<agent> [<arg>...]]` 跨平台直启；`scripts/launch.sh` 为 POSIX 兼容薄 shim——只转发 `node dist/cli.js launch "$@"`，无决策逻辑）。语义（跨角色必 fresh、同角色连续轮延续、窄收割、寻址键守卫、adopt-root birth、单次投递与有界观察等全量规格见下）：auto 模式 / start-next 用；建任务后的首轮同此；第三参裸 agent 或已分词 args 均可——计划构造时统一冻结为 LaunchInvocation（route、tab/pane label、roots、prompt、平台执行计划），marker 写「可移植审计投影」（逻辑 route + route_source + target_kind + digest），child 只消费私有完整计划；缺省解析链 = cast → 三级 workspace（详见上文 6.2 行）；`launch --cleanup <task_id>`（任务关闭钩子，触发沿见 4.4——decide close 同步沿 + Notifier 转变沿，best-effort）。**锚点解析提前到入口一次性完成**并全程复用 ExecutionContext（anchor/hubRoot/routingRoot/checkoutRoot 四根分离，`TUT_PROJECT_ROOT` 只影响 routingRoot、永不改写 hubRoot；所有 cwd 依赖取自 context 字段而非散落 process.cwd()；shell 方言发现顺序 = pane 元数据 → `TUT_PANE_SHELL` → 平台默认（Windows=powershell5、其余=posix），未知方言 birth 前 loud fail。控制面 herdr 命令逐项 raw argv（shell:false 禁第二次解析）；仅 pane 内命令经确定性 renderer 出单一字符串（POSIX `sq` / PS5/pwsh 保守 script block + 子进程隔离 env / cmd 安全双引号词或 base64url encoded runner）。**三分支轮次交接**（详见 4.4）：①同任务同角色连续轮 + 现存活 pane → 只投递不收割不新生；②新生分支（角色变更/首轮/死 pane）→ 窄收割收窄规则与 `TUT_CONTINUITY_ROLES` 逃生旋钮保留，收割后仍存在活的 `<T>.<role>` → loud abort 寻址键守卫；③`--fresh` 显式 force-close 后新生。运维口径：cast 中途换 agent 后启动同角色轮配 `--fresh`。**birth 锚定**：锚点链 `tut-hub` → `tut-notify` → `$TUT_SPLIT_BASE` → loud fail（dry-run 输出占位符），绝不取首个/聚焦猜测。实现为 fail-closed 收紧：`$TUT_SPLIT_BASE` 仅在快照中**完全不存在** tut-hub/tut-notify pane 时才被咨询——存在但不可锚（缺 workspace_id/cwd 等）的系统 pane 同样 loud fail，不落回 split-base（比链式阅读更严，方向安全）。**birth 序列（adopt-root 双标签）**：存在性检查只探 route.agent 裸首词（POSIX which 预检 / Windows 结构化解析——候选枚举以 Node 内 PATH+PATHEXT 自枚举为正源，不经 where.exe 文本输出、无代码页解码问题，where.exe 仅在 PATH 缺失时作 fallback；PE native 直 spawn、Node entry 直 spawn、.cmd/.bat/.ps1/.sh shim 一律 spawn 前 fail-closed 拒绝并给可行动指引；which/where 探测子进程带超时（默认 8s，`TUT_PROBE_TIMEOUT_MS` 可调）与超时即 kill；候选存在性 stat 与 extensionless PE 头事实同享该预算；Windows PATH walk 总预算独立可调——`TUT_PROBE_WALK_TIMEOUT_MS`（缺省 24s，覆盖候选发现与全部断点续探；钳位边界与 `TUT_PROBE_TIMEOUT_MS` 同为 [250ms, 60s]，非数字/垃圾值回退缺省）——生产默认链把候选事实收集放进可杀子进程，行协议增量消费（每候选一行 NDJSON、按 argv 序流式产出；预算超时 SIGKILL 后已收事实保留，挂住候选与其同目录后续按有界不可用标记、自下一目录断点续探，walk 得到 definitive 结果即停杀仍在扫描的 child——同批候选互不为人质；主进程线程池不被死 UNC 扣作人质；Node fs 无 AbortSignal/可取消 stat 是根因，纯 Promise.race 只能救调用方救不了线程池），注入 seam 则走 signal+race 契约——PATH 含失效 UNC 不再分钟级挂起、也不再吞掉同批可用候选；POSIX 保持裸名 + which 预检零新机构，which 二进制本身缺失（ENOENT）单独给安装 which 的 hint，不误导为装 agent）→ tab create（naming 模板渲染 tab 标签；planner 一次解析同一 snapshot 的 route 与 naming 并随 invocation 冻结传递，child 不再读配置）→ 根 pane 双通道发现 → rename 寻址键 `<task_id>.<role>` → renderer 生成的单串进 `pane run`。**拉起禁自更新**照旧（codex 追加 `-c check_for_update_on_startup=false`、pi 走一次性 env、`TUT_SUPPRESS_AGENT_UPDATE=0` 关闭）。tab create 异常路径双重保险保留：exit 0 但输出不可解析走 tab-list 恢复——恢复只认「单空根 pane（未改名无标签）且 tab 内无 `<task_id>.` 活标签」的候选（默认 tab 模板撞名不跨任务收养，多候选歧义即拒绝）；signal 中断视为"可能已生效"禁止盲建第二个同 label；fallback split/move/sweep 有界重试。**投递机制**（7.2.1）：原 prompt 单次 send-text + 至多一次 Enter + 有界状态观察与诊断双 sink；born/延续共享状态就绪门（born 见 working 等 idle，延续首次可分类即放行），无屏幕就绪门控，当前 attribution-unavailable 只升级人工、不自动确认 |
-
-主实现为 TypeScript 内部入口，`scripts/launch.sh` 为 POSIX 兼容转发 shim。调用方把命令首词与有序 args 逐项传入；旧的第三参裸 agent 继续可用，第三参为 legacy 命令字符串时仅在入口解析一次。存在性检查只探首词（POSIX `which` 预检 / Windows PATH+PATHEXT 自枚举结构化解析，where.exe 仅 PATH 缺失时 fallback——见上表 birth 序列），Herdr 收到逐项 shell-neutral argv；codex 在用户 args 后追加 `-c check_for_update_on_startup=false`，pi 走一次性子进程 env（Windows 上绝不用 POSIX `env` 前缀），未知命令逐项原样传递，`TUT_SUPPRESS_AGENT_UPDATE=0` 关闭 suppression。其余生命周期、锚定、收割、投递与回退语义不变。**任务 checkout 路由对两臂同语义**：canonical 臂（start-next / Notifier 规划）与 legacy 位置参数臂都在规划期读 `/state` 的 `entry.checkout`（cast 同规则）并冻结进 ExecutionContext——worktree 任务无论走哪扇门都 born 于其 checkoutRoot，hubRoot 共享不动；hub 不可达（fetch 失败）、`/state` 非 2xx 或返回不可解析 JSON 时，legacy 臂先打一行 stderr（含 URL 与原因）再退化 current/default（文档既定兼容门，不静默）；HTTP 200 但目标任务不在 `tasks` 中则是调用方错误，在任何 Herdr mutation 前拒绝启动（非零退出）——「不存在」不解释为 current/default。裁决为路由而非全盘 fail-closed：路由数据在 `/state` 恒备，fail-closed 无安全增益、反而砍掉 `launch.sh` 兼容门；但降级必须可见、缺任务必须拒绝。create 三面（store / MCP / CLI）对 worktree 路由统一要求 path、ref 仅作旁注（ref-only 在 create 即拒——启动侧不建 worktree，冻结即死任务），并对不存在的 path 打一行非阻断警告（typo 即永久烧轮的缓解）。
-
-任何实现只要履行契约即可接入：更换终端容器、或将来的 Agent 直报，都只改这两个粘合脚本——Hub、派生、通知逻辑不动。
-
-**启动器环境入口**：`TUT_HERDR_EXECUTABLE` 覆盖 Herdr 可执行文件（可指定安装绝对路径），由 CLI、启动器与 Notifier 的 Herdr 客户端共用；未设置或为空时 Windows 缺省 `herdr.exe`，其余平台缺省 `herdr`。
-
-**事件链契约**
-
-Notifier 在 `127.0.0.1:<event-port>` 监听 `POST /agent-event`（缺省端口 3002）：JSON 核心字段为字符串 `{event, agent, pane}`，已知 event 为 working / blocked / done / delivery_giveup。接受事件返回 200 `{ok:true}`，未知事件名返回 200 `{ok:true,ignored:true}`；无效 JSON 或核心字段类型错误返回 400。其他路径返回 404，端点上的非 POST 方法返回 405（`Allow: POST`）。Host 必须为 loopback（127.0.0.1 / localhost / [::1]，否则 403；容忍缺 Host）；请求体上限 64 KiB，超限中断请求。监听失败为启动错误，端口占用不会静默失去辅通道。投递放弃的可选证据字段及采信规则见 7.2.1。
-
-事件生产者以非空 `TUT_EVENT_PORT_URL` 覆盖完整接收 URL，缺省 `http://127.0.0.1:3002/agent-event`；它不改变 Notifier 的监听端口。非默认端口的部署须使生产者 URL 与 `--event-port` 一致。
-
-Notifier 的辅通道（blocked 即时告警、done 交叉验证、working 续期 stall 计时——仅 launch 交接后首个 working 命中，见下文映射段）依赖 Herdr 把 pane 内 Agent 的状态变化投给 TUT 的 canonical 事件链：`herdr-hook.mjs`（stdin 收 payload）→ `herdr pane get` 解析标签 → `on-agent-event.mjs <event> <agent> <pane>` → POST Notifier。两个 `.mjs` 由 npm 包分发；`on-agent-event.sh` 与 `hook.sh` 为 POSIX 兼容薄 shim（只转发同包 Node 入口），Windows 不执行 shim。安装与激活步骤见 [README.zh-CN.md](../README.zh-CN.md#herdr-事件接线) / [README.md](../README.md#herdr-event-hookup)。
-
-`herdr-hook.mjs` 订阅 `pane.agent_status_changed`，Herdr 将事件 payload 以 UTF-8 JSON 全量写入 stdin（command array 不携带 JSON）。职责与契约：① 读 stdin 到 EOF 并解析（空/坏 payload/缺关键字段记 stderr 诊断后 exit 0——辅通道丢失不应引发 Herdr 重试风暴）；② 状态映射——working / blocked / done 直通，idle 仅在前一状态是 working 时映射为 done（聚焦 pane 回合结束报 idle；其余 idle 忽略，避免假告警），每个合法 status 处理后都更新上一状态；③ 经 `herdr pane get <pane_id>`（raw argv）把 pane_id 解析成标签，拿不到绝不把 pane_id 猜成标签；④ 以 `process.execPath` 直接 spawn 同包 `on-agent-event.mjs`，argv 为三个 raw 值并继承 `TUT_EVENT_PORT_URL`。上一状态按 pane_id 的 SHA-256 派生文件名存于 `HERDR_PLUGIN_STATE_DIR`（缺省 `<os.tmpdir()>/tut-herdr-state`），temp+rename 原子写。`on-agent-event.mjs` 校验三参数（canonical 入口词表 event ∈ working/blocked/done/delivery_giveup，见 7.2 契约行与 7.2.1——其中 delivery_giveup 只由启动器自发，Herdr hook 本身只产生三种状态事件）、以 `JSON.stringify` 组 body、Node fetch + AbortController 2 秒超时 POST `/agent-event`；连接失败/超时/非 2xx 均 best-effort exit 0（轮询是主通道），仅调用契约本身非法才 exit 1。
-
-事件 → 任务映射按 agent 身份：herdr 事件不带 task_id，Notifier 两级反查——① pane 标签 = task_id 直接命中；② 标签 → agent 身份匹配「当前正等该 role 且路由到该 agent 的任务」（task cast ?? 默认阵容），唯一命中、多个取 updated_at 最新、没有则如实降级（blocked 仍告警、done 触发即时对比；working 只有命中在役 launch watch（或 launch 尚在 in-flight 的早到信号）——即 launch 交接后的首个 working——才刷新计时并熄灭对应 launch watch，无在役 watch 的 working（manual start-next 拉起、旧 role/旧 pane）一律不刷新计时；stall 续期仅有两源：launch 交接后首个 working 与 /state 的 updated_at/version 推进；unwatched working、blocked、give-up 均不续期，working↔blocked 横跳、零 hub 进展不再无限推迟看门狗，blocked 即时告警与看门狗照发，轮询主通道不受影响）。启动器自发的 delivery_giveup 事件 pane 字段携带轮次 pane 标签，同走前缀反查，不经 agent 身份链。working 的 launch 短引信另见下文；无法在当前快照命中的 working 事件会随下一次对比重试反查。
-
-auto 启动的可见性分两段：启动器成功返回后立即通知「launch succeeded」，并开始短引信（默认 300s，可由 `tut notify --working-timeout <s>` 配置）；匹配同一任务/轮次的 `working` 事件到达后再通知「agent working」并熄灭引信。引信到期仍没有 working 信号时，经同一 Channel 告警并提示人工介入。working 事件若早于下一次 /state 快照到达，Notifier 先触发一次对比，快照补齐后重做前缀反查，避免 fresh pane 的时序竞态被误判为未知事件。
-
-#### 7.2.1 投递机制：delivery confirmation v2 单次尝试与有界观察
-
-born 与 continuation 共用单一路径，pane 命令直接启动 Agent；保留原方言、环境与生命周期规则。原 prompt 最多 send-text 一次，不变换正文；无屏幕就绪门、落框匹配、nonce 或旁路 shell 探针。
-
-1. 冻结目标精确 pane 身份与本地 attemptId，使用单调时钟。发送前检查取消和总预算；初始预算不足或 send-text 能证明文本未派出时返回 not-sent / exit 1，仍须 inspect-first，不授权自动重试。
-2. 发送文本前读取 `herdr pane list` 基线；使用单一 `TUT_BASELINE_READY_TIMEOUT_MS`（缺省 90000ms，正安全整数；非法值回落并提示 stderr）预算，从首次探测前起算，受 planning/birth 前起算的 170s 总 deadline 裁剪。unknown（含暂时读错误）与 born-working 等待共用此 deadline，不因状态变化重置。等待期间零 send-text、零 Enter；迟到/错序/取消样本不得放行，精确 ID 缺失/重复、身份改变立即停止。
-   - continuation：首次有效 idle/blocked/done/working 即锁定基线，working 不等待。
-   - born 尚未见有效 working：idle/blocked/done 保留立即放行；unknown/暂时错误继续等待。
-   - born 首次有效 working 后进入 settling：working/unknown/暂时错误/blocked/done 均继续等待，只有有效 idle 正常放行。
-   - readiness 耗尽：仅按最后一次探测的实际有效状态回退。working 单发单按后 baseline-working；blocked/done 按真实非 working 基线单次投递并观察；unknown、读错误、迟到或错序末样本走 baseline-unknown，零输入，绝不回捞旧 working。超时回退不称作 ready。取消/身份守卫和总 deadline 优先，投递预留不足仍零输入走 deadline（入口预算不足仍 delivery-budget-unavailable）。
-   锁定基线且预算允许后依次 send-text → Enter；文本 uncertain 立即升级、零 Enter。Codex 路由在 text 明确 sent 后等待 250ms，再提交 Enter，避免连续普通字符输入触发 TUI 粘贴保护；该间隔计入既有 flip/总预算，预算不足或取消时零 Enter、禁止重发文本。其它 agent 不加间隔；间隔是输入节奏控制，不是消费确认。
-3. 目标合法时最多一次显式 Enter。Enter 的 not-sent/uncertain 均不补按；正常传输后，基线 working 仍直接 baseline-working 报告未确认，不等待、不观察翻转。已知非 working 基线才进入有界观察。
-4. `TUT_STATUS_FLIP_TIMEOUT_MS` 为非 working 基线最终放行时起算的观察预算（正常 idle 或超时 blocked/done 回退，覆盖 send-text、Enter 与后续观察，unknown 与 born settling 等待不占此预算；working 分支不包含 send-text：Codex 在 text 明确 sent 后、250ms 输入等待之前起算，等待与 Enter 共用该冻结期限；其它 agent 在 Enter 调用前起算。输入等待耗尽 flip 预算则零 Enter，以 deadline 结束，不重新起算）（默认 30000ms，1–60000）；`TUT_STATUS_POLL_MS` 默认 min(250ms, flip 预算)，范围 1–flip 预算。逐次查询携带 sequence、起止单调时间、身份与错误；迟到/取消/错序样本不能改变已接受结果。每次 v2 控制调用独立受 C ≤ 10000ms 硬顶约束（配置可缩短），并裁剪到剩余 deadline；flip 窗口可由多次 ≤C 调用及 sleep 组成，不把整段窗口授予一个调用。
-5. 当前 adapter 的 attribution 固定 unavailable，detector source/age、server epoch、agent generation 不可得时为 null。即便看到非 working→working，也只能记录 working-observed 与 attribution-unavailable，**不能证明本轮输入已消费**，不会生成 submit-confirmed。超时、身份错误、状态不可用、取消均诚实升级；无第二次文本/Enter，不自动重投或另建 pane。
-6. 就绪等待未放行也经原 give-up 通道返回 unconfirmed / exit 0 / retry forbidden，保持人工检查入口。文本可能已派出即 unconfirmed / exit 0 / retry forbidden；exit 0 仅表示这次尝试已处理，不是提交确认。终态先冻结，再 best-effort POST `delivery_giveup`（2s）并有界 flush。冻结三字段 `{event, agent, pane}` 上加法携带 `delivery_v2`，包括原因、状态、传输、计数与预算；有效 v2 优先，坏加法字段整体丢弃，旧 box/transport/probe 仅作历史解析兼容，不授予提交许可。
-
-就绪等待期间 launcher 仍占用本轮启动调用。冷启动较慢时可提高 `TUT_BASELINE_READY_TIMEOUT_MS`，希望更早交人工时可缩短；增大旋钮不扩大 170s launcher 总期限，也不改变独立的 flip 预算。非法配置提示不受诊断开关影响。
-
-证据保持 schema=2，既有事件仍可解析；实际进入基线就绪等待（unknown 或 born-working）时携带可选 `baseline_wait: {budget_ms, elapsed_ms}`（离开等待阶段即冻结耗时，不含 flip 窗口）；status_before 为最终真实基线，投递前 working→idle 不计 status_flip。新增未投递组合 `text_calls=0 / text_transport=not-sent / text_error=null / enter_calls=0 / elapsed_ms=null` 如实表示就绪门未放行，仅用于 baseline-unknown、identity-invalid、cancelled 或 deadline；既有已发送证据字段含义不变，未投递证据绝不授权补救 Enter。
-
-统一人工指引：投递未确认，请检查目标 pane；仅当目标仍是预期 Agent、提示仍在输入框且没有尚待完成的控制调用时，人工按一次 Enter；输入框已空或工作已开始时先核查本轮，禁止盲按与自动重投。杀掉本地 CLI 不撤销服务端可能迟执行的动作。
-
-就绪等待只在进入等待、正常放行或耗尽时输出 baseline-wait-start/baseline-ready/baseline-wait-exhausted，注明 branch、触发状态以及耗尽时实际状态和回退动作；不逐拍输出等待轮询行。其余诊断相位为 status-before/send-text/input-settle/enter/status-observed/working-observed/give-up；stderr、事件与 delivery.log 来自同一终态证据，不写 prompt 或完整屏幕。`TUT_DELIVERY_DIAG=0` 只关闭诊断，故障/flush 超时不改投递结果。`.context-hub/delivery.log` 保持 5MiB + 一代 `.1` 轮转。状态观察不等于可靠自动确认，真实平台矩阵与人工 canary 仍需另行授权。
-
-#### 7.2.2 受控 Enter 补救
-
-Notifier 消费 delivery_giveup 后通过最小 `Remediator.remediate(request)` 接口调用策略；内置 enter-repress。`auto.remediate = off | enter-repress` 可由 `tut config set` 配置；未配置时 auto 开启、manual 关闭。off 不执行任何补救调用、不新增补救日志，launcher 不附加补救证据，沿用原升级路径。
-
-补救开启时原 delivery_v2 加法携带冻结目标 `target` 和 `prompt_tail`（规范化尾部最多 80 字符的 SHA-256 与长度，不落正文），常规补救不要求 prompt_tail 存在或有效；下述历史 working 重评额外要求该字段有效；缺少 target 的旧证据仍可解析但不足以补救。三门全过才代按：①精确 pane_id 匹配、当前 pane 唯一存在且 label 与事件 pane 一致；target.agentSession 非空时保持预期 agent 与 session 的 agent/kind/value 强绑定校验，只有显式 null 时允许无 session 绑定。当前 herdr 接口不暴露 session，绑定按 pane 归属 + 角色标签 + 可分类状态（agent_status 非 unknown），仍须通过下述非 working 状态门；②投递证据 `text_transport=sent` 即视为 prompt 已送达（staged），uncertain / not-sent 拒绝；常规路径不读取 pane 缓冲验证尾部，屏幕只作诊断；历史 working 重评路径额外要求当前输入框尾部匹配（见下）；③原证据为已知非 working 基线、无翻转、无错误、text/Enter 均明确 sent、reason=deadline，并在补救前再次读取非 working 状态。无翻转仅是操作授权判据，不声称证明输入未消费；uncertain/缺证据一律升级人工。读取失败或身份改变也拒绝按键。 对 reason=baseline-unknown 且 status_before=unknown 的证据，原基线的暂时读取错误不妨碍等待，但身份错误仍拒绝；保留其余传输与完整性检查，先用单调时钟按同一 `TUT_BASELINE_READY_TIMEOUT_MS` 旋钮有界等待（缺省 90s），直到状态首次可分类；等待期间不按键、不重发文本，身份丢失/改变或生命周期失效立即停止。可分类后重新核验上述身份、文本传输证据与当前非 working 状态三门；仍 unknown 至上限则零按键升级人工。就绪等待独立于代按后的 flip 观察预算，原始证据不改写。等待期每次轮询后及代按前通过 /state 重读任务与补救开关；只允许 waiting_for 仍为本角色且派生状态仍等于事件时的在役轮次状态，无关 note 引起的 version 增长不终止等待。角色/状态变化、needs_attention、降级/缺失任务、读取失败或开关关闭均停止本次补救，停止后不恢复。
-
-加法重评：原证据为 `reason=attribution-unavailable`、已知非 working 基线、`status_flip=true/status_last=working` 且读/传输无错误时，历史 working 仍保留，不作消费证明。首次保守拒绝以 action=none 追加审计后，同一调用内开启一次有界重评（共用 readyMs，默认 90s），不要求第二个事件。仅 Codex 可进入此路径：当前身份/label/生命周期有效，连续至少三次有效 idle 样本且跨度至少 2s，当前可见屏幕最后一个 `›` 输入框的规范化尾部与原 prompt_tail 严格匹配，且候选输入与已识别底栏之间不存在回答正文，才放行；屏幕仅在此路径作为额外保守条件，不能单独授权。working/unknown/读失败打断稳定窗口，身份错误或生命周期失效立即终止；超时零按键升级人工。重新核验输入框、label、idle 和生命周期后才能追加按键意图；意图持久化后再读 idle，工作中状态不按。agentSession=null 不构成假 working 或未消费证明。重评仍占用同一 attempt/pane 去重锁，最多一次机器 Enter，绝不重发文本；按键后失败不再次补按。审计加法标记 `reevaluated=true` 与 `staged_basis=codex-input-tail`，原 delivery_v2 证据不改写。 重评耗尽沿用现有 `reason` 字段：从未达成 idle 稳定窗为 `reevaluation-deadline: stable-window-not-reached`；曾达成稳定窗但输入尾部从未匹配为 `reevaluation-deadline: input-tail-not-matched`（后续 idle 中断不抹去已到达该门的事实）；尾部匹配但读取返回时已耗尽预算保留 `reevaluation-deadline`。此区分仅用于审计，不改变等待预算与按键门。
-按 attempt_id 去重并串行保护 pane；先占用再 await，按键前追加动作意图，完成后追加结果，至多一次 sendEnter，绝不重发文本。复用 7.2.1 的预算旋钮、状态读取与时序校验规则观察到 working 时追加 `remediation` 证据（策略、动作、Enter 结果、状态翻转、机器补救归因）；可选加法字段 `staged_basis=text-transport-sent` 记录 gate ② 的授权依据，保留原 attribution 与 submit_confirmed 不变，归因表示机器代按后观察到翻转，不提升为因果提交证明。未翻转/控制错误追加二次 give-up 并走人工升级，不递归。原日志不覆写。去重为 notifier 进程生命周期内有效；事件无持久重放机制，重启不重放补救。
-
-补救动作/结果属于审计材料，不受 `TUT_DELIVERY_DIAG` 控制：即使该值为 0，仍输出 stderr 并尽力追加 delivery.log；持久 sink 失败不吞 stderr，诊断开关仅控制普通投递诊断。策略异常保留错误消息于 reason 并输出 stderr。观察窗内暂时读失败、未知/迟到/错序样本不判失败，继续到投递 deadline；身份丢失/改变仍立即停止。有合法 working 末样本时，优先按机器补救归因，即使同期任务已前进。
-
-去重账本最多保留 4096 个 attempt，满额后新 attempt 升级人工，不淘汰旧 ID（避免重复按键）；同时活动 pane 最多 64 个，结束即释放。`auto.*` 是历史配置分组名，不表示所有子键都只在 auto 模式有效：`launch_roles` 只约束自动启动，显式 `auto.remediate=enter-repress` 对 manual 也有效；仅缺省值随模式切换。非法 remediate 值保守回落 off 并在 stderr 提示。
-
-### 7.3 替代与演进
-
-- **换容器**：tmux/zellij 等终端容器的插件理论上可履行同样契约，改动仅限粘合脚本
-- **Agent 直报**：Agent 自身经 lifecycle hooks 上报状态，绕过终端容器——依赖各 Agent CLI 的集成能力，是后续路径
-- **Hub repo 化之后**：Herdr 从必需的粘合层降级为可选的本机增强——通知主通道（轮询本地 /state）不依赖它；不用的代价是 blocked 检测与交叉验证退化为超时兜底、auto 启动需要另配启动器。能力清单不减，必要性下降
-
-### 7.4 用量审计（opt-in 测量 watcher）
-
-用量测量是独立 harness（`scripts/usage-audit/`），用户显式开启才工作，默认 **off**——off 时零读写零进程；Hub、launcher、notifier、worker skills 一律不 import、不启动它。测量职责在专用 harness，永不在被测方：产品运行时不承担任何统计工作，测量的开销与故障都不进入轮次链路。
-
-- **开关与启动**：workspace config 顶层键 `usage_audit`（`"off" | "on"`，缺省 off）。`tut up` 在 on 时 detached 启动打包内 watcher（`--watch`），日志落 `.context-hub/usage-audit.log`；off、脚本缺失或 spawn 失败只提示不阻断（non-fatal，spawn 的异步失败有 error 监听兜底）。
-- **数据形态**：watcher 每 pass 经 Hub 只读接口取全量任务记录，按 launch→delivery 轮次归集 token 四元组与原生成本，写入任务目录旁车文件 `tasks/<id>/usage.json`。**usage.json 不是记录**：不参与状态折叠、不进 meta、fold/sweep/repair 一律不碰——「记录永不删除」的不变量不因它改变。schema 冻结 v1，细则见 `scripts/usage-audit/README.md`。
-- **归集口径**：按 launch marker 的 frozen route agent 定位原生会话（pi 按 cwd 目录名，codex 全机扫 session_meta.cwd 并排除 subagent），消息正文解析即弃、只留元数据；歧义、缺失、损坏一律记 unresolved，绝不造数补零。未变化的会话文件按 mtime+size 跳过重读；重复相同失败限频记日志。
-- **单实例与自愈**：canonical root 的 SHA-256 锁存于 OS tmpdir（内含 pid）；崩溃残留锁在确认 pid 已死（ESRCH）后自愈，自愈以 `.reclaim` mkdir 互斥串行化（同 rig-lock 模式）；空、损坏、EPERM 锁一律按活处理拒抢。
-- **隐私边界**：纯本地——正文不出本机、诊断不含内容、usage.json 落盘前剥离 cwd/task_id/launch_ts 等路径信息；除访问本机 Hub 外零网络。
-
-## 8. 技术选型（当前实现）
-
-本章集中记录当前的具体选型——它们都是可替换的实现细节，不属于架构（各模块的架构语义见前述各章）。
-
-### 8.1 Agent Host：Herdr
-
-Herdr 履行信号源与启动器两个契约（见 7.2）：
-
-- 所有 Agent 在同一窗口管理，sidebar 实时显示各 Agent 状态
-- 插件系统提供事件投递能力（履行信号源契约）
-- `herdr pane run` 在指定 pane 执行命令（履行启动器契约）
-- 状态检测两层：screen manifest（规则匹配终端输出）+ lifecycle hooks（Agent 集成直报，更精准，取决于各 Agent CLI 是否提供）；只有 screen manifest 时 blocked 可能偶尔漏判
-
-### 8.2 Notifier：`tut notify` 子命令
-
-Notifier 实现为 tut CLI 的子命令，部署形态是开一个专属 pane 常驻运行 `tut notify`。好处：与各 agent 同一窗口管理、崩溃在 sidebar 可见、stdout 即运行日志、团队场景每机结构同构。注意：该 pane 不适用 pane 标题 = task_id 约定（4.4），也不参与 auto 模式的 role → pane 路由。
-
-### 8.3 Channel：可配置的输出端
-
-Channel 是抽象的通知输出端，Notifier 可配置一个或多个：
-
-- **本机桌面提醒**：人在机器前时最直接、零网络依赖——notifier 是本机进程，直接调系统通知（macOS osascript / Windows PowerShell+WinRT toast（registry AUMID 注册 `TUT.Notifier` 身份；title/body 换行折叠为空格；系统通知关闭时 toast 静默失败属平台边界）/ Linux notify-send / 终端 bell 为公共兜底）；Herdr 若提供桌面提醒能力亦可接入
-- **飞书/Telegram webhook**：人离开机器、或团队场景
-
-Channel 只做投递，不解释语义：每条通知的文案由 Notifier 按证据生成（delivery_giveup 按有效 v2 原因解释，受控补救观察到翻转时报告机器代按，其余给出人工检查指引，见 6.1/7.2.1/7.2.2），保证任何 Channel 呈现的指引一致且证据安全。
-
-## 9. 工程约定
-
-### 9.1 技术栈与代码结构
-
-- TypeScript + Node ≥ 20，@modelcontextprotocol/sdk（Streamable HTTP transport，单端口同时服务 MCP 和 /state）
-
-```
-take-ur-turn/
-├── design/
-│   ├── system-design.md               # 本文档
-│   ├── context-design.md              # 上下文设计（放什么、怎么管理）
-├── skills/                # Agent skill 文本
-├── scripts/               # 事件链 canonical：on-agent-event.mjs / herdr-hook.mjs（Node 入口，Windows 可用）；兼容薄 shim：launch.sh / on-agent-event.sh / hook.sh（POSIX only，只转发）；tut-resolve.mjs 为旧消费者/parity fixture 保留；workspace.json 为种子（运行时零读取）；assert-release.js（发布硬门：npm pack 前枚举断言 dist/cli.js 与 launcher pane-runner（并拒绝退役 probe 构建残留）、role skills 等运行时契约物存在，防未构建/残缺包发布） / mcp-smoke.mjs（MCP 冒烟脚本）；usage-audit/（opt-in 用量审计 watcher，见 7.4）
-├── src/
-│   ├── cli.ts             # tut CLI 入口与命令分派；构建入口保持 dist/cli.js
-│   ├── cli/               # args / usage / shared / task / rig / misc / bridge：参数、命令处理与 MCP 桥接入口
-│   ├── common/            # 跨模块契约与公共配置
-│   │   ├── types.ts       # seam 类型
-│   │   ├── agent-command.ts # AgentRoute/argv 解析与 shell-neutral 校验
-│   │   ├── config.ts      # .context-hub/config.json 读写
-│   │   ├── workspace.ts   # role → agent 三级解析链与 naming 模板解析
-│   │   ├── channels.ts    # 通知输出端（desktop 降级链 / webhook）
-│   │   └── checkout-warning.ts # worktree 路径的非阻断警告
-│   ├── hub/               # 共享记忆、状态投影与本地服务
-│   │   ├── server.ts      # tut serve：启动 MCP + /state
-│   │   ├── http.ts        # /state、/mode、/repair-meta、/recover-record、/mcp
-│   │   ├── store.ts       # 文件读写、版本、并发队列
-│   │   ├── state-machine.ts # 派生规则（纯函数）+ waiting_for 计算
-│   │   ├── hub-client.ts  # CLI → Hub 的 HTTP 薄客户端
-│   │   ├── rig.ts         # rig 身份、标签与环境
-│   │   ├── rig-lock.ts    # 同根启动互斥
-│   │   └── rig-discovery.ts # Hub 发现与归属验证
-│   ├── launcher/          # TS 启动器：轮次交接 / birth 锚定 / 投递与观察 / checkout 路由；launch.ts 解析目标与启动标记，legacy-herdr-client.ts 承载 Herdr 控制客户端，herdr-client-v2.ts 承载投递协议（内部入口 dist/cli.js launch，见 7.2）
-│   ├── mcp/
-│   │   ├── server.ts      # 5 个 MCP 工具的 schema 和 handler
-│   │   └── stdio-bridge.ts # tut mcp：归属验证、stdio ↔ HTTP、断线重连
-│   ├── notifier/
-│   │   ├── notifier.ts    # tut notify：轮询 /state、判门、通知、调 launch
-│   │   └── host-relay.ts  # Host 状态转发
-│   ├── doctor/            # index / types / constants / shared 与 checks/：运行环境与存储健康诊断（只诊断不修复）
-│   └── remediator.ts      # 投递失败的受控补救
-└── test/                  # vitest：派生规则全序列 + store 并发
+```text
+src/cli.ts           CLI 构建入口（dist/cli.js）
+src/core/            Hub、MCP、Notifier、共享契约、CLI、诊断与 run 基础库
+src/herdr/           pane 启动器与终端视图适配
+src/standalone/      detached 电源与 headless 启动器
+skills/              共用及各角色操作文本
+scripts/             事件接线、打包检查与用量 harness
+test/                Vitest 验证
+design/              本文及三篇叶子文档
 ```
 
-CLI 全量语法以 `src/cli/usage.ts` 的 USAGE 为准。以下入口的关键契约：
+物理代码分区与本文的协议辖区不同；宿主文档按用户行为归属组织。CLI 完整语法以 src/core/cli/usage.ts 为准。watch 退出码 0=轮次边界（含 pending_approval）、1=操作错、2=approved / closed、3=needs_attention；终态与待处置立即返回。ack 追加 human ack note，status 只读总览，config 管配置，skill 输出角色文本，init 初始化接线。
 
-- `mcp`：stdio ↔ HTTP 接入桥，发现与归属验证、重连/退出语义见 4.3.1。
-- `watch`：退出码 0 = 轮次边界（含 pending_approval）、1 = 操作错误、2 = approved / closed 终态、3 = needs_attention；已处于终态或待处置时立即退出。
-- `ack`：追加 human ack note，是 3.2 的异常复位入口，不修改既有记录。
-- `status`：输出一次性状态总览。
-- `config`：读取或设置项目运行配置。
-- `skill`：输出角色 skill 文本。
-- `init`：初始化项目接线。
-
-### 9.2 测试要求
-
-- vitest。派生函数按纯函数测：转换表全覆盖、异常序列归化（needs_attention）、同输入同输出（幂等重放）；黄金向量按 flow 参数化，覆盖 3.1 的 flow 差异行以及 `blocked_external` 档、`reviewing` 态 executor note 行；auto 判门测试以 `pass` 与 `blocked_external` 双 verdict 证实「无 decision 被拦截、human approve / reject 后走既定去向」（3.3 / 6.2）；以三类损坏 fixture（meta 损坏、记录损坏、目录消失）验证 `/state` 可见性（degraded 名单与差分告警）、修复 / 重算后的最终 degraded 结果、`decide close` 的可用性边界（仅存储链路修复后可用），以及 Notifier 各类告警只在对应沿触发一次（4.3 处置协议）；修复通道 fixture（4.3）：`repair-meta` 重建后下一轮 /state 移出 degraded、随后 decide close 可用（version 由服务端取磁盘最大记录版本、不接受调用方输入；写入走 temp+rename 且经单写者队列）；`recover-record` 登记后折叠成功、坏件字节未被覆写（digest 复核）、登记后改动坏件 → 登记作废回 degraded、不可恢复任务留驻 degraded 且 close 不可用；验证 `tut doctor` 只诊断不修复
+发布检查在 npm pack 前验证 dist/cli.js、pane runner、role skills 等运行时材料，拒绝残缺包和退役构建残留。修改后运行 build、typecheck、test；派生表、异常重放、并发写、人工门、故障恢复、宿主身份 / 停止与观察边界按真实契约验证。文档引用与公开集泄露检查须通过。
