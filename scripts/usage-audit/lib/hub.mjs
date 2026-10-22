@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
+import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
 
 export function requestTimeout(env = process.env) {
   const ms = Number(env.TUT_USAGE_AUDIT_TIMEOUT_MS ?? 30_000);

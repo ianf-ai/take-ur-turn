@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ContextRecord, Warning } from "../src/common/types.js";
-import { foldWithLint } from "../src/hub/record-lint.js";
-import { initialCursor } from "../src/hub/state-machine.js";
-import { Store } from "../src/hub/store.js";
+import type { ContextRecord, Warning } from "../src/core/common/types.js";
+import { foldWithLint } from "../src/core/hub/record-lint.js";
+import { initialCursor } from "../src/core/hub/state-machine.js";
+import { Store } from "../src/core/hub/store.js";
 
 const spec = "## 验收场景\n1. first\n2. second";
 const exit = "## 退出条件逐条核验\n1. 满足 — tested first\n2. 满足 — tested second";

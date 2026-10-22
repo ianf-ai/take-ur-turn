@@ -11,9 +11,18 @@ export function extract(task, root) {
       ordinal++;
       const previous = pending.get(m.role);
       const agent = typeof m.route === 'string' ? m.route.split(/\s/)[0] : m.route?.agent;
+      // Supersession disposition is mode-split (tui zero-change contract): a
+      // tui marker keeps the conservative whole-round diagnostic; a headless
+      // marker records the replaced-launch chain instead, so the DELIVERING
+      // (rescue) round stays measurable while every replaced launch stays
+      // honestly unaccounted — anchored later as unresolved entries, never
+      // merged into the round (that tradeoff is a human decision, see README).
+      const superseded = previous ? (m.launch_mode === 'headless'
+        ? { superseded_versions: [...(previous.superseded_versions ?? []), previous.launch_version] }
+        : { problem: 'superseded_launch' }) : {};
       pending.set(m.role, { task_id: task.task_id, round: ordinal, role: m.role, agent,
         launch_version: r.version, launch_ts: r.timestamp, cwd,
-        ...(previous ? { problem: 'superseded_launch' } : {}) });
+        ...superseded });
       continue;
     }
     if (!deliveries[r.role]?.includes(r.content_type)) continue;
@@ -39,9 +48,19 @@ export function attribute(rounds, sessions) {
     return { round, candidates, reason: candidates.length > 1 ? 'ambiguous_sessions' : errors.length ? [...new Set(errors)].sort().join(',') : candidates.length ? undefined : 'missing_session_or_end' };
   });
   // Check every task, even when only one task is requested for output.
+  // Two-tier conflict disclosure (tui zero-change redline): every round a
+  // headless rescue delivery (it carries superseded_versions) joins the
+  // candidate set NEWLY (the parent commit force-dropped it unmeasured), so
+  // when it collides it absorbs the conflict alone and never rebrands
+  // another round's unique measurement. All other pairs keep the parent
+  // commit's exact symmetric semantics.
+  const rescue = m => m.round.superseded_versions !== undefined;
   for (const a of matches) for (const b of matches) {
     if (a === b) continue;
-    if (a.candidates.some(x => b.candidates.some(y => x.session_file === y.session_file && x.start_line <= y.end_line && y.start_line <= x.end_line))) a.reason = 'overlapping_rounds';
+    if (!a.candidates.some(x => b.candidates.some(y => x.session_file === y.session_file && x.start_line <= y.end_line && y.start_line <= x.end_line))) continue;
+    if (rescue(a) && !rescue(b)) a.reason = 'overlapping_rounds';
+    else if (rescue(b) && !rescue(a)) b.reason = 'overlapping_rounds';
+    else { a.reason = 'overlapping_rounds'; b.reason = 'overlapping_rounds'; }
   }
   return matches;
 }

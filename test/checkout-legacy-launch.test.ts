@@ -13,15 +13,15 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
-import { hubCreate } from "../src/hub/hub-client.js";
-import { startServer, type RunningServer } from "../src/hub/server.js";
+import { hubCreate } from "../src/core/hub/hub-client.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
 
 const runLaunch = promisify(execFile);
 const DIST_CLI = path.resolve(import.meta.dirname, "../dist/cli.js");
@@ -166,7 +166,7 @@ async function stubHub(
   };
 }
 
-/** R2 follow-up (review v5 P1): an unreadable hub must degrade loudly, and a
+/** Review follow-up: an unreadable hub must degrade loudly, and a
  *  200 that does not know the task must refuse — neither may silently plan a
  *  current-checkout round, which would reopen the worktree isolation breach. */
 describe("legacy door: /state metadata failure modes", () => {
@@ -199,6 +199,36 @@ describe("legacy door: /state metadata failure modes", () => {
       TUT_READY_TIMEOUT_MS: "300",
     };
   }
+
+  it.each([false, true])("positional launch uses task cast unless an explicit agent is supplied (%s)", async explicit => {
+    const castArgs = ["-m", "cast-model", "-c", "model_reasoning_effort=high"];
+    const hub = await stubHub((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ tasks: [{ task_id: "cast-task", cast: { executor: { agent: "codex", args: castArgs } } }] }));
+    });
+    const log = path.join(tempRoot("tut-cast-priority-"), "herdr.log");
+    try {
+      const env = launchEnv(hub.url, log);
+      env.TUT_DRY_RUN = "1";
+      // Deliberately conflict with cast, including the original high/max mismatch.
+      const project = tempRoot("tut-cast-workspace-");
+      mkdirSync(path.join(project, ".context-hub"));
+      writeFileSync(path.join(project, ".context-hub/workspace.json"), JSON.stringify({
+        roles: { executor: { agent: "codex", args: ["-c", "model_reasoning_effort=max"] } },
+      }));
+      env.TUT_PROJECT_ROOT = project;
+      const result = await runLaunch(process.execPath, [
+        DIST_CLI, "launch", "cast-task", "executor", ...(explicit ? ["pi", "--model", "explicit-model"] : []),
+      ], { env });
+      expect(result.stdout).toContain(explicit
+        ? "'pi' '--model' 'explicit-model'"
+        : "'codex' '-m' 'cast-model' '-c' 'model_reasoning_effort=high'");
+      expect(result.stdout).not.toContain("model_reasoning_effort=max");
+      if (explicit) expect(result.stdout).not.toContain("cast-model");
+    } finally {
+      await hub.close();
+    }
+  });
 
   it("degrades LOUDLY on a non-2xx /state: one stderr line (URL + status), door stays open on current", { timeout: 30000 }, async () => {
     const hub = await stubHub((_req, res) => {

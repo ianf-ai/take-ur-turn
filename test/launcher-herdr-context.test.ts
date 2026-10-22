@@ -11,21 +11,21 @@ import {
   HerdrClientError,
   resolveHerdrExecutable,
   type HerdrPane,
-} from "../src/launcher/legacy-herdr-client.js";
+} from "../src/herdr/launcher/legacy-herdr-client.js";
 import {
   requireBirthAnchor,
   resolveExecutionContext,
   resolveWorkspaceSnapshot,
   selectAnchor,
-} from "../src/launcher/anchor.js";
-import { buildLaunchInvocation, deserializeLaunchInvocation, serializeLaunchInvocation } from "../src/launcher/invocation.js";
-import type { DirectSpawn } from "../src/launcher/process.js";
-import type { ExecutionContext, LaunchRequest } from "../src/common/types.js";
+} from "../src/herdr/launcher/anchor.js";
+import { buildLaunchInvocation, deserializeLaunchInvocation, serializeLaunchInvocation } from "../src/core/launcher/invocation.js";
+import type { DirectSpawn } from "../src/herdr/launcher/process.js";
+import type { ExecutionContext, LaunchRequest } from "../src/core/common/types.js";
 import {
   readWorkspaceConfigSnapshot,
   resolveAgentRouteWithSource,
   resolveTabLabelTemplateFromSnapshot,
-} from "../src/common/workspace.js";
+} from "../src/core/common/workspace.js";
 
 interface SpawnedCall {
   file: string;

@@ -1,7 +1,7 @@
-import { parseDeliveryV2 } from "../src/launcher/escalation.js";
+import { parseDeliveryV2 } from "../src/herdr/launcher/escalation.js";
 import { describe, expect, it, vi } from "vitest";
-import { createDelivery, parseDeliveryKnobs, createDeliveryDiagnostics, createRemediationAudit, diagEnabled, DELIVERY_LOG_MAX_BYTES, type DiagnosticsFs, type DeliveryEvidenceV2 } from "../src/launcher/delivery.js";
-import type { AgentStatus, CallContext, DeliveryClientV2, PaneIdentity, ReadFault, SendResult, StatusSample } from "../src/launcher/herdr-client-v2.js";
+import { createDelivery, parseDeliveryKnobs, createDeliveryDiagnostics, createRemediationAudit, diagEnabled, DELIVERY_LOG_MAX_BYTES, type DiagnosticsFs, type DeliveryEvidenceV2 } from "../src/herdr/launcher/delivery.js";
+import type { AgentStatus, CallContext, DeliveryClientV2, PaneIdentity, ReadFault, SendResult, StatusSample } from "../src/herdr/launcher/herdr-client-v2.js";
 
 function memoryFs(): {
   fs: DiagnosticsFs;
@@ -578,7 +578,7 @@ describe('delivery through the real delivery confirmation v2 client cancellation
   it.each(['timeout', 'cancel'] as const)('%s settles a child that never closes; late server writes never resend', async mode => {
     const { EventEmitter } = await import('node:events');
     const { PassThrough } = await import('node:stream');
-    const { HerdrClient } = await import('../src/launcher/legacy-herdr-client.js');
+    const { HerdrClient } = await import('../src/herdr/launcher/legacy-herdr-client.js');
     const ctrl = new AbortController();
     const children: (import('node:child_process').ChildProcess & { stdout: InstanceType<typeof PassThrough>; stderr: InstanceType<typeof PassThrough> })[] = [];
     const calls: string[][] = [];

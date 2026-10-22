@@ -3,8 +3,8 @@ import { PassThrough } from 'node:stream';
 import type { ChildProcess } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { describe, expect, it, vi } from 'vitest';
-import { HerdrClient, paneIdentityFrom, type CallContext, type PaneIdentity } from '../src/launcher/legacy-herdr-client.js';
-import type { DirectSpawn } from '../src/launcher/process.js';
+import { HerdrClient, paneIdentityFrom, type CallContext, type PaneIdentity } from '../src/herdr/launcher/legacy-herdr-client.js';
+import type { DirectSpawn } from '../src/herdr/launcher/process.js';
 
 const target = (): PaneIdentity => ({ paneId: 'p1', terminalId: 't1', workspaceId: 'w1',
   agentSession: { agent: 'codex', kind: 'session_id', value: 's1' }, serverEpoch: null, agentGeneration: null });

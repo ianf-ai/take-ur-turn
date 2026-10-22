@@ -15,9 +15,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { startServer, type RunningServer } from "../src/hub/server.js";
-import { Store } from "../src/hub/store.js";
-import { writeConfigKey } from "../src/common/config.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
+import { Store } from "../src/core/hub/store.js";
+import { writeConfigKey } from "../src/core/common/config.js";
 
 let tmp: string;
 let root: string;
@@ -545,7 +545,7 @@ function requestNoHost(pathname: string): Promise<RawResponse> {
 
 // --- repair/recovery endpoints + concurrent /mode -----------------------------------
 
-describe("POST /repair-meta (A-class entry, system-design 4.3)", () => {
+describe("POST /repair-meta (meta-rebuild entry, system-design 4.3)", () => {
   it("rebuilds a corrupt meta over HTTP: next /state moves the task out of degraded, decide-side append works", async () => {
     const dir = path.join(root, "tasks", "routing-task");
     writeFileSync(path.join(dir, "meta.json"), "{ broken");
@@ -594,7 +594,7 @@ describe("POST /repair-meta (A-class entry, system-design 4.3)", () => {
     expect(badJson.status).toBe(400);
   });
 
-  it("P2-1: a present-but-invalid KNOWN field is a 400, never silently dropped — no rebuild, no disk change", async () => {
+  it("a present-but-invalid KNOWN field is a 400, never silently dropped — no rebuild, no disk change", async () => {
     const dir = path.join(root, "tasks", "routing-task");
     writeFileSync(path.join(dir, "meta.json"), "{ broken");
     let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string; flow: string }[]; degraded?: string[] };
@@ -647,7 +647,7 @@ describe("POST /repair-meta (A-class entry, system-design 4.3)", () => {
   });
 });
 
-describe("POST /recover-record (B-class entry, system-design 4.3)", () => {
+describe("POST /recover-record (record-recovery entry, system-design 4.3)", () => {
   it("registers recovery over HTTP: task leaves degraded, folding uses the recovered copy", async () => {
     const dir = path.join(root, "tasks", "routing-task");
     const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
@@ -794,7 +794,7 @@ describe("state awareness HTTP projection", () => {
     }
   });
 
-  const readState = async (suffix = "") => await (await fetch(`${baseUrl}/state${suffix}`)).json() as { tasks: import("../src/hub/store.js").TaskListEntry[] };
+  const readState = async (suffix = "") => await (await fetch(`${baseUrl}/state${suffix}`)).json() as { tasks: import("../src/core/hub/store.js").TaskListEntry[] };
   it("retires closed tasks by default, exposes explicit history and preserves every record", async () => {
     const before = await store.readTask("routing-task");
     await store.append("routing-task", { role: "human", content_type: "decision",

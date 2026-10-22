@@ -3,10 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { resolveExecutionContext } from "../src/launcher/anchor.js";
-import { buildLaunchInvocation, serializeLaunchInvocation, validateLaunchInvocation } from "../src/launcher/invocation.js";
-import { Store } from "../src/hub/store.js";
-import { readWorkspaceConfigSnapshot, resolveAgentRouteWithSource, resolveTabLabelTemplateFromSnapshot } from "../src/common/workspace.js";
+import { resolveExecutionContext } from "../src/herdr/launcher/anchor.js";
+import { buildLaunchInvocation, serializeLaunchInvocation, validateLaunchInvocation } from "../src/core/launcher/invocation.js";
+import { Store } from "../src/core/hub/store.js";
+import { readWorkspaceConfigSnapshot, resolveAgentRouteWithSource, resolveTabLabelTemplateFromSnapshot } from "../src/core/common/workspace.js";
 
 const tempRoots: string[] = [];
 

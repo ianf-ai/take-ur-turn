@@ -1,12 +1,12 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
   resolveNotifierPort: async () => 3002,
 }));
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -15,8 +15,8 @@ import path from "node:path";
 // default hub URL — not reachable in tests. The real client against a real
 // hub is covered in test/hub-client.test.ts; mode/start-next take --url and
 // are tested against a real server below.
-vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
+vi.mock("../src/core/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/hub-client.js")>()),
   hubCreate: vi.fn(),
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
@@ -26,16 +26,16 @@ vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
 
 // The notify-clamp tests below need the handler boundary without running a
 // real Notifier loop — mock runNotify only, everything else stays real.
-vi.mock("../src/notifier/notifier.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/notifier/notifier.js")>()),
+vi.mock("../src/core/notifier/notifier.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/notifier/notifier.js")>()),
   runNotify: vi.fn(),
 }));
 
 import { USAGE, main, parseArgs, notifyHealthy, DEFAULT_HUB_URL, DEFAULT_EVENT_PORT, CLI_FETCH_TIMEOUT_MS } from "../src/cli.js";
-import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError } from "../src/hub/hub-client.js";
-import { Notifier, runNotify } from "../src/notifier/notifier.js";
-import { startServer, type RunningServer } from "../src/hub/server.js";
-import { Store } from "../src/hub/store.js";
+import { hubCreate, hubDecide, hubList, hubPublish, hubRead, HubError } from "../src/core/hub/hub-client.js";
+import { Notifier, runNotify } from "../src/core/notifier/notifier.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
+import { Store } from "../src/core/hub/store.js";
 import http from "node:http";
 import { readFileSync } from "node:fs";
 
@@ -55,6 +55,10 @@ async function withCleanChain<T>(fn: () => Promise<T>): Promise<T> {
   const prevPanes = process.env.TUT_HERDR_PANES;
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-cli-chain-"));
   process.chdir(tmp);
+  // The start-next door routes on the rig's launch_mode: these are the tui-side
+  // fixtures (pane chain); the headless side lives in test/start-next-headless.test.ts.
+  mkdirSync(path.join(tmp, ".context-hub"), { recursive: true });
+  writeFileSync(path.join(tmp, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
   process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
   process.env.TUT_HERDR_EXECUTABLE = path.resolve(import.meta.dirname, "bin/herdr");
   process.env.TUT_HERDR_PANES = "[]";
@@ -362,8 +366,8 @@ describe("cli arg parsing (pure parseArgs)", () => {
     });
   });
 
-  it("USAGE documents all seventeen subcommands", () => {
-    for (const cmd of ["serve", "notify", "mode", "config", "start-next", "watch", "create", "publish", "read", "list", "status", "decide", "ack", "assign", "up", "skill", "init"]) {
+  it("USAGE documents all eighteen subcommands", () => {
+    for (const cmd of ["serve", "notify", "mode", "config", "start-next", "watch", "create", "publish", "read", "list", "status", "decide", "ack", "assign", "up", "down", "skill", "init"]) {
       expect(USAGE).toContain(`tut ${cmd}`);
     }
   });
@@ -931,8 +935,8 @@ describe("mode / start-next handlers (real hub)", () => {
     const prev = process.env.TUT_DRY_RUN;
     process.env.TUT_DRY_RUN = "1";
     try {
-      const code = await main(["start-next", created.task_id, "--url", baseUrl, "--force"]);
-      expect(code).toBe(0);
+      const code = await withCleanChain(() => main(["start-next", created.task_id, "--url", baseUrl, "--force"]));
+      expect(code, io.err()).toBe(0);
     } finally {
       if (prev === undefined) delete process.env.TUT_DRY_RUN;
       else process.env.TUT_DRY_RUN = prev;
@@ -983,6 +987,9 @@ describe("mode / start-next handlers (real hub)", () => {
     const prevPanes = process.env.TUT_HERDR_PANES;
     const chainTmp = mkdtempSync(path.join(os.tmpdir(), "tut-cli-race-"));
     process.chdir(chainTmp);
+    // tui-side pin of the start-next launch_mode switch (headless side: test/start-next-headless.test.ts).
+    mkdirSync(path.join(chainTmp, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(chainTmp, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
     process.env.TUT_USER_CONFIG_DIR = path.join(chainTmp, "user-config");
     process.env.TUT_HERDR_EXECUTABLE = path.resolve(import.meta.dirname, "bin/herdr");
     process.env.TUT_HERDR_PANES = JSON.stringify([
@@ -1131,6 +1138,20 @@ describe("--url parse (both flag forms; absent → undefined, default in handler
     expect(parseArgs(["list"])).toEqual({ command: "list", json: false });
     expect(parseArgs(["status"])).toEqual({ command: "status", json: false });
     expect(parseArgs(["up"])).toEqual({ command: "up", dryRun: false });
+  });
+
+  it("up accepts --root; down parses with and without --root", () => {
+    expect(parseArgs(["up", "--root", "/tmp/rig-b"])).toEqual({ command: "up", dryRun: false, root: "/tmp/rig-b" });
+    expect(parseArgs(["up", "--root=/x", "--url", "http://127.0.0.1:3005"])).toEqual({
+      command: "up",
+      dryRun: false,
+      root: "/x",
+      url: "http://127.0.0.1:3005",
+    });
+    expect(parseArgs(["down"])).toEqual({ command: "down" });
+    expect(parseArgs(["down", "--root", "/tmp/rig-b"])).toEqual({ command: "down", root: "/tmp/rig-b" });
+    expect(parseArgs(["down", "extra"])).toEqual({ command: "usage", error: "unexpected argument: extra" });
+    expect(parseArgs(["down", "--url", "http://127.0.0.1:3001"])).toEqual({ command: "usage", error: "unknown argument: --url" });
   });
 });
 
@@ -1328,7 +1349,7 @@ describe("default URL/port convergence", () => {
   it("structural guard: the quoted hub-url literal appears exactly once across the CLI modules", () => {
     // The constant's definition is the ONLY quoted literal; a re-forked copy
     // in a parser, handler, or rendered command trips this count.
-    const cliDir = path.resolve(import.meta.dirname, "../src/cli");
+    const cliDir = path.resolve(import.meta.dirname, "../src/core/cli");
     const src = [path.resolve(cliDir, "../cli.ts"),
       ...readdirSync(cliDir).filter(name => name.endsWith(".ts")).map(name => path.join(cliDir, name))]
       .map(file => readFileSync(file, "utf8")).join("\n");
@@ -1337,7 +1358,7 @@ describe("default URL/port convergence", () => {
 
   it("USAGE teaches the multi-hub --url discipline and documents up --event-port", () => {
     expect(USAGE).toContain("verified via /state.hub_root");
-    expect(USAGE).toContain("tut up [--url <u>] [--event-port <p>] [--dry-run]");
+    expect(USAGE).toContain("tut up [--url <u>] [--event-port <p>] [--root <dir>] [--dry-run]");
   });
 });
 

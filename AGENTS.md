@@ -25,6 +25,8 @@ take-ur-turn/
 ├── design/
 │   ├── system-design.md               # 系统设计（当前有效方案）
 │   ├── context-design.md              # 上下文设计（放什么、怎么管理）
+│   ├── herdr-host.md                   # Herdr 宿主实现
+│   └── standalone-host.md              # Standalone 宿主实现
 ├── skills/            # Agent skill 文本
 ├── scripts/           # 粘合脚本（信号源 / 启动器契约）
 ├── src/               # Context Hub 源码

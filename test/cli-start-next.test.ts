@@ -1,6 +1,6 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
 }));
 
@@ -20,8 +20,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // that combination. The launch-log seam (readLaunchLog/markLaunched) goes
 // through hub-client, mocked the same way as test/cli.test.ts; the launcher
 // itself is the REAL scripts/launch.sh run under TUT_DRY_RUN=1.
-vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
+vi.mock("../src/core/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/hub-client.js")>()),
   hubCreate: vi.fn(),
   hubPublish: vi.fn(),
   hubRead: vi.fn(),
@@ -29,10 +29,21 @@ vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
   hubDecide: vi.fn(),
 }));
 
+// Launch-mode routing pin: this file owns the tui side of the start-next
+// switch (the pane chain). The manual door's shipped default IS the pane
+// chain (a missing key never selects headless), so pinning the config read
+// to "tui" keeps every test here on the tui side; the headless side —
+// including the real config-file read of the switch — lives in
+// test/start-next-headless.test.ts.
+vi.mock("../src/core/common/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/common/config.js")>()),
+  readLaunchMode: vi.fn(async () => "tui" as const),
+}));
+
 import { main, parseArgs } from "../src/cli.js";
-import { ensureNotifierEventUrl } from "../src/cli/task.js";
-import { hubDecide, hubPublish, hubRead } from "../src/hub/hub-client.js";
-import type { AgentRoute } from "../src/common/types.js";
+import { ensureNotifierEventUrl } from "../src/core/cli/task.js";
+import { hubDecide, hubPublish, hubRead } from "../src/core/hub/hub-client.js";
+import type { AgentRoute } from "../src/core/common/types.js";
 
 // --- parse -----------------------------------------------------------------------
 

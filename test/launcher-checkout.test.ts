@@ -14,9 +14,9 @@ import {
   currentCheckoutProvider,
   resolveCheckout,
   type CheckoutProvider,
-} from "../src/launcher/checkout.js";
-import { resolveWorkspaceSnapshot, type PaneListSource } from "../src/launcher/anchor.js";
-import type { HerdrPane } from "../src/launcher/legacy-herdr-client.js";
+} from "../src/core/launcher/checkout.js";
+import { resolveWorkspaceSnapshot, type PaneListSource } from "../src/herdr/launcher/anchor.js";
+import type { HerdrPane } from "../src/herdr/launcher/legacy-herdr-client.js";
 
 const hubPane: HerdrPane = {
   pane_id: "w1:p0",

@@ -23,8 +23,7 @@
 //                                           placeholders preserved verbatim.
 //                                           The PANE label is never rendered
 //                                           here — it stays the fixed
-//                                           <task_id>.<role> addressing key
-//                                           (system-design 4.4).
+//                                           <task_id>.<role> addressing key.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";

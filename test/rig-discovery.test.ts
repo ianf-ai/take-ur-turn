@@ -8,17 +8,17 @@ import { createServer } from "node:net";
 // Virtualize only fixed port occupancy. HTTP/MCP below use real ephemeral
 // servers, so this suite never binds or mutates a developer's live 3001 rig.
 const availability = vi.hoisted(() => vi.fn(async (_port: number) => true));
-vi.mock("../src/hub/rig-discovery.js", async importOriginal => {
-  const actual = await importOriginal<typeof import("../src/hub/rig-discovery.js")>();
+vi.mock("../src/core/hub/rig-discovery.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>();
   return { ...actual, resolveUpHub: (url: string, explicit: boolean, root: string, event?: number) =>
     actual.resolveUpHub(url, explicit, root, event, availability) };
 });
 
-import { canonicalRoot, discoverHub, portFree, probeHub, resolveCliHubUrl, resolveRigRoot, resolveUpHub, resolveNotifierEventEndpoint } from "../src/hub/rig-discovery.js";
-import { startServer, type RunningServer } from "../src/hub/server.js";
-import { hubCreate, hubList } from "../src/hub/hub-client.js";
+import { canonicalRoot, discoverHub, portFree, probeHub, resolveCliHubUrl, resolveRigRoot, resolveUpHub, resolveNotifierEventEndpoint } from "../src/core/hub/rig-discovery.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
+import { hubCreate, hubList } from "../src/core/hub/hub-client.js";
 import { main } from "../src/cli.js";
-import { rigLabel } from "../src/hub/rig.js";
+import { rigLabel } from "../src/core/hub/rig.js";
 
 const cwd = process.cwd();
 const repo = path.resolve(import.meta.dirname, "..");

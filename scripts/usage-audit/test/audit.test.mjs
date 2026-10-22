@@ -6,13 +6,13 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { Store } from '../../../dist/hub/store.js';
-import { startServer } from '../../../dist/hub/server.js';
-import { readConfigFile, writeConfigKey, parseConfigValue } from '../../../dist/common/config.js';
+import { Store } from '../../../dist/core/hub/store.js';
+import { startServer } from '../../../dist/core/hub/server.js';
+import { readConfigFile, writeConfigKey, parseConfigValue } from '../../../dist/core/common/config.js';
 import { extract, attribute } from '../lib/rounds.mjs';
 import { measure, readSession } from '../lib/sessions.mjs';
 import { run, collect, enabled, lock, lockPath, merge, writeUsage, loadUsage, source, validateUsage } from '../lib/audit.mjs';
-import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
+import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
 import { parse } from '../run.mjs';
 const T = n => new Date(Date.UTC(2026,0,1,0,0,0,n)).toISOString();
 async function temp(t) { const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'usage-test-'))); t.after(() => fs.rm(dir,{recursive:true,force:true})); return dir; }
@@ -240,6 +240,145 @@ test('missing launch/route, identity conflict and repeated launches never fabric
   assert.deepEqual(extract(task(root,versions),root).map(r=>r.problem),['missing_launch','superseded_launch','agent_conflict']);
   const l=launch(1,1);delete l.payload.launch.route;
   assert.equal(extract(task(root,[l,delivery(2,3)]),root)[0].problem,'missing_route');
+});
+const hlaunch=(v,n,agent='pi',role='executor')=>({...launch(v,n,agent,role),payload:{launch:{role,base_version:v-1,launch_mode:'headless',route:{agent,args:[]}}}});
+test('headless supersession: delivering round stays measurable, replaced launches anchored unaccounted (tui unchanged)',async t=>{
+  const root=await temp(t);
+  const rounds=extract(task(root,[hlaunch(1,5),hlaunch(2,6),delivery(3,30)]),root);
+  assert.equal(rounds[0].problem,undefined);
+  assert.deepEqual(rounds[0].superseded_versions,[1]);
+  // rescue chain: two replaced launches, newest launch delivers
+  assert.deepEqual(extract(task(root,[hlaunch(1,5),hlaunch(2,6),hlaunch(3,7),delivery(4,30)]),root)[0].superseded_versions,[1,2]);
+  // tui marker (no launch_mode): conservative whole-round diagnostic, zero change
+  assert.equal(extract(task(root,[launch(1,5),launch(2,6),delivery(3,30)]),root)[0].problem,'superseded_launch');
+  const s=await session(root,'pi',[piHead(root),user(10),pi(40,'stop')]);
+  const [m]=attribute(rounds,[s]);
+  assert.equal(m.reason,undefined);
+  const value=validateUsage(merge(null,[m]));
+  assert.equal(value.rounds.length,1);
+  assert.equal(value.rounds[0].launch_version,2);
+  assert.equal(value.rounds[0].total_tokens,37);
+  assert.deepEqual(value.unresolved,[{delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  assert.equal(value.total.complete,false);// the replaced launch's work stays unaccounted
+});
+test('headless unmeasured delivering round still anchors its replaced launches',async t=>{
+  const root=await temp(t);
+  const rounds=extract(task(root,[hlaunch(1,5),hlaunch(2,6),delivery(3,30)]),root);
+  const [m]=attribute(rounds,[]);// no sessions at all
+  assert.equal(m.reason,'missing_session_or_end');
+  const value=merge(null,[m]);
+  assert.equal(value.rounds.length,0);
+  assert.deepEqual(value.unresolved,[{delivery_version:3,launch_version:2,reason:'missing_session_or_end'},
+    {delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+});
+test('cross-task shared-cwd concurrency and same-session double claim stay honestly unattributed',async t=>{
+  const root=await temp(t);
+  // 2026-10-18 shape: two headless tasks launched seconds apart in the SAME
+  // rig-root cwd; each round sees both concurrent executor sessions.
+  const a=extract(task(root,[hlaunch(1,5),delivery(2,70)],'task-a'),root);
+  const b=extract(task(root,[hlaunch(1,6),delivery(2,60)],'task-b'),root);
+  const sA=await session(root,'pi',[piHead(root),user(10),pi(80,'stop')],'a.jsonl');
+  const sB=await session(root,'pi',[piHead(root),user(11),pi(81,'stop')],'b.jsonl');
+  assert.deepEqual(attribute([...a,...b],[sA,sB]).map(x=>x.reason),['overlapping_rounds','overlapping_rounds']);
+  // same-file shape: one session, two deliveries, both windows claim it
+  const single=await session(root,'pi',[piHead(root),user(10),user(12),pi(50,'stop')],'c.jsonl');
+  const two=extract(task(root,[hlaunch(1,5),delivery(2,30),hlaunch(3,11),delivery(4,40)],'task-c'),root);
+  assert.deepEqual(attribute(two,[single]).map(x=>x.reason),['overlapping_rounds','overlapping_rounds']);
+});
+test('headless early exit without a native end: honest unresolved, ledger still lands (no completeness gating)',async t=>{
+  const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const {task_id:id}=await store.createTask({title:'Early exit',description:'test',role:'human',creator:'test',flow:'direct'});
+  await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:0,launch_mode:'headless',route:{agent:'pi',args:[]}}}});
+  await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
+  const task=await store.readTask(id),Lts=Date.parse(task.versions[0].timestamp),D=Date.parse(task.versions[1].timestamp);
+  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,`--${root.slice(1).replaceAll('/','-')}--`);await fs.mkdir(cwdDir,{recursive:true});
+  // executor died mid-work: kickoff covered, no assistant stop covering the delivery
+  const rows=[piHead(root),user(10),pi(20,'toolUse')];
+  rows[0].timestamp=new Date(Lts-100).toISOString();rows[1].timestamp=new Date(Lts).toISOString();rows[2].timestamp=new Date(D-1000).toISOString();
+  await session(cwdDir,'pi',rows);
+  const options={root,piRoot,codexRoot:path.join(root,'codex'),watch:false,intervalMs:5,timeoutMs:1000};
+  const hub={list:()=>store.listTasks(),read:id=>store.readTask(id)};
+  const [report]=await collect(options,{hub});
+  assert.equal(report.total.rounds,0);
+  assert.equal(report.unresolved[0].reason,'missing_session_or_end');
+  // 写盘条件：有归账轮即写——zero resolved rounds never drops the whole ledger
+  const v=await loadUsage(path.join(root,'.context-hub/tasks',id));
+  assert.equal(v.rounds.length,0);
+  assert.deepEqual(v.unresolved,[{delivery_version:2,launch_version:1,reason:'missing_session_or_end'}]);
+  assert.equal(v.total.complete,false);
+});
+async function headlessFixture(t) {
+  const root=await temp(t),lockFile=lockPath(canonicalRoot(root));
+  t.after(async()=>{await fs.rm(lockFile,{force:true});await fs.rm(lockFile+'.reclaim',{recursive:true,force:true});});
+  const store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const {task_id:id}=await store.createTask({title:'Headless',description:'test',role:'human',creator:'test',flow:'direct'});
+  await store.append(id,{role:'human',content_type:'note',payload:{summary:'rescue launch',body:'test',launch:{role:'executor',base_version:0,launch_mode:'headless',route:{agent:'pi',args:[]}}}});
+  await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:1,launch_mode:'headless',route:{agent:'pi',args:[]}}}});
+  await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
+  const task=await store.readTask(id),Lts=Date.parse(task.versions[1].timestamp),D=Date.parse(task.versions[2].timestamp);
+  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,`--${root.slice(1).replaceAll('/','-')}--`);await fs.mkdir(cwdDir,{recursive:true});
+  // real headless session shape: header cwd at the rig root, one kickoff user
+  // message at the (winning) launch, assistant stop after the delivery
+  const rows=[piHead(root),user(10),pi(40,'stop')];
+  rows[0].timestamp=new Date(Lts-100).toISOString();rows[1].timestamp=new Date(Lts).toISOString();rows[2].timestamp=new Date(D+100).toISOString();
+  await session(cwdDir,'pi',rows);
+  const options={root,piRoot,codexRoot:path.join(root,'codex'),watch:false,intervalMs:5,timeoutMs:1000};
+  return {root,id,options,hub:{list:()=>store.listTasks(),read:id=>store.readTask(id)},store};
+}
+test('headless session fixture: usage.json lands with the resolved rescue round plus honest superseded entry',async t=>{
+  const f=await headlessFixture(t);
+  const [report]=await collect(f.options,{hub:f.hub});
+  assert.equal(report.changed,true);
+  assert.equal(report.total.rounds,1);
+  assert.equal(report.total.total_tokens,37);
+  assert.deepEqual(report.unresolved,[{delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  const v=await loadUsage(path.join(f.root,'.context-hub/tasks',f.id));
+  assert.equal(v.rounds[0].launch_version,2);
+  assert.deepEqual(v.unresolved,[{delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  assert.equal(v.total.complete,false);
+  // idempotent re-pass: byte and coverage stable
+  const file=path.join(f.root,'.context-hub/tasks',f.id,'usage.json'),bytes=await fs.readFile(file,'utf8');
+  await collect(f.options,{hub:f.hub});
+  assert.equal(await fs.readFile(file,'utf8'),bytes);
+});
+test('--since replay keeps the superseded disclosure beside preserved successes',async t=>{
+  const root=await temp(t);
+  const rounds=extract(task(root,[hlaunch(1,5),hlaunch(2,6),delivery(3,30),hlaunch(4,50),delivery(5,70)]),root);
+  const s=await session(root,'pi',[piHead(root),user(10),pi(40,'stop'),user(60),pi(80,'stop')]);
+  const matches=attribute(rounds,[s]);
+  assert.deepEqual(matches.map(m=>m.reason),[undefined,undefined]);
+  const full=merge(null,matches);
+  assert.equal(full.rounds.length,2);assert.equal(full.total.total_tokens,74);
+  assert.deepEqual(full.unresolved,[{delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  assert.equal(full.total.complete,false);
+  // cutoff between D3 and D5: the older rescue round stays preserved; its
+  // replaced launch's disclosure must survive and complete must stay false
+  const later=merge(full,matches,Date.parse(T(50)));
+  assert.equal(later.rounds.length,2);assert.equal(later.total.total_tokens,74);
+  assert.deepEqual(later.unresolved,[{delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  assert.equal(later.total.complete,false);
+  assert.deepEqual(merge(full,matches,Date.parse(T(50))),later);// repeated runs stable
+});
+test('cross-mode shared session leaves tui attribution identical to the parent; the headless rescue absorbs the conflict',async t=>{
+  const root=await temp(t);
+  const s=await session(root,'pi',[piHead(root),user(10),pi(40,'stop')]);
+  const headless=extract(task(root,[hlaunch(1,5),hlaunch(2,6),delivery(3,30)],'task-h'),root);
+  const tui=extract(task(root,[launch(1,5),delivery(2,30)],'task-t'),root);
+  const [h,m]=attribute([...headless,...tui],[s]);
+  // tui keeps the parent commit's exact outcome: unique candidate, measured
+  assert.equal(m.reason,undefined);
+  assert.equal(m.candidates.length,1);
+  assert.equal(m.candidates[0].total_tokens,37);
+  // the newly measurable headless rescue round absorbs the collision alone
+  assert.equal(h.reason,'overlapping_rounds');
+  const tuiValue=validateUsage(merge(null,[m]));
+  assert.equal(tuiValue.total.rounds,1);assert.equal(tuiValue.total.total_tokens,37);
+  assert.deepEqual(tuiValue.unresolved,[]);assert.equal(tuiValue.total.complete,true);
+  const headlessValue=merge(null,[h]);
+  assert.equal(headlessValue.rounds.length,0);// no fabricated accounting
+  assert.deepEqual(headlessValue.unresolved,[{delivery_version:3,launch_version:2,reason:'overlapping_rounds'},
+    {delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  assert.equal(headlessValue.total.complete,false);
 });
 test('configuration default is off, key-preserving on/off writes and invalid explicit values',async t=>{
   const root=await temp(t), storage=path.join(root,'.context-hub');

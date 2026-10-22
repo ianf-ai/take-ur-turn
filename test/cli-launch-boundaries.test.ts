@@ -1,6 +1,6 @@
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
-vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
   resolveCliHubUrl: async (url: string) => url,
 }));
 
@@ -19,21 +19,30 @@ const hubMocks = vi.hoisted(() => ({
   hubRead: vi.fn(),
 }));
 
-vi.mock("../src/launcher/process.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/launcher/process.js")>()),
+vi.mock("../src/herdr/launcher/process.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/herdr/launcher/process.js")>()),
   runInternalLaunch: processMocks.runInternalLaunch,
   runInternalLaunchInvocation: processMocks.runInternalLaunchInvocation,
 }));
 
-vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
+vi.mock("../src/core/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/hub-client.js")>()),
   hubDecide: hubMocks.hubDecide,
   hubPublish: hubMocks.hubPublish,
   hubRead: hubMocks.hubRead,
 }));
 
+// Launch-mode routing pin: this file exercises the tui side of the start-next
+// switch (frozen launcher-child environment); the manual door's shipped
+// default is the pane chain (missing key), pinned here via the config read.
+// The headless side lives in test/start-next-headless.test.ts.
+vi.mock("../src/core/common/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/common/config.js")>()),
+  readLaunchMode: vi.fn(async () => "tui" as const),
+}));
+
 import { main } from "../src/cli.js";
-import { DEFAULT_CHILD_TIMEOUT_MS } from "../src/launcher/process.js";
+import { DEFAULT_CHILD_TIMEOUT_MS } from "../src/herdr/launcher/process.js";
 
 function captureIo(): { out: () => string; err: () => string; restore: () => void } {
   let stdout = "";

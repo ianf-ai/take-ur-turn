@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { derive, foldOntoCursor, initialCursor } from "../src/hub/state-machine.js";
-import type { ContextRecord, DerivedState, Flow } from "../src/common/types.js";
+import { derive, foldOntoCursor, initialCursor } from "../src/core/hub/state-machine.js";
+import { foldWithLint } from "../src/core/hub/record-lint.js";
+import type { ContextRecord, DerivedState, Flow } from "../src/core/common/types.js";
 
 /**
  * Golden vectors are the single source of truth ("double
@@ -128,9 +129,9 @@ describe("derive: unit properties beyond the fixtures", () => {
         version: 2,
         task_id: "unit-ack-truthy",
         role: "reviewer",
-        content_type: "review",
+        content_type: "design",
         timestamp: "2026-08-15T09:01:00Z",
-        payload: { summary: "early review", verdict: "pass", body: "out of sequence" },
+        payload: { summary: "duplicate design", body: "out of sequence" },
       },
       {
         version: 3,
@@ -209,6 +210,117 @@ describe("derive: unit properties beyond the fixtures", () => {
       warnings: [],
     } satisfies DerivedState);
   });
+});
+
+describe("out-of-table legal reviews enter the human gate", () => {
+  function record(version: number, content_type: string, payload: Record<string, unknown> = {}): ContextRecord {
+    return { version, task_id: "review-gate", role: content_type === "review" ? "reviewer" : "human",
+      content_type, timestamp: "2026-10-21T00:00:00Z", payload: { summary: "gate", body: "gate regression", ...payload } as ContextRecord["payload"] };
+  }
+  const statuses = ["designing", "implementing", "reviewing", "revising", "pending_approval", "approved", "closed"] as const;
+  const verdicts = ["pass", "blocked_external", "fail_code", "fail_design"] as const;
+
+  for (const flow of ["full", "direct", "solo"] as const) {
+    for (const status of statuses) {
+      it(`${flow}/${status}: all legal verdicts use the table or the human catch-all; closed absorbs`, () => {
+        for (const verdict of verdicts) {
+          const inTable = status === "reviewing" && flow !== "solo" && !(flow === "direct" && verdict === "fail_design");
+          const target = verdict === "fail_code" ? "revising" : verdict === "fail_design" ? "designing" : "pending_approval";
+          const closed = status === "closed";
+          const actual = foldOntoCursor({ status, warnings: [], prevVersion: 0 }, [record(1, "review", { verdict })], flow);
+          expect(actual.status).toBe(closed ? "closed" : inTable ? target : "pending_approval");
+          expect(actual.warnings).toEqual(inTable ? [] : [{ version: 1, code: closed ? "CLOSED_ABSORB" : "OUT_OF_TABLE" }]);
+          expect(actual.needs_attention).toBe(!inTable);
+          expect(actual.waiting_for).toBe(inTable && target !== "pending_approval" ? `agent:${target === "designing" ? "architect" : "executor"}` : "human");
+        }
+      });
+
+      it(`${flow}/${status}: missing, invalid and prototype verdicts retain existing behavior`, () => {
+        for (const verdict of [undefined, "bogus", "constructor", "__proto__", "toString"]) {
+          const payload = verdict === undefined ? {} : { verdict };
+          const actual = foldOntoCursor({ status, warnings: [], prevVersion: 0 }, [record(1, "review", payload)], flow);
+          expect(actual.status).toBe(status);
+          expect(actual.warnings).toEqual([{ version: 1, code: status === "closed" ? "CLOSED_ABSORB" :
+            flow !== "solo" && status === "reviewing" ? "INVALID_VERDICT" : "OUT_OF_TABLE" }]);
+        }
+      });
+    }
+  }
+
+  it.each(["approve", "reject", "close"])("direct fail_design: notes retain warnings until %s; cold and incremental agree", decision => {
+    const records = [record(1, "code_changes"), record(2, "review", { verdict: "fail_design" }),
+      record(3, "note"), record(4, "note", { ack: true }), record(5, "decision", { decision })];
+    let cursor = initialCursor("direct");
+    for (let i = 0; i < records.length; i++) {
+      cursor = foldOntoCursor(cursor, [records[i]!], "direct");
+      const whole = derive("review-gate", records.slice(0, i + 1), "direct");
+      expect(cursor).toMatchObject(whole!);
+      if (i >= 1 && i < 4) expect(whole).toEqual({ status: "pending_approval", waiting_for: "human", needs_attention: true,
+        warnings: [{ version: 2, code: "OUT_OF_TABLE" }] });
+    }
+    expect(derive("review-gate", records, "direct")).toEqual({
+      status: decision === "approve" ? "approved" : decision === "reject" ? "revising" : "closed",
+      waiting_for: decision === "reject" ? "agent:executor" : decision === "close" ? "none" : "human",
+      needs_attention: false, warnings: [],
+    });
+  });
+
+  it("clears only gate warnings on approval, retains new structural anomalies, and never mutates a cached gate cursor", () => {
+    const gate = foldOntoCursor(initialCursor("direct"), [record(1, "mystery"), record(2, "review", { verdict: "pass" })], "direct");
+    const snapshot = structuredClone(gate);
+    const ack = foldOntoCursor(gate, [record(3, "note", { ack: true })], "direct");
+    expect(ack.warnings).toEqual([{ version: 2, code: "OUT_OF_TABLE" }]);
+    const invalidDecision = foldOntoCursor(gate, [record(3, "decision", { decision: "bogus" })], "direct");
+    expect(invalidDecision.warnings).toContainEqual({ version: 2, code: "OUT_OF_TABLE" });
+    const approved = foldOntoCursor(gate, [record(4, "decision", { decision: "approve" })], "direct");
+    expect(approved.status).toBe("approved");
+    expect(approved.warnings).toEqual([{ version: 1, code: "OUT_OF_TABLE" }, { version: 4, code: "VERSION_GAP" }]);
+    expect(gate).toEqual(snapshot);
+  });
+
+  for (const reviewFirst of [false, true]) {
+    it.each(["approve", "reject", "ack", "close"] as const)(
+      `duplicate versions, review ${reviewFirst ? "first" : "last"}: %s preserves warning origins across all fold paths`, action => {
+        const other = record(2, "code_changes");
+        const review = record(2, "review", { verdict: "fail_design" });
+        const prefix = [record(1, "code_changes"), ...(reviewFirst ? [review, other] : [other, review])];
+        const ending = action === "ack" ? record(3, "note", { ack: true }) : record(3, "decision", { decision: action });
+        const records = [...prefix, ending];
+        const outOfTable = { version: 2, code: "OUT_OF_TABLE" };
+        const duplicate = { version: 2, code: "VERSION_DUPLICATE" };
+        const expected = action === "close" ? [] : action === "ack" ? [outOfTable] :
+          reviewFirst ? [duplicate, outOfTable] : [outOfTable, duplicate];
+        const cold = derive("review-gate", records, "direct")!;
+        expect(cold.warnings).toEqual(expected);
+        const gate = foldOntoCursor(initialCursor("direct"), prefix, "direct");
+        const reviewWarning = gate.reviewGateWarnings![0]!;
+        const otherWarning = gate.warnings.find(w => w.code === "OUT_OF_TABLE" && w !== reviewWarning)!;
+        expect(otherWarning).toEqual(reviewWarning); // same public shape, distinct occurrences
+        expect(otherWarning).not.toBe(reviewWarning);
+        const resumed = foldOntoCursor(gate, [ending], "direct");
+        expect(resumed.warnings.includes(reviewWarning)).toBe(action === "ack");
+        expect(resumed.warnings.includes(otherWarning)).toBe(action === "approve" || action === "reject");
+
+        const spec = "## 验收场景\n1. preserve warning origins";
+        const linted = foldWithLint(initialCursor("direct"), records, "direct", spec);
+        expect(linted.warnings.filter(w => w.code === "OUT_OF_TABLE" || w.code === "VERSION_DUPLICATE")).toEqual(expected);
+        expect(linted.warnings.filter(w => w.code.startsWith("REVIEW_")).map(w => w.code))
+          .toEqual(action === "ack" || action === "close" ? [] :
+            ["REVIEW_EXIT_CONDITIONS_INCOMPLETE", "REVIEW_SCOPE_SECTION_MISSING"]);
+
+        for (let split = 0; split <= records.length; split++) {
+          const head = foldOntoCursor(initialCursor("direct"), records.slice(0, split), "direct");
+          // A cloned cache cursor must retain aliases between the warning
+          // list and its protected subset, including at a duplicate boundary.
+          const tail = foldOntoCursor(structuredClone(head), records.slice(split), "direct");
+          const { prevVersion: _v, reviewGateWarnings: _gate, ...state } = tail;
+          expect(state).toEqual(cold);
+          const lintHead = foldWithLint(initialCursor("direct"), records.slice(0, split), "direct", spec);
+          expect(foldWithLint(structuredClone(lintHead), records.slice(split), "direct", spec)).toEqual(linted);
+        }
+      },
+    );
+  }
 });
 
 describe("revision after fail_design rework", () => {
@@ -297,14 +409,14 @@ describe("foldOntoCursor: incremental fold", () => {
         const whole = derive(vector.task_id, ordered, vector.flow);
         const cursor = initialCursor(vector.flow ?? "full");
         const head = foldOntoCursor(cursor, ordered.slice(0, split), vector.flow ?? "full");
-        const { prevVersion: _p, ...headState } = head;
+        const { prevVersion: _p, reviewGateWarnings: _headGate, ...headState } = head;
         expect(headState).toStrictEqual(derive(vector.task_id, ordered.slice(0, split), vector.flow));
         const tail = foldOntoCursor(
-          { status: head.status, prevVersion: head.prevVersion, warnings: head.warnings },
+          head,
           ordered.slice(split),
           vector.flow ?? "full",
         );
-        const { prevVersion: _q, ...tailState } = tail;
+        const { prevVersion: _q, reviewGateWarnings: _tailGate, ...tailState } = tail;
         expect(tailState).toStrictEqual(whole);
       }
     }
@@ -361,7 +473,7 @@ describe("foldOntoCursor: incremental fold", () => {
       const split = Math.floor(rand() * (ordered.length + 1));
       const head = foldOntoCursor(initialCursor(flow), ordered.slice(0, split), flow);
       const tail = foldOntoCursor(head, ordered.slice(split), flow);
-      const { prevVersion: _drop, ...tailState } = tail;
+      const { prevVersion: _drop, reviewGateWarnings: _tailGate, ...tailState } = tail;
       expect(tailState).toStrictEqual(whole);
     }
   });

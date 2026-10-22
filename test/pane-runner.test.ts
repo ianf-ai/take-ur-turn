@@ -1,4 +1,4 @@
-// pane-runner (dist/launcher/pane-runner.js) — the encoded-form execution
+// pane-runner (dist/herdr/launcher/pane-runner.js) — the encoded-form execution
 // target (launcher port design §3.3).  These tests pin the argv contract,
 // payload validation, shell/file-association shim refusal, and the fixed
 // exit-code table.
@@ -18,11 +18,11 @@ import {
   spawnPlanFor,
   validatePaneRunnerPayload,
   type PaneRunnerPayload,
-} from "../src/launcher/pane-runner.js";
-import { encodePaneRunnerPayload } from "../src/launcher/shell-renderer.js";
+} from "../src/herdr/launcher/pane-runner.js";
+import { encodePaneRunnerPayload } from "../src/herdr/launcher/shell-renderer.js";
 
 const run = promisify(execFile);
-const RUNNER = path.resolve(import.meta.dirname, "../dist/launcher/pane-runner.js");
+const RUNNER = path.resolve(import.meta.dirname, "../dist/herdr/launcher/pane-runner.js");
 const TRASH: string[] = [];
 
 function tmpdir(): string {

@@ -1,0 +1,17 @@
+{
+  "rounds" : [ {
+    "round": 1,
+    "role": "executor",
+    "agent": "codex",
+    "launch_version": 1,
+    "delivery_version": 2,
+    "ts": "2026-09-20T15:21:06.398Z",
+    "input_tokens": 9.39662e5,
+    "output_tokens": 4485,
+    "total_tokens": 944147,
+    "cost_usd": null,
+    "session_file": "sessions/中文-😀.jsonl",
+    "future": { "escaped": "\u0061", "retained": true }
+  } ],
+  "schema_version" : 1
+}

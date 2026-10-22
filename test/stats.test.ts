@@ -3,10 +3,10 @@ import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { collectStats } from "../src/stats.js";
-import { Store } from "../src/hub/store.js";
+import { collectStats } from "../src/core/stats.js";
+import { Store } from "../src/core/hub/store.js";
 import { main, parseArgs } from "../src/cli.js";
-import type { Flow, Payload } from "../src/common/types.js";
+import type { Flow, Payload } from "../src/core/common/types.js";
 
 let tmp: string, root: string, store: Store;
 beforeEach(async () => {

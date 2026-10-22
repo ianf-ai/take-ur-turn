@@ -3,8 +3,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { readConfigFile } from '../../../dist/common/config.js';
-import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
+import { readConfigFile } from '../../../dist/core/common/config.js';
+import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
 import { source } from './hub.mjs';
 export { source } from './hub.mjs';
 import { extract, attribute } from './rounds.mjs';
@@ -157,12 +157,23 @@ export function merge(previous, matches, since) {
   for (const m of matches) {
     const r = m.round, selected = since === undefined || instant(r.ts) >= since;
     if (selected && !m.reason) {
-      const { cwd, task_id, launch_ts, problem, ...identity } = r;
+      const { cwd, task_id, launch_ts, problem, superseded_versions, ...identity } = r;
       rounds.set(r.launch_version, { ...identity, ...m.candidates[0] });
     } else if (selected || !rounds.has(r.launch_version)) {
       unresolved.push({ delivery_version: r.delivery_version, ...(r.launch_version ? { launch_version: r.launch_version } : {}),
         reason: selected ? m.reason : 'not_selected', ...(rounds.has(r.launch_version) ? { preserved: true } : {}) });
     }
+    // Headless supersession (mode-split in extract): the delivering round
+    // accounts for itself above; each launch it replaced stays unaccounted
+    // and is anchored here with existing schema-v1 fields (attribution
+    // without fabrication). Merging a replaced launch's usage into the round
+    // is deliberately NOT done (human decision, see README dispositions).
+    // The anchor is NOT gated on `selected`: a --since replay that preserves
+    // the delivering round's earlier measurement must keep the disclosure
+    // and its coverage gap (complete stays false). A superseding round's
+    // successful measurement never stands in for its replaced launches.
+    if (r.superseded_versions) for (const v of r.superseded_versions)
+      unresolved.push({ delivery_version: r.delivery_version, launch_version: v, reason: 'superseded_launch' });
   }
   const sorted = [...rounds.values()].sort((a,b) => a.launch_version-b.launch_version);
   return { schema_version: 1, rounds: sorted, unresolved, total: total(sorted, unresolved) };

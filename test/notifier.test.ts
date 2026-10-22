@@ -1,7 +1,7 @@
-import { createRemediationAudit, promptTailEvidence } from '../src/launcher/delivery.js';
-import { createEnterRepress } from '../src/remediator.js';
-import { canonicalRoot, resolveRigRoot } from "../src/hub/rig-discovery.js";
-import { rigLabel } from "../src/hub/rig.js";
+import { createRemediationAudit, promptTailEvidence } from '../src/herdr/launcher/delivery.js';
+import { createEnterRepress } from '../src/core/remediator.js';
+import { canonicalRoot, resolveRigRoot } from "../src/core/hub/rig-discovery.js";
+import { rigLabel } from "../src/core/hub/rig.js";
 /**
  * Notifier unit tests: fake-clock-driven compare loop, mocked channels,
  * injected fetch/launch/now. The event HTTP listener is exercised for real on an
@@ -24,7 +24,7 @@ const h = vi.hoisted(() => {
   const channelsSeen: unknown[] = [];
   return { sent, channelsSeen };
 });
-vi.mock("../src/common/channels.js", () => ({
+vi.mock("../src/core/common/channels.js", () => ({
   createChannels: (cfg: unknown) => {
     h.channelsSeen.push(cfg);
     return [
@@ -34,15 +34,15 @@ vi.mock("../src/common/channels.js", () => ({
   },
 }));
 
-import { Notifier, runNotify, spawnLaunch, type NotifierDeps, type StateResponse, type StateTask } from "../src/notifier/notifier.js";
-import { giveUpGuidance, parseDeliveryV2 } from "../src/launcher/escalation.js";
-import { launchBlocked } from "../src/launcher/launch.js";
-import { derive } from "../src/hub/state-machine.js";
-import { Store } from "../src/hub/store.js";
-import { HubError } from "../src/hub/hub-client.js";
-import { writeConfigKey, writeFlowMode } from "../src/common/config.js";
-import { startServer } from "../src/hub/server.js";
-import type { AgentRoute, ContextRecord } from "../src/common/types.js";
+import { Notifier, runNotify, spawnLaunch, type NotifierDeps, type StateResponse, type StateTask } from "../src/core/notifier/notifier.js";
+import { giveUpGuidance, parseDeliveryV2 } from "../src/herdr/launcher/escalation.js";
+import { launchBlocked } from "../src/core/launcher/launch.js";
+import { derive } from "../src/core/hub/state-machine.js";
+import { Store } from "../src/core/hub/store.js";
+import { HubError } from "../src/core/hub/hub-client.js";
+import { writeConfigKey, writeFlowMode } from "../src/core/common/config.js";
+import { startServer } from "../src/core/hub/server.js";
+import type { AgentRoute, ContextRecord } from "../src/core/common/types.js";
 import { HANDLERS, parseArgs } from "../src/cli.js";
 
 const U1 = "2026-08-15T10:00:00.000Z";
@@ -83,7 +83,7 @@ function state(
 
 interface HarnessOpts {
   markLaunched?: NotifierDeps["markLaunched"];
-  remediator?: import("../src/remediator.js").Remediator;
+  remediator?: import("../src/core/remediator.js").Remediator;
   flowMode?: string;
   notify?: unknown;
   /** auto-mode launch whitelist (state.auto.launch_roles); omitted = no auto key. */
@@ -119,9 +119,12 @@ interface HarnessOpts {
   order?: string[];
   /** Artificial pane-list delay inside the done sweep, fake-timer ms (concurrency-barrier tests). */
   sweepDelayMs?: number;
+  readLaunchMode?: NotifierDeps["readLaunchMode"];
+  /** Startup catchup switch (launch.catchup); default injects the "off" default so the existing suite stays hermetic. */
+  readLaunchCatchup?: NotifierDeps["readLaunchCatchup"];
   /** Close-edge cleanup seam; default records into `cleanups`. */
   cleanup?: (taskId: string) => Promise<void>;
-  relay?: (report: import("../src/notifier/host-relay.js").HostStatusReport, notify: unknown) => Promise<void>;
+  relay?: (report: import("../src/core/notifier/host-relay.js").HostStatusReport, notify: unknown) => Promise<void>;
   log?: (line: string) => void;
 }
 
@@ -159,6 +162,8 @@ function makeHarness(opts: HarnessOpts = {}) {
           append: async (_file, line) => { auditLines.push(line); }, rename: async () => {},
         },
       }),
+      readLaunchMode: opts.readLaunchMode ?? (async () => "tui" as const),
+      readLaunchCatchup: opts.readLaunchCatchup ?? (async () => "off" as const),
       fetchState: async (url: string) => {
         if (failing) throw new Error(`connect ECONNREFUSED ${url}`);
         fetches += 1;
@@ -1034,6 +1039,7 @@ describe("auto-mode gate", () => {
     const notifier = new Notifier(
       { url: "http://hub", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
         fetchState: async () => current,
         readLog: async () => records,
         markLaunched: async () => {
@@ -1065,6 +1071,7 @@ describe("auto-mode gate", () => {
     const notifier = new Notifier(
       { url: "http://hub", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
         fetchState: async () => current,
         readLog: async () => [],
         markLaunched: async () => {
@@ -1103,6 +1110,7 @@ describe("auto-mode gate", () => {
     const notifier = new Notifier(
       { url: "http://hub", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
         fetchState: async () => current,
         readLog: async () => {
           reads += 1;
@@ -1172,6 +1180,7 @@ describe("auto-mode gate", () => {
     const notifier = new Notifier(
       { url: "http://x:1", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
         fetchState: async () => cur,
         readLog: async () => [],
         markLaunched: async () => {
@@ -1211,6 +1220,7 @@ describe("auto-mode gate", () => {
     const notifier = new Notifier(
       { url: "http://x:1", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
         fetchState: async () => cur,
         readLog: async () => [],
         markLaunched: async () => undefined,
@@ -1300,6 +1310,7 @@ describe("auto-mode launch whitelist", () => {
     const notifier = new Notifier(
       { url: "http://hub", interval: 5, eventPort: 3999, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
         fetchState: async () => current,
         readLog: async () => [...log],
         markLaunched: async (taskId, role, baseVersion) => {
@@ -2026,7 +2037,7 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
   });
 
   it("half-valid core pair (box=held, transport missing) degrades to the conservative hint — atomic normalization", async () => {
-    // Review R2 P1: the core evidence pair box+transport is ATOMIC.  A
+    // Review follow-up: the core evidence pair box+transport is ATOMIC.  A
     // programmatic half-pair must not buy the held copy (the wire path is
     // covered by the HTTP endpoint tests below).
     const hz = makeHarness();
@@ -2091,7 +2102,7 @@ describe("delivery give-up escalation (launcher → channel, 7.2.1)", () => {
   });
 
   it("in-flight give-up (real auto ordering): launch return does NOT re-arm the short fuse, stall clock intact", async () => {
-    // Review v4 P1 closure test: the launcher child emits the event BEFORE it
+    // Closure test: the launcher child emits the event BEFORE it
     // exits, so the give-up always beats the launch return. The fuse must not
     // be armed for this round afterwards, and the stall watchdog keeps its
     // original clock (no markProgress on give-up).
@@ -2177,6 +2188,41 @@ describe("done-event pane sweep: final screens archived into the notify log", ()
     { pane_id: "w11:p1", label: "" }, // the human's unlabeled pane — never swept
     T1_REV,
   ];
+
+  it.each(['headless', 'invalid'])('skips every pane operation in %s mode, keeping compare and recheck', async mode => {
+    const hz = makeHarness({ panes: INVENTORY, readLaunchMode: async () => { if (mode === 'invalid') throw new Error('bad config'); return 'headless'; } });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: 'done', agent: 'pi', pane: 't1.executor' }); await hz.flush();
+    await vi.waitFor(() => expect(hz.fetchCount()).toBe(2));
+    expect(hz.sweptReads).toEqual([]); expect(hz.sweepListCount()).toBe(0); expect(hz.fetchCount()).toBe(2);
+    await vi.advanceTimersByTimeAsync(5000); await hz.flush(); expect(hz.fetchCount()).toBe(3);
+    if (mode === 'invalid') expect(hz.logs.some(l => l.includes('done sweep skipped: launch mode unreadable'))).toBe(true);
+  });
+
+  it('reads the real default (tui) on a fresh root and proceeds with the pane sweep', async () => {
+    const hz = makeHarness({ panes: INVENTORY, readLaunchMode: async () => (await import('../src/core/common/config.js')).readLaunchMode(path.join(mkdtempSync(path.join(os.tmpdir(), 'tut-w3-mode-')), '.context-hub')) });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: 'done', agent: 'pi', pane: 't1.executor' }); await hz.flush();
+    await vi.waitFor(() => expect(hz.sweptReads).toEqual(['w11:p6', 'w11:p3']));
+    expect(hz.sweepListCount()).toBe(1);
+  });
+
+  it('registers the sweep barrier before awaiting the mode read', async () => {
+    let hold = false, release!: (mode: 'tui') => void;
+    const order: string[] = [];
+    const hz = makeHarness({ flowMode: 'auto', autoRoles: ALL_ROLES.launch_roles, panes: [T1_EXEC], order,
+      readLaunchMode: async () => { if (hold) { hold = false; return new Promise<'tui'>(resolve => { release = resolve; }); } return 'tui'; } });
+    hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })])); await hz.notifier.requestCompare();
+    hold = true;
+    hz.set(state([task({ task_id: 't1', status: 'reviewing', waiting_for: 'agent:reviewer', updated_at: U2 })], { flow_mode: 'auto', auto: ALL_ROLES }));
+    hz.notifier.receiveEvent({ event: 'done', agent: 'pi', pane: 't1.executor' });
+    void hz.notifier.requestCompare(); await hz.flush();
+    expect(order).not.toContain('marker'); expect(order).not.toContain('sweep-list-start');
+    release('tui'); await hz.flush(); await vi.waitFor(() => expect(order).toContain('launch'));
+    expect(order.indexOf('sweep-read:w11:p6')).toBeLessThan(order.indexOf('marker'));
+  });
 
   it("snapshots every <T>.* pane with timestamp + label into the log; other panes are never read", async () => {
     const hz = makeHarness({
@@ -2328,7 +2374,7 @@ describe("done-event pane sweep: final screens archived into the notify log", ()
 
 describe("defaultLoadRouting: the real loader reads the three-level chain (cwd L1 + TUT_USER_CONFIG_DIR L2)", () => {
   it("L1 fixture defines the maps; L2 covers roles L1 lacks; legacy labels absent", async () => {
-    const { defaultLoadRouting } = await import("../src/notifier/notifier.js");
+    const { defaultLoadRouting } = await import("../src/core/notifier/notifier.js");
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
@@ -2364,7 +2410,7 @@ describe("defaultLoadRouting: the real loader reads the three-level chain (cwd L
   });
 
   it("no config anywhere → built-in DEFAULT_ROLES with agent-named identities only", async () => {
-    const { defaultLoadRouting } = await import("../src/notifier/notifier.js");
+    const { defaultLoadRouting } = await import("../src/core/notifier/notifier.js");
     const { mkdtempSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
@@ -2394,7 +2440,7 @@ describe("custom tab-label template regression: template output never enters eve
     // pane addressing inputs stay template-free — pinned against a fixture
     // that actually carries naming.tab_label (same vector as the launcher
     // test in cli-assign-launch.test.ts).
-    const { defaultLoadRouting } = await import("../src/notifier/notifier.js");
+    const { defaultLoadRouting } = await import("../src/core/notifier/notifier.js");
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
     const os = await import("node:os");
     const path = await import("node:path");
@@ -2716,7 +2762,7 @@ function rawRequest(
         path: pathname,
         headers: host === undefined ? {} : { host }, // lowercase; node sends it as Host
       },
-      (res) => {
+     (res) => {
         let data = "";
         res.on("data", (chunk: Buffer) => {
           data += chunk.toString("utf8");
@@ -3135,7 +3181,7 @@ describe("degraded / disappearance edges", () => {
     expect(hz.logs.some((l) => l.includes("[t-back] reappeared in /state"))).toBe(true);
   });
 
-  it("recovery tick (P1-3): degraded→tasks[] is NOT a new task — recovery log only, no waiting-for notification; the next edge flows as usual", async () => {
+  it("recovery tick : degraded→tasks[] is NOT a new task — recovery log only, no waiting-for notification; the next edge flows as usual", async () => {
     const hz = makeHarness();
     await hz.notifier.requestCompare(); // baseline: healthy
     hz.set(state([task({ task_id: "t-rec", status: "implementing", waiting_for: "agent:executor" })]));
@@ -3161,7 +3207,7 @@ describe("degraded / disappearance edges", () => {
     expect(titlesMatching("waiting for")).toHaveLength(flowTitles + 1);
   });
 
-  it("recovery tick (P1-3): vanished→tasks[] restore is log-only — no waiting-for notification; the next edge flows as usual", async () => {
+  it("recovery tick : vanished→tasks[] restore is log-only — no waiting-for notification; the next edge flows as usual", async () => {
     const hz = makeHarness();
     await hz.notifier.requestCompare(); // baseline
     hz.set(state([task({ task_id: "t-back2", status: "implementing", waiting_for: "agent:executor" })]));
@@ -3184,7 +3230,7 @@ describe("degraded / disappearance edges", () => {
     expect(titlesMatching("waiting for")).toHaveLength(flowTitles + 1);
   });
 
-  it("recovery tick into pending_approval (P1-3): no approval notification on the recovery tick; the reminder lands on the next poll instead", async () => {
+  it("recovery tick into pending_approval : no approval notification on the recovery tick; the reminder lands on the next poll instead", async () => {
     const hz = makeHarness();
     await hz.notifier.requestCompare();
     hz.set(state([task({ task_id: "t-appr", status: "pending_approval", waiting_for: "human" })]));
@@ -3210,7 +3256,7 @@ describe("degraded / disappearance edges", () => {
     expect(titlesMatching("waiting for human")).toHaveLength(2);
   });
 
-  it("auto recovery tick (P1-3): degraded→tasks[] launches nothing — no marker, no launch, honest decision line; the next edge launches as usual", async () => {
+  it("auto recovery tick : degraded→tasks[] launches nothing — no marker, no launch, honest decision line; the next edge launches as usual", async () => {
     const order: string[] = [];
     const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor", "reviewer"], order });
     await hz.notifier.requestCompare(); // baseline (auto): decision lines only
@@ -3240,7 +3286,7 @@ describe("degraded / disappearance edges", () => {
     expect(hz.launches[1]).toMatchObject({ taskId: "t-auto", role: "reviewer" });
   });
 
-  it("recovery-tick stall restart (P1-3 round 2): degraded past the stall threshold recovers with NO stalled alert — the timer restarts from the recovery tick", async () => {
+  it("recovery-tick stall restart : degraded past the stall threshold recovers with NO stalled alert — the timer restarts from the recovery tick", async () => {
     const hz = makeHarness({ stallMin: 30 });
     hz.at(0);
     await hz.notifier.requestCompare(); // baseline
@@ -3275,7 +3321,7 @@ describe("degraded / disappearance edges", () => {
     expect(titlesMatching("possibly stalled")).toHaveLength(1);
   });
 
-  it("recovery-tick stall restart (P1-3 round 2): vanished past the stall threshold reappears with NO stalled alert — timing restarts from the reappearance", async () => {
+  it("recovery-tick stall restart : vanished past the stall threshold reappears with NO stalled alert — timing restarts from the reappearance", async () => {
     const hz = makeHarness({ stallMin: 30 });
     hz.at(0);
     await hz.notifier.requestCompare(); // baseline
@@ -3412,9 +3458,9 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     };
   };
   const logCacheOf = (notifier: Notifier): Map<string, { version: number; records: ContextRecord[]; sig: string | null }> =>
-    (notifier as unknown as { logCache: Map<string, { version: number; records: ContextRecord[]; sig: string | null }> }).logCache;
+   (notifier as unknown as { logCache: Map<string, { version: number; records: ContextRecord[]; sig: string | null }> }).logCache;
 
-  it("P1-1: the cursor is EXCLUSIVE against the inclusive wire — quiet rounds pull nothing, a new version pulls since=cached+1", async () => {
+  it("the cursor is EXCLUSIVE against the inclusive wire — quiet rounds pull nothing, a new version pulls since=cached+1", async () => {
     let tail: ContextRecord[] = [note("t1", 1), note("t1", 2), marker("t1", 3, 2)];
     const hub = inclusiveHub(() => tail);
     const hz = makeHarness({
@@ -3429,7 +3475,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     await hz.notifier.requestCompare(); // baseline: one FULL pull
     expect(hub.calls).toEqual([0]);
 
-    // Quiet rounds — /state version covered by the cache: ZERO log pulls (P1-2),
+    // Quiet rounds — /state version covered by the cache: ZERO log pulls ,
     // and the dedup verdict still comes from the merged cache.
     hz.at(5_000);
     await hz.notifier.requestCompare();
@@ -3451,7 +3497,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     expect(logCacheOf(hz.notifier).get("t1")?.version).toBe(4);
   });
 
-  it("P1-3: same-version DIFFERENT records survive the merge — identity dedup, not version dedup", async () => {
+  it("same-version DIFFERENT records survive the merge — identity dedup, not version dedup", async () => {
     // Reproduction shape from the review: v1 decision(close) cached; an
     // external same-version duplicate lands; the /state signature changes at
     // an UNCHANGED version → full re-sync returns BOTH v1 records. The merged
@@ -3505,7 +3551,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     expect(folded?.needs_attention).toBe(false); // the v2 ack cleared the anomaly — the clean /state shape was honest
   });
 
-  it("P1-3 (marker combo): duplicate-version markers and non-markers both reach launchBlocked", async () => {
+  it("(marker combo): duplicate-version markers and non-markers both reach launchBlocked", async () => {
     // Two files share version 3 — one a launch marker, one an ordinary note.
     // The incremental reply carries both; the merge must keep both so the
     // dedup scan sees the marker (a version-keyed merge would drop one).
@@ -3532,7 +3578,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     expect(hz.logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v3");
   });
 
-  it("P1-3 round 2: a marker landing while needs_attention is ALREADY set is recovered on the attention-clearing edge", async () => {
+  it("round 2: a marker landing while needs_attention is ALREADY set is recovered on the attention-clearing edge", async () => {
     // Reproduction shape from review round 2: the cache must be synced UNDER
     // the attention-set entry for the poison to persist — that happens through
     // the UNGATED fullLog caller (launchGenerationSuperseded reads watched
@@ -3603,7 +3649,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     expect(hz.logs.filter((l) => l.includes("auto-decision")).pop()).toContain("dedup=launched@v1");
   });
 
-  it("P1-2: a fold-visible /state change at an UNCHANGED version drops the cache for a full re-sync; a rewind evicts too", async () => {
+  it("a fold-visible /state change at an UNCHANGED version drops the cache for a full re-sync; a rewind evicts too", async () => {
     const sinceValues: number[] = [];
     const hz = makeHarness({
       flowMode: "auto",
@@ -3749,6 +3795,7 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
       for (let i = 0; i < 2; i++) {
         const notifier = new Notifier({ url: running.url, interval: 5, eventPort: 3998, stallTimeoutMin: 30 }, {
           launch: async () => { spawns++; return "launched"; },
+          readLaunchMode: async () => "tui" as const, // pin the TUI backend: the merged autoLaunch consults the launch mode (the real default is tui since 0.9.0)
           resolveTarget: async () => "pi",
           loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
           listPanes: async () => [],
@@ -3907,9 +3954,9 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
       );
       openNotifiers.push(notifier);
       const fullLogOf = (entry: unknown) =>
-        (notifier as unknown as { fullLog(t: string, e?: unknown): Promise<ContextRecord[]> }).fullLog("gov-clear", entry);
+       (notifier as unknown as { fullLog(t: string, e?: unknown): Promise<ContextRecord[]> }).fullLog("gov-clear", entry);
       const cacheOf = () =>
-        (notifier as unknown as { logCache: Map<string, { records: ContextRecord[] }> }).logCache.get("gov-clear")?.records ?? [];
+       (notifier as unknown as { logCache: Map<string, { records: ContextRecord[] }> }).logCache.get("gov-clear")?.records ?? [];
 
       // Warm: v1 executor marker (dedup=launched@v1).
       await notifier.requestCompare();
@@ -3999,8 +4046,9 @@ describe("notifier rig isolation", () => {
 
   it("freezes the actual notifier endpoint in the auto worker plan", async () => {
     let current = state([task({ task_id: "t1", status: "designing", waiting_for: "agent:architect" })], { flow_mode: "auto", auto: ALL_ROLES });
-    const plans: import("../src/common/types.js").LaunchInvocation[] = [];
+    const plans: import("../src/core/common/types.js").LaunchInvocation[] = [];
     const notifier = new Notifier({ url: "http://127.0.0.1:4311", eventPort: 4312, interval: 5, stallTimeoutMin: 30 }, {
+      readLaunchMode: async () => "tui" as const,
       fetchState: async () => current,
       readLog: async () => [],
       resolveTarget: async () => "pi",
@@ -4122,7 +4170,7 @@ describe('notifier remediation policy and pluggable interface', () => {
     'refreshes lifecycle: notes survive but %s stops remediation', async change => {
       const base = task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor', version: 1 });
       const decisions: boolean[] = [];
-      const remediate = vi.fn(async (request: import('../src/remediator.js').RemediationRequest) => {
+      const remediate = vi.fn(async (request: import('../src/core/remediator.js').RemediationRequest) => {
         hz.set(state([{ ...base, version: 2 }], { flow_mode: 'auto' }));
         decisions.push(await request.canAct()); // no compare: callback must fetch fresh /state
         if (change === 'read-error') hz.setFailing(true);
@@ -4159,7 +4207,7 @@ describe('notifier remediation policy and pluggable interface', () => {
     ['auto', 'off', false], ['manual', 'off', false], ['manual', 'enter-repress', true],
   ] as const)('%s with %s invokes strategy=%s', async (mode, setting, enabled) => {
     vi.stubEnv('TUT_DELIVERY_DIAG', '0');
-    const remediate = vi.fn(async (_request: import('../src/remediator.js').RemediationRequest) => ({ strategy: 'test-future-strategy', action: 'machine-enter' as const,
+    const remediate = vi.fn(async (_request: import('../src/core/remediator.js').RemediationRequest) => ({ strategy: 'test-future-strategy', action: 'machine-enter' as const,
       result: 'working-observed' as const, enter_transport: 'sent' as const, status_flip: true,
       attribution: 'machine-remediation' as const, reason: 'working-observed' }));
     const hz = makeHarness({ remediator: { remediate } });
@@ -4199,7 +4247,7 @@ describe('notifier remediation policy and pluggable interface', () => {
     const result = { strategy: 'enter-repress', action: 'machine-enter' as const,
       result: 'working-observed' as const, enter_transport: 'sent' as const,
       status_flip: true, attribution: 'machine-remediation' as const, reason: 'working-observed' };
-    const remediate = vi.fn(async (request: import('../src/remediator.js').RemediationRequest) => {
+    const remediate = vi.fn(async (request: import('../src/core/remediator.js').RemediationRequest) => {
       await request.recordAction!({ ...result, result: 'attempting', reason: '机器代按 Enter' });
       return result;
     });

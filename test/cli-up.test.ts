@@ -1,6 +1,6 @@
 // These tests isolate provisioning/probes; real endpoint selection has its own integration suite.
-vi.mock("../src/hub/rig-discovery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/rig-discovery.js")>()),
+vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
   resolveUpHub: async (url: string, _explicit: boolean, _root: string, eventPort?: number) => ({ url, eventPort: eventPort ?? 3002 }),
   discoverHub: async () => undefined,
 }));
@@ -16,14 +16,14 @@ import { once } from "node:events";
 // The seed hint reads the project scope through the hub-client layer; mock
 // ONLY hubRead (the up handler's one hub-client call) so the hint branches are
 // drivable without a live MCP endpoint — the same pattern as test/cli.test.ts.
-vi.mock("../src/hub/hub-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/hub/hub-client.js")>()),
+vi.mock("../src/core/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/core/hub/hub-client.js")>()),
   hubRead: vi.fn(),
 }));
 
 import { herdrPaneList, main, parseArgs } from "../src/cli.js";
-import { hubRead, HubError, type HubReadResult } from "../src/hub/hub-client.js";
-import type { ContextRecord } from "../src/common/types.js";
+import { hubRead, HubError, type HubReadResult } from "../src/core/hub/hub-client.js";
+import type { ContextRecord } from "../src/core/common/types.js";
 
 // tut up — parse layer first; behavior tests below drive the real
 // handler through main() with:
@@ -565,6 +565,7 @@ describe("tut up (behavior)", () => {
       expect(io.err()).toContain("HERDR_PANE_ID");
       expect(io.err()).toContain("valid pane id");
       expect(io.err()).toContain("unset/empty");
+      expect(io.err()).toContain("tut config set power.mode standalone"); // the no-herdr escape hatch
       expect(logLines(logPath)).toEqual([
         "pane list",
         serviceFixture(`pane split --current --direction right --no-focus --cwd ${project}`),
@@ -1710,4 +1711,95 @@ it.each(["", "   ", "w1"])("handles system-tab workspace anchor %j", async (work
       expect(io.err().match(/workspace pinning unavailable/g)).toHaveLength(1);
     }
   } finally { io.restore(); }
+});
+
+// --- power.mode guard (the up entry split) ----------------------------------------
+// Discriminating tests: the config key power.mode must route up to EXACTLY
+// one power implementation — herdr (pane provisioning, no power.json) or
+// standalone (detached processes + power.json, NO herdr call) — and illegal
+// values must fail visibly before any probe or pane read.
+describe("up power.mode guard", () => {
+  it("missing key stays on the herdr path: panes provisioned, no power.json", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    useFixtureHerdr(logPath, [{ pane_id: "anchor:p1", cwd: project }]);
+    process.env.HERDR_PANE_ID = "anchor:p1";
+    stubFetch(logAwareProbes(logPath));
+    const io = captureIo();
+    try {
+      expect(await runUp(["up"])).toBe(0);
+      expect(logLines(logPath).some((line) => line.startsWith("pane run"))).toBe(true);
+      expect(existsSync(path.join(project, ".context-hub", "power.json"))).toBe(false);
+    } finally { io.restore(); }
+  });
+
+  it("explicit power.mode=herdr behaves identically to the default", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    mkdirSync(path.join(project, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(project, ".context-hub", "config.json"), JSON.stringify({ flow_mode: "manual", power: { mode: "herdr" } }));
+    useFixtureHerdr(logPath, [{ pane_id: "anchor:p1", cwd: project }]);
+    process.env.HERDR_PANE_ID = "anchor:p1";
+    stubFetch(logAwareProbes(logPath));
+    const io = captureIo();
+    try {
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.out()).toContain(`up: expected host relay label: ${scopedFixture("tut-host", path.dirname(logPath))}`);
+      expect(existsSync(path.join(project, ".context-hub", "power.json"))).toBe(false);
+    } finally { io.restore(); }
+  });
+
+  it("power.mode=standalone dispatches to the standalone path: no pane traffic, no label line, no power.json on failure", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    mkdirSync(path.join(project, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(project, ".context-hub", "config.json"), JSON.stringify({ flow_mode: "manual", power: { mode: "standalone" } }));
+    useFixtureHerdr(logPath);
+    process.env.TUT_UP_CLI_SELF = path.join(project, "dist", "cli.js");
+    process.env.TUT_UP_HUB_WAIT_MS = "50";
+    stubFetch(() => refused()); // nothing ever healthy: spawn target is a fake self
+    const io = captureIo();
+    try {
+      expect(await runUp(["up"])).toBe(1);
+      expect(io.out()).not.toContain("host relay label"); // herdr presentation never ran
+      expect(io.err()).toContain("stayed unhealthy");
+      expect(readLog(logPath)).toBe(""); // not one herdr invocation
+      expect(existsSync(path.join(project, ".context-hub", "power.json"))).toBe(false); // half-born rigs leave no state
+    } finally { io.restore(); }
+  });
+
+  it("unrelated config damage (illegal flow_mode) keeps the OLD herdr up behavior", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    mkdirSync(path.join(project, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(project, ".context-hub", "config.json"), JSON.stringify({ flow_mode: "bogus" }));
+    useFixtureHerdr(logPath, [{ pane_id: "anchor:p1", cwd: project }]);
+    process.env.HERDR_PANE_ID = "anchor:p1";
+    stubFetch(logAwareProbes(logPath));
+    const io = captureIo();
+    try {
+      // The pre-power contract: up proceeds on the herdr path (the corrupt
+      // config surfaces only through the usage step's own warning).
+      expect(await runUp(["up"])).toBe(0);
+      expect(io.out()).toContain("up: expected host relay label:");
+      expect(logLines(logPath).some((line) => line.startsWith("pane run"))).toBe(true);
+      expect(io.err()).not.toContain("power.mode");
+      expect(existsSync(path.join(project, ".context-hub", "power.json"))).toBe(false);
+    } finally { io.restore(); }
+  });
+
+  it("an illegal power.mode fails visibly before any probe or pane read", async () => {
+    const { project, logPath } = makeProject(true);
+    process.chdir(project);
+    mkdirSync(path.join(project, ".context-hub"), { recursive: true });
+    writeFileSync(path.join(project, ".context-hub", "config.json"), JSON.stringify({ flow_mode: "manual", power: { mode: "both" } }));
+    useFixtureHerdr(logPath);
+    stubFetch(() => refused());
+    const io = captureIo();
+    try {
+      expect(await runUp(["up"])).toBe(1);
+      expect(io.err()).toContain('invalid power.mode: "both" (expected "herdr" | "standalone")');
+      expect(readLog(logPath)).toBe("");
+    } finally { io.restore(); }
+  });
 });

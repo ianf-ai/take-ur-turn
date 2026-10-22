@@ -5,7 +5,7 @@
  * caller (including these tests and the real Notifier) is always on the
  * default budget.
  *
- * The OS child boundary (../src/launcher/process.js) is the only mocked
+ * The OS child boundary (../src/herdr/launcher/process.js) is the only mocked
  * module: the default-window kill itself is proven in launcher-entry.test.ts
  * (fake-clock wedged child at exactly DEFAULT_CHILD_TIMEOUT_MS, plus the real
  * SIGSTOP child).  Here the REAL notifier code above that boundary must
@@ -17,14 +17,14 @@
 import { describe, expect, it, vi } from "vitest";
 
 const sent: { title: string; body: string; task_id?: string }[] = [];
-vi.mock("../src/common/channels.js", () => ({
+vi.mock("../src/core/common/channels.js", () => ({
   createChannels: () => [
     { name: "desktop", send: async (msg: { title: string; body: string; task_id?: string }) => { sent.push(msg); } },
   ],
 }));
 
-vi.mock("../src/launcher/process.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/launcher/process.js")>()),
+vi.mock("../src/herdr/launcher/process.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/herdr/launcher/process.js")>()),
   // The default-budget failure return proven by launcher-entry.test.ts: the
   // backstop SIGKILLed the wedged launcher child once DEFAULT_CHILD_TIMEOUT_MS
   // elapsed (the shape Test A settles as — never a pending promise).
@@ -32,9 +32,9 @@ vi.mock("../src/launcher/process.js", async (importOriginal) => ({
     Promise.resolve({ code: null, signal: "SIGKILL" as const, stdout: "", stderr: "", timedOut: true as const }),
 }));
 
-import { DEFAULT_CHILD_TIMEOUT_MS } from "../src/launcher/process.js";
-import { Notifier, spawnLaunchInvocation, type StateResponse } from "../src/notifier/notifier.js";
-import { buildLaunchInvocation } from "../src/launcher/invocation.js";
+import { DEFAULT_CHILD_TIMEOUT_MS } from "../src/herdr/launcher/process.js";
+import { Notifier, spawnLaunchInvocation, type StateResponse } from "../src/core/notifier/notifier.js";
+import { buildLaunchInvocation } from "../src/core/launcher/invocation.js";
 
 function invocation() {
   return buildLaunchInvocation({
@@ -96,6 +96,8 @@ describe("production default launcher budget through the Notifier boundary", () 
     const notifier = new Notifier(
       { url: "http://hub.test", interval: 5, eventPort: 0, stallTimeoutMin: 30 },
       {
+        readLaunchMode: async () => "tui" as const,
+        readLaunchCatchup: async () => "off" as const,
         fetchState: async () => current,
         readLog: async (): Promise<never[]> => [],
         resolveTargetWithSource: async () => ({ route: { agent: "codex", args: ["--model", "gpt-5.6"] }, source: "task-cast" }),

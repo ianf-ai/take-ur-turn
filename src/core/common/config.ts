@@ -1,0 +1,516 @@
+/**
+ * .context-hub/config.json access (readConfig/writeFlowMode for POST /mode,
+ * plus the tut config get/set engine at the bottom of this file).
+ *
+ * Read side is per-request semantics: readFlowMode re-reads the file on every
+ * call so `tut mode` can switch flow_mode without restarting serve.
+ * Read failures (missing/unreadable/corrupt) NEVER throw — /state must not 5xx
+ * on config problems; fall back to "manual" with a stderr warning.
+ * readConfig follows the same never-throw discipline (null instead of a
+ * fallback) so /state can echo the optional `notify` key only when a real,
+ * parseable config object exists behind it; the optional `auto` whitelist
+ * section rides the same read via autoSectionOf — malformed
+ * shapes read as absent, never invalidating the whole file.
+ * Write side is atomic (temp + rename), same pattern as store.ts.
+ */
+
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { KNOWN_ROLES } from "./workspace.js";
+
+export type LaunchMode = "headless" | "tui";
+
+export type PowerMode = "herdr" | "standalone";
+
+/** Shared value validation for both power-mode readers. */
+function powerModeOf(power: unknown): PowerMode {
+  if (typeof power !== "object" || power === null) throw new Error('invalid power.mode (expected "herdr" | "standalone")');
+  const mode = (power as { mode?: unknown }).mode;
+  if (mode === undefined) return "herdr";
+  if (mode === "herdr" || mode === "standalone") return mode;
+  throw new Error(`invalid power.mode: ${JSON.stringify(mode)} (expected "herdr" | "standalone")`);
+}
+
+/** Strict power policy (the tut config get discipline of readLaunchMode):
+ *  broken files and illegal values never mean defaults — the CLI refuses. */
+export async function readPowerMode(root: string): Promise<PowerMode> {
+  const outcome = await readConfigFile(root);
+  if (outcome.status === "missing") return "herdr";
+  if (outcome.status === "invalid") throw new Error(`cannot read power.mode: ${configPath(root)} is unreadable or corrupt — fix it by hand`);
+  if (!Object.hasOwn(outcome.config, "power")) return "herdr";
+  return powerModeOf(outcome.config.power);
+}
+
+/**
+ * The power-switch reader (tut up / tut down): power-only validation.
+ * Unrelated config damage (corrupt JSON, illegal flow_mode, …) reads as the
+ * herdr default — EXACTLY the pre-power behavior of up on a broken config
+ * (the usage step still warns separately), so the power switch never widens
+ * old failure modes. Only a present-but-illegal power section throws.
+ */
+export async function readPowerModeForSwitch(root: string): Promise<PowerMode> {
+  let raw: string;
+  try {
+    raw = await readFile(configPath(root), "utf8");
+  } catch {
+    return "herdr"; // missing or unreadable: not a power problem
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "herdr"; // corrupt JSON cannot carry a power key
+  }
+  if (typeof parsed !== "object" || parsed === null || !Object.hasOwn(parsed, "power")) return "herdr";
+  return powerModeOf((parsed as Record<string, unknown>).power);
+}
+
+/** Strict launch policy; unlike readConfig, broken files never mean defaults. */
+export async function readLaunchMode(root: string): Promise<LaunchMode> {
+  const outcome = await readConfigFile(root);
+  if (outcome.status === "missing") return "tui";
+  if (outcome.status === "invalid") throw new Error(`cannot read launch_mode: ${configPath(root)} is unreadable or corrupt`);
+  const value = outcome.config.launch_mode;
+  if (!Object.hasOwn(outcome.config, "launch_mode")) return "tui";
+  if (value === "headless" || value === "tui") return value;
+  throw new Error('invalid launch_mode (expected "headless" | "tui")');
+}
+
+export type LaunchCatchup = "off" | "on";
+
+/**
+ * The optional `launch` section: `catchup` is the Notifier's startup
+ * catchup switch (launch.catchup). Absent section / absent key = "off",
+ * the pre-catchup behavior; sibling keys survive writeConfigKey's
+ * key-preserving writes.
+ */
+export interface LaunchSection {
+  catchup?: LaunchCatchup;
+  [key: string]: unknown;
+}
+
+/**
+ * Strict startup-catchup read — the same fail-visible discipline as
+ * readLaunchMode: a missing file or a missing key means the "off" default,
+ * but an UNREADABLE file or an illegal value throws (the caller logs one
+ * line and withholds catchup — never a silent fallthrough to either side).
+ */
+export async function readLaunchCatchup(root: string): Promise<LaunchCatchup> {
+  const outcome = await readConfigFile(root);
+  if (outcome.status === "missing") return "off";
+  if (outcome.status === "invalid") throw new Error(`cannot read launch.catchup: ${configPath(root)} is unreadable or corrupt`);
+  const section = outcome.config.launch;
+  if (section === undefined) return "off";
+  if (typeof section !== "object" || section === null) {
+    throw new Error('invalid launch.catchup (expected "off" | "on")');
+  }
+  const value = section.catchup;
+  if (value === undefined) return "off";
+  if (value === "off" || value === "on") return value;
+  throw new Error('invalid launch.catchup (expected "off" | "on")');
+}
+
+export type FlowMode = "manual" | "auto";
+
+export type LaunchCheckoutMode = "rig" | "anchored";
+
+/** Optional `launch` section: `checkout` is the headless anchoring policy.
+ *  Hand-edited like `notify` — deliberately NOT a `tut config` engine key
+ *  (registering it would rewrite the usage text the CLI byte ruler pins). */
+export interface LaunchSection {
+  checkout?: LaunchCheckoutMode;
+}
+
+/** Strict headless checkout policy; like readLaunchMode, broken files never
+ *  mean defaults — an invalid value refuses the launch that reads it. */
+export async function readLaunchCheckout(root: string): Promise<LaunchCheckoutMode> {
+  const outcome = await readConfigFile(root);
+  if (outcome.status === "missing") return "rig";
+  if (outcome.status === "invalid") throw new Error(`cannot read launch.checkout: ${configPath(root)} is unreadable or corrupt`);
+  const section = (outcome.config as { launch?: unknown }).launch;
+  if (section === undefined) return "rig";
+  if (typeof section !== "object" || section === null || Array.isArray(section)) {
+    throw new Error('invalid launch.checkout (expected "rig" | "anchored")');
+  }
+  const value = (section as { checkout?: unknown }).checkout;
+  if (value === undefined) return "rig";
+  if (value === "rig" || value === "anchored") return value;
+  throw new Error('invalid launch.checkout (expected "rig" | "anchored")');
+}
+
+/**
+ * The optional `auto` section: `launch_roles`
+ * is the auto-mode trust whitelist, keyed by ROLE (not agent). Absent = empty
+ * = withhold every auto launch (conservative default; the enabler fills it in
+ * explicitly). Hand-edited into config.json; writeFlowMode's key-preserving
+ * RMW keeps it across `tut mode` switches.
+ */
+export interface AutoConfig {
+  launch_roles: string[];
+  remediate?: "off" | "enter-repress";
+}
+
+/** Extend-only tolerance: unknown extra keys are preserved and ignored. */
+export interface Config {
+  flow_mode: FlowMode;
+  auto?: AutoConfig;
+  launch?: LaunchSection;
+  [key: string]: unknown;
+}
+
+const DEFAULT_CONFIG: Config = { flow_mode: "manual" };
+
+export function configPath(root: string): string {
+  return path.join(root, "config.json");
+}
+
+/** Same temp-file scheme as store.ts: sibling temp + atomic rename, best-effort cleanup on error.
+ *  The temp name carries a per-call monotonic counter next to the pid:
+ *  concurrent writers in THIS process used to share one `<pid>.tmp` name and
+ *  truncate each other mid-write (a 4-round POST /mode burst corrupted
+ *  config.json in production); a unique suffix makes every writer's temp
+ *  distinct, and the per-path write chain below serializes the
+ *  read-modify-write so the last writer wins instead of the fastest one. */
+let tempSeq = 0;
+function tempPathFor(filePath: string): string {
+  tempSeq += 1;
+  return `${filePath}.${process.pid}.${tempSeq}.tmp`;
+}
+
+/**
+ * Per-config-path serialized write chain: every RMW writer
+ * (writeFlowMode, writeConfigKey, ensureConfig's create branch) runs inside
+ * this chain, so concurrent POST /mode calls read-modify-write one at a time
+ * — no lost updates, no interleaved temp/rename. The chain is
+ * failure-tolerant: a rejected predecessor never blocks later writers.
+ */
+const configWriteChains = new Map<string, Promise<unknown>>();
+
+function chainedConfigWrite<T>(filePath: string, op: () => Promise<T>): Promise<T> {
+  const prev = configWriteChains.get(filePath) ?? Promise.resolve();
+  const run = prev.then(op, op); // a failed predecessor must not wedge the chain
+  configWriteChains.set(
+    filePath,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return run;
+}
+
+async function writeConfigAtomic(filePath: string, config: Config): Promise<void> {
+  const temp = tempPathFor(filePath);
+  try {
+    await writeFile(temp, JSON.stringify(config, null, 2) + "\n", "utf8");
+    await rename(temp, filePath);
+  } catch (e) {
+    await unlink(temp).catch(() => undefined);
+    throw e;
+  }
+}
+
+/**
+ * Ensure `<root>/config.json` exists with `{"flow_mode": "manual"}`; create it
+ * atomically if missing. Returns the parsed config (existing file is left
+ * untouched, including unknown keys).
+ */
+export async function ensureConfig(root: string): Promise<Config> {
+  const filePath = configPath(root);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (e) {
+    if (!isErrnoException(e, "ENOENT")) throw e;
+    // Missing file: create atomically INSIDE the write chain (a concurrent
+    // POST /mode racing serve startup must not interleave with this create).
+    return chainedConfigWrite(filePath, async () => {
+      // Re-check under the chain: a concurrent writer may have created it.
+      try {
+        const existing = await readFile(filePath, "utf8");
+        return parseConfigStrict(existing, filePath);
+      } catch (e2) {
+        if (!isErrnoException(e2, "ENOENT")) throw e2;
+      }
+      await mkdir(root, { recursive: true });
+      await writeConfigAtomic(filePath, DEFAULT_CONFIG);
+      return { ...DEFAULT_CONFIG };
+    });
+  }
+  // Existing corrupt config throws to the caller: ensureConfig runs once at
+  // serve startup where failing fast is correct (readFlowMode owns the
+  // never-throw contract).
+  return parseConfigStrict(raw, filePath);
+}
+
+/**
+ * Read flow_mode FRESH from `<root>/config.json` on every call. Missing file,
+ * unreadable file, invalid JSON, or an invalid flow_mode value → "manual" +
+ * stderr warning; never throws.
+ */
+export async function readFlowMode(root: string): Promise<FlowMode> {
+  const filePath = configPath(root);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (e) {
+    if (isErrnoException(e, "ENOENT")) return "manual"; // pre-ensureConfig root: silent default
+    process.stderr.write(`tut: warning: cannot read ${filePath}: ${(e as Error).message}; defaulting flow_mode to "manual"\n`);
+    return "manual";
+  }
+  let config: Config;
+  try {
+    config = parseConfigStrict(raw, filePath);
+  } catch (e) {
+    process.stderr.write(`tut: warning: ${(e as Error).message}; defaulting flow_mode to "manual"\n`);
+    return "manual";
+  }
+  return config.flow_mode;
+}
+
+/** Parse and validate; throws on invalid JSON or invalid flow_mode (caller decides policy). */
+function parseConfigStrict(raw: string, filePath: string): Config {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`invalid JSON in ${filePath}: ${(e as Error).message}`);
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error(`invalid config in ${filePath}: expected an object`);
+  }
+  const candidate = parsed as { flow_mode?: unknown };
+  if (candidate.flow_mode !== "manual" && candidate.flow_mode !== "auto") {
+    throw new Error(`invalid config in ${filePath}: flow_mode must be "manual" or "auto"`);
+  }
+  return parsed as Config;
+}
+
+/** Distinguish the three read outcomes readConfig collapses to null (writeFlowMode needs the difference). */
+export type ReadOutcome = { status: "ok"; config: Config } | { status: "missing" } | { status: "invalid" };
+
+export async function readConfigFile(root: string): Promise<ReadOutcome> {
+  const filePath = configPath(root);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (e) {
+    if (isErrnoException(e, "ENOENT")) return { status: "missing" };
+    return { status: "invalid" };
+  }
+  try {
+    return { status: "ok", config: parseConfigStrict(raw, filePath) };
+  } catch {
+    return { status: "invalid" };
+  }
+}
+
+/**
+ * Read the FULL config object fresh from `<root>/config.json` (same per-request
+ * semantics as readFlowMode). Missing file, unreadable file, invalid JSON, or
+ * an invalid flow_mode → null; never throws and never warns — callers decide
+ * policy (/state echoes `notify` only when this returns a real object).
+ */
+export async function readConfig(root: string): Promise<Config | null> {
+  const outcome = await readConfigFile(root);
+  return outcome.status === "ok" ? outcome.config : null;
+}
+
+/**
+ * Extract the validated `auto` section from a config object
+ * (/state's optional `auto` key is this value). Tolerant of every malformed
+ * shape and never throws: an `auto` that is not an object, or whose
+ * `launch_roles` is present but not an array of strings, reads as ABSENT —
+ * which withholds every auto launch (same conservative effect
+ * as an empty list, but also keeps /state's surface schema-clean). An `auto`
+ * object without `launch_roles` normalizes to the explicit empty whitelist.
+ */
+export function autoSectionOf(config: Config | null | undefined): AutoConfig | undefined {
+  const candidate = config?.auto;
+  if (typeof candidate !== "object" || candidate === null) return undefined;
+  const roles = (candidate as { launch_roles?: unknown }).launch_roles;
+  if (candidate.remediate !== undefined && candidate.remediate !== "off" && candidate.remediate !== "enter-repress") {
+    process.stderr.write('tut: invalid auto.remediate (expected "off" | "enter-repress"); using "off"\n');
+  }
+  const remediate = candidate.remediate === undefined ? {} : { remediate: candidate.remediate === "enter-repress" ? "enter-repress" as const : "off" as const };
+  if (roles === undefined) return { launch_roles: [], ...remediate };
+  if (!Array.isArray(roles) || !roles.every((role) => typeof role === "string"))
+    return candidate.remediate === undefined ? undefined : { launch_roles: [], ...remediate };
+  return { launch_roles: roles, ...remediate };
+}
+
+/**
+ * Key-preserving flow_mode switch (POST /mode's engine):
+ * read-modify-write — unknown keys (e.g. the Notifier's `notify` config) all
+ * survive — via the same temp+rename atomic write as every other config write.
+ * A missing file starts from defaults (serve's ensureConfig normally created
+ * it already); a file that exists but cannot be parsed THROWS rather than
+ * clobber keys it cannot read — POST /mode surfaces that as a 500.
+ */
+export async function writeFlowMode(root: string, mode: FlowMode): Promise<Config> {
+  const filePath = configPath(root);
+  return chainedConfigWrite(filePath, async () => {
+    const outcome = await readConfigFile(root);
+    if (outcome.status === "invalid") {
+      throw new Error(`cannot switch flow_mode: ${filePath} is unreadable or corrupt`);
+    }
+    const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
+    config.flow_mode = mode;
+    await mkdir(root, { recursive: true });
+    await writeConfigAtomic(filePath, config);
+    return config;
+  });
+}
+
+// --- tut config get/set engine -------------------------------------------------
+//
+// The CLI surface (tut config) edits the SAME file serve re-reads per request
+// (readConfig above), so a write is picked up by the next poll cycle with no
+// restart and no Hub round-trip — config get/set works with the Hub down too
+// (same discipline as tut assign editing workspace.json directly).
+
+/** Scalar-settable config keys exposed to `tut config set`. */
+export type ConfigKey = "launch_mode" | "launch.catchup" | "power.mode" | "review_standards" | "usage_audit" | "flow_mode" | "auto.launch_roles" | "auto.remediate";
+
+/** All keys `tut config set` accepts, in hint-listing order. */
+export const CONFIG_KEYS: readonly ConfigKey[] = ["flow_mode", "launch_mode", "launch.catchup", "power.mode", "auto.launch_roles", "auto.remediate", "usage_audit", "review_standards"];
+
+/** One typed key/value pair ready to apply (discriminated so writeConfigKey narrows). */
+export type ConfigKeyAssignment = { key: "launch_mode"; value: LaunchMode } | { key: "launch.catchup"; value: LaunchCatchup } | { key: "power.mode"; value: PowerMode } | { key: "review_standards"; value: string } | { key: "usage_audit"; value: "off" | "on" } | { key: "flow_mode"; value: FlowMode } | { key: "auto.launch_roles"; value: string[] } | { key: "auto.remediate"; value: "off" | "enter-repress" };
+
+/** Legal-value domain hint for a key — used by `tut config` error text and help. */
+export function configKeyDomain(key: ConfigKey): string {
+  if (key === "launch_mode") return '"headless" | "tui"';
+  if (key === "launch.catchup") return '"off" | "on"';
+  if (key === "power.mode") return '"herdr" | "standalone"';
+  if (key === "review_standards") return 'comma-separated non-empty file paths, e.g. standards/review.md,/shared/team.txt; "" disables; no ASCII control characters or empty items; filenames containing commas are unsupported';
+  if (key === "usage_audit") return '"off" | "on"';
+  if (key === "auto.remediate") return '"off" | "enter-repress"';
+  return key === "flow_mode"
+    ? '"manual" | "auto"'
+    : `comma-separated bare role names (${KNOWN_ROLES.join("|")}), e.g. ${KNOWN_ROLES.join(",")}; "" clears the whitelist`;
+}
+
+/** Available-keys hint line shared by every `tut config` rejection path. */
+export function configKeysHint(): string {
+  const keys = CONFIG_KEYS.map((key) => `${key} (${configKeyDomain(key)})`).join(", ");
+  return `available keys: ${keys}; notify (get only — an object config, edit config.json by hand)`;
+}
+
+/**
+ * Validate and normalize a raw CLI string for one key. launch_roles: ""
+ * clears to the empty whitelist; comma-separated role names are trimmed and
+ * de-duplicated (order preserved) and must all be KNOWN_ROLES — the
+ * whitelist is role-keyed, so a typo must fail loudly, not silently withhold.
+ */
+export function parseConfigValue(
+  key: ConfigKey,
+  raw: string,
+): { ok: true; assignment: ConfigKeyAssignment } | { ok: false; error: string } {
+  if (key === "launch_mode") {
+    if (raw === "headless" || raw === "tui") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for launch_mode (expected ${configKeyDomain(key)})` };
+  }
+  if (key === "launch.catchup") {
+    if (raw === "off" || raw === "on") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for launch.catchup: "${raw}" (expected ${configKeyDomain(key)})` };
+  }
+  if (key === "review_standards") return parseReviewStandards(raw);
+  if (key === "usage_audit") {
+    if (raw === "off" || raw === "on") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for usage_audit: "${raw}" (expected off | on)` };
+  }
+  if (key === "flow_mode") {
+    if (raw === "manual" || raw === "auto") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for flow_mode: "${raw}" (expected ${configKeyDomain("flow_mode")})` };
+  }
+  if (key === "auto.remediate") {
+    if (raw === "off" || raw === "enter-repress") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for auto.remediate: "${raw}" (expected ${configKeyDomain(key)})` };
+  }
+  if (key === "power.mode") {
+    if (raw === "herdr" || raw === "standalone") return { ok: true, assignment: { key, value: raw } };
+    return { ok: false, error: `invalid value for power.mode: "${raw}" (expected ${configKeyDomain(key)})` };
+  }
+  const roles: string[] = [];
+  for (const piece of raw.split(",")) {
+    const role = piece.trim();
+    if (role.length === 0) continue;
+    if (!(KNOWN_ROLES as readonly string[]).includes(role)) {
+      // The error is the documentation: the format AND a copy-pasteable
+      // example ride along (roles are bare names — agents like "codex" are
+      // the classic wrong value this must teach its way out of).
+      return {
+        ok: false,
+        error:
+          `invalid role in auto.launch_roles: "${role}" — not a known role; ` +
+          `expected ${configKeyDomain("auto.launch_roles")}`,
+      };
+    }
+    if (!roles.includes(role)) roles.push(role);
+  }
+  return { ok: true, assignment: { key, value: roles } };
+}
+
+/** Local key validation shared by CLI set and get; never loads standard files. */
+export function parseReviewStandards(raw: unknown):
+  | { ok: true; assignment: { key: "review_standards"; value: string } }
+  | { ok: false; error: string } {
+  if (typeof raw === "string" && !/[\u0000-\u001f\u007f]/u.test(raw)) {
+    const items = raw.trim() === "" ? [] : raw.split(",").map((item) => item.trim());
+    if (items.every((item) => item.length > 0)) {
+      return { ok: true, assignment: { key: "review_standards", value: items.join(",") } };
+    }
+  }
+  return { ok: false, error: `invalid value for review_standards (expected ${configKeyDomain("review_standards")})` };
+}
+
+/**
+ * Key-preserving write of ONE validated key — the same read-modify-write +
+ * atomic temp/rename discipline as writeFlowMode: unknown keys (notify, future
+ * sections) and sibling keys inside `auto` all survive. Missing file starts
+ * from defaults; a file that exists but cannot be parsed THROWS rather than
+ * clobber keys it cannot read (the CLI surfaces that as exit 1).
+ */
+export async function writeConfigKey(root: string, assignment: ConfigKeyAssignment): Promise<Config> {
+  const { key } = assignment;
+  const filePath = configPath(root);
+  return chainedConfigWrite(filePath, async () => {
+    const outcome = await readConfigFile(root);
+    if (outcome.status === "invalid") {
+      throw new Error(`cannot set ${key}: ${filePath} is unreadable or corrupt`);
+    }
+    const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
+    if (assignment.key === "launch_mode") {
+      config.launch_mode = assignment.value;
+    } else if (assignment.key === "launch.catchup") {
+      const existing = typeof config.launch === "object" && config.launch !== null ? config.launch : {};
+      config.launch = { ...existing, catchup: assignment.value };
+    } else if (assignment.key === "review_standards") {
+      config.review_standards = assignment.value;
+    } else if (assignment.key === "usage_audit") {
+      config.usage_audit = assignment.value;
+    } else if (assignment.key === "flow_mode") {
+      config.flow_mode = assignment.value;
+    } else {
+      const existing = typeof config.auto === "object" && config.auto !== null ? config.auto : {};
+      if (assignment.key === "auto.launch_roles") {
+        config.auto = { ...existing, launch_roles: assignment.value };
+      } else if (assignment.key === "auto.remediate") {
+        config.auto = { launch_roles: [], ...existing, remediate: assignment.value };
+      } else if (assignment.key === "power.mode") {
+        const power = typeof config.power === "object" && config.power !== null ? config.power : {};
+        config.power = { ...power, mode: assignment.value };
+      } else {
+        throw new Error(`unsupported config key: ${key}`);
+      }
+    }
+    await mkdir(root, { recursive: true });
+    await writeConfigAtomic(filePath, config);
+    return config;
+  });
+}
+
+function isErrnoException(e: unknown, code: string): boolean {
+  return typeof e === "object" && e !== null && "code" in e && (e as { code?: unknown }).code === code;
+}

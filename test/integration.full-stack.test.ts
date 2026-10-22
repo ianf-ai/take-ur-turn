@@ -42,9 +42,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { startServer, type RunningServer } from "../src/hub/server.js";
-import { Notifier } from "../src/notifier/notifier.js";
-import { hubCreate, hubDecide, hubPublish, hubRead } from "../src/hub/hub-client.js";
+import { startServer, type RunningServer } from "../src/core/hub/server.js";
+import { Notifier } from "../src/core/notifier/notifier.js";
+import { hubCreate, hubDecide, hubPublish, hubRead } from "../src/core/hub/hub-client.js";
 import { main } from "../src/cli.js";
 
 // --- shared harness -----------------------------------------------------------------
@@ -207,6 +207,7 @@ async function startStack(): Promise<Stack> {
     `${JSON.stringify(
       {
         flow_mode: "manual",
+        launch_mode: "tui",
         notify: { channels: ["webhook"], webhook_url: sink.url },
         auto: { launch_roles: ["architect", "executor", "reviewer"] },
       },
@@ -238,6 +239,10 @@ async function startHubOnly(): Promise<string> {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-intstack-"));
   cleanups.push(() => rmSync(tmp, { recursive: true, force: true }));
   setEnv("TUT_PROJECT_ROOT", tmp);
+  // launch_mode=tui keeps the manual start-next door on the pane chain here;
+  // the headless door's coverage lives in test/start-next-headless.test.ts.
+  mkdirSync(path.join(tmp, ".context-hub"), { recursive: true });
+  writeFileSync(path.join(tmp, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
   const running = await startServer({ root: path.join(tmp, ".context-hub"), port: 0 });
   setEnv("TUT_HUB_ROOT", tmp);
   cleanups.push(() => running.close());

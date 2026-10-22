@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { LaunchInvocation } from "../src/common/types.js";
-import type { HerdrCommandResult, HerdrPane } from "../src/launcher/legacy-herdr-client.js";
-import { birthPane } from "../src/launcher/birth.js";
+import type { LaunchInvocation } from "../src/core/common/types.js";
+import type { HerdrCommandResult, HerdrPane } from "../src/herdr/launcher/legacy-herdr-client.js";
+import { birthPane } from "../src/herdr/launcher/birth.js";
 import {
   cleanupTaskPanes,
   planReap,
@@ -9,7 +9,7 @@ import {
   runRoundLifecycle,
   taskPaneLabel,
   type LifecycleClient,
-} from "../src/launcher/lifecycle.js";
+} from "../src/herdr/launcher/lifecycle.js";
 
 const anchor = { workspace_id: "w1", cwd: "/repo", pane_id: "w1:p1" };
 
@@ -67,7 +67,7 @@ function lifecycleFixture(initial: HerdrPane[]): {
 
 describe("launcher lifecycle policy", () => {
   it("a turn-complete (done) seat continues — the agent process is alive and waiting for the next prompt", async () => {
-    // F1 live evidence: pi reports agent_status=done the moment it finishes a
+    //  live evidence: pi reports agent_status=done the moment it finishes a
     // turn while its node.exe stays in the foreground process group. The
     // hand-off to the next same-role round happens exactly then, so a "done"
     // seat is the canonical continuation target, not a corpse.
