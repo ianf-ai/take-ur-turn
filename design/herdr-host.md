@@ -191,7 +191,7 @@ auto 启动成功先通知 launch succeeded 并开始 working 短引信；同任
 
 delivery_giveup 经 task 标签反查立即告警，有效 delivery_v2 优先解释原因；无有效证据 reason=unknown。通知按 task / pane / agent / attempt 进程内去重，无 v2 则按任务版本；版本前进可再提醒。give-up 不续期 stall，若命中 working 短引信则解除，避免重复告警；受控 Enter 规则见 3.3。
 
-done 在任何异步读 mode 前同步登记 per-task sweep barrier；只有 launch_mode=tui 才列本 rig `<T>.*` pane，逐个读取 visible 尾部 40 行写通知日志，每行带时间和标签。headless 或不可读 / 非法 mode 记录 skip，不调用 Herdr；缺配置 / 缺键按 tui。成功、skip、失败均释放 barrier，下一轮 marker / spawn 等它落定；归档 best-effort，done 的即时 compare 与延迟复查仍执行。
+done 在任何异步读 mode 前同步登记 per-task sweep barrier；只有 launch_mode=tui 才列本 rig `<T>.*` pane，逐个读取 visible 尾部 40 行写通知日志，每行带时间和标签。detached（含旧配置别名 headless）或不可读 / 非法 mode 记录 skip，不调用 Herdr；缺配置 / 缺键按 tui。成功、skip、失败均释放 barrier，下一轮 marker / spawn 等它落定；归档 best-effort，done 的即时 compare 与延迟复查仍执行。
 
 Host 状态转送复用 pending_approval 进入沿与 needs_attention 上升沿，各沿仅尝试一次 pane send-text，同轮可各一条。JSON 只含 task_id / status / waiting_for，status 使用报告沿名，不含标题、指令或授权。目标取 notify.host_pane_label，缺省 / 空取本 rig `tut-host-<rig>`；只在唯一精确匹配时发送，零个 / 多个 / 失败仅日志，不重试、不阻塞比较队列、不持久去重。Host 收到只是知悉信号。
 

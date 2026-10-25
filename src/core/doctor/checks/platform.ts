@@ -1,11 +1,10 @@
 import { homedir } from "node:os";
-import { resolvePaneShellDialect, PaneShellError } from "../../../herdr/launcher/shell-renderer.js";
 import { worst } from "../shared.js";
 import type { DoctorCheck, DoctorContext, DoctorStatus } from "../types.js";
 
 // --- check 7: platform -----------------------------------------------------------
 
-function checkPlatform(ctx: DoctorContext): DoctorCheck {
+function checkPlatform(ctx: DoctorContext, probeShell: (ctx: DoctorContext, check: DoctorCheck, statuses: DoctorStatus[]) => void): DoctorCheck {
   const check: DoctorCheck = {
     name: "platform",
     title: "platform info",
@@ -21,18 +20,7 @@ function checkPlatform(ctx: DoctorContext): DoctorCheck {
     statuses.push("warn");
     check.details.push("node below the engines floor (>=20) — unsupported territory");
   }
-  try {
-    const dialect = resolvePaneShellDialect(ctx.env, ctx.platform);
-    check.details.push(
-      `pane shell dialect: ${dialect}${ctx.env.TUT_PANE_SHELL !== undefined ? " (TUT_PANE_SHELL)" : " (platform default)"}`,
-    );
-  } catch (e) {
-    if (e instanceof PaneShellError) {
-      statuses.push("fail");
-      check.details.push(`${e.message} — birth-time resolution fails loud on unknown dialects`);
-      check.fix = "unset TUT_PANE_SHELL or set it to one of posix, powershell5, pwsh, cmd";
-    }
-  }
+  probeShell(ctx, check, statuses);
   if (ctx.platform === "win32") {
     const nonAscii = [homedir(), ctx.projectRoot, ctx.env.USERNAME ?? ""].some((p) => /[^\x00-\x7f]/u.test(p));
     if (nonAscii) {

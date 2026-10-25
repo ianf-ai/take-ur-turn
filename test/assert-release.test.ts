@@ -28,6 +28,8 @@ async function makeRoot(files: Record<string, string>): Promise<string> {
 
 /** Complete, healthy fixture — individual cases delete/shrink one entry. */
 const HEALTHY_FILES: Record<string, string> = {
+  "scripts/windows-run/broker.ps1": "# broker\n",
+  "scripts/windows-run/native.cs": "// native helper\n",
   "dist/core/cli.js": `export {};\n${"x".repeat(2_001)}`,
   "dist/cli.js": `#!/usr/bin/env node\n${"x".repeat(10_001)}`,
   "dist/herdr/launcher/pane-runner.js": "export {};\n",
@@ -61,6 +63,13 @@ afterEach(async () => {
 });
 
 describe("scripts/assert-release.js release gate", () => {
+  it.each(['broker.ps1', 'native.cs'])('requires the installed Windows helper %s', async name => {
+    const files = { ...HEALTHY_FILES };
+    delete files[`scripts/windows-run/${name}`];
+    const result = await runGate(await freshRoot(files));
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(name);
+  });
   it("passes when every runtime entry exists and is non-empty", async () => {
     const root = await freshRoot(HEALTHY_FILES);
     const result = await runGate(root);
@@ -74,7 +83,7 @@ describe("scripts/assert-release.js release gate", () => {
     const root = await freshRoot(files);
     const result = await runGate(root);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("dist/cli.js");
+    expect(result.stderr).toContain(path.join("dist", "cli.js"));
   });
 
   it.each(['', 'truncated'])("rejects a missing/undersized core dispatcher (%s)", async content => {
@@ -83,7 +92,7 @@ describe("scripts/assert-release.js release gate", () => {
     else delete files['dist/core/cli.js'];
     const result = await runGate(await freshRoot(files));
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain('dist/core/cli.js');
+    expect(result.stderr).toContain(path.join('dist', 'core', 'cli.js'));
   });
 
   it("fails when dist/herdr/launcher/pane-runner.js is missing (absolute-path pane contract)", async () => {
@@ -156,7 +165,7 @@ describe("scripts/assert-release.js release gate", () => {
     const root = await freshRoot({ ...HEALTHY_FILES, "dist/cli.js": "#!/usr/bin/env node\nsmall" });
     const result = await runGate(root);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("dist/cli.js");
+    expect(result.stderr).toContain(path.join("dist", "cli.js"));
     expect(result.stderr).toContain("suspiciously small");
   });
 

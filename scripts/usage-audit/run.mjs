@@ -4,8 +4,13 @@ import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { run } from './lib/audit.mjs';
 import { requestTimeout } from './lib/hub.mjs';
-export function parse(argv, env = process.env) {
-  const o = { root: process.cwd(), url: 'http://127.0.0.1:3001', piRoot: path.join(os.homedir(), '.pi/agent/sessions'), codexRoot: path.join(os.homedir(), '.codex/sessions'), intervalMs: 5000, timeoutMs: Infinity };
+export function parse(argv, env = process.env, runtime = {}) {
+  const platform = runtime.platform ?? process.platform, home = runtime.home ?? os.homedir();
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const o = { root: runtime.cwd ?? process.cwd(), url: 'http://127.0.0.1:3001',
+    ...(platform === 'win32' ? { platform, home, piEnv: { PI_CODING_AGENT_SESSION_DIR: env.PI_CODING_AGENT_SESSION_DIR, PI_CODING_AGENT_DIR: env.PI_CODING_AGENT_DIR } }
+      : { piRoot: paths.join(home, '.pi/agent/sessions') }),
+    codexRoot: paths.join(home, '.codex/sessions'), intervalMs: 5000, timeoutMs: Infinity };
   let modes = 0;
   const seen = new Set();
   for (let i=0; i<argv.length; i++) {
@@ -33,13 +38,13 @@ export function parse(argv, env = process.env) {
   }
   if (!o.help && modes !== 1) throw new Error('choose exactly one: --watch | --since ISO8601 | --backfill | --recover');
   if (!o.help) o.requestTimeoutMs = requestTimeout(env);
-  for (const key of ['root','piRoot','codexRoot']) o[key] = path.resolve(o[key]);
+  for (const key of ['root','piRoot','codexRoot']) if (o[key] !== undefined) o[key] = paths.resolve(runtime.cwd ?? process.cwd(), o[key]);
   return o;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     const options = parse(process.argv.slice(2));
-    if (options.help) console.log('usage-audit --watch | --since ISO8601 | --backfill | --recover\n  --root PROJECT_ROOT --url HUB_URL --task TASK_ID\n  --pi-root DIR --codex-root DIR --interval-ms 5000 --timeout-ms N\n  TUT_USAGE_AUDIT_TIMEOUT_MS: Hub read timeout, default 30000ms\n  --recover: report owner, reclaim dead lock only, backfill, suggest --watch; never kill\nBuild first: npm run build. See README.md for schema and diagnostics.');
+    if (options.help) console.log('usage-audit --watch | --since ISO8601 | --backfill | --recover\n  --root PROJECT_ROOT --url HUB_URL --task TASK_ID\n  --pi-root DIR --codex-root DIR --interval-ms 5000 --timeout-ms N\n  TUT_USAGE_AUDIT_TIMEOUT_MS: Hub/local I/O deadline, default 30000ms\n  --recover: report owner, reclaim dead lock only, backfill, suggest --watch; never kill\nBuild first: npm run build. See README.md for schema and diagnostics.');
     else {
       const abort = new AbortController();
       for (const signal of ['SIGINT','SIGTERM']) process.once(signal, () => abort.abort());

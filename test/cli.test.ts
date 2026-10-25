@@ -1,3 +1,4 @@
+import { fixtureExecutable } from "./helpers/executable.js";
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
 vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
@@ -8,6 +9,7 @@ vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
+import { rm } from "node:fs/promises";
 import path from "node:path";
 
 // The context-subcommand handler tests mock ONLY the hub-client layer: their
@@ -52,6 +54,7 @@ async function withCleanChain<T>(fn: () => Promise<T>): Promise<T> {
   const prevCwd = process.cwd();
   const prevUserDir = process.env.TUT_USER_CONFIG_DIR;
   const prevHerdr = process.env.TUT_HERDR_EXECUTABLE;
+  const prevPath = process.env.PATH;
   const prevPanes = process.env.TUT_HERDR_PANES;
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-cli-chain-"));
   process.chdir(tmp);
@@ -60,7 +63,8 @@ async function withCleanChain<T>(fn: () => Promise<T>): Promise<T> {
   mkdirSync(path.join(tmp, ".context-hub"), { recursive: true });
   writeFileSync(path.join(tmp, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
   process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
-  process.env.TUT_HERDR_EXECUTABLE = path.resolve(import.meta.dirname, "bin/herdr");
+  process.env.PATH = [path.resolve(import.meta.dirname, "bin"), prevPath].join(path.delimiter);
+  process.env.TUT_HERDR_EXECUTABLE = fixtureExecutable(path.resolve(import.meta.dirname, "bin/herdr"));
   process.env.TUT_HERDR_PANES = "[]";
   try {
     return await fn();
@@ -68,11 +72,13 @@ async function withCleanChain<T>(fn: () => Promise<T>): Promise<T> {
     process.chdir(prevCwd);
     if (prevUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
     else process.env.TUT_USER_CONFIG_DIR = prevUserDir;
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
     if (prevHerdr === undefined) delete process.env.TUT_HERDR_EXECUTABLE;
     else process.env.TUT_HERDR_EXECUTABLE = prevHerdr;
     if (prevPanes === undefined) delete process.env.TUT_HERDR_PANES;
     else process.env.TUT_HERDR_PANES = prevPanes;
-    rmSync(tmp, { recursive: true, force: true });
+    await rm(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 
@@ -984,6 +990,7 @@ describe("mode / start-next handlers (real hub)", () => {
     const prevCwd = process.cwd();
     const prevUserDir = process.env.TUT_USER_CONFIG_DIR;
     const prevHerdr = process.env.TUT_HERDR_EXECUTABLE;
+    const prevPath = process.env.PATH;
     const prevPanes = process.env.TUT_HERDR_PANES;
     const chainTmp = mkdtempSync(path.join(os.tmpdir(), "tut-cli-race-"));
     process.chdir(chainTmp);
@@ -991,7 +998,8 @@ describe("mode / start-next handlers (real hub)", () => {
     mkdirSync(path.join(chainTmp, ".context-hub"), { recursive: true });
     writeFileSync(path.join(chainTmp, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
     process.env.TUT_USER_CONFIG_DIR = path.join(chainTmp, "user-config");
-    process.env.TUT_HERDR_EXECUTABLE = path.resolve(import.meta.dirname, "bin/herdr");
+    process.env.PATH = [path.resolve(import.meta.dirname, "bin"), prevPath].join(path.delimiter);
+    process.env.TUT_HERDR_EXECUTABLE = fixtureExecutable(path.resolve(import.meta.dirname, "bin/herdr"));
     process.env.TUT_HERDR_PANES = JSON.stringify([
       { pane_id: "FIX:hub", label: "tut-hub", workspace_id: "wX", cwd: "/repo", agent_status: "idle" },
       { pane_id: "FIX:notify", label: "tut-notify", workspace_id: "wX", cwd: "/repo", agent_status: "idle" },
@@ -1003,11 +1011,13 @@ describe("mode / start-next handlers (real hub)", () => {
       process.chdir(prevCwd);
       if (prevUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
       else process.env.TUT_USER_CONFIG_DIR = prevUserDir;
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
       if (prevHerdr === undefined) delete process.env.TUT_HERDR_EXECUTABLE;
       else process.env.TUT_HERDR_EXECUTABLE = prevHerdr;
       if (prevPanes === undefined) delete process.env.TUT_HERDR_PANES;
       else process.env.TUT_HERDR_PANES = prevPanes;
-      rmSync(chainTmp, { recursive: true, force: true });
+      await rm(chainTmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
 
     expect(code).toBe(1);
@@ -1358,7 +1368,7 @@ describe("default URL/port convergence", () => {
 
   it("USAGE teaches the multi-hub --url discipline and documents up --event-port", () => {
     expect(USAGE).toContain("verified via /state.hub_root");
-    expect(USAGE).toContain("tut up [--url <u>] [--event-port <p>] [--root <dir>] [--dry-run]");
+    expect(USAGE).toContain("tut up [--url <u>] [--event-port <p>] [--root <dir>] [--adopt] [--dry-run]");
   });
 });
 

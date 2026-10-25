@@ -4,6 +4,24 @@ import { open } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { release } from "node:os";
+import { createWindowsRunFileSession, openWindowsRunFile } from "./windows-run-file.js";
+
+/** Only bounded read operations are shared with the Windows helper. */
+export interface RunFileStat { size: number; dev: number; ino: number; isFile(): boolean }
+export interface RunFile {
+  stat(): Promise<RunFileStat>;
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+  close(): Promise<void>;
+}
+export type RunFileOpener = (file: string) => Promise<RunFile>;
+
+/** Reuse compilation only within one sequential snapshot, not file handles. */
+export async function withRunFileSession<T>(read: (open: RunFileOpener) => Promise<T>, platform: NodeJS.Platform = process.platform): Promise<T> {
+  if (platform !== "win32") return read(openRunFile);
+  const session = createWindowsRunFileSession();
+  try { return await read(file => session.open(file)); }
+  finally { await session.close(); }
+}
 
 // Darwin ABI, present in macOS 11's XNU. Older kernels must fail closed.
 // Node does not export it. Unlike O_NOFOLLOW it rejects *every* symlink in
@@ -13,7 +31,8 @@ import { release } from "node:os";
 const DARWIN_NOFOLLOW_ANY = 0x20000000;
 
 /** Exported only as an internal OS seam; callers cannot request an unsafe fallback. */
-export async function openRunFile(file: string, platform: NodeJS.Platform = process.platform, kernelRelease = release()): Promise<FileHandle> {
+export async function openRunFile(file: string, platform: NodeJS.Platform = process.platform, kernelRelease = release()): Promise<RunFile> {
+  if (platform === "win32") return openWindowsRunFile(file);
   const flags = constants.O_RDONLY | constants.O_NONBLOCK;
   if (platform === "darwin") {
     if (Number.parseInt(kernelRelease, 10) < 20 || !Number.isFinite(Number.parseInt(kernelRelease, 10))) {

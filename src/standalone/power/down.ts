@@ -33,6 +33,7 @@ import { RunReadStore, type RunEntry } from "../../core/hub/run-store.js";
 import { powerStatePath, processAlive, groupAlive, processStartToken, readPowerState, writePowerState, readPowerMembers, prunePowerMembers, type ServiceFacts, type PowerState, type PowerMember } from "./standalone-up.js";
 import path from "node:path";
 import { sleepMs } from "../../core/cli/shared.js";
+import { stopWindowsService } from "./windows.js";
 
 /** TUT_DOWN_GRACE_MS (read per call) bounds the SIGTERM grace window —
  *  test/ops knob, the same discipline as TUT_UP_HUB_WAIT_MS. */
@@ -129,6 +130,18 @@ async function signalGroupLadder(name: string, pid: number, pgid: number): Promi
  */
 async function stopService(name: string, facts: ServiceFacts, storageDir: string): Promise<StopOutcome> {
   if (facts.pid === null) return "no-pid";
+  if (process.platform === "win32") {
+    try {
+      if (facts.process_scope !== "windows-tree") throw new Error("no Windows tree registration; explicitly adopt the service with tut up --adopt");
+      if (facts.stopped_at && !processAlive(facts.pid)) return "already-stopped";
+      await stopWindowsService(path.dirname(storageDir), facts.pid, facts.start_token);
+      process.stdout.write(`down: ${name} stopped (Windows identity-verified tree; runs excluded; no Job Object container)\n`);
+      return "forced";
+    } catch (error) {
+      process.stderr.write(`tut: down: ${name}: ${(error as Error).message}; stop unverified\n`);
+      return "unverified";
+    }
+  }
   const pgid = facts.pgid ?? facts.pid;
   if (!groupAlive(pgid)) return "already-stopped";
   if (!processAlive(facts.pid)) {
@@ -196,6 +209,11 @@ async function endpointsStillServing(root: string, state: PowerState): Promise<s
  * what "already stopped" means on a retry.
  */
 async function rigFullyStopped(root: string, state: PowerState): Promise<boolean> {
+  if (process.platform === "win32") {
+    // Only used after a completed stop. A live replacement is not ours to stop.
+    if ([state.hub, state.notifier, state.watcher].some(facts => facts?.pid != null && processAlive(facts.pid))) return false;
+    return (await endpointsStillServing(root, state)).length === 0;
+  }
   if (state.hub.pid !== null && groupAlive(state.hub.pgid ?? state.hub.pid)) return false;
   if (state.notifier.pid !== null && groupAlive(state.notifier.pgid ?? state.notifier.pid)) return false;
   if (state.watcher != null && state.watcher.pid !== null && groupAlive(state.watcher.pgid ?? state.watcher.pid)) return false;
@@ -221,12 +239,22 @@ export async function stopStandaloneRig(root: string, state: PowerState): Promis
   }
 
   const services: DownReport["services"] = [];
+  const stop = async (name: string, facts: ServiceFacts): Promise<void> => {
+    const outcome = await stopService(name, facts, storageDir);
+    services.push({ name, outcome });
+    if (process.platform === "win32" && (outcome === "forced" || outcome === "stopped")) {
+      facts.stopped_at = new Date().toISOString();
+      // Persist partial completion before attempting another service. A failed
+      // stop never writes the rig-level stopped_at marker.
+      await writePowerState(storageDir, state);
+    }
+  };
   // Reverse start order: hub → notifier → watcher becomes notifier → watcher → hub.
-  services.push({ name: "notifier", outcome: await stopService("notifier", state.notifier, storageDir) });
+  await stop("notifier", state.notifier);
   if (state.watcher != null) {
-    services.push({ name: "usage watcher", outcome: await stopService("usage watcher", state.watcher, storageDir) });
+    await stop("usage watcher", state.watcher);
   }
-  services.push({ name: "hub", outcome: await stopService("hub", state.hub, storageDir) });
+  await stop("hub", state.hub);
 
   // Fail-visible edges: a service without recorded facts is only stoppable
   // via its endpoint evidence; one that refused to die, or whose identity

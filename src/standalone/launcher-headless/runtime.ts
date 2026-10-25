@@ -106,14 +106,14 @@ export class HeadlessRuntime {
           if (intent.startup === 'failed') {
             if (existing !== undefined && existing.run === id) {
               this.occupied.delete(intent.task_id);
-              this.deps.log(`headless run ${id}: startup intent confirmed failed; releasing adopted reservation (task ${intent.task_id})`);
+              this.deps.log(`detached run ${id}: startup intent confirmed failed; releasing adopted reservation (task ${intent.task_id})`);
             }
           } else if (existing?.run !== id && (existing === undefined || existing.run === undefined || existingComplete)) {
             this.replaceSeat(intent.task_id, { task: {task_id:intent.task_id,title:intent.task_id}, role:intent.headless.role, agent:intent.headless.route.agent, attempt:intent.headless.attempt_id, run:id, uncertain:true, intentOnly:true }, existingMeta);
-            this.deps.log(`headless run ${id}: adopted pending startup intent (task ${intent.task_id}, role ${intent.headless.role}${existingComplete ? ', replacing completed seat' : ''}); handshake unconfirmed; inspect tut ps`);
+            this.deps.log(`detached run ${id}: adopted pending startup intent (task ${intent.task_id}, role ${intent.headless.role}${existingComplete ? ', replacing completed seat' : ''}); handshake unconfirmed; inspect tut ps`);
           }
         } catch { /* Legacy/manual incomplete run has no headless ownership. */ }
-        if (initial) this.deps.log(`headless run ${id}: incomplete/unreadable; inspect tut ps`);
+        if (initial) this.deps.log(`detached run ${id}: incomplete/unreadable; inspect tut ps`);
         continue;
       }
       if (!meta.task_id || !meta.headless) continue;
@@ -155,14 +155,14 @@ export class HeadlessRuntime {
     await hubPublish(plan.hubUrl, {task_id:plan.task_id,role:'human',content_type:'note',expected_version:plan.base_version,
       payload:{summary:`launch: ${plan.role} (base v${plan.base_version})`,body:`Recorded headless launch of ${plan.role} via ${via}; attempt_id=${plan.attempt_id}.`,
         launch:{protocol_version:2,role:plan.role,base_version:plan.base_version,via,route:plan.route,route_source:plan.route_source,
-          target_kind:'headless-posix',target_digest:plan.target_digest,launch_mode:'headless',attempt_id:plan.attempt_id,trigger_version:plan.trigger_version}}});
+          target_kind:plan.target_kind ?? 'headless-posix',target_digest:plan.target_digest,launch_mode:'headless',attempt_id:plan.attempt_id,trigger_version:plan.trigger_version}}});
   }
   /** Reserve synchronously before detached handshake, preventing a second writer. */
   launch(plan: HeadlessPlan): void {
     if (plan.checkout_fallback === true) {
       // Anchored mode found no 工作区 declaration: the fallback is explicit,
-      // auditable, and never a silent guess (design 7.6).
-      this.deps.log(`headless checkout fallback: no 工作区 declaration in description for task ${plan.task_id}; spawn cwd stays at rig root ${plan.hubRoot}`);
+      // auditable, and never a silent guess.
+      this.deps.log(`detached checkout fallback: no 工作区 declaration in description for task ${plan.task_id}; spawn cwd stays at rig root ${plan.hubRoot}`);
     }
     const run = this.launchAttempt(plan);
     this.starting.add(run);
@@ -205,10 +205,14 @@ export class HeadlessRuntime {
           const sessionBusy = sessionOccupants(this.store, { agent: plan.route.agent, session_id: plan.ownership.designated_session_id });
           if (sessionBusy.length > 0) throw new AdmissionCovered(`session already held by: ${sessionBusy.map(o => o.run_id).join(', ')}`);
         }
+        if (plan.ownership.windows && plan.ownership.resume_from_run_id) {
+          try { (await import('./windows-plan.js')).verifyWindowsContinuation(plan.ownership, plan.checkoutRoot); }
+          catch (e) { throw new AdmissionStale(`native session changed before spawn: ${(e as Error).message}`); }
+        }
         return await (this.deps.start ?? startRun)(this.store,plan.argv,plan.checkoutRoot,plan.task_id,{env:plan.env,headless:plan.ownership,...(plan.checkout !== undefined ? {checkout:plan.checkout} : {})});
       });
       owned.run = id; owned.starting = false;
-      this.deps.log(`headless started task=${plan.task_id} role=${plan.role} attempt_id=${plan.attempt_id} run_id=${id}; ${plan.ownership.session_reason}; tut attach ${id}`);
+      this.deps.log(`detached started task=${plan.task_id} role=${plan.role} attempt_id=${plan.attempt_id} run_id=${id}; ${plan.ownership.session_reason}; tut attach ${id}`);
       onOutcome?.({ kind: 'launched', run_id: id });
     } catch (e) {
       owned.starting = false;
@@ -216,7 +220,7 @@ export class HeadlessRuntime {
         // The winner (typically a manual resume) represents the same round;
         // release only this candidate, not a winner already discovered by sync.
         if (this.occupied.get(plan.task_id) === owned) this.occupied.delete(plan.task_id);
-        this.deps.log(`headless launch skipped task=${plan.task_id} role=${plan.role} attempt_id=${plan.attempt_id}: ${e.message}`);
+        this.deps.log(`detached launch skipped task=${plan.task_id} role=${plan.role} attempt_id=${plan.attempt_id}: ${e.message}`);
         onOutcome?.({ kind: 'skipped', reason: e.message });
         return;
       }
@@ -278,7 +282,7 @@ export class HeadlessRuntime {
         const meta = this.store.read(id);
         assertOwnership(owned, meta);
         if (complete(meta)) this.queueCompletion(owned, meta);
-      } catch (e) { this.deps.log(`headless completion metadata check failed run=${id}: ${(e as Error).message}`); }
+      } catch (e) { this.deps.log(`detached completion metadata check failed run=${id}: ${(e as Error).message}`); }
     }
     const reads = new Map<string, Promise<ContextRecord[]>>();
     for (const [id, { owned, meta }] of this.completions) {
@@ -293,7 +297,7 @@ export class HeadlessRuntime {
           await this.report(owned, 'stopped-without-publish', meta);
         }
         this.completions.delete(id);
-      } catch (e) { this.deps.log(`headless completion context check failed task=${task}: ${(e as Error).message}`); }
+      } catch (e) { this.deps.log(`detached completion context check failed task=${task}: ${(e as Error).message}`); }
     }
   }
   private async observeSilence(owned: Owned, meta: RunMeta, options: { now: number; stallMs: number; tasks: ReadonlyMap<string, { status: string }> }): Promise<void> {
@@ -312,11 +316,11 @@ export class HeadlessRuntime {
       previous.alerted = true; // Reserve the edge before any async send, including failures.
       const body = `task_id=${owned.task.task_id}; role=${owned.role}; attempt_id=${owned.attempt}; run_id=${id}; reason=suspected-blocked/silent; log mtime unchanged for ${options.now - previous.since}ms; long silence may mean thinking or waiting, not confirmed blocked; observed_at=${new Date(options.now).toISOString()}; inspect tut ps / tut attach ${id}`;
       this.deps.log(body);
-      try { await this.deps.send({ title: `TUT ${owned.task.task_id}: headless silent`, body, task_id: owned.task.task_id }); }
-      catch (e) { this.deps.log(`headless silence notification failed: ${(e as Error).message}`); }
+      try { await this.deps.send({ title: `TUT ${owned.task.task_id}: detached silent`, body, task_id: owned.task.task_id }); }
+      catch (e) { this.deps.log(`detached silence notification failed: ${(e as Error).message}`); }
     } catch (e) {
       this.silence.delete(id);
-      this.deps.log(`headless log observation failed run_id=${id}: ${(e as Error).message}`);
+      this.deps.log(`detached log observation failed run_id=${id}: ${(e as Error).message}`);
     }
   }
   /** True consumes the interval; false defers until run evidence is complete. */
@@ -330,7 +334,7 @@ export class HeadlessRuntime {
     let runs: RunMeta[];
     try { runs = this.store.list().map(id => this.store.read(id)).filter(m => m.task_id === task && m.headless); }
     catch (e) {
-      this.deps.log(`headless delivery observation unknown task=${task}: ${(e as Error).message}`);
+      this.deps.log(`detached delivery observation unknown task=${task}: ${(e as Error).message}`);
       throw e; // Notifier retains the version interval for the next poll.
     }
     if (runs.some(m => !complete(m))) return false;
@@ -346,16 +350,16 @@ export class HeadlessRuntime {
       const at = Date.parse(record.timestamp);
       const intervals = runs.map(m => ({ start: Date.parse(m.started_at), end: Date.parse(m.ended_at!) }));
       if (!Number.isFinite(at) || at > now || !Number.isFinite(Date.parse(preceding!.timestamp)) || at < Date.parse(preceding!.timestamp) || intervals.some(i => !Number.isFinite(i.start) || !Number.isFinite(i.end) || i.end < i.start) || at < Date.parse(ownedRun.started_at)) {
-        this.deps.log(`headless delivery observation unknown task=${task} version=${record.version}: inconsistent timeline`); continue;
+        this.deps.log(`detached delivery observation unknown task=${task} version=${record.version}: inconsistent timeline`); continue;
       }
       if (intervals.some(i => i.start <= at && at <= i.end)) continue;
       try {
         await this.notices.once(`ghost:${task}:${record.version}`, async () => {
           const body = `task_id=${task}; role=${record.role}; version=${record.version}; attempt_id=${marker.attempt_id}; run_id=${ownedRun.run_id}; reason=ghost-delivery; record_at=${record.timestamp}; observed_at=${new Date(now).toISOString()}; no owned run covers the delivery timestamp (round ended_at=${ownedRun.ended_at}); inspect tut read ${task} / tut ps / tut attach ${ownedRun.run_id}`;
           this.deps.log(body);
-          await this.deps.send({ title: `TUT ${task}: headless diagnostic`, body, task_id: task });
+          await this.deps.send({ title: `TUT ${task}: detached diagnostic`, body, task_id: task });
         });
-      } catch (e) { this.deps.log(`headless delivery notification failed: ${(e as Error).message}`); }
+      } catch (e) { this.deps.log(`detached delivery notification failed: ${(e as Error).message}`); }
     }
     return true;
   }
@@ -372,18 +376,18 @@ export class HeadlessRuntime {
       // A queued local candidate may have yielded admission to a CLI run.
       // Consume that current reservation, not the candidate captured at close.
       try { this.syncNew(); }
-      catch (e) { this.deps.log(`headless close ${taskId}: ownership sync failed (${(e as Error).message}); using known reservation`); }
+      catch (e) { this.deps.log(`detached close ${taskId}: ownership sync failed (${(e as Error).message}); using known reservation`); }
       const owned = this.occupied.get(taskId) ?? atClose;
       const base: CloseStopAuditInput = { task_id: taskId, ...(closeVersion !== undefined ? { close_version: closeVersion } : {}),
         ...(owned.run !== undefined ? { run: { run_id: owned.run, attempt_id: owned.attempt } } : {}) };
       if (!owned.run) {
-        this.deps.log(`headless close ${taskId}: startup unconfirmed`);
+        this.deps.log(`detached close ${taskId}: startup unconfirmed`);
         await this.auditCloseStop({ ...base, failure: 'startup unconfirmed: no run id at close time' });
         return;
       }
       try {
         const result = await (this.deps.stop ?? stopRun)(this.store,owned.run);
-        this.deps.log(`headless close ${taskId} run_id=${owned.run}: ${result.result}`);
+        this.deps.log(`detached close ${taskId} run_id=${owned.run}: ${result.result}`);
         const meta = result.meta;
         const stop = meta.stop_request;
         await this.auditCloseStop({
@@ -401,7 +405,7 @@ export class HeadlessRuntime {
           },
         });
       } catch (e) {
-        this.deps.log(`headless close ${taskId}: ${(e as Error).message}; inspect tut ps / tut attach ${owned.run}`);
+        this.deps.log(`detached close ${taskId}: ${(e as Error).message}; inspect tut ps / tut attach ${owned.run}`);
         await this.auditCloseStop({ ...base, failure: `stop attempt failed: ${(e as Error).message}` });
       }
     })().finally(() => this.stopping.delete(taskId));
@@ -445,9 +449,9 @@ export class HeadlessRuntime {
       await this.notices.once(key,async () => {
         const body = `${owned.task.title}; task_id=${owned.task.task_id}; role=${owned.role}; agent=${owned.agent}; attempt_id=${owned.attempt}; reason=${reason}; received_at=${new Date().toISOString()}${owned.run ? `; run_id=${owned.run}` : ''}${meta?.exit_code !== undefined ? `; exit_code=${meta.exit_code}` : ''}${meta?.exit_signal ? `; signal=${meta.exit_signal}` : ''}${detail ? `; ${detail}` : ''}; inspect tut ps / tut attach${owned.run ? ` ${owned.run}` : ''} and task context; explicitly wake after resolving.`;
         this.deps.log(body);
-        await this.deps.send({title:`TUT ${owned.task.task_id}: headless ${diagnostic ? 'diagnostic' : 'give-up'}`,body,task_id:owned.task.task_id});
+        await this.deps.send({title:`TUT ${owned.task.task_id}: detached ${diagnostic ? 'diagnostic' : 'give-up'}`,body,task_id:owned.task.task_id});
       });
-    } catch (e) { this.deps.log(`headless notification failed attempt_id=${owned.attempt}: ${(e as Error).message}`); }
+    } catch (e) { this.deps.log(`detached notification failed attempt_id=${owned.attempt}: ${(e as Error).message}`); }
   }
 }
 export { complete };

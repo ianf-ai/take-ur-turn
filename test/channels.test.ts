@@ -60,7 +60,7 @@ describe("desktop channel", () => {
 
   it("uses osascript on success and skips the rest of the chain", async () => {
     mockExec({ osascript: null });
-    await first(createChannels(undefined)).send({ title: "TUT t1: hi", body: "body text" });
+    await first(createChannels(undefined, { platform: "darwin" })).send({ title: "TUT t1: hi", body: "body text" });
     const osa = callsTo("osascript");
     expect(osa).toHaveLength(1);
     expect(osa[0]?.[1]).toEqual(["-e", NOTIFY_SCRIPT, "--", "body text", "TUT t1: hi"]);
@@ -70,7 +70,7 @@ describe("desktop channel", () => {
 
   it("falls back to notify-send when osascript is unavailable (e.g. Linux)", async () => {
     mockExec({ "notify-send": null });
-    await first(createChannels(undefined)).send({ title: "a title", body: "a body" });
+    await first(createChannels(undefined, { platform: "darwin" })).send({ title: "a title", body: "a body" });
     expect(callsTo("osascript")).toHaveLength(1); // attempted first
     const ns = callsTo("notify-send");
     expect(ns).toHaveLength(1);
@@ -80,7 +80,7 @@ describe("desktop channel", () => {
 
   it("ends at the terminal bell when both commands fail, and never throws", async () => {
     mockExec({});
-    const desktop = first(createChannels({ channels: ["desktop"] }));
+    const desktop = first(createChannels({ channels: ["desktop"] }, { platform: "darwin" }));
     await expect(desktop.send({ title: "t", body: "b" })).resolves.toBeUndefined();
     expect(callsTo("osascript")).toHaveLength(1);
     expect(callsTo("notify-send")).toHaveLength(1);
@@ -89,7 +89,7 @@ describe("desktop channel", () => {
 
   it("message text never enters AppleScript source: the -e script is a constant, text rides in argv", async () => {
     mockExec({ osascript: null });
-    await first(createChannels(undefined)).send({ title: 'title "injection" $(rm -rf /)', body: 'bod"y' });
+    await first(createChannels(undefined, { platform: "darwin" })).send({ title: 'title "injection" $(rm -rf /)', body: 'bod"y' });
     const args = (callsTo("osascript")[0]?.[1] as string[]) ?? [];
     expect(args[0]).toBe("-e");
     expect(args[1]).toBe(NOTIFY_SCRIPT); // constant — no interpolation whatsoever
@@ -100,7 +100,7 @@ describe("desktop channel", () => {
   it("a title carrying quotes and a do-shell-script payload stays plain argv data (cannot inject)", async () => {
     mockExec({ osascript: null });
     const title = 'x" & (do shell script "touch /tmp/pwned") & "y';
-    await first(createChannels(undefined)).send({ title, body: "plain" });
+    await first(createChannels(undefined, { platform: "darwin" })).send({ title, body: "plain" });
     const args = (callsTo("osascript")[0]?.[1] as string[]) ?? [];
     expect(args[1]).toBe(NOTIFY_SCRIPT); // script source unchanged by the payload
     expect(args[4]).toBe(title); // payload arrives verbatim as argv — never executed
@@ -224,7 +224,7 @@ describe("desktop channel", () => {
     mockExec({ osascript: null });
     const title = "TUT t9: line1\nline2";
     const body = "body\nline2";
-    await first(createChannels(undefined)).send({ title, body });
+    await first(createChannels(undefined, { platform: "darwin" })).send({ title, body });
     const args = (callsTo("osascript")[0]?.[1] as string[]) ?? [];
     expect(args.slice(3)).toEqual([body, title]); // newlines intact in argv
     expect(stderrLines).toEqual([]);
@@ -374,7 +374,7 @@ describe("webhook channel", () => {
 
 describe("createChannels config", () => {
   it("missing config → [\"desktop\"] without a warning", () => {
-    expect(names(createChannels(undefined))).toEqual(["desktop"]);
+    expect(names(createChannels(undefined, { platform: "darwin" }))).toEqual(["desktop"]);
     expect(stderrLines).toEqual([]);
   });
 

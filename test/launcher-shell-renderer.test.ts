@@ -1,3 +1,5 @@
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 // Shell dialect renderer — golden vectors and boundary contracts
 // (launcher port design §4; work unit 6).  The vectors below are FROZEN
 // bytes: they pin the four-dialect deterministic algorithms, the pane-runner
@@ -488,8 +490,8 @@ describe("pane-runner payload encoding", () => {
   });
 
   it("default runtime resolves the package-absolute pane-runner entry from src and dist alike", () => {
-    const runtime = defaultPaneRuntime("file:///repo/src/herdr/launcher/shell-renderer.ts");
-    expect(runtime.paneRunnerEntry).toBe("/repo/dist/herdr/launcher/pane-runner.js");
+    const runtime = defaultPaneRuntime(pathToFileURL(path.resolve("src/herdr/launcher/shell-renderer.ts")).href);
+    expect(runtime.paneRunnerEntry).toBe(path.resolve("dist/herdr/launcher/pane-runner.js"));
     expect(runtime.nodeExecutable).toBe(process.execPath);
   });
 });

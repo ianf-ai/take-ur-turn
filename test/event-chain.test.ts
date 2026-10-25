@@ -1,3 +1,4 @@
+import { fixtureExecutable } from "./helpers/executable.js";
 /**
  * Canonical Node event chain (system-design 7.2 signal-source contract):
  *
@@ -34,7 +35,7 @@ const ON_AGENT_EVENT_MJS = path.join(SCRIPTS, "on-agent-event.mjs");
 const ON_AGENT_EVENT_SH = path.join(SCRIPTS, "on-agent-event.sh");
 const HERDR_HOOK_MJS = path.join(SCRIPTS, "herdr-hook.mjs");
 const HOOK_SH = path.join(SCRIPTS, "hook.sh");
-const HERDR_FIXTURE = fileURLToPath(new URL("./bin/herdr", import.meta.url));
+const HERDR_FIXTURE = fixtureExecutable(fileURLToPath(new URL("./bin/herdr", import.meta.url)));
 const LEGACY_HOOK = fileURLToPath(new URL("./fixtures/legacy-herdr-hook.sh", import.meta.url));
 
 const PANE = "w1:p1";
@@ -61,7 +62,8 @@ function run(
   options: { env?: NodeJS.ProcessEnv; stdin?: string } = {},
 ): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { env: options.env ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const shellShim = process.platform === "win32" && command.endsWith(".sh");
+    const child = spawn(shellShim ? "sh.exe" : command, shellShim ? [command.replaceAll("\\", "/"), ...args] : args, { env: options.env ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (chunk: Buffer) => {

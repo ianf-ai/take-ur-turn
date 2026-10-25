@@ -154,7 +154,7 @@ function baseOptions(root: string): DoctorOptions & { environment: NodeJS.Proces
 // --- healthy assembly ------------------------------------------------------------
 
 describe("tut doctor (healthy assembly)", () => {
-  it("reports ok with all nine checks green", async () => {
+  it("reports ok with all ten checks green", async () => {
     const root = healthyRoot();
     const report = await runDoctor(baseOptions(root));
     expect(report.ok).toBe(true);
@@ -168,6 +168,7 @@ describe("tut doctor (healthy assembly)", () => {
       "platform",
       "agent-channel",
       "preflight",
+      "power",
     ]);
     for (const c of report.checks) expect(c.status, c.name).toBe("ok");
     expect(check(report, "hub").summary).toContain("flow_mode=manual");
@@ -1086,7 +1087,7 @@ describe("rig hash collision diagnosis", () => {
     try {
       const report = await runDoctor(baseOptions(healthyRoot()));
       expect(check(report, "paths").status).toBe("fail");
-      expect(check(report, "paths").details.join("\n")).toContain("rigHash collision deadbeef: /rig-one <-> /rig-two");
+      expect(check(report, "paths").details.join("\n")).toContain(`rigHash collision deadbeef: ${path.resolve("/rig-one")} <-> ${path.resolve("/rig-two")}`);
       expect(report.ok).toBe(false);
     } finally { hash.mockRestore(); list.mockRestore(); }
   });
@@ -1141,7 +1142,7 @@ describe("notifier ownership discovery", () => {
     const result = check(report, "notifier");
     expect(result.status).toBe("ok");
     expect(result.summary).toContain(":3004/agent-event");
-    expect(result.details.join(" ")).toContain("非本 workspace（来自 /foreign/rig）");
+    expect(result.details.join(" ")).toContain(`非本 workspace（来自 ${path.resolve("/foreign/rig")}）`);
     expect(result.details.join(" ")).toContain(":3002/agent-event");
     expect(result.details.join(" ")).toContain(root);
     expect(snapshotTree(tmp)).toEqual(before);
@@ -1195,7 +1196,7 @@ describe("notifier ownership discovery", () => {
     const report = await runDoctor(opts);
     expect(check(report, "hub").status).toBe("fail");
     expect(check(report, "notifier").status).toBe("fail");
-    expect(report.checks).toHaveLength(9);
+    expect(report.checks).toHaveLength(10);
   });
 
   it("never pairs a notifier when Hub is offline", async () => {

@@ -16,7 +16,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { psq } from "../../herdr/launcher/shell-renderer.js";
+import { psq } from "./shell-quote.js";
 
 export interface Notification {
   title: string;

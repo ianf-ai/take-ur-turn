@@ -4,6 +4,8 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { validateControlMeta } from './validation.js';
 import type { StopRequest } from './protocol.js';
+import type { WindowsState } from './windows-protocol.js';
+import { readWindowsRunMeta, statWindowsRunFile } from '../hub/windows-run-file.js';
 
 export interface HeadlessOwnership {
   schema: 1; role: string; attempt_id: string; base_version: number; trigger_version: number;
@@ -37,6 +39,7 @@ export interface RunMeta {
   stopped_by?: string; stopped_at?: string;
   identity_probe?: string; identity_ack?: string;
   control_protocol?: string; stop_request?: StopRequest;
+  windows?: WindowsState;
   resume?: ResumeSource;
 }
 /** A run is complete only with terminal evidence: ended_at present, and any
@@ -159,6 +162,15 @@ export class RunStore {
   }
   /** Observe output activity without reading or retaining log content. */
   logInfo(id: string): { mtimeMs: number } {
+    if (process.platform === 'win32') {
+      try { return { mtimeMs: statWindowsRunFile(path.join(this.directory(id), 'log')).mtimeMs }; }
+      catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EUNSAFEPATH') {
+          throw Object.assign(new Error('unsafe or not a regular run file: log', { cause: e }), { code: 'EUNSAFEPATH' });
+        }
+        throw e;
+      }
+    }
     // A FIFO without a writer must reach fstat instead of blocking the poll.
     const fd = this.open(id, 'log', C.O_RDONLY | C.O_NONBLOCK);
     try { return { mtimeMs: fstatSync(fd).mtimeMs }; }
@@ -202,11 +214,16 @@ export class RunStore {
     } finally { unlock(); }
   }
   read(id: string): RunMeta {
+    if (process.platform === 'win32') return validateMeta(JSON.parse(readWindowsRunMeta(path.join(this.directory(id), 'meta.json')).toString('utf8')), id);
     const fd = this.open(id, 'meta.json', C.O_RDONLY);
     try { return validateMeta(JSON.parse(readFileSync(fd, 'utf8')), id); } finally { closeSync(fd); }
   }
   /** Exclusive file locks, with serialized, identity-checked dead-owner recovery. */
-  async lock(id: string, name: 'meta' | 'stop', waitMs = 2000): Promise<() => void> {
+  async lock(id: string, name: 'meta' | 'stop', waitMs = process.platform === 'win32' && name === 'meta' ? 20000 : 2000): Promise<() => void> {
+    // A Windows metadata transaction includes the bounded native read (15s)
+    // and atomic publication retry (1s). The former POSIX 2s default could
+    // make the original supervisor abandon a healthy concurrent writer.
+    // Explicit caller deadlines, stop/admission locks and POSIX stay intact.
     const file = path.join(this.directory(id), `${name}.lock`);
     return this.lockFile(file, waitMs, `${name} lock in-progress or unverifiable for ${id}`);
   }
@@ -223,10 +240,20 @@ export class RunStore {
     const owner = JSON.stringify({ pid: process.pid, token: randomBytes(16).toString('hex') });
     const deadline = performance.now() + waitMs;
     let unverifiable = false;
+    const retryable = (e: unknown): boolean => process.platform === 'win32' &&
+      ['EPERM', 'EACCES', 'EBUSY'].includes((e as NodeJS.ErrnoException).code ?? '');
     for (;;) {
       let fd: number | undefined;
       try { fd = openSync(file, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600); }
-      catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
+      catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+          // A recently unlinked Windows lock can remain delete-pending while
+          // a competitor closes its read handle. Never unlink to resolve it.
+          const remaining = deadline - performance.now();
+          if (!retryable(e) || remaining <= 0) throw e;
+          await delay(Math.min(20, remaining)); continue;
+        }
+      }
       if (fd !== undefined) {
         try { writeFileSync(fd, owner); } finally { closeSync(fd); }
         return () => { if (readFileSync(file, 'utf8') !== owner) throw new Error(`lock ownership changed: ${file}`); unlinkSync(file); };
@@ -253,13 +280,15 @@ export class RunStore {
           } catch (e) { if (!['EEXIST', 'ENOENT'].includes((e as NodeJS.ErrnoException).code ?? '')) throw e; }
           finally { if (held) rmdirSync(reclaim); }
         }
-      } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT' && (!retryable(e) || performance.now() >= deadline)) throw e;
+      }
       const remaining = deadline - performance.now();
       if (remaining <= 0) throw new Error(unverifiable ? `cannot verify lock after ${waitMs}ms: ${file}` : busyMessage);
       await delay(Math.min(20, remaining));
     }
   }
-  private write(id: string, meta: RunMeta): void {
+  private write(id: string, meta: RunMeta): void | Promise<void> {
     validateMeta(meta, id);
     const dir = this.directory(id);
     const file = path.join(dir, `meta.${randomBytes(12).toString('hex')}.tmp`);
@@ -268,24 +297,52 @@ export class RunStore {
     catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
     const fd = openSync(file, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
     try { writeFileSync(fd, `${JSON.stringify(meta)}\n`); } finally { closeSync(fd); }
-    renameSync(file, path.join(dir, 'meta.json'));
+    const target = path.join(dir, 'meta.json');
+    if (process.platform !== 'win32') { renameSync(file, target); return; }
+    return this.publishWindowsMeta(file, target);
+  }
+  private async publishWindowsMeta(file: string, target: string): Promise<void> {
+    // Safe readers pin Windows paths without sharing deletion. Yield only
+    // the final atomic publication, under the same meta lock, so a transient
+    // reader can close. Never unlink the target or rewrite the pending bytes.
+    // Persistent contention reports the original error and keeps the artifact.
+    const deadline = performance.now() + 1000;
+    for (;;) {
+      try {
+        // Recheck after each yield: a link must never be silently retired.
+        try { if (lstatSync(target).isSymbolicLink()) throw new Error('unsafe meta symlink'); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+        renameSync(file, target); return;
+      } catch (e) {
+        const remaining = deadline - performance.now();
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes((e as NodeJS.ErrnoException).code ?? '') || remaining <= 0) throw e;
+        await delay(Math.min(20, remaining));
+      }
+    }
   }
   async initialize(id: string, meta: RunMeta): Promise<void> {
     const unlock = await this.lock(id, 'meta');
     try {
       try { this.read(id); throw new Error(`meta already exists: ${id}`); }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
-      this.write(id, meta);
+      const publication = this.write(id, meta);
+      if (publication) await publication;
     } finally { unlock(); }
   }
   async updateMeta(id: string, fn: (current: RunMeta) => RunMeta): Promise<RunMeta> {
     const unlock = await this.lock(id, 'meta');
-    try { const next = fn(this.read(id)); this.write(id, next); return next; } finally { unlock(); }
+    try {
+      const next = fn(this.read(id));
+      const publication = this.write(id, next);
+      if (publication) await publication;
+      return next;
+    } finally { unlock(); }
   }
   /** Supported repair channel for unreadable run archives: the whole
    *  disposition — safe meta read, artifact scan, decision, isolate/adopt —
    *  runs under the meta lock, so concurrent repairs serialize and never act
-   *  on a stale snapshot. Every read refuses links (O_NOFOLLOW) and never
+   *  on a stale snapshot. Every read refuses links (native bridge on Windows,
+   *  O_NOFOLLOW on POSIX) and never
    *  waits on special files (O_NONBLOCK, then regular-file check — the same
    *  discipline as logInfo); no path deletes or overwrites evidence
    *  (isolation always moves meta.json to a FRESH evidence name). Artifacts
@@ -305,8 +362,7 @@ export class RunStore {
         for (const name of readdirSync(dir).sort()) {
           if (!META_TMP_PATTERN.test(name)) continue;
           try {
-            const fd = this.open(id, name, C.O_RDONLY | C.O_NONBLOCK);
-            try { scanned.push({ name, raw: readFileSync(fd, 'utf8'), mtimeMs: fstatSync(fd).mtimeMs }); } finally { closeSync(fd); }
+            scanned.push({ name, ...this.readRepairFile(id, name) });
           } catch { /* links, non-regular, FIFOs and torn artifacts are never adoption evidence */ }
         }
         return scanned;
@@ -329,14 +385,28 @@ export class RunStore {
       }
     } finally { unlock(); }
   }
+  private readRepairFile(id: string, name: string): { raw: string; mtimeMs: number } {
+    if (process.platform === 'win32') {
+      const file = path.join(this.directory(id), name);
+      // Node's O_NOFOLLOW does not reject Windows symlinks. lstat supplies
+      // the diagnostic (including dangling links); the native handle-relative
+      // reader enforces reparse refusal even if the pathname changes after it.
+      const st = lstatSync(file);
+      if (st.isSymbolicLink()) throw Object.assign(new Error('symbolic link'), { code: 'ELOOP' });
+      if (!st.isFile()) throw new Error(`not a regular run file: ${name}`);
+      return { raw: readWindowsRunMeta(file).toString('utf8'), mtimeMs: st.mtimeMs };
+    }
+    const fd = this.open(id, name, C.O_RDONLY | C.O_NONBLOCK);
+    try { return { raw: readFileSync(fd, 'utf8'), mtimeMs: fstatSync(fd).mtimeMs }; }
+    finally { closeSync(fd); }
+  }
   /** Link-refusing, non-blocking meta state for classification; a missing
    *  meta.json keeps any existing quarantine marker visible so re-runs stay
    *  idempotent. O_NONBLOCK so a writerless FIFO reaches the regular-file
    *  check instead of blocking the caller inside the lock. */
   private readRepairMetaState(id: string, dir: string): RepairMetaState {
     try {
-      const fd = this.open(id, 'meta.json', C.O_RDONLY | C.O_NONBLOCK);
-      try { return { kind: 'bytes', raw: readFileSync(fd, 'utf8') }; } finally { closeSync(fd); }
+      return { kind: 'bytes', raw: this.readRepairFile(id, 'meta.json').raw };
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       const message = (e as Error).message;

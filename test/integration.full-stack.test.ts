@@ -187,7 +187,13 @@ interface Stack {
   out(): string;
 }
 
+function launchFixtureEnvironment(): void {
+  setEnv("TUT_PANE_SHELL", "posix");
+  setEnv("PATH", [path.resolve(import.meta.dirname, "bin"), path.dirname(process.execPath), process.env.PATH ?? ""].join(path.delimiter));
+}
+
 async function startStack(): Promise<Stack> {
+  launchFixtureEnvironment();
   const io = captureIo(); // restored last: the notifier may log until it closes
   cleanups.push(() => io.restore());
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-intstack-"));
@@ -236,6 +242,7 @@ async function attachNotifier(stack: Stack): Promise<void> {
 
 /** Hub alone (mode / start-next tests need no notifier). */
 async function startHubOnly(): Promise<string> {
+  launchFixtureEnvironment();
   const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-intstack-"));
   cleanups.push(() => rmSync(tmp, { recursive: true, force: true }));
   setEnv("TUT_PROJECT_ROOT", tmp);
@@ -296,7 +303,9 @@ function runScript(
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(script, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = process.platform === "win32"
+      ? spawn("sh.exe", [script.replaceAll("\\", "/"), ...args], { env, stdio: ["ignore", "pipe", "pipe"] })
+      : spawn(script, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -551,7 +560,7 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
       // Hermetic launch path: fixture bin first on PATH — fixture pi satisfies
       // the routed-agent pre-check, fixture herdr answers pane list with no
       // panes — so launch.sh's dry-run needs no live Herdr session.
-      setEnv("PATH", `${path.resolve(import.meta.dirname, "bin")}:${path.dirname(process.execPath)}:/usr/bin:/bin`);
+      setEnv("PATH", [path.resolve(import.meta.dirname, "bin"), path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter));
       const id = await createTask(stack.baseUrl, "Auto Launch Task");
       await attachNotifier(stack); // baseline: designing / agent:architect (manual), silent
       await waitForBaseline(stack);
@@ -636,7 +645,7 @@ describe("integration: full stack (serve + notifier + CLI drivers)", () => {
     const io = captureIo();
     cleanups.push(() => io.restore());
 
-    expect(await main(["start-next", id, "--url", baseUrl])).toBe(0);
+    expect(await main(["start-next", id, "--url", baseUrl]), io.err()).toBe(0);
     const out = io.out();
     expect(out).toContain("DRY-RUN: herdr pane send-text"); // literal text + Enter commit
     expect(out).toContain("--label TUT executor"); // tab label: naming template (default)
@@ -779,7 +788,7 @@ describe("cast routing end-to-end", () => {
 
       const prev = process.env.TUT_DRY_RUN;
       process.env.TUT_DRY_RUN = "1";
-      setEnv("PATH", `${path.resolve(import.meta.dirname, "bin")}:${process.env.PATH ?? ""}`);
+      setEnv("PATH", [path.resolve(import.meta.dirname, "bin"), process.env.PATH ?? ""].join(path.delimiter));
       setEnv("TUT_HERDR_PANES", "[]"); // fixture Herdr makes the dry-run boundary hermetic
       // Hermetic chain for the no-cast task's resolution: clean L1 (temp
       // cwd) + pinned empty L2 → DEFAULT_ROLES (executor=pi), never the
@@ -790,7 +799,7 @@ describe("cast routing end-to-end", () => {
       process.chdir(chainTmp);
       process.env.TUT_USER_CONFIG_DIR = path.join(chainTmp, "user-config");
       try {
-        await main(["start-next", castId, "--url", baseUrl]);
+        expect(await main(["start-next", castId, "--url", baseUrl]), io.err()).toBe(0);
         expect(io.out()).toContain("(agent 'codex', label"); // cast routed the round to codex
         expect(io.out()).toContain(agentFixture("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search'", "<hub-root>", baseUrl));
 

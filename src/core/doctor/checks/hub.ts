@@ -3,13 +3,14 @@ import { canonicalRoot } from "../../hub/rig-discovery.js";
 import { DOCTOR_HUB_TIMEOUT_MS } from "../constants.js";
 import { worst } from "../shared.js";
 import type { DoctorCheck, DoctorContext } from "../types.js";
+import type { CheckoutRoute } from '../../common/types.js';
 
 // --- check 1: hub --------------------------------------------------------------
 
 interface HubStateView {
   hub_root?: string;
   flow_mode?: string;
-  tasks?: Array<{ task_id: string; needs_attention?: boolean }>;
+  tasks?: Array<{ task_id: string; needs_attention?: boolean; checkout?: CheckoutRoute }>;
   degraded?: string[];
   auto?: { launch_roles: string[] };
 }
@@ -19,6 +20,8 @@ interface HubOutcome {
   check: DoctorCheck;
   /** The hub's degraded list when it answered (empty otherwise). */
   degraded: string[];
+  /** Only populated after Hub ownership verification. */
+  checkouts?: Array<{ task_id: string; path: string; ref: string }>;
 }
 
 /** /state's own value domains (http.ts handleState): flow_mode selects the
@@ -154,7 +157,13 @@ async function checkHub(ctx: DoctorContext): Promise<HubOutcome> {
     check.details.push(`hub reports degraded (storage-damaged) tasks: ${degraded.join(", ")}`);
     check.details.push("class/file-level diagnosis: see the storage check below");
   }
-  return { check, degraded, verified: { root: ctx.hubRoot, url: ctx.url } };
+  const checkouts = tasks.flatMap(task => {
+    const checkout = task.checkout;
+    return checkout?.kind === 'worktree' && typeof checkout.path === 'string' && typeof checkout.ref === 'string'
+      ? [{ task_id: task.task_id, path: path.resolve(ctx.hubRoot, checkout.path), ref: checkout.ref }]
+      : [];
+  });
+  return { check, degraded, verified: { root: ctx.hubRoot, url: ctx.url }, checkouts };
 }
 
 export { checkHub };

@@ -15,10 +15,18 @@
  */
 
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { KNOWN_ROLES } from "./workspace.js";
 
-export type LaunchMode = "headless" | "tui";
+export type LaunchMode = "detached" | "tui";
+
+/** Product configuration boundary; persisted launch/run protocol names stay headless. */
+function launchModeOf(value: unknown): LaunchMode | undefined {
+  if (value === "headless") return "detached";
+  if (value === "detached" || value === "tui") return value;
+  return undefined;
+}
 
 export type PowerMode = "herdr" | "standalone";
 
@@ -72,8 +80,9 @@ export async function readLaunchMode(root: string): Promise<LaunchMode> {
   if (outcome.status === "invalid") throw new Error(`cannot read launch_mode: ${configPath(root)} is unreadable or corrupt`);
   const value = outcome.config.launch_mode;
   if (!Object.hasOwn(outcome.config, "launch_mode")) return "tui";
-  if (value === "headless" || value === "tui") return value;
-  throw new Error('invalid launch_mode (expected "headless" | "tui")');
+  const mode = launchModeOf(value);
+  if (mode !== undefined) return mode;
+  throw new Error(`invalid launch_mode (expected ${configKeyDomain("launch_mode")})`);
 }
 
 export type LaunchCatchup = "off" | "on";
@@ -203,7 +212,23 @@ async function writeConfigAtomic(filePath: string, config: Config): Promise<void
   const temp = tempPathFor(filePath);
   try {
     await writeFile(temp, JSON.stringify(config, null, 2) + "\n", "utf8");
-    await rename(temp, filePath);
+    if (process.platform === "win32") {
+      // A reader can briefly deny replacement on Windows. Keep the complete
+      // temp and the per-path RMW queue while yielding; never unlink the old
+      // config or repeat the update. Persistent failures retain the original
+      // error and the existing best-effort cleanup of our own temp below.
+      const deadline = performance.now() + 1000;
+      for (;;) {
+        try { await rename(temp, filePath); break; }
+        catch (e) {
+          const remaining = deadline - performance.now();
+          if (!['EPERM', 'EACCES', 'EBUSY'].includes((e as NodeJS.ErrnoException).code ?? '') || remaining <= 0) throw e;
+          await delay(Math.min(20, remaining));
+        }
+      }
+    } else {
+      await rename(temp, filePath);
+    }
   } catch (e) {
     await unlink(temp).catch(() => undefined);
     throw e;
@@ -380,7 +405,7 @@ export type ConfigKeyAssignment = { key: "launch_mode"; value: LaunchMode } | { 
 
 /** Legal-value domain hint for a key — used by `tut config` error text and help. */
 export function configKeyDomain(key: ConfigKey): string {
-  if (key === "launch_mode") return '"headless" | "tui"';
+  if (key === "launch_mode") return '"tui" | "detached" ("headless" is a compatibility alias)';
   if (key === "launch.catchup") return '"off" | "on"';
   if (key === "power.mode") return '"herdr" | "standalone"';
   if (key === "review_standards") return 'comma-separated non-empty file paths, e.g. standards/review.md,/shared/team.txt; "" disables; no ASCII control characters or empty items; filenames containing commas are unsupported';
@@ -408,7 +433,8 @@ export function parseConfigValue(
   raw: string,
 ): { ok: true; assignment: ConfigKeyAssignment } | { ok: false; error: string } {
   if (key === "launch_mode") {
-    if (raw === "headless" || raw === "tui") return { ok: true, assignment: { key, value: raw } };
+    const value = launchModeOf(raw);
+    if (value !== undefined) return { ok: true, assignment: { key, value } };
     return { ok: false, error: `invalid value for launch_mode (expected ${configKeyDomain(key)})` };
   }
   if (key === "launch.catchup") {

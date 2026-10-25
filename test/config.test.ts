@@ -12,6 +12,7 @@ import {
   readConfig,
   readConfigFile,
   readFlowMode,
+  readLaunchMode,
   readPowerMode,
   readPowerModeForSwitch,
   writeConfigKey,
@@ -536,5 +537,25 @@ describe("power.mode", () => {
     // Contrast: the STRICT reader (tut config get) still refuses unrelated damage.
     writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "bogus" }));
     await expect(readPowerMode(root)).rejects.toThrow("unreadable or corrupt");
+  });
+});
+
+describe("launch_mode normalization", () => {
+  it.each(["detached", "headless", "tui"])("normalizes %s at the boundary and preserves concurrent updates", async (raw) => {
+    const original = { flow_mode: "manual", power: { mode: "standalone", extra: true },
+      auto: { launch_roles: ["executor"], extra: 3 }, launch: { catchup: "on" }, future: { keep: true } };
+    writeFileSync(path.join(root, "config.json"), JSON.stringify(original));
+    const value = raw === "headless" ? "detached" : raw;
+    const parsed = parseConfigValue("launch_mode", raw);
+    expect(parsed).toEqual({ ok: true, assignment: { key: "launch_mode", value } });
+    if (!parsed.ok) throw new Error(parsed.error);
+    await Promise.all([
+      writeConfigKey(root, parsed.assignment),
+      writeFlowMode(root, "auto"),
+      writeConfigKey(root, { key: "launch.catchup", value: "off" }),
+    ]);
+    expect(await readLaunchMode(root)).toBe(value);
+    expect(await readConfig(root)).toEqual({ ...original, flow_mode: "auto", launch_mode: value, launch: { catchup: "off" } });
+    expect(readdirSync(root)).toEqual(["config.json"]);
   });
 });

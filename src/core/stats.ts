@@ -25,7 +25,7 @@ function addTokens(target: Record<string, Tokens>, agent: string, source: Tokens
     output_tokens: safeAdd(old.output_tokens, source.output_tokens), total_tokens: safeAdd(old.total_tokens, source.total_tokens), cost_usd: cost };
 }
 
-/** Usage audit measures worker deliveries independently of workflow transitions. */
+/** Legacy audit anchors remain valid when reading preserved v1 sidecars. */
 function isUsageDelivery(record: ContextRecord): boolean {
   return (record.role === "architect" && record.content_type === "design") ||
     (record.role === "executor" && ["code_changes", "revision"].includes(record.content_type)) ||
@@ -39,10 +39,21 @@ export function taskMetrics(task: ReadTaskResult, entry: TaskListEntry) {
   const reviews = { pass: 0, blocked_external: 0, fail_code: 0, fail_design: 0 };
   const per_role = counts();
   const usageDeliveries = new Set<number>();
+  const pendingUsage = new Set<string>(), launchedUsage = new Set<string>();
   let first_review: Verdict | null = null;
   let revision_rounds = 0, codeDeliveries = 0;
   for (const record of [...task.versions].sort((a, b) => a.version - b.version)) {
-    if (isUsageDelivery(record)) usageDeliveries.add(record.version);
+    const marker = record.payload.launch as Record<string, unknown> | undefined;
+    if (record.content_type === "note" && marker && typeof marker.role === "string" &&
+        ["architect", "executor", "reviewer"].includes(marker.role) && typeof marker.base_version === "number" &&
+        Number.isInteger(marker.base_version) && marker.base_version < record.version) {
+      pendingUsage.add(marker.role);
+      launchedUsage.add(marker.role);
+    } else if (pendingUsage.delete(record.role) || (!launchedUsage.has(record.role) && isUsageDelivery(record))) {
+      // Match the audit's launch -> first same-role publication boundary.
+      // Later notes/reviews in that native session add no coverage demand.
+      usageDeliveries.add(record.version);
+    }
     const before = cursor.status;
     cursor = foldOntoCursor(cursor, [record], flow);
     // The review catch-all changes status to request human adjudication; it
@@ -107,7 +118,8 @@ function usageMetrics(raw: unknown, task: ReadTaskResult, deliveries: Set<number
     const launch = integer(r.launch_version), delivery = integer(r.delivery_version);
     const record = task.versions.find(v => v.version === delivery);
     const launchRecord = task.versions.find(v => v.version === launch);
-    if (launch < 1 || delivery <= launch || launches.has(launch) || measured.has(delivery) || !deliveries.has(delivery) ||
+    if (launch < 1 || delivery <= launch || launches.has(launch) || measured.has(delivery) ||
+      (!deliveries.has(delivery) && (!record || !isUsageDelivery(record))) ||
       !launchRecord || launchRecord.payload.launch === undefined || r.role !== record?.role ||
       (r.agent !== "codex" && r.agent !== "pi")) throw new Error("invalid usage attribution");
     const marker = object(launchRecord.payload.launch);

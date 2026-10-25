@@ -84,7 +84,45 @@ function directDesignRecord(taskId: string): ContextRecord {
 
 async function expectCode(p: Promise<unknown>, code: ErrorCode): Promise<void> {
   await expect(p).rejects.toMatchObject({ code });
+  await expect(p).rejects.toBeInstanceOf(StoreError);
 }
+
+describe("Store facade boundary", () => {
+  it("keeps the runtime exports limited to the existing API", async () => {
+    expect(Object.keys(await import("../src/core/hub/store.js")).sort()).toEqual([
+      "LEGACY_TASK_ID_PATTERN", "Store", "StoreError", "recordFileVersion", "validateMetaArtifact", "validateRecordArtifact",
+    ]);
+  });
+
+  it("read-only stores refuse every mutation and do not sweep or repair artifacts", async () => {
+    const { store, root } = newStore();
+    const { task_id } = await store.createTask({ title: "Read Only", description: "d", creator: "a", role: "human" });
+    await store.whenSwept;
+    const dir = taskDir(root, task_id);
+    const record = directDesignRecord(task_id);
+    const snapshot = path.join(tmp, "snapshot.json");
+    writeFileSync(snapshot, JSON.stringify(record));
+    writeFileSync(path.join(dir, "v001.design.json"), "{ broken record");
+    writeFileSync(path.join(dir, "meta.json"), "{ broken meta");
+    const staleTemp = path.join(dir, "meta.json.999999.tmp");
+    writeFileSync(staleTemp, "old temp");
+    utimesSync(staleTemp, new Date(0), new Date(0));
+    const before = readdirSync(dir).sort().map(name => [name, readFileSync(path.join(dir, name), "utf8")]);
+    const reader = new Store(root, { readOnly: true });
+    await reader.whenSwept;
+    for (const operation of [
+      () => reader.createTask({ title: "Forbidden", description: "d", creator: "a", role: "human" }),
+      () => reader.append(task_id, { role: "executor", content_type: "note", payload: validPayload() }),
+      () => reader.append("project", { role: "executor", content_type: "note", payload: validPayload() }),
+      () => reader.repairMeta(task_id, {}),
+      () => reader.recoverRecord(task_id, { record_file: "v001.design.json", from_path: snapshot }),
+    ]) {
+      await expect(operation()).rejects.toThrow("Store is read-only");
+    }
+    expect(readdirSync(path.join(root, "tasks"))).toEqual([task_id]);
+    expect(readdirSync(dir).sort().map(name => [name, readFileSync(path.join(dir, name), "utf8")])).toEqual(before);
+  });
+});
 
 describe("createTask", () => {
   it("slugifies the title and writes meta.json only", async () => {
@@ -560,7 +598,7 @@ describe("atomic writes", () => {
    * exclusive create.
    */
   function blindReconciliation(store: Store): void {
-   (store as unknown as { taskDirNames: () => Promise<string[]> }).taskDirNames = async () => [];
+   (store as unknown as { io: { taskDirNames: () => Promise<string[]> } }).io.taskDirNames = async () => [];
   }
 
   it("an existing same-name record file still yields VERSION_CONFLICT (link-based exclusive create)", async () => {
@@ -1454,8 +1492,8 @@ describe("recoverRecord (record-recovery, system-design 4.3)", () => {
 
     // Fail the manifest append (phase 2 — the commit point) exactly once: the
     // .recovered copy has already landed when it throws.
-    const internals = store as unknown as { appendRecoveryLine: (taskId: string, line: string) => Promise<void> };
-    const realAppend = internals.appendRecoveryLine.bind(store);
+    const internals = (store as unknown as { io: { appendRecoveryLine: (taskId: string, line: string) => Promise<void> } }).io;
+    const realAppend = internals.appendRecoveryLine.bind(internals);
     let calls = 0;
     const spy = vi.spyOn(internals, "appendRecoveryLine").mockImplementation(async (taskId: string, line: string) => {
       calls += 1;
@@ -1535,7 +1573,7 @@ describe("post-write degradation and close boundaries", () => {
     const { task_id } = await store.createTask({ title: "Post Write", description: "d", creator: "alice", role: "agent:architect" });
     // Force writeMeta to fail AFTER the record file lands (disk-full / permission shape).
     const writeMetaSpy = vi
-      .spyOn(store as unknown as { writeMeta: (taskId: string, meta: unknown) => Promise<void> }, "writeMeta")
+      .spyOn((store as unknown as { io: { writeMeta: (taskId: string, meta: unknown) => Promise<void> } }).io, "writeMeta")
       .mockRejectedValue(new Error("ENOSPC: no space left on device"));
     try {
       const result = await store.append(task_id, { role: "agent:architect", content_type: "design", payload: validPayload() });

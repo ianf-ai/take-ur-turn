@@ -1,3 +1,4 @@
+import { writeNodeExecutable } from './helpers/executable.js';
 /** Anchored headless checkout.
  *  Covers the five acceptance scenarios and the review v5 closure conditions:
  *  parallel isolation (including space-containing declared paths that are a
@@ -10,7 +11,7 @@
  *  fabricated on disk exactly as git lays them out, plus real-git pins. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, unlinkSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readFlowMode, readLaunchCheckout } from '../src/core/common/config.js';
@@ -25,12 +26,15 @@ import { Notifier } from '../src/core/notifier/notifier.js';
 import type { ContextRecord } from '../src/core/common/types.js';
 
 // Isolated audit fixtures deliberately remain outside the source repository.
+// The declaration grammar is POSIX-rooted. On Windows use the current-drive
+// root spelling, which still resolves to this test's actual temporary checkout.
+const declaredPath = (file: string) => path.sep === '\\' ? file.replaceAll('\\', '/').replace(/^[a-z]:/i, '') : file;
 const roots: string[] = []; const notifiers: Notifier[] = []; const servers: RunningServer[] = []; const runs: { store: RunStore; id: string }[] = [];
 function root() { const r = mkdtempSync(path.join(os.tmpdir(), 'tut-anchored-')); roots.push(r); return r; }
 function config(r: string, value: unknown) { mkdirSync(path.join(r, '.context-hub'), { recursive: true }); writeFileSync(path.join(r, '.context-hub/config.json'), JSON.stringify(value)); }
 function record(version: number, content_type = 'note', role = 'human'): ContextRecord { return { version, task_id: 't', content_type, role, timestamp: new Date().toISOString(), payload: { summary: 'fixture', body: 'fixture' } }; }
-async function until(fn: () => boolean | Promise<boolean>, ms = 5000) { const end = performance.now() + ms; while (!await fn()) { if (performance.now() > end) throw new Error('condition timed out'); await delay(25); } }
-function fixture(r: string, code: string, name = 'codex') { const bin = path.join(r, 'bin'); mkdirSync(bin, { recursive: true }); const file = path.join(bin, name); writeFileSync(file, `#!${process.execPath}\n${code}\n`); chmodSync(file, 0o700); return file; }
+async function until(fn: () => boolean | Promise<boolean>, ms = process.platform === 'win32' ? 45_000 : 5000) { const end = performance.now() + ms; while (!await fn()) { if (performance.now() > end) throw new Error('condition timed out'); await delay(25); } }
+function fixture(r: string, code: string, name = 'codex') { const bin = path.join(r, 'bin'); mkdirSync(bin, { recursive: true }); const file = path.join(bin, name); return writeNodeExecutable(file, code); }
 /** A minimal valid repository layout (git's own markers): HEAD + objects/ + refs/. */
 function repoLayout(gitDir: string, branch: string) {
   mkdirSync(gitDir, { recursive: true });
@@ -203,19 +207,20 @@ describe('workspace anchor validation (git layouts, no git execution)', () => {
     await expect(validateWorkspaceAnchor({ path: checkout, branch: 'main' })).resolves.toBe(checkout);
     await expect(validateWorkspaceAnchor({ path: checkout, branch: 'nope' })).rejects.toThrow('branch mismatch: declared nope, actual main');
     // Relative pointer: rewritten by hand, resolved against the declared checkout.
+    unlinkSync(path.join(checkout, '.git')); // Git for Windows marks its pointer file read-only.
     writeFileSync(path.join(checkout, '.git'), 'gitdir: ../separate-gitdir\n');
     await expect(validateWorkspaceAnchor({ path: checkout, branch: 'main' })).resolves.toBe(checkout);
     // The same declaration anchors a real plan (cwd/checkout = declared path).
     const hub = root(); fixture(hub, ''); config(hub, { flow_mode: 'manual', launch: { checkout: 'anchored' } });
     const plan = await buildHeadlessPlan({ task: { task_id: 't', title: 't', version: 1 }, role: 'executor',
       records: [record(1, 'design', 'architect')], hubRoot: hub, hubUrl: 'http://127.0.0.1:1', eventUrl: 'http://127.0.0.1:2', env: planEnv(hub),
-      description: `## 授权与工作区\n工作区：${checkout}（分支 main），合入由驱动 approve 后执行。` });
+      description: `## 授权与工作区\n工作区：${declaredPath(checkout)}（分支 main），合入由驱动 approve 后执行。` });
     expect(plan.checkoutRoot).toBe(checkout); expect(plan.checkout).toBe(checkout);
   });
 });
 
 describe('anchored plan resolution', () => {
-  const declaration = (wt: string, branch: string) => `## 授权与工作区\n工作区：${wt}（分支 ${branch}），合入由驱动 approve 后执行。`;
+  const declaration = (wt: string, branch: string) => `## 授权与工作区\n工作区：${declaredPath(wt)}（分支 ${branch}），合入由驱动 approve 后执行。`;
   const base = (hub: string, taskId: string) => ({ task: { task_id: taskId, title: taskId, version: 1 }, role: 'executor', records: [record(1, 'design', 'architect')], hubRoot: hub, hubUrl: 'http://127.0.0.1:1', eventUrl: 'http://127.0.0.1:2', env: planEnv(hub) });
   it('isolates two tasks anchored at distinct declared worktrees', async () => {
     const hub = root(); fixture(hub, ''); const r2 = root();
@@ -289,7 +294,7 @@ describe('anchored plan resolution', () => {
     const logs: string[] = [];
     const runtime = new HeadlessRuntime(hub, { send: async () => {}, log: line => logs.push(line), read: async () => [], start: async () => '20261018T000000000Z-00000000' });
     runtime.launch(plan);
-    expect(logs.some(l => l.includes('headless checkout fallback') && l.includes('工作区') && l.includes(hub))).toBe(true);
+    expect(logs.some(l => l.includes('detached checkout fallback') && l.includes('工作区') && l.includes(hub))).toBe(true);
   });
   it('keeps the rig default byte-identical: no new fields, no config dependency', async () => {
     const hub = root(); fixture(hub, '');
@@ -351,7 +356,7 @@ describe('notifier anchored end-to-end (real Hub, marker, spawn)', () => {
   };
   it('launches an anchored task in its declared worktree with meta.checkout recorded', async () => {
     const hub = root(); const wt = fakeWorktree(hub, 'declared-wt', 'owner/declared');
-    const h = await harness({ launch: { checkout: 'anchored' } }, `## 授权与工作区\n工作区：${wt}（分支 owner/declared），合入由驱动 approve 后执行。`);
+    const h = await harness({ launch: { checkout: 'anchored' } }, `## 授权与工作区\n工作区：${declaredPath(wt)}（分支 owner/declared），合入由驱动 approve 后执行。`);
     await h.notifier.requestCompare();
     await until(() => h.runtime.runs().some(m => m.task_id === h.task.task_id));
     const meta = h.runtime.runs().find(m => m.task_id === h.task.task_id)!; runs.push({ store: h.runtime.store, id: meta.run_id });
@@ -364,6 +369,6 @@ describe('notifier anchored end-to-end (real Hub, marker, spawn)', () => {
     await until(() => h.runtime.runs().some(m => m.task_id === h.task.task_id && complete(h.runtime.store.read(m.run_id))));
     const meta = h.runtime.runs().find(m => m.task_id === h.task.task_id)!; runs.push({ store: h.runtime.store, id: meta.run_id });
     expect(meta.cwd).toBe(realpathSync(h.hub)); expect('checkout' in meta).toBe(false);
-    expect(h.logs.some(l => l.includes('headless checkout fallback') && l.includes(h.task.task_id))).toBe(true);
+    expect(h.logs.some(l => l.includes('detached checkout fallback') && l.includes(h.task.task_id))).toBe(true);
   });
 });

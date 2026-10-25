@@ -8,6 +8,25 @@ import { RunReadStore } from "../src/core/hub/run-store.js";
 // A configurable module facade lets fault injection use real filesystem I/O.
 vi.mock("node:fs/promises", async importOriginal => ({ ...await importOriginal<typeof import("node:fs/promises")>() }));
 
+// Instrument the public file-opener seam on both hosts. Native Windows opens
+// use PowerShell handles, so spying on node:fs.open alone misses actual reads.
+const fileBoundary = vi.hoisted(() => ({ lengths: undefined as number[] | undefined, afterOpen: undefined as (() => Promise<void>) | undefined }));
+vi.mock('../src/core/hub/run-file.js', async original => {
+  const actual = await original<typeof import('../src/core/hub/run-file.js')>();
+  const wrap = (open: import('../src/core/hub/run-file.js').RunFileOpener) => async (file: string) => {
+    try {
+      const handle = await open(file);
+      if (/[/\\]log$/.test(file) && fileBoundary.lengths) {
+        const read = handle.read.bind(handle);
+        handle.read = (...args) => { fileBoundary.lengths!.push(args[2]); return read(...args); };
+      }
+      return handle;
+    } finally { await fileBoundary.afterOpen?.(); }
+  };
+  return { ...actual, openRunFile: wrap(actual.openRunFile),
+    withRunFileSession: <T>(read: (open: import('../src/core/hub/run-file.js').RunFileOpener) => Promise<T>) => actual.withRunFileSession(open => read(wrap(open))),
+  };
+});
 let root: string;
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), "tut-runs-")); });
 afterEach(async () => { await rm(root, { recursive: true, force: true }); });
@@ -130,25 +149,14 @@ it("preserves real empty lines while ignoring only the terminal newline", async 
 
 it("bounds the actual log read even when the file contains megabytes", async () => {
   await seed("huge", {}, "x".repeat(2 * 1024 * 1024));
-  const original = files.open;
   const readCalls: number[] = [];
-  const spy = vi.spyOn(files, "open").mockImplementation(async (...args) => {
-    const handle = await original(...args);
-    if (String(args[0]).endsWith("/log")) {
-      const read = handle.read.bind(handle);
-      vi.spyOn(handle, "read").mockImplementation(((...input: unknown[]) => {
-        readCalls.push(input[2] as number);
-        return Reflect.apply(read, handle, input);
-      }) as typeof handle.read);
-    }
-    return handle;
-  });
+  fileBoundary.lengths = readCalls;
   try {
     const [run] = await new RunReadStore(root).snapshot();
     expect(readCalls).toEqual([65536]);
     expect(run!.log_tail[0]).toHaveLength(65536);
     expect(run!.log_truncated).toBe(true);
-  } finally { spy.mockRestore(); }
+  } finally { fileBoundary.lengths = undefined; }
 });
 
 it("shows a run disappearing after enumeration as a local failure and keeps its neighbor", async () => {
@@ -183,7 +191,7 @@ it.each(["meta.json", "log"])("does not leak %s when a run directory is linked o
   await writeFile(path.join(outside, "log"), "OUTSIDE_LOG_MARKER");
   const saved = path.join(root, "saved-run");
   const target = await files.realpath(path.join(dir, name));
-  const originalStat = files.lstat, originalOpen = files.open;
+  const originalStat = files.lstat;
   let swapped = false, arranged = false, restored = false;
   const restore = async () => {
     if (swapped) { await rm(dir); await rename(saved, dir); swapped = false; restored = true; }
@@ -195,10 +203,7 @@ it.each(["meta.json", "log"])("does not leak %s when a run directory is linked o
     }
     return originalStat(...args);
   }) as typeof files.lstat);
-  const openSpy = vi.spyOn(files, "open").mockImplementation(async (...args) => {
-    try { return await originalOpen(...args); }
-    finally { await restore(); } // Restore before the caller can check its parent again.
-  });
+  fileBoundary.afterOpen = restore; // Restore before the caller re-checks its parent.
   try {
     const runs = await new RunReadStore(root).snapshot();
     expect(arranged).toBe(true); expect(restored).toBe(true);
@@ -207,5 +212,5 @@ it.each(["meta.json", "log"])("does not leak %s when a run directory is linked o
     expect(raced.degraded).toBe(true);
     expect(raced.issues).toContainEqual({ source: name === "log" ? "log" : "meta", code: "unsafe_path" });
     expect(runs.find(r => r.run_id === "healthy")!.degraded).toBe(false);
-  } finally { statSpy.mockRestore(); openSpy.mockRestore(); await restore(); }
+  } finally { statSpy.mockRestore(); fileBoundary.afterOpen = undefined; await restore(); }
 });

@@ -1,28 +1,42 @@
-// Workspace three-level chain + naming: the resolution
-// chain (L1 project → L2 user → built-in defaults), per-field fallback,
-// never-throw corruption tolerance, the tab-label template rendering
-// (scripts/tut-resolve.mjs), and — the parity pin — the SAME fixture vectors
-// asserted against BOTH implementations (src/workspace.ts resolveAgent and
-// `node scripts/tut-resolve.mjs resolve`) so the bash/TS dual-implementation
-// world cannot drift. The repo's seed file (scripts/workspace.json) is
-// asserted to exist and be valid JSON — its CONTENT is shape-example only
-// and never asserted (runtime reads nothing from the repo).
+// Workspace three-level chain, per-role fallback, corruption tolerance and
+// naming. Route fixtures exercise the authoritative TypeScript resolver;
+// rendering fixtures use the built Node launch entry that consumes it.
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_ROLES,
   DEFAULT_TAB_LABEL,
   resolveAgent,
+  resolveAgentRoute,
   resolveTabLabelTemplate,
 } from "../src/core/common/workspace.js";
 
+const homeFixture = vi.hoisted(() => ({ directory: undefined as string | undefined }));
+vi.mock("node:os", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, homedir: () => homeFixture.directory ?? actual.homedir() };
+});
+
 const run = promisify(execFile);
 const SCRIPTS_DIR = path.resolve(import.meta.dirname, "../scripts");
-const TUT_RESOLVE = path.join(SCRIPTS_DIR, "tut-resolve.mjs");
+const CLI = path.resolve(import.meta.dirname, "../dist/cli.js");
+const FIXTURE_BIN = path.resolve(import.meta.dirname, "bin");
+
+function launchEnv(l1: string, l2: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PATH: [FIXTURE_BIN, process.env.PATH ?? ""].join(path.delimiter),
+    TUT_DRY_RUN: "1",
+    TUT_HUB_URL: "http://127.0.0.1:1",
+    TUT_HERDR_PANES: "[]",
+    TUT_PROJECT_ROOT: l1,
+    TUT_USER_CONFIG_DIR: l2,
+  };
+}
 
 /** A workspace config file written under <dir>/.context-hub/ (L1 layout). */
 function writeL1(root: string, body: unknown): string {
@@ -151,149 +165,99 @@ describe("workspace chain fixtures", () => {
   });
 });
 
-// --- parity: same fixture vectors, TS resolveAgent vs tut-resolve.mjs --------------
-// The chain exists twice by necessity (bash-side launch.sh cannot run the TS
-// build; single-file unification was rejected) — parity is pinned HERE: the
-// same vectors must produce identical output on both sides.
+// --- authoritative route fixtures ----------------------------------------------
 
-describe("parity: src/workspace.ts resolveAgent ≡ scripts/tut-resolve.mjs resolve", () => {
+describe("workspace route resolution", () => {
   const TRASH: string[] = [];
   afterEach(() => {
     for (const dir of TRASH.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  /** One fixture pair → both implementations' answers for every role. */
-  async function bothSides(l1Body: unknown | null, l2Body: unknown | null): Promise<Record<string, [string, string]>> {
-    const l1 = mkdtempSync(path.join(os.tmpdir(), "tut-parity-l1-"));
-    const l2 = mkdtempSync(path.join(os.tmpdir(), "tut-parity-l2-"));
-    TRASH.push(l1, l2);
+  function temp(label: string): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), `tut-route-${label}-`));
+    TRASH.push(dir);
+    return dir;
+  }
+
+  async function routes(l1Body: unknown | null, l2Body: unknown | null) {
+    const l1 = temp("l1");
+    const l2 = temp("l2");
     if (l1Body !== null) writeL1(l1, l1Body);
     if (l2Body !== null) writeL2(l2, l2Body);
-
-    const out: Record<string, [string, string]> = {};
-    for (const role of ["architect", "executor", "reviewer", "boss"]) {
-      const ts = await resolveAgent(role, undefined, { projectRoot: l1, userConfigDir: l2 });
-      const sh = (
-        await run(process.execPath, [TUT_RESOLVE, "resolve", role], {
-          env: { ...process.env, TUT_PROJECT_ROOT: l1, TUT_USER_CONFIG_DIR: l2 },
-        })
-      ).stdout;
-      out[role] = [ts, sh];
-    }
-    return out;
+    return Object.fromEntries(await Promise.all(
+      ["architect", "executor", "reviewer", "boss"].map(async role =>
+        [role, await resolveAgentRoute(role, undefined, { projectRoot: l1, userConfigDir: l2 })]),
+    ));
   }
 
   it("vector: L1 full hit", async () => {
-    const sides = await bothSides(
+    expect(await routes(
       { roles: { architect: { agent: "a1" }, executor: { agent: "e1" }, reviewer: { agent: "r1" } } },
       { roles: { architect: { agent: "a2" } } },
-    );
-    for (const [ts, sh] of Object.values(sides)) expect(sh).toBe(ts);
-    expect(sides.architect?.[0]).toBe("a1");
+    )).toEqual({ architect: "a1", executor: "e1", reviewer: "r1", boss: "codex" });
   });
 
   it("vector: L1 partial → per-role L2 fallback", async () => {
-    const sides = await bothSides(
+    expect(await routes(
       { roles: { executor: { agent: "e1" } } },
       { roles: { architect: { agent: "a2" }, executor: { agent: "e2" }, reviewer: { agent: "r2" } } },
-    );
-    for (const [ts, sh] of Object.values(sides)) expect(sh).toBe(ts);
-    expect(sides.architect?.[0]).toBe("a2");
-    expect(sides.executor?.[0]).toBe("e1");
+    )).toEqual({ architect: "a2", executor: "e1", reviewer: "r2", boss: "codex" });
   });
 
   it("vector: corrupt L1 → L2", async () => {
-    const l1 = mkdtempSync(path.join(os.tmpdir(), "tut-parity-c1-"));
-    const l2 = mkdtempSync(path.join(os.tmpdir(), "tut-parity-c2-"));
-    TRASH.push(l1, l2);
+    const l1 = temp("corrupt");
+    const l2 = temp("fallback");
     mkdirSync(path.join(l1, ".context-hub"), { recursive: true });
     writeFileSync(path.join(l1, ".context-hub", "workspace.json"), "{ broken", "utf8");
     writeL2(l2, { roles: { executor: { agent: "l2x" } } });
-
-    const ts = await resolveAgent("executor", undefined, { projectRoot: l1, userConfigDir: l2 });
-    const sh = (
-      await run(process.execPath, [TUT_RESOLVE, "resolve", "executor"], {
-        env: { ...process.env, TUT_PROJECT_ROOT: l1, TUT_USER_CONFIG_DIR: l2 },
-      })
-    ).stdout;
-    expect(sh).toBe(ts);
-    expect(ts).toBe("l2x");
+    expect(await resolveAgentRoute("executor", undefined, { projectRoot: l1, userConfigDir: l2 })).toBe("l2x");
   });
 
-  it("vector: both levels absent → DEFAULT_ROLES values identical on both sides (incl. unknown role)", async () => {
-    const sides = await bothSides(null, null);
-    for (const [ts, sh] of Object.values(sides)) expect(sh).toBe(ts);
-    expect(sides.architect?.[0]).toBe("codex");
-    expect(sides.executor?.[0]).toBe("pi");
-    expect(sides.reviewer?.[0]).toBe("codex");
-    expect(sides.boss?.[0]).toBe("codex"); // unknown-role fallback, parity-pinned
+  it("vector: both levels absent → built-in defaults, including unknown role", async () => {
+    expect(await routes(null, null)).toEqual({ architect: "codex", executor: "pi", reviewer: "codex", boss: "codex" });
   });
 
-  it("vector: legacy {label, agent} tolerated identically", async () => {
-    const sides = await bothSides(
-      { roles: { executor: { label: "exec", agent: "legacy-agent" } } },
-      null,
-    );
-    for (const [ts, sh] of Object.values(sides)) expect(sh).toBe(ts);
-    expect(sides.executor?.[0]).toBe("legacy-agent");
+  it("vector: legacy {label, agent} tolerated", async () => {
+    expect(await routes({ roles: { executor: { label: "exec", agent: "legacy-agent" } } }, null))
+      .toEqual({ architect: "codex", executor: "legacy-agent", reviewer: "codex", boss: "codex" });
   });
 
-  it("vector: TUT_USER_CONFIG_DIR empty string — both sides treat it as UNSET (HOME fallback), never a cwd-relative read", async () => {
-    // The trap: a stray ./workspace.json next to the resolution root — exactly
-    // what the old mjs `??` bug silently read when the env var was "" (L2 =
-    // path.join("", "workspace.json")). Empty must mean unset on BOTH sides:
-    // L2 falls back to <HOME>/.config/tut.
-    const fakeHome = mkdtempSync(path.join(os.tmpdir(), "tut-parity-home-"));
-    const root = mkdtempSync(path.join(os.tmpdir(), "tut-parity-root-"));
-    TRASH.push(fakeHome, root);
-    mkdirSync(path.join(fakeHome, ".config", "tut"), { recursive: true });
-    writeFileSync(path.join(fakeHome, ".config", "tut", "workspace.json"), JSON.stringify({ roles: { executor: { agent: "home-l2" } } }));
-    writeFileSync(path.join(root, "workspace.json"), JSON.stringify({ roles: { executor: { agent: "stray-trap" } } })); // the bug's file
-
+  it("vector: empty TUT_USER_CONFIG_DIR uses the home config, never a cwd-relative read", async () => {
+    const fakeHome = temp("home");
+    const root = temp("root");
+    writeL2(path.join(fakeHome, ".config", "tut"), { roles: { executor: { agent: "home-l2" } } });
+    writeL2(root, { roles: { executor: { agent: "stray-trap" } } });
     const prevCwd = process.cwd();
-    const prevHome = process.env.HOME;
+    homeFixture.directory = fakeHome;
     const prevUserDir = process.env.TUT_USER_CONFIG_DIR;
-    process.chdir(root); // TS side: default projectRoot = cwd (L1 = root/.context-hub — absent)
-    process.env.HOME = fakeHome; // os.homedir() reads $HOME at call time (POSIX)
-    process.env.TUT_USER_CONFIG_DIR = ""; // the degenerate input under test
+    process.chdir(root);
+    process.env.TUT_USER_CONFIG_DIR = "";
     try {
-      const ts = await resolveAgent("executor"); // no options: defaultUserConfigDir() reads the env
-      const sh = (
-        await run(process.execPath, [TUT_RESOLVE, "resolve", "executor"], {
-          env: { ...process.env, HOME: fakeHome, TUT_PROJECT_ROOT: root, TUT_USER_CONFIG_DIR: "" },
-          cwd: root,
-        })
-      ).stdout;
-      expect(sh).toBe(ts); // parity: identical output on both sides
-      expect(ts).toBe("home-l2"); // empty = unset → HOME L2, NOT the stray cwd file
+      expect(await resolveAgentRoute("executor")).toBe("home-l2");
     } finally {
       process.chdir(prevCwd);
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
+      homeFixture.directory = undefined;
       if (prevUserDir === undefined) delete process.env.TUT_USER_CONFIG_DIR;
       else process.env.TUT_USER_CONFIG_DIR = prevUserDir;
     }
   });
 
-  it("vector: TUT_PROJECT_ROOT wins over the anchor-cwd positional", async () => {
-    const winner = mkdtempSync(path.join(os.tmpdir(), "tut-parity-w-"));
-    const loser = mkdtempSync(path.join(os.tmpdir(), "tut-parity-l-"));
-    TRASH.push(winner, loser);
-    writeL1(winner, { roles: { executor: { agent: "winner" } } });
-    writeL1(loser, { roles: { executor: { agent: "loser" } } });
-
-    const sh = (
-      await run(process.execPath, [TUT_RESOLVE, "resolve", "executor", loser], {
-        env: { ...process.env, TUT_PROJECT_ROOT: winner, TUT_USER_CONFIG_DIR: mkdtempSync(path.join(os.tmpdir(), "tut-parity-e-")) },
-      })
-    ).stdout;
-    expect(sh).toBe("winner");
+  it("vector: launch routing honors TUT_PROJECT_ROOT over caller cwd", async () => {
+    const winner = temp("winner");
+    const loser = temp("loser");
+    writeL1(winner, { roles: { executor: { agent: "pi" } } });
+    writeL1(loser, { roles: { executor: { agent: "codex" } } });
+    const { stdout } = await run(process.execPath, [CLI, "launch", "route-root", "executor"], {
+      cwd: loser,
+      env: launchEnv(winner, temp("empty")),
+    });
+    expect(stdout).toContain("(agent 'pi',");
   });
 });
 
-// --- tab-label rendering (tut-resolve.mjs tab-label) -------------------------------
+// --- tab-label rendering through the Node launch entry ----------------------------
 
-describe("tab-label template rendering (tut-resolve.mjs)", () => {
+describe("tab-label template rendering (Node launcher)", () => {
   const TRASH: string[] = [];
   afterEach(() => {
     for (const dir of TRASH.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -311,10 +275,12 @@ describe("tab-label template rendering (tut-resolve.mjs)", () => {
     if (template !== null) writeL1(l1, { naming: { tab_label: template } });
     const { stdout } = await run(
       process.execPath,
-      [TUT_RESOLVE, "tab-label", role, task, agent],
-      { env: { ...process.env, TUT_PROJECT_ROOT: l1, TUT_USER_CONFIG_DIR: l2 } },
+      [CLI, "launch", task, role, agent],
+      { env: launchEnv(l1, l2) },
     );
-    return stdout;
+    const label = stdout.match(/DRY-RUN: birth: herdr tab create .* --label (.+) --no-focus/);
+    expect(label).not.toBeNull();
+    return label![1]!;
   }
 
   it("default template renders the three conventional roles", async () => {
@@ -341,15 +307,9 @@ describe("tab-label template rendering (tut-resolve.mjs)", () => {
   });
 });
 
-// --- seed file + retired artifacts (design acceptance ②/④) -------------------------
+// --- retired workspace contracts -------------------------------------------------
 
-describe("repo seed & retired artifacts", () => {
-  it("scripts/workspace.json exists and is valid JSON (the ONLY thing asserted about the seed)", () => {
-    const file = path.join(SCRIPTS_DIR, "workspace.json");
-    expect(existsSync(file)).toBe(true);
-    expect(() => JSON.parse(readFileSync(file, "utf8"))).not.toThrow();
-  });
-
+describe("retired workspace contracts", () => {
   it("scripts/routes.json is retired (deleted, not merely unread)", () => {
     expect(existsSync(path.join(SCRIPTS_DIR, "routes.json"))).toBe(false);
   });

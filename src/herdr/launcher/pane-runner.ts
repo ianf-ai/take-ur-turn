@@ -1,5 +1,5 @@
 /**
- * Pane runner (dist/herdr/launcher/pane-runner.js — launcher port design §3.3).
+ * Pane runner (dist/herdr/launcher/pane-runner.js).
  *
  * The encoded-form execution target for cmd and PowerShell dialects: it
  * accepts exactly one `--payload <base64url>` argv pair, decodes the

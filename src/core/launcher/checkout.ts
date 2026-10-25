@@ -1,5 +1,5 @@
 /**
- * Checkout seam (launcher port design §6).
+ * Checkout seam.
  *
  * A launch has exactly one checkout route.  `current` keeps the existing
  * anchor checkout; `worktree` points at an already-created checkout.  The

@@ -64,6 +64,9 @@ export function closeStopAuditPayload(input: CloseStopAuditInput): {
   const auditId = closeStopAuditId(input);
   const meta = input.meta;
   const stop = input.stop;
+  const windows = meta?.control_protocol === 'windows-console-v1';
+  const scope = windows ? 'root-and-owned-job' : 'root-and-original-group';
+  const descendants = windows ? 'job-members-only' : 'not-performed';
   const lines = [
     "System stop audit recorded by tut after consuming decision(close): the owned run was stopped through the existing cooperative stop protocol.",
     "This is an operation audit, not a human authorization, decision, ack, or launch; it does not reopen or advance the task.",
@@ -93,7 +96,7 @@ export function closeStopAuditPayload(input: CloseStopAuditInput): {
     if (stop.outcome !== undefined) lines.push(`stop_outcome=${stop.outcome}`);
   }
   if (input.failure !== undefined) lines.push(`failure=${input.failure}`);
-  lines.push("scope=root-and-original-group", "descendants_check=not-performed");
+  lines.push(`scope=${scope}`, `descendants_check=${descendants}`);
   return {
     summary: `close-stop audit${input.run !== undefined ? `: run ${input.run.run_id}` : ""}${input.stop !== undefined ? (input.stop.success ? " (stopped)" : " (unconfirmed)") : ""}`,
     body: lines.join("\n"),
@@ -119,8 +122,8 @@ export function closeStopAuditPayload(input: CloseStopAuditInput): {
         }
       : {}),
     ...(input.failure !== undefined ? { failure: input.failure } : {}),
-    scope: "root-and-original-group",
-    descendants_check: "not-performed",
+    scope,
+    descendants_check: descendants,
   };
 }
 

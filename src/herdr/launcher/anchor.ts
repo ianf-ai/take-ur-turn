@@ -8,6 +8,7 @@
 
 import { rigLabel } from "../../core/hub/rig.js";
 import path from "node:path";
+import { inspectWorktree, reportWorktreeWarning } from '../../core/preflight/worktree.js';
 import { HerdrClient, type HerdrPane } from "./legacy-herdr-client.js";
 import {
   resolveCheckout,
@@ -167,6 +168,10 @@ export async function resolveWorkspaceSnapshot(
     checkoutInput,
     options.checkoutProvider,
   );
+  if (!checkout.checkoutRoot.startsWith('<')) {
+    const ref = checkout.checkout.kind === 'worktree' ? checkout.checkout.ref : undefined;
+    reportWorktreeWarning(inspectWorktree(checkout.checkoutRoot, ref === undefined ? [] : [{ ref, source: 'task checkout.ref' }]));
+  }
   const context: ExecutionContext = selected === undefined
     ? {
         ...(dryRun ? { anchor: PLACEHOLDER_ANCHOR } : {}),

@@ -76,7 +76,7 @@ export type ParsedArgs =
   | { command: "decide"; task_id: string; decision: "approve" | "reject" | "close"; by: string; reason?: string; url?: string }
   | { command: "ack"; task_id: string; note?: string; url?: string }
   | { command: "assign"; role: "architect" | "executor" | "reviewer"; agent: AgentRoute }
-  | { command: "up"; dryRun: boolean; url?: string; eventPort?: number; root?: string }
+  | { command: "up"; dryRun: boolean; adopt?: boolean; url?: string; eventPort?: number; root?: string }
   | { command: "down"; root?: string }
   | { command: "skill"; role: SkillRole }
   | { command: "init" }
@@ -633,8 +633,8 @@ function parseDoctor(args: readonly string[]): ParsedArgs {
 }
 
 /**
- * tut repair-meta — the CLI client of POST /repair-meta (meta-rebuild,
- * system-design 4.3). Every flag mirrors one JSON body field of the
+ * tut repair-meta — the CLI client of POST /repair-meta (meta-rebuild).
+ * Every flag mirrors one JSON body field of the
  * endpoint; absent flags OMIT the field so the store-side fallbacks apply
  * (title → task_id, flow → full). Values pass through untouched — the store
  * is the single validation authority, so a bad value comes back as an
@@ -685,8 +685,8 @@ function parseRepairMeta(args: readonly string[]): ParsedArgs {
 }
 
 /**
- * tut recover-record — the CLI client of POST /recover-record (record-recovery,
- * system-design 4.3): exactly the endpoint's three required fields
+ * tut recover-record — the CLI client of POST /recover-record (record-recovery):
+ * exactly the endpoint's three required fields
  * (task_id, record_file, from_path) plus the optional provenance note.
  * record_file is a file NAME within the task directory (v003.note.json),
  * not a path; --from is the local path to the recovered original bytes.
@@ -780,7 +780,7 @@ function parseAssign(args: readonly string[]): ParsedArgs {
 }
 
 function parseUp(args: readonly string[]): ParsedArgs {
-  const t = tokenize(args, { values: new Set(["url", "event-port", "root"]), bools: new Set(["dry-run"]) });
+  const t = tokenize(args, { values: new Set(["url", "event-port", "root"]), bools: new Set(["dry-run", "adopt"]) });
   if ("error" in t) return { command: "usage", error: t.error };
   const extra = extraPositionalError(t, 0);
   if (extra !== undefined) return { command: "usage", error: extra };
@@ -793,6 +793,7 @@ function parseUp(args: readonly string[]): ParsedArgs {
   return {
     command: "up",
     dryRun: t.bools.has("dry-run"),
+    ...(t.bools.has("adopt") ? { adopt: true } : {}),
     ...(url !== undefined ? { url } : {}),
     ...(eventPort !== undefined ? { eventPort } : {}),
     ...(root !== undefined ? { root } : {}),

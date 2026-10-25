@@ -1,3 +1,4 @@
+import { birthPane } from '../src/herdr/launcher/birth.js';
 import { scopedFixture, agentFixture } from "./rig-fixtures.js";
 // Fresh-session launcher coverage:
 // birth anchoring (tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail),
@@ -8,14 +9,14 @@ import { scopedFixture, agentFixture } from "./rig-fixtures.js";
 // fixture herdr (test/bin/herdr — argv logged to TUT_HERDR_LOG, scripted
 // JSON out); assertions read the log and the child's stdio.
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 
 const SCRIPTS_DIR = path.resolve(import.meta.dirname, "../scripts");
-const LAUNCH_SH = path.join(SCRIPTS_DIR, "launch.sh");
+const LAUNCH_ARGS = [path.resolve(import.meta.dirname, "../dist/cli.js"), "launch"];
 const FIXTURE_BIN = path.join(path.resolve(import.meta.dirname, ".."), "test", "bin");
 const NODE_DIR = path.dirname(process.execPath);
 const runLaunch = promisify(execFile);
@@ -71,7 +72,9 @@ const expectAgentRun = (lines: string[], pane: string, target: { executable: str
   const line = lines.find((candidate) => candidate.startsWith(`pane run ${pane} `));
   expect(line).toBeDefined();
   expect(line).not.toContain("probe-runner.js");
-  expect(line).toContain(`'${target.executable}'`);
+  const executable = path.sep === "\\" && ["pi", "codex"].includes(target.executable)
+    ? path.join(FIXTURE_BIN, `${target.executable}.exe`) : target.executable;
+  expect(line).toContain(`'${executable}'`);
   for (const arg of target.args) expect(line).toContain(`'${arg}'`);
   for (const [key, value] of Object.entries(target.env)) expect(line).toContain(`'${key}=${value}'`);
   expect(line).toContain("cd -- '/repo'");
@@ -82,8 +85,8 @@ const expectAgentRun = (lines: string[], pane: string, target: { executable: str
  *  The workspace chain is pinned hermetically: TUT_PROJECT_ROOT → the L1
  *  fixture, TUT_USER_CONFIG_DIR → an empty L2 (chain falls to the fixture). */
 const env = (panes: unknown[], extra: Record<string, string> = {}, dryRun = false): NodeJS.ProcessEnv => ({
-  ...process.env,
-  PATH: `${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
+  ...process.env, TUT_PANE_SHELL: "posix",
+  PATH: [FIXTURE_BIN, NODE_DIR, "/usr/bin", "/bin"].join(path.delimiter),
   TUT_HERDR_PANES: JSON.stringify(panes),
   TUT_HUB_ROOT: "/repo",
   TUT_HUB_URL: "http://127.0.0.1:1", // deterministic: hub down → file chain + stderr note
@@ -107,7 +110,7 @@ async function runLogged(
   const log = path.join(os.tmpdir(), `tut-fresh-${process.pid}-${Math.random().toString(36).slice(2)}.log`);
   rmSync(log, { force: true });
   try {
-    const r = await runLaunch(LAUNCH_SH, args, { env: env(panes, { TUT_HERDR_LOG: log, ...extra }, dryRun) });
+    const r = await runLaunch(process.execPath, [...LAUNCH_ARGS, ...args], { env: env(panes, { TUT_HERDR_LOG: log, ...extra }, dryRun) });
     return {
       lines: readFileSync(log, "utf8").split("\n").filter((l) => l.length > 0),
       stdout: r.stdout,
@@ -233,17 +236,18 @@ describe("birth anchor: tut-hub → tut-notify → TUT_SPLIT_BASE → loud fail"
     // placeholder anchors instead of failing.
     const bin = mkdtempSync(path.join(os.tmpdir(), "tut-nostub-"));
     try {
-      writeFileSync(path.join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      if (path.sep === "\\") copyFileSync(path.join(FIXTURE_BIN, "pi.exe"), path.join(bin, "pi.exe"));
+      else writeFileSync(path.join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       const noHerdr = {
-        ...process.env,
-        PATH: `${bin}:${NODE_DIR}:/usr/bin:/bin`,
+        ...process.env, TUT_PANE_SHELL: "posix",
+        PATH: [bin, NODE_DIR, "/usr/bin", "/bin"].join(path.delimiter),
         TUT_DRY_RUN: "1",
         TUT_HUB_ROOT: "/repo",
   TUT_HUB_URL: "http://127.0.0.1:1",
         TUT_PROJECT_ROOT: CHAIN_ROOT, // hermetic chain even without herdr
         TUT_USER_CONFIG_DIR: EMPTY_L2,
       };
-      const { stdout } = await runLaunch(LAUNCH_SH, ["t2", "reviewer", "pi"], { env: noHerdr });
+      const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t2", "reviewer", "pi"], { env: noHerdr });
       expect(stdout).toContain("DRY-RUN: birth: herdr tab create --workspace <workspace> --cwd <cwd> --label TUT reviewer --no-focus");
       expect(stdout).toContain(scopedFixture("DRY-RUN: birth: herdr pane rename <root> t2.reviewer", "<hub-root>")); // pane label fixed
       expect(stdout).toContain(scopedFixture("(agent 'pi', label 't2.reviewer')", "<hub-root>"));
@@ -574,19 +578,20 @@ describe("self-update suppression: the agent run command disables startup update
     // command; command -v must check 'stubagent', not the wrapped form.
     const bin = mkdtempSync(path.join(os.tmpdir(), "tut-supp-unk-"));
     try {
-      writeFileSync(path.join(bin, "stubagent"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      if (path.sep === "\\") copyFileSync(path.join(FIXTURE_BIN, "pi.exe"), path.join(bin, "stubagent.exe"));
+      else writeFileSync(path.join(bin, "stubagent"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       const r = await runLogged(["t1", "executor", "stubagent"], [HUB_PANE], {
         TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
-        PATH: `${bin}:${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
+        PATH: [bin, FIXTURE_BIN, NODE_DIR, "/usr/bin", "/bin"].join(path.delimiter),
       });
       expect(r.code).toBe(0);
-      expectAgentRun(r.lines, "FIX:root1", { executable: "stubagent", args: [], env: {} });
+      expectAgentRun(r.lines, "FIX:root1", { executable: path.sep === "\\" ? path.join(bin, "stubagent.exe") : "stubagent", args: [], env: {} });
 
       // Presence check: an agent not on PATH fails the birth with the BARE
       // name in the message (the wrapped form is never what is probed).
       const miss = await runLogged(["t1", "executor", "ghost-agent"], [HUB_PANE], {});
       expect(miss.code).toBe(1);
-      expect(miss.stderr).toContain("agent 'ghost-agent' not on PATH");
+      expect(miss.stderr).toMatch(/agent 'ghost-agent' (?:not on PATH|not found on PATH)/u);
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }
@@ -778,10 +783,41 @@ describe("tab create exit 0 + unparseable output: tab list recovery, no second c
   });
 });
 
+// Windows reports forced process termination as a numeric exit, so it cannot
+// manufacture a POSIX SIGTERM receipt through a native exe. Exercise that
+// result shape at the client seam; POSIX retains the real signaled-child path.
+async function interruptedBirthFixture(recover: boolean): Promise<void> {
+  const calls: string[] = []; let stderr = '';
+  const pane = await birthPane({ anchor: HUB_PANE, birthCwd: '/repo', tabLabel: 'TUT executor',
+    paneLabel: scopedFixture('t1.executor', '/repo'), commandText: 'fixture command',
+    stderr: line => { stderr += line; }, client: { command: async args => {
+      calls.push(args.join(' '));
+      if (args[0] === 'tab' && args[1] === 'create') return { code: null, signal: 'SIGTERM', stdout: '', stderr: '' };
+      const data = args[0] === 'tab' ? { tabs: recover ? [{ label: 'TUT executor', tab_id: 'FIX:t1' }] : [] }
+        : { panes: [{ pane_id: 'FIX:root1', label: '', workspace_id: 'w11', cwd: '/repo', tab_id: 'FIX:t1', agent_status: 'idle' }] };
+      return { code: 0, signal: null, stdout: JSON.stringify(data), stderr: '' };
+    } },
+  });
+  expect(calls.filter(line => line.startsWith('tab create'))).toHaveLength(1);
+  expect(calls).toContain('tab list --workspace w11');
+  expect(stderr).toContain('signal SIGTERM');
+  if (recover) {
+    expect(pane).toBe('FIX:root1');
+    expect(calls).toContain(scopedFixture('pane rename FIX:root1 t1.executor', '/repo'));
+    expect(calls).toContain('pane run FIX:root1 fixture command');
+    expect(stderr).toContain('tab id recovered via tab list');
+  } else {
+    expect(pane).toBeUndefined();
+    expect(calls.some(line => /^(pane split|pane run|pane rename)/.test(line))).toBe(false);
+    expect(stderr).toContain('refusing a second create');
+  }
+}
+
 // --- tab-create edge: signal termination may have created a remote tab --------
 
 describe("tab create signal termination: recover or refuse, never blindly duplicate", () => {
   it("recovers a tab whose create response was interrupted and completes birth", async () => {
+    if (process.platform === "win32") return interruptedBirthFixture(true);
     const r = await runLogged(["t1", "executor", "pi"], [
       HUB_PANE,
       { pane_id: "FIX:root1", label: "", workspace_id: "w11", cwd: "/repo", tab_id: "FIX:t1", agent_status: "idle" },
@@ -801,6 +837,7 @@ describe("tab create signal termination: recover or refuse, never blindly duplic
   });
 
   it("refuses a second create when signal recovery cannot identify the tab", async () => {
+    if (process.platform === "win32") return interruptedBirthFixture(false);
     const r = await runLogged(["t1", "executor", "pi"], [HUB_PANE], {
       TUT_HERDR_TAB_CREATE_SIGNAL: "SIGTERM",
       TUT_HERDR_TABS: "[]",

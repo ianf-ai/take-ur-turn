@@ -5,7 +5,7 @@
  *   POST   /mcp   → stateless Streamable HTTP (per-request McpServer + transport,
  *                   destroyed on response close — verified idiom)
  *   GET|DELETE /mcp → 405 + Allow: POST (stateless mode has no SSE stream / session)
- *   GET|HEAD /state → frozen shape for the Notifier (system-design 4.3)
+ *   GET|HEAD /state → frozen shape for the Notifier
  *                   + optional top-level `notify` key echoing config.json's notify
  *                   field (additive revision, absent by default)
  *                   + optional top-level `auto` key echoing the validated auto
@@ -18,9 +18,9 @@
  *   GET|HEAD /board → self-contained read-only board (no external assets)
  *   POST   /mode  → flow_mode switch for `tut mode`:
  *                   validate → key-preserving read-modify-write → echo {flow_mode}
- *   POST   /repair-meta    → meta rebuild (system-design 4.3):
+ *   POST   /repair-meta    → meta rebuild:
  *                   server-computed version + human-supplied rebuild fields
- *   POST   /recover-record  → record-recovery registration (4.3):
+ *   POST   /recover-record  → record-recovery registration:
  *                   pin corrupt bytes, land the .recovered copy, append the
  *                   recovery.jsonl registration line
  *   other         → 404 JSON
@@ -174,7 +174,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     const flowMode = config?.flow_mode ?? "manual";
     const tasks: StateTaskEntry[] = [];
     for (const entry of snapshot.tasks) {
-      // project scope never appears in /state (system-design 4.3) — it has no derived state
+      // project scope never appears in /state — it has no derived state
       if (entry.task_id === PROJECT_TASK_ID || (!includeClosed && entry.status === "closed")) continue;
       tasks.push({
         task_id: entry.task_id,
@@ -197,7 +197,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
     // Optional `auto` key (same additive pattern): the validated
     // launch whitelist section — absent when missing/corrupt/malformed, so the
     // notifier's conservative default (empty = withhold all) applies.
-    // Optional `degraded` key (system-design 4.3 additive revision):
+    // Optional `degraded` key (additive revision):
     // storage-corrupted tasks that failed to fold — present only when non-empty,
     // so consumers may treat absence as healthy. A vanished directory is
     // invisible here by construction; consumers diff tasks∪degraded against
@@ -245,7 +245,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
   }
 
   /**
-   * meta-rebuild repair entry (system-design 4.3): rebuild a corrupt/missing
+   * meta-rebuild repair entry: rebuild a corrupt/missing
    * meta.json through the hub's single-writer queue. Runs on the LIVE hub
    * only — a second process writing meta directly would race concurrent
    * appends (lost updates / version clobbers). The CLI client is `tut
@@ -277,7 +277,7 @@ export function createRequestHandler(deps: RequestHandlerDeps): RequestHandler {
   }
 
   /**
-   * record-recovery registration entry (system-design 4.3): pin the corrupt
+   * record-recovery registration entry: pin the corrupt
    * bytes, land the recovered copy, append the registration line. The
    * recovered bytes come from the caller (human-held external snapshot) —
    * the hub never fetches backups itself.

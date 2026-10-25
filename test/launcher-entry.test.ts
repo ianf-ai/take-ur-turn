@@ -192,7 +192,7 @@ describe("internal Node process boundary", () => {
     const spawnFn: DirectSpawn = (file, args) =>
       spawn(file, [...args], { shell: false, stdio: ["ignore", "pipe", "pipe"] });
     const result = await runNodeCommand(
-      ["-e", "process.kill(process.pid, 'SIGSTOP'); setInterval(() => {}, 100);"],
+      ["-e", process.platform === "win32" ? "setInterval(() => {}, 100);" : "process.kill(process.pid, 'SIGSTOP'); setInterval(() => {}, 100);"],
       { spawnFn, timeoutMs: 400 },
     );
     expect(result.timedOut).toBe(true);
@@ -263,6 +263,7 @@ describe("compat birth plan", () => {
       "TUT_DRY_RUN",
       "TUT_SUPPRESS_AGENT_UPDATE",
       "PATH",
+      "TUT_PANE_SHELL",
       "TUT_HERDR_PANES",
       "TUT_HERDR_LOG",
       "TUT_DELIVERY_DIAG",
@@ -274,8 +275,9 @@ describe("compat birth plan", () => {
     const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const errors = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     process.env.TUT_SUPPRESS_AGENT_UPDATE = "1";
+    process.env.TUT_PANE_SHELL = "posix";
     delete process.env.TUT_DRY_RUN;
-    process.env.PATH = fixtureBin + ":" + (previous.PATH ?? "");
+    process.env.PATH = [fixtureBin, previous.PATH ?? ""].join(path.delimiter);
     process.env.TUT_HERDR_PANES = "[]";
     process.env.TUT_HERDR_LOG = herdrLog;
     process.env.TUT_DELIVERY_DIAG = "0";
@@ -351,6 +353,7 @@ describe("Notifier canonical launch hand-off", () => {
         waiting_for: "agent:architect",
       }],
     };
+    vi.stubEnv("PATH", [path.resolve(import.meta.dirname, "bin"), process.env.PATH ?? ""].join(path.delimiter));
     let captured: LaunchInvocation | undefined;
     let capturedMarker: unknown;
     const notifier = new Notifier(
@@ -394,8 +397,9 @@ describe("Notifier canonical launch hand-off", () => {
 
     expect(captured).toBeDefined();
     expect(captured!.route).toEqual({ agent: "codex", args: ["--model", "gpt-5.6"] });
-    expect(captured!.posix_direct?.args).toEqual(["--model", "gpt-5.6", "-c", "check_for_update_on_startup=false"]);
+    expect((captured!.posix_direct ?? captured!.effective_agent)?.args).toEqual(["--model", "gpt-5.6", "-c", "check_for_update_on_startup=false"]);
     expect(captured!.marker_projection).toEqual(capturedMarker);
     expect(captured!.marker_projection?.route_source).toBe("task-cast");
+    vi.unstubAllEnvs();
   });
 });

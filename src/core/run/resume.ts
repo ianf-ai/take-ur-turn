@@ -26,11 +26,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { userInfo } from 'node:os';
 import { RunStore, complete, validateHeadlessOwnership, type HeadlessOwnership, type ResumeSource, type RunMeta } from './store.js';
-import { requirePosix, startRun, StartRunError } from './control.js';
+import { startRun, StartRunError } from './control.js';
+import { requireHeadlessPlatform } from '../../standalone/launcher-headless/run-platform.js';
+import type { WindowsOwnership } from '../../standalone/launcher-headless/windows-plan.js';
 import { sessionOccupants, taskOccupants, withAdmissionLock, type SessionIdentity } from './admission.js';
 import { codexArgv } from '../../standalone/launcher-headless/codex-argv.js';
 import { nativeArgv } from '../../standalone/launcher-headless/plan.js';
 import type { ContextRecord } from '../common/types.js';
+import { worktreeGitEnvironment } from '../launcher/worktree-git.js';
 
 export class ResumeError extends Error {
   constructor(message: string, readonly reason: string) { super(message); this.name = 'ResumeError'; }
@@ -53,7 +56,9 @@ export interface ResumePlan {
   managed: boolean;
   /** Rebuilt ownership for managed resumes; base/trigger versions are filled
    *  by the managed gate (they must reflect a fresh log read). */
-  headless?: Omit<HeadlessOwnership, 'base_version' | 'trigger_version'> & { base_version?: number; trigger_version?: number };
+  headless?: Omit<WindowsOwnership, 'base_version' | 'trigger_version'> & { base_version?: number; trigger_version?: number };
+  target_kind?: 'headless-posix' | 'headless-windows';
+  target_digest?: string;
   env: NodeJS.ProcessEnv;
   resume: ResumeSource;
 }
@@ -66,6 +71,7 @@ export interface PlanResumeOptions {
   /** Base of the pi session store (default ~/.pi/agent/sessions; test seam). */
   piSessionsBase?: string;
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
 }
 
 const CONTINUATION_PROMPT = '继续这个 run 的工作：先核对并简要说明已有结果（本会话此前已完成的部分），然后继续原范围内尚未完成的工作；不要重新开始已经完成的部分。';
@@ -225,7 +231,8 @@ export function parsePlainPiArgv(argv: readonly string[]): PlainPiParse {
 // --- planning -------------------------------------------------------------------
 
 export async function planResume(store: RunStore, fromRunId: string, opts: PlanResumeOptions = {}): Promise<ResumePlan> {
-  requirePosix();
+  const platform = opts.platform ?? process.platform;
+  requireHeadlessPlatform(platform);
   let from: RunMeta;
   try {
     from = store.read(fromRunId);
@@ -238,7 +245,11 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
       : 'source-run-incomplete';
     throw new ResumeError(`source run ${fromRunId} has no completion evidence (status=${from.status}${from.ended_at ? '' : ', no ended_at'}${from.stop_request ? `, stop ${from.stop_request.phase}` : ''}); resume accepts only completed runs — never implicitly stops the source`, reason);
   }
-  const agent = path.basename(from.argv[0] ?? '');
+  const windowsPlan = platform === 'win32' ? await import('../../standalone/launcher-headless/windows-plan.js') : undefined;
+  const windows = windowsPlan && from.headless ? windowsPlan.readWindowsLaunch(from.headless) : undefined;
+  const windowsPi = windows?.target.agent === 'pi' ? await import('./windows-pi-session.js') : undefined;
+  if (platform === 'win32' && !windows) throw new ResumeError('Windows resume requires a managed run with frozen logical/physical identity', 'windows-launch-unavailable');
+  const agent = windows?.target.agent ?? path.basename(from.argv[0] ?? '');
   const managed = from.headless !== undefined;
   let session: SessionHandle;
 
@@ -263,9 +274,15 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
         throw e;
       }
     }
-    const base = opts.piSessionsBase ?? process.env.PI_CODING_AGENT_SESSION_DIR ?? path.join(os.homedir(), '.pi', 'agent', 'sessions');
-    const verified = verifyPiSession(base, from.cwd, id);
-    if (!verified.ok) throw new ResumeError(verified.reason, 'pi-session-not-found');
+    if (windows?.pi_session) {
+      if (windows.pi_session.launch_cwd !== path.win32.resolve(from.cwd)) throw new ResumeError('frozen Windows pi cwd differs from run cwd', 'pi-session-not-found');
+      try { windows.pi_session = windowsPi!.verifyWindowsPiSession(windows.pi_session, id); }
+      catch (e) { throw new ResumeError((e as Error).message, 'pi-session-not-found'); }
+    } else {
+      const base = opts.piSessionsBase ?? process.env.PI_CODING_AGENT_SESSION_DIR ?? path.join(os.homedir(), '.pi', 'agent', 'sessions');
+      const verified = verifyPiSession(base, from.cwd, id);
+      if (!verified.ok) throw new ResumeError(verified.reason, 'pi-session-not-found');
+    }
     session = { agent: 'pi', session_id: id, source: source! };
   } else {
     throw new ResumeError(`source run ${fromRunId} agent '${agent || '(none)'}' is not resumable: only codex/pi native sessions are supported; shell wrappers and unknown agents refuse explicitly`, 'unsupported-agent');
@@ -277,7 +294,10 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
 
   let argv: string[];
   if (managed) {
-    argv = nativeArgv(from.headless!.route, prompt, session.session_id);
+    const route = from.headless!.route;
+    const logical = nativeArgv(windows ? { agent, args: agent === 'pi' ? windowsPi!.windowsPiRouteArgs(route.args).args : route.args } : route, prompt, session.session_id);
+    argv = windows ? windowsPlan!.physicalWindowsArgv(windows.target, logical, windows.pi_session) : logical;
+    if (windows) windows.logical_argv = logical;
   } else if (agent === 'codex') {
     const parsed = parsePlainCodexArgv(from.argv);
     argv = codexArgv(parsed.agent, parsed.optionTokens, prompt, session.session_id);
@@ -287,7 +307,7 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
   }
 
   const env = managed
-    ? { ...(opts.env ?? process.env), TUT_HUB_ROOT: store.hubRoot, ...(opts.hubUrl !== undefined ? { TUT_HUB_URL: opts.hubUrl } : {}), ...(opts.eventUrl !== undefined ? { TUT_EVENT_PORT_URL: opts.eventUrl } : {}) }
+    ? { ...(opts.env ?? process.env), TUT_HUB_ROOT: store.hubRoot, ...(opts.hubUrl !== undefined ? { TUT_HUB_URL: opts.hubUrl } : {}), ...(opts.eventUrl !== undefined ? { TUT_EVENT_PORT_URL: opts.eventUrl } : {}), ...worktreeGitEnvironment({ hubRoot: store.hubRoot, checkoutRoot: from.cwd }) }
     : (opts.env ?? process.env);
 
   const resume: ResumeSource = {
@@ -313,6 +333,7 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
       session_reason: `resume: manual continuation of run ${fromRunId}`,
       resume_from_run_id: fromRunId,
       ...(agent === 'pi' ? { designated_session_id: session.session_id } : {}),
+      ...(windows ? { windows } : {}),
     };
   }
 
@@ -328,6 +349,7 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
     ...(headless !== undefined ? { headless } : {}),
     env,
     resume,
+    ...(windows ? { target_kind: 'headless-windows' as const, target_digest: windowsPlan!.windowsLaunchDigest(store.hubRoot, from.cwd, argv) } : {}),
   };
 }
 
@@ -346,6 +368,7 @@ export interface ManagedResumeDeps {
   publishMarker?: (hubUrl: string, marker: {
     task_id: string; role: string; attempt_id: string; base_version: number; trigger_version: number;
     resume_from_run_id: string; route: { agent: string; args: string[] }; route_source: string;
+    target_kind?: 'headless-posix' | 'headless-windows'; target_digest?: string;
   }, expectedVersion?: number) => Promise<{ version: number }>;
   start?: typeof startRun;
 }
@@ -402,6 +425,7 @@ async function publishManualMarker(
   marker: {
     task_id: string; role: string; attempt_id: string; base_version: number; trigger_version: number;
     resume_from_run_id: string; route: { agent: string; args: string[] }; route_source: string;
+    target_kind?: 'headless-posix' | 'headless-windows'; target_digest?: string;
   },
   expectedVersion?: number,
 ): Promise<{ version: number }> {
@@ -421,7 +445,8 @@ async function publishManualMarker(
         via: 'manual',
         route: marker.route,
         route_source: marker.route_source,
-        target_kind: 'headless-posix',
+        target_kind: marker.target_kind ?? 'headless-posix',
+        ...(marker.target_digest ? { target_digest: marker.target_digest } : {}),
         launch_mode: 'headless',
         attempt_id: marker.attempt_id,
         trigger_version: marker.trigger_version,
@@ -500,6 +525,7 @@ export async function executeManagedResume(
         throw new ResumeError(`task ${plan.task_id} still has incomplete runs: ${taskBusy.map(o => `${o.run_id} (${o.detail})`).join(', ')}`, 'task-busy');
       }
       try {
+        if (plan.headless!.windows) (await import('../../standalone/launcher-headless/windows-plan.js')).verifyWindowsContinuation(plan.headless as WindowsOwnership, plan.cwd);
         await publishMarker(input.hubUrl, {
           task_id: plan.task_id!,
           role: plan.headless!.role,
@@ -509,6 +535,8 @@ export async function executeManagedResume(
           resume_from_run_id: plan.from_run_id,
           route: plan.headless!.route,
           route_source: plan.headless!.route_source,
+          ...(plan.target_kind ? { target_kind: plan.target_kind } : {}),
+          ...(plan.target_digest ? { target_digest: plan.target_digest } : {}),
         }, base);
       } catch (e) {
         const message = (e as Error).message;

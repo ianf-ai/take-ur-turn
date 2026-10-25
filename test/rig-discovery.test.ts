@@ -54,7 +54,7 @@ beforeEach(() => {
   for (const name of ["TUT_HUB_ROOT", "TUT_HUB_URL"]) vi.stubEnv(name, "");
   // Empty URL values are not part of this fixture's configuration.
   delete process.env.TUT_HUB_URL; delete process.env.TUT_HUB_ROOT;
-  vi.stubEnv("PATH", `${path.join(repo, "test/bin")}:${path.dirname(process.execPath)}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", [path.join(repo, "test/bin"), path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter));
   vi.stubEnv("TUT_UP_CLI_SELF", path.join(repo, "dist/cli.js"));
   vi.stubEnv("TUT_USER_CONFIG_DIR", path.join(tmp, "user"));
   log = path.join(tmp, "herdr.log");
@@ -465,3 +465,7 @@ describe("Hub root handshake", () => {
     expect(await portFree(port)).toBe(true);
   });
 });
+
+// This suite inspects POSIX command text; target discovery still uses the real host.
+beforeEach(() => { vi.stubEnv("TUT_PANE_SHELL", "posix"); });
+afterEach(() => { vi.unstubAllEnvs(); });

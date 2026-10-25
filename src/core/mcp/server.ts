@@ -1,5 +1,5 @@
 /**
- * Context Hub MCP surface: the 5 tools of system-design 4.1.
+ * Context Hub MCP surface: create, publish, read, list, decide.
  *
  * Thin adapter over the Store: every handler maps 1:1 to
  * a Store call, no business logic here. Result mapping follows the schema
@@ -57,14 +57,14 @@ const STATUS_ENUM = z.enum([
 ]);
 
 /**
- * Workflow variant enum (system-design 3.1): full = design → implement →
+ * Workflow variant enum: full = design → implement →
  * review → human approval; direct = design already exists, start at
  * implementing (design records become reference notes); solo = small change,
  * starts implementing, design/review phases skipped (code_changes goes straight to human approval).
  */
 const FLOW_ENUM = z.enum(["full", "direct", "solo"]);
 
-/** Per-task cast (system-design 4.1): legacy string or parameterized route. */
+/** Per-task cast: legacy string or parameterized route. */
 const CAST_ROLES_ENUM = z.enum(["architect", "executor", "reviewer"]);
 const agentRouteSchema = z.union([
   z.string(),
@@ -72,7 +72,7 @@ const agentRouteSchema = z.union([
 ]);
 const castSchema = z.record(CAST_ROLES_ENUM, agentRouteSchema).optional();
 
-/** Payload envelope as a raw zod schema: extend-only passthrough (context-design 2.3/5). */
+/** Payload envelope as a raw zod schema: extend-only passthrough. */
 const payloadSchema = z
   .object({
     summary: z.string().optional(),

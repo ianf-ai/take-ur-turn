@@ -1,3 +1,4 @@
+import path from "node:path";
 import { rigLabel } from "../src/core/hub/rig.js";
 
 /** Upgrade older behavior fixtures to the rig addressing convention. */
@@ -8,5 +9,10 @@ export function scopedFixture(text: string, root: string): string {
 /** Exact expected POSIX agent command with the mandatory rig environment. */
 export function agentFixture(text: string, root: string, hub = "http://127.0.0.1:1"): string {
   const assignments = `'TUT_HUB_ROOT=${root}' 'TUT_HUB_URL=${hub}' 'TUT_EVENT_PORT_URL=http://127.0.0.1:1/agent-event' `;
+  if (path.sep === "\\") {
+    for (const name of ["pi", "codex"]) {
+      text = text.replaceAll(`'${name}'`, `'${path.resolve(import.meta.dirname, "bin", `${name}.exe`)}'`);
+    }
+  }
   return text.replace(/(&& )(env 'PI_SKIP_VERSION_CHECK=1' )?/, (_, prefix, pi) => `${prefix}${pi ?? "env "}${assignments}`);
 }

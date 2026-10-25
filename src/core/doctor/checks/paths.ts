@@ -1,7 +1,6 @@
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { HerdrClient } from "../../../herdr/launcher/legacy-herdr-client.js";
 import { rigHash } from "../../hub/rig.js";
 import { worst } from "../shared.js";
 import type { DoctorCheck, DoctorContext, DoctorStatus } from "../types.js";
@@ -20,7 +19,7 @@ function pathHazards(p: string, platform: NodeJS.Platform): string[] {
   return hazards;
 }
 
-async function checkPaths(ctx: DoctorContext): Promise<DoctorCheck> {
+async function checkPaths(ctx: DoctorContext, probePanes: (ctx: DoctorContext) => Promise<ReadonlyArray<{ label?: string; cwd?: string }>>): Promise<DoctorCheck> {
   const check: DoctorCheck = {
     name: "paths",
     title: "path safety",
@@ -51,7 +50,7 @@ async function checkPaths(ctx: DoctorContext): Promise<DoctorCheck> {
   check.status = worst(statuses);
   // Only system panes carry the rig root as cwd; task checkouts can differ.
   try {
-    const { panes } = await new HerdrClient({ env: ctx.env, platform: ctx.platform }).paneList();
+    const panes = await probePanes(ctx);
     const rootsByHash = new Map<string, Set<string>>();
     for (const pane of panes) {
       const match = /^tut-(?:hub|notify)-([a-f0-9]{8})$/.exec(pane.label ?? "");

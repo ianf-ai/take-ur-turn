@@ -453,6 +453,139 @@ it('groups actual derived approvals for every flow, retains Approved and unknown
   selectBucket(app,'unmapped');expect(app.elements.get('rows')!.text()).toContain('future_state');expect(app.elements.get('rows')!.text()).not.toContain('Title d');expect(app.elements.get('rows')!.text()).not.toContain('pending_approval');
   expect(fetcher.mock.calls.some(([url])=>url.includes('/versions'))).toBe(false);app.stop();
 });
+it.each([
+  ['designing','architect','designing'],
+  ['implementing','executor','implementing'],
+  ['revising','executor','implementing'],
+  ['reviewing','reviewer','reviewing'],
+])('shows pending in %s until a current-round run appears',async(status,role,key)=>{
+  const runs:unknown[]=[run('other',{task_id:'another-task'})];
+  const fetcher=appFetch([task('t',status,{waiting_for:'agent:'+role})],runs);
+  const app=boardV2App(fetcher);await vi.advanceTimersByTimeAsync(0);selectBucket(app,key);
+  const who=()=>app.elements.get('rows')!.children[0]!.children[3]!.text();
+  expect(who()).toBe('pending');
+  runs.push(run('previous',{started_at:'2026-10-16T23:58:59Z',status:'exited',pid_alive:false,argv_summary:'["pi","--model","previous-model"]'}));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(who()).toBe('pending');
+  runs.push(run('next',{started_at:'2026-10-17T00:00:00Z'}));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(who()).toBe('codex · model-1');
+  expect(fetcher.mock.calls.every(([url])=>['/state?include=closed','/runs','/hubs'].includes(url))).toBe(true);
+  app.stop();
+});
+it.each([
+  ['designing','implementing','architect','executor'],
+  ['implementing','reviewing','executor','reviewer'],
+  ['revising','reviewing','executor','reviewer'],
+])('clears the previous command across %s → %s before the next launch',async(before,after,previousRole,nextRole)=>{
+  const t=task('t',before,{waiting_for:'agent:'+previousRole});
+  const runs=[run('previous',{argv_summary:'["pi","--model","previous-model"]'})];
+  const fetcher=appFetch([t],runs),app=boardV2App(fetcher);
+  await vi.advanceTimersByTimeAsync(0);selectBucket(app,before==='revising'?'implementing':before);
+  const who=()=>app.elements.get('rows')!.children[0]!.children[3]!.text();
+  expect(who()).toBe('pi · previous-model');
+  // The old process may still be running after it publishes its delivery.
+  Object.assign(t,{status:after,waiting_for:'agent:'+nextRole,version:3,updated_at:'2026-10-17T00:00:00Z'});
+  await vi.advanceTimersByTimeAsync(5000);selectBucket(app,after);
+  expect(who()).toBe('pending');
+  runs.push(run('current',{started_at:t.updated_at}));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(who()).toBe('codex · model-1');
+  expect(fetcher.mock.calls.some(([url])=>url.includes('/versions'))).toBe(false);
+  app.stop();
+});
+it.each([
+  ['2026-10-16T23:58:59.999Z','pending'],
+  ['2026-10-16T23:59:00.000Z','codex · model-1'],
+  ['2026-10-17T07:59:00+08:00','codex · model-1'],
+  ['2026-10-16T23:59:00.001Z','codex · model-1'],
+])('compares run time %s against the inclusive record-time boundary',async(started_at,expected)=>{
+  const app=boardV2App(appFetch([task('t')],[run('current',{started_at,status:'exited'})]));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(app.elements.get('rows')!.children[0]!.children[3]!.text()).toBe(expected);app.stop();
+});
+it('selects the newest current-round run and re-bounds on a new record without a status change',async()=>{
+  const t=task('t');
+  const app=boardV2App(appFetch([t],[
+    run('newest',{started_at:'2026-10-16T23:59:30Z',status:'exited'}),
+    run('older',{argv_summary:'["pi","--model","older"]'}),
+    run('other',{task_id:'another-task',started_at:'2026-10-17T00:00:00Z'}),
+  ]));
+  await vi.advanceTimersByTimeAsync(0);
+  const who=()=>app.elements.get('rows')!.children[0]!.children[3]!.text();
+  expect(who()).toBe('codex · model-1');
+  t.updated_at='2026-10-17T00:00:00Z';t.version++;
+  await vi.advanceTimersByTimeAsync(5000);expect(who()).toBe('pending');app.stop();
+});
+it.each([undefined,'unknown','invalid'])('keeps unavailable round timestamps (%s) unknown',async value=>{
+  for(const [t,r] of [[task('t','implementing',{updated_at:value}),run()], [task('t'),run('current',{started_at:value})]]) {
+    const app=boardV2App(appFetch([t],[r]));await vi.advanceTimersByTimeAsync(0);
+    expect(app.elements.get('rows')!.children[0]!.children[3]!.text()).toBe('unknown');app.stop();
+  }
+});
+it.each([
+  {status:'running',pid_alive:false},
+  {status:'running',pid_alive:null},
+  {status:undefined,pid_alive:null},
+  {status:'exited',pid_alive:false},
+  {status:'stopped',pid_alive:true},
+  {status:'stopped',pid_alive:false},
+  {status:'stopped',pid_alive:null},
+])('shows the current-round command regardless of process observations: %j',async extra=>{
+  const app=boardV2App(appFetch([task('t')],[run('current',extra)]));await vi.advanceTimersByTimeAsync(0);
+  expect(app.elements.get('rows')!.children[0]!.children[3]!.text()).toBe('codex · model-1');app.stop();
+});
+it('does not infer no run before the first successful runs snapshot',async()=>{
+  const base=appFetch([task('t')]);
+  const fetcher=vi.fn((url:string,options?:RequestInit)=>url==='/runs'?Promise.reject(Error('offline')):base(url,options));
+  const app=boardV2App(fetcher);await vi.advanceTimersByTimeAsync(0);
+  expect(app.elements.get('rows')!.children[0]!.children[3]!.text()).toBe('unknown · stale');app.stop();
+});
+it.each(['meta_missing','meta_invalid','unsafe_path'])('keeps run attribution unknown for %s and recovers on healthy snapshots',async code=>{
+  const broken={run_id:'unreadable-active',pid_alive:null,degraded:true,issues:[{source:'meta',code}],log_available:false,log_tail:[],log_truncated:false};
+  const runs:unknown[]=[broken];
+  const app=boardV2App(appFetch([task('t','reviewing',{waiting_for:'agent:reviewer'})],runs));
+  await vi.advanceTimersByTimeAsync(0);selectBucket(app,'reviewing');
+  const who=()=>app.elements.get('rows')!.children[0]!.children[3]!.text();
+  expect(who()).toBe('unknown');
+  runs.push(run('previous',{status:'exited',pid_alive:false}));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(who()).toBe('unknown');
+  runs.splice(0,runs.length);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(who()).toBe('pending');
+  runs.push(run('current',{started_at:'2026-10-17T00:00:00Z'}));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(who()).toBe('codex · model-1');app.stop();
+});
+it.each([
+  {task_id:undefined,degraded:true,issues:[{source:'log',code:'log_missing'}]},
+  {task_id:'another-task',degraded:true,issues:[{source:'log',code:'log_invalid'}]},
+  {task_id:'another-task',degraded:false,issues:[]},
+])('does not confuse log failures or other task runs with unknown attribution: %j',async extra=>{
+  const app=boardV2App(appFetch([task('t')],[run('other',extra),run('previous',{started_at:'2026-10-16T23:58:59Z',status:'exited',pid_alive:false,degraded:true,issues:[{source:'log',code:'log_missing'}]})]));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(app.elements.get('rows')!.children[0]!.children[3]!.text()).toBe('pending');app.stop();
+});
+it.each(['human','none',undefined,'agent:'])('does not use waiting_for=%s to select a current-round command',async waiting_for=>{
+  const app=boardV2App(appFetch([task('t','implementing',{waiting_for})],[run('previous',{status:'exited'})]));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(app.elements.get('rows')!.children[0]!.children[3]!.text()).toBe('codex · model-1');app.stop();
+});
+it('preserves needs-human and done column behavior when no run is active',async()=>{
+  const tasks=[task('flagged','reviewing',{needs_attention:true,waiting_for:'agent:reviewer'}),
+    ...['pending_approval','approved','closed'].map(status=>task(status,status,{flow:'direct',waiting_for:'human'}))];
+  const app=boardV2App(appFetch(tasks,[run('previous',{task_id:'flagged',status:'exited',started_at:'2020-01-01'}),run('broken',{task_id:undefined,degraded:true,issues:[{source:'meta',code:'meta_invalid'}]})],async()=>response({schema_version:1,rounds:[{total_tokens:321}]})));
+  await vi.advanceTimersByTimeAsync(0);selectBucket(app,'needs-human');await vi.advanceTimersByTimeAsync(0);
+  const rows=()=>app.elements.get('rows')!.children;
+  expect(rows().find(r=>r.dataset.taskId==='flagged')!.children[3]!.text()).toBe('codex · model-1');
+  expect(rows().find(r=>r.dataset.taskId==='pending_approval')!.children[3]!.text()).toBe('321 tok');
+  expect(app.elements.get('th-activity')!.text()).toBe('Status');
+  selectBucket(app,'done');await vi.advanceTimersByTimeAsync(0);
+  expect(rows()).toHaveLength(2);
+  for(const row of rows()) {expect(row.children[2]!.text()).toBe('direct');expect(row.children[3]!.text()).toBe('321 tok');}
+  app.stop();
+});
 it('shows Pending approval tokens and human-highlighted expandable records',async()=>{
   const app=boardV2App(appFetch([task('t','pending_approval',{waiting_for:'human'})],[],async url=>url.endsWith('/usage')?response({schema_version:1,rounds:[{total_tokens:321}]}):response(records())),'#task/t');
   await vi.advanceTimersByTimeAsync(0);selectBucket(app,'needs-human');selectRow(app,'t');await vi.advanceTimersByTimeAsync(0);

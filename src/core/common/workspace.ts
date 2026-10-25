@@ -12,13 +12,10 @@
  * roles fall back per role key (L1 defining executor only leaves architect
  * to L2/L3); `naming.tab_label` falls back independently (L1 → L2 →
  * "TUT {role}"). Entries may carry extra keys (the legacy {label, agent}
- * shape included) — only `.agent` is read. scripts/workspace.json in the
- * repo is a SEED (shape example) and is never read at runtime.
+ * shape included); `{agent,args}` entries preserve ordered arguments.
  *
- * TS consumers (assign / up / start-next / Notifier) resolve
- * through here; scripts/tut-resolve.mjs mirrors the exact chain for
- * launch.sh (plain node, zero-dep). Parity between the two implementations
- * is pinned by test (same fixture vectors, same output).
+ * All consumers (assign / up / start-next / Notifier / legacy launch)
+ * resolve through this module. Configuration examples live in README.md.
  */
 
 import { readFile } from "node:fs/promises";
@@ -34,7 +31,7 @@ export const DEFAULT_ROLES: Record<string, string> = {
   reviewer: "codex",
 };
 
-/** Final fallback for a role DEFAULT_ROLES does not know (parity with tut-resolve.mjs). Visible face: `tut create` warns (non-blocking) when the creator role is outside the conventional set — this fallback is what the warning explains. */
+/** Final fallback for a role DEFAULT_ROLES does not know. Visible face: `tut create` warns (non-blocking) when the creator role is outside the conventional set — this fallback is what the warning explains. */
 export const UNKNOWN_ROLE_AGENT = "codex";
 
 export const KNOWN_ROLES = ["architect", "executor", "reviewer"] as const;
@@ -252,8 +249,8 @@ export async function resolveAgent(role: string, cast?: Cast, opts: ResolveOptio
 
 /**
  * Resolve the tab-label naming template (independent chain: L1 → L2 →
- * default "TUT {role}"). Rendering lives in scripts/tut-resolve.mjs
- * (`tab-label` subcommand) — the TS side has no tab-label consumer.
+ * default "TUT {role}"). Herdr launch planners render the template from
+ * the same frozen workspace snapshot as the route.
  */
 export async function resolveTabLabelTemplate(opts: ResolveOptions = {}): Promise<string> {
   const snapshot = opts.workspaceSnapshot ?? await readWorkspaceConfigSnapshot(opts);

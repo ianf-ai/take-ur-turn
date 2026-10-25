@@ -226,7 +226,7 @@ MCP HTTP 请求限时 10 秒。退出码为 0（EOF / 正常关闭）、1（参�
 
 任务表为状态 dot、Task、第 3 列、第 4 列、Age。Task 取 title，Age 取 updated_at，不逐行读 versions。按投影桶决定列语义：working 三桶（designing / implementing / reviewing）第 3 列为 Activity，仅由 round_count / warnings / pending_since 合成，第 4 列为 Agent · Model；needs-human 第 3 列为 Status、第 4 列为 Tokens；done 第 4 列为 flow。
 
-Agent · Model 从最新 run 的 argv_summary 提取，不用 cast 猜运行事实；支持 --model / -m 及附值形式，缺失或截断显示未知。Tokens 求 usage 各轮 total_tokens 之和，缺失、非法或 unresolved 显示未知或部分值，不补零。
+Agent · Model 在 working 三桶中只显示当前回合的运行事实：从该任务满足 `run.started_at ≥ /state.updated_at`（任务最新记录时间）的最新 run 的 argv_summary 提取，无论该 run 仍在运行或已退出；当前回合尚无 run 时显示 `pending`，存在不可归属的元数据损坏 run 或时间证据不可用时显示 `unknown`。不用 cast 或 PID 探测猜运行事实，不承载等待或角色话术；支持 --model / -m 及附值形式，缺失或截断显示未知。Tokens 求 usage 各轮 total_tokens 之和，缺失、非法或 unresolved 显示未知或部分值，不补零。
 
 LIVE 为 designing / implementing / reviewing / revising，LATE 为 pending_approval / approved / closed，详情读取仍按底态选择。
 
@@ -264,7 +264,7 @@ Reviewer 首轮全面审按顺序读头部 digest，疑似命中或写 finding �
 
 需要多角色、过程记忆或独立 review 时使用 TUT；纯查询和主会话可直接完成的小事不建任务。新语义、并发时序、接口变更选 full；已有明确设计且涉及核心路径、门禁或公开面选 direct；简单且不涉及高代价核心路径、门禁或公开面选 solo。
 
-多工作单元可先审批设计与分解再实施；已在仓外获批的设计可验证基线后转正为任务 design。分解表包含各单元验收、接缝归属和最终集成形态，未经人批准不批量拆分或并行。独立单元使用人准备的 worktree，Host 不执行 Git 操作；集成由获授权的 Executor 承担并全量验证。
+多工作单元可先审批设计与分解再实施；已在仓外获批的设计可验证基线后转正为任务 design。分解表包含各单元验收、接缝归属和最终集成形态，未经人批准不批量拆分或并行。独立单元的 worktree 由授权代理按任务冻结路径准备（不触远端）；集成由获授权的 Executor 承担并全量验证。
 
 不建设计任务时，可由 Reviewer 以设计审查 note 提供轻量意见，Host 按授权决定是否继续。发起前的阵容覆盖检查按 flow 选择角色：full 检查 Architect / Executor / Reviewer，direct 检查 Executor / Reviewer，solo 检查 Executor；cast 点名的 agent 同样须确认 CLI 可用。
 
@@ -332,7 +332,7 @@ auto 每轮对候选记等待角色、门、白名单、查重、最终动作与
 
 #### 新增交付的运行时间线核对
 
-仅在本次有效 `launch_mode=headless` 且 task 归属明确时核对新增 worker 交付。manual flow 不等于 TUI，观察不受 auto 白名单约束，也不赋予启动权限。human note/decision/ack、普通 worker note、系统 launch note 均排除。
+仅在本次有效 `launch_mode=detached` 且 task 归属明确时核对新增 worker 交付。manual flow 不等于 TUI，观察不受 auto 白名单约束，也不赋予启动权限。human note/decision/ack、普通 worker note、系统 launch note 均排除。
 
 按记录之前最近的合法 launch marker 定位轮次；必须明确 headless，且 attempt、role、base_version 与本地可信 run 对应。TUI/legacy marker、无 marker、跨 rig 或身份不明不推定为 headless。
 
@@ -340,7 +340,7 @@ auto 每轮对候选记等待角色、门、白名单、查重、最终动作与
 
 用交付 timestamp 与 run 的 started_at/ended_at 区间核对，边界相等视为覆盖。publish 与退出在同一轮询窗口被看到时，已完成 run 仍提供时间证据。仅能确认无归属 run 覆盖记录时间才产生 `ghost-delivery`。时间非法、时序矛盾按 unknown，不作肯定诊断。正文包括 task、role、版本、attempt/run、记录与观察时间、无覆盖依据及 `tut read` / `tut ps` / `tut attach` 指引。
 
-Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。Hub 读取偶然看到更高版本，不提前消费。读取失败保留下界，下轮无需新增版本即可重试。首见、冷启动、版本回退、任务消失/降级后恢复、切入 headless 均先建基线，不追报历史新增；切出 headless 清理边界。
+Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。Hub 读取偶然看到更高版本，不提前消费。读取失败保留下界，下轮无需新增版本即可重试。首见、冷启动、版本回退、任务消失/降级后恢复、切入 detached 均先建基线，不追报历史新增；切出 detached 清理边界。
 
 通知按 task_id + record.version 去重，同一静止版本不重报。此路径不写 Hub 记录、不执行 stop/resume/重投。
 
@@ -368,12 +368,14 @@ Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。H
 | 开关 | 选择 | 缺省 |
 |---|---|---|
 | power.mode | herdr / standalone：服务电源实现 | herdr |
-| launch_mode | tui / headless：Notifier 发车后端 | tui |
+| launch_mode | tui / detached：start-next 与 Notifier 发车后端 | tui |
 | flow_mode | manual / auto：谁按启动键 | manual |
+
+`launch_mode` 读写接受 `tui` / `detached` 及兼容别名 `headless`，旧值在配置输入边界归一为 `detached`；get 返回规范值但不回写，set 两种拼写均只写 `detached`。别名无预定删除日期，不产生周期告警。产品配置名不改变记录协议：新旧 marker 的 `launch_mode:'headless'`、`target_kind:'headless-posix'` 和 run 的 `headless` 归属键保持不变，不迁移存量记录、run 或 usage 文件。
 
 三者互不替代：切电源不切发车，切发车不产生轮次，auto 不越过审批。power / launch 的配置 set 保键原子写，非法 set 不落盘；launch_mode 缺文件 / 缺键用缺省，损坏或非法值拒绝本次启动。up / down 的 power 读取只验证出现的 power 节；缺失、不可读或坏 JSON 按 herdr 缺省，显式非法 power 节失败；config get power.mode 使用严格读取并报告坏文件。
 
-实现边界：Herdr 负责 pane 生命周期、rig 标签、终端发车、hook、投递与 Enter；Standalone 负责 detached 服务、run / stop / resume、headless 发车、只读座位、checkout preflight 和 watcher 进程。各实现负责身份、互斥、有界控制、失败证据与清理，不改共享状态和授权规则。
+实现边界：Herdr 负责 pane 生命周期、rig 标签、终端发车、hook、投递与 Enter；Standalone 负责 detached 服务、run / stop / resume、detached 发车、只读座位、checkout preflight 和 watcher 进程。各实现负责身份、互斥、有界控制、失败证据与清理，不改共享状态和授权规则。
 
 两种电源的 up 均调用同一用量 watcher 启动辅助函数；watcher 进程协议见 [Standalone 用量 watcher](standalone-host.md#8-用量-watcher)。
 
@@ -389,9 +391,13 @@ hubRoot 是所属 Hub / 共享存储根；routingRoot 为 TUT_PROJECT_ROOT 或 h
 
 route 按 task cast → 项目 workspace → 用户 workspace → 内置逐 role 回退。项目声明为 `<routingRoot>/.context-hub/workspace.json`，缺失 / 损坏字段由 Hub 根声明补充；用户文件为 `~/.config/tut/workspace.json`，TUT_USER_CONFIG_DIR 可改目录。内置 architect=codex、executor=pi、reviewer=codex，未知 role 回落 codex；参数原样保序。
 
-读侧缺失 / 损坏文件视该级缺席，逐字段回退；`{label,agent}` 仅消费 agent，`{agent,args}` 保留参数。TS resolveAgentRoute 是权威解析，resolveAgent 提供显示字符串；scripts/tut-resolve.mjs 供旧消费者和 parity fixture，scripts/workspace.json 是运行时不读取的种子。assign 修改项目声明，缺文件时以当前有效三角色初始化；只影响未被 task cast 固定的后续任务。
+读侧缺失 / 损坏文件视该级缺席，逐字段回退；`{label,agent}` 仅消费 agent，`{agent,args}` 保留参数。TS resolveAgentRoute 是唯一解析源，resolveAgent 提供显示字符串；配置示例与升级指引见 README 的工作区配置节。assign 修改项目声明，缺文件时以当前有效三角色初始化；只影响未被 task cast 固定的后续任务。
 
 启动环境显式注入 TUT_HUB_ROOT / TUT_HUB_URL / TUT_EVENT_PORT_URL，不假设服务端继承启动者环境，不改全局 process.env、不保存完整环境。
+
+任务执行根与 Hub 根不同时，两条发车链向 worker 显式注入空的 `GIT_ALLOW_PROTOCOL`，以进程级 Git transport 隔离代替修改共享 remote / pushurl：所有 Git 远端传输在连接及取凭据前失败，本地 add / commit 保持可用。fetch / pull 同样被阻止；推送由代理主会话执行。主 checkout 发车与人自行打开的普通 worktree 不新增此限制，不修改全局 / 仓库配置或既有凭据存储。该环境守卫防误操作，不构成防主动清除环境变量或绕用其他客户端的安全沙箱。
+
+headless 每次启动及受管 resume 均重新注入该环境，原生 session 可延续；Herdr 的任务 worktree 每轮新生进程，避免既有 pane 延续时无法补注入环境。current checkout 的 Herdr 连续轮策略不变。Windows 不在此隔离策略的验收范围。
 
 ### 7.3 辅助事件接口
 
@@ -409,7 +415,7 @@ TypeScript、Node.js ≥ 20；运行时依赖为 MCP SDK 与显式声明以保�
 src/cli.ts           CLI 构建入口（dist/cli.js）
 src/core/            Hub、MCP、Notifier、共享契约、CLI、诊断与 run 基础库
 src/herdr/           pane 启动器与终端视图适配
-src/standalone/      detached 电源与 headless 启动器
+src/standalone/      detached 电源与 detached 启动器
 skills/              共用及各角色操作文本
 scripts/             事件接线、打包检查与用量 harness
 test/                Vitest 验证

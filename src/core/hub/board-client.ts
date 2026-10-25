@@ -240,6 +240,16 @@ function bucketActivity(t, key) {
 function latestRun(taskId, runs) {
   return runs.filter(r=>r.task_id===taskId).slice().sort((a,b)=>(timestamp(b.started_at)??-Infinity)-(timestamp(a.started_at)??-Infinity)||b.run_id.localeCompare(a.run_id))[0] ?? null;
 }
+function currentRoundCommand(task, runs) {
+  const boundary=timestamp(task.updated_at);
+  if (!runs || boundary===null) return 'unknown';
+  // Unattributed metadata failures may hide a current run; log failures do not.
+  if (runs.some(r=>!r.task_id&&r.issues.some(i=>i.source==='meta'))) return 'unknown';
+  const own=runs.filter(r=>r.task_id===task.task_id);
+  if (own.some(r=>timestamp(r.started_at)===null)) return 'unknown';
+  const run=latestRun(task.task_id,own.filter(r=>timestamp(r.started_at)>=boundary));
+  return run?commandSummary(run.argv_summary).text:'pending';
+}
 function tokenTotal(data) {
   if (!data || data.schema_version !== 1 || !Array.isArray(data.rounds) || (data.unresolved!==undefined&&!Array.isArray(data.unresolved))) throw Error('usage 响应结构无效');
   let total=0, known=0;
@@ -366,7 +376,12 @@ function renderTable() {
       who.textContent=cached?.text??'读取中…';
       if(cached?.error)who.setAttribute('title',cached.error);
     } else if(LIVE.has(t.status)) {
-      const run=latestRun(t.task_id,runList());who.textContent=run?commandSummary(run.argv_summary).text:'unknown · no run';
+      if(['designing','implementing','reviewing'].includes(key)) {
+        who.textContent=currentRoundCommand(t,states.runs?.snapshot?.runs);
+      } else {
+        const run=latestRun(t.task_id,runList());
+        who.textContent=run?commandSummary(run.argv_summary).text:'unknown · no run';
+      }
       if(states.runs?.error)who.textContent+=' · stale';
     } else who.textContent='unknown · '+t.status;
     const ageCell=node('td',age(t.updated_at),'dw');ageCell.dataset.updatedAt=t.updated_at??'';

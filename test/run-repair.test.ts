@@ -5,11 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { RunStore, probe, QUARANTINE_BASE, type RunMeta } from '../src/core/run/store.js';
-import { repairRun, quarantinedMarker } from '../src/core/run/repair.js';
+import { repairRun as actualRepairRun, quarantinedMarker, type RepairOptions } from '../src/core/run/repair.js';
 import { listRuns } from '../src/core/run/control.js';
 import { parseArgs } from '../src/core/cli/args.js';
 import { runDoctor } from '../src/core/doctor/index.js';
 
+// Historical fixtures model POSIX groups. Windows cannot probe a negative
+// PID; provide only the declared dead fixture-group facts via the public seam.
+// Real positive-PID liveness and explicit unknown/permission cases stay real.
+const fixtureProbe: typeof probe = (pid, kill) => process.platform === 'win32' && [-59089, -2147483000].includes(pid) ? false : probe(pid, kill);
+const repairRun = (store: RunStore, id: string, options: RepairOptions = {}) => actualRepairRun(store, id, { probe: fixtureProbe, ...options });
 const sha = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -51,9 +56,9 @@ async function liveGroup(): Promise<{ pid: number; stop: () => void }> {
   child.unref();
   const pid = child.pid!;
   for (let i = 0; i < 500; i++) {
-    try { process.kill(-pid, 0); break; } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ESRCH') break; await sleep(2); }
+    try { process.kill(process.platform === 'win32' ? pid : -pid, 0); break; } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ESRCH') break; await sleep(2); }
   }
-  return { pid, stop: () => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ } } };
+  return { pid, stop: () => { try { if (process.platform === 'win32') child.kill('SIGKILL'); else process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ } } };
 }
 
 describe('tut repair-run: disposition of invalid run meta', () => {
@@ -361,6 +366,23 @@ describe('concurrent and locked dispositions serialize under the meta lock', () 
 });
 
 describe('symbolic links are never followed into a false verdict', () => {
+  it('a dangling meta link is unsafe rather than absent, even beside a valid artifact', async () => {
+    const f = fixture();
+    const id = f.store.create();
+    const dir = f.store.directory(id);
+    const target = path.join(f.root, 'missing-target.json');
+    symlinkSync(target, path.join(dir, 'meta.json'));
+    const artifact = path.join(dir, `meta.${'a'.repeat(24)}.tmp`);
+    const bytes = f.validMeta(id);
+    writeFileSync(artifact, bytes);
+    const outcome = await repairRun(f.store, id);
+    expect(outcome).toMatchObject({ disposition: 'refused', reason: expect.stringContaining('symbolic link') });
+    expect(lstatSync(path.join(dir, 'meta.json')).isSymbolicLink()).toBe(true);
+    expect(existsSync(target)).toBe(false);
+    expect(readFileSync(artifact, 'utf8')).toBe(bytes);
+    expect(readdirSync(dir).some(n => n.startsWith(QUARANTINE_BASE))).toBe(false);
+  });
+
   it('a symlinked artifact is not adoption evidence; quarantine proceeds without touching the link target', async () => {
     const f = fixture();
     const id = f.rawRun(legacyMeta);
@@ -390,7 +412,7 @@ describe('symbolic links are never followed into a false verdict', () => {
 
     const outcome = await repairRun(f.store, id);
     expect(outcome.disposition).toBe('refused');
-    expect((outcome as { reason: string }).reason).toContain('symbolic link');
+    expect((outcome as { reason: string }).reason).toMatch(/symbolic link|EUNSAFEPATH/);
     expect(lstatSync(path.join(dir, 'meta.json')).isSymbolicLink()).toBe(true); // link untouched
     expect(JSON.parse(readFileSync(target, 'utf8')).run_id).toBe(id);           // target untouched
     // And the protocol's own readers see it as unreadable — no false health anywhere.

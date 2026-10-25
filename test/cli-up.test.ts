@@ -65,6 +65,12 @@ async function runUp(args: string[]): Promise<number> {
 function serviceFixture(text: string): string {
   const env = "TUT_HUB_ROOT=" + fixtureRoot + " TUT_HUB_URL=" + fixtureHub + " TUT_EVENT_PORT_URL=" + fixtureEvent;
   if (text.includes("pane split") && !text.startsWith("up: [dry-run]")) return text + " --env TUT_HUB_ROOT=" + fixtureRoot + " --env TUT_HUB_URL=" + fixtureHub + " --env TUT_EVENT_PORT_URL=" + fixtureEvent;
+  if (path.sep === "\\") {
+    const self = path.join(fixtureRoot, "dist", "cli.js");
+    text = text.replace(`cd ${fixtureRoot} &&`, `cd '${fixtureRoot}' &&`)
+      .replace(`node ${self}`, `'${process.execPath}' '${self}'`);
+    return text.replace(/&& (?:TUT_EVENT_PORT_URL=\S+ )?/, `&& TUT_HUB_ROOT='${fixtureRoot}' TUT_HUB_URL=${fixtureHub} TUT_EVENT_PORT_URL=${fixtureEvent} `);
+  }
   return text.replace(/&& (?:TUT_EVENT_PORT_URL=\S+ )?node /, "&& " + env + " node ");
 }
 
@@ -103,7 +109,8 @@ function projectNote(summary: string, body = ""): ContextRecord {
 
 /** Fixture herdr (plus codex/pi fixtures) first on PATH; system dirs after. */
 function useFixtureHerdr(logPath: string, panes?: unknown[]): void {
-  process.env.PATH = `${TEST_BIN}:${NODE_BIN_DIR}:/usr/bin:/bin`;
+  vi.stubEnv("TUT_PANE_SHELL", "posix");
+  process.env.PATH = [TEST_BIN, NODE_BIN_DIR, "/usr/bin", "/bin"].join(path.delimiter);
   process.env.TUT_HERDR_LOG = logPath;
   if (panes === undefined) delete process.env.TUT_HERDR_PANES;
   else process.env.TUT_HERDR_PANES = JSON.stringify(panes.map((value) => {
@@ -272,12 +279,16 @@ describe("tut up (behavior)", () => {
       expect(io.out()).toContain("up: no workspace lineup config found");
       expect(io.out()).toContain("using built-in defaults (architect=codex, executor=pi, reviewer=codex)");
       // Light path first: tut assign is the primary customization hint,
-      // the full cp comes after it (the advanced route).
+      // the documentation pointer comes after it (the advanced route).
       const out = io.out();
       const assignIdx = out.indexOf("to customize: tut assign <role> <agent>");
-      const cpIdx = out.indexOf(`cp ${path.join(REPO, "scripts", "workspace.json")} ${path.join(project, ".context-hub", "workspace.json")}`);
+      const docsIdx = out.indexOf("full control: see README.md → Configuration → Workspace lineup");
       expect(assignIdx).toBeGreaterThanOrEqual(0);
-      expect(cpIdx).toBeGreaterThan(assignIdx);
+      expect(docsIdx).toBeGreaterThan(assignIdx);
+      expect(out).toContain("https://github.com/ianf-ai/take-ur-turn#configuration");
+      expect(out).toContain(`save your config to ${path.join(project, ".context-hub", "workspace.json")}`);
+      expect(out).toContain(path.join(project, "empty-l2", "workspace.json"));
+      expect(out).not.toContain("full control: cp ");
       expect(existsSync(path.join(project, ".context-hub", "workspace.json"))).toBe(false); // a hint, never a write
     } finally {
       io.restore();
@@ -658,7 +669,7 @@ describe("tut up (behavior)", () => {
 
       expect(code).toBe(0);
       const out = io.out();
-      expect(out).toContain("up: [dry-run] would start the usage watcher (detached; log at .context-hub/usage-audit.log)");
+      expect(out).toContain(`up: [dry-run] would start the usage watcher (detached; log at ${path.join(".context-hub", "usage-audit.log")})`);
       expect(out).not.toContain("tut-usage"); // headless watcher — no pane
     } finally {
       io.restore();
@@ -710,7 +721,7 @@ describe("tut up (behavior)", () => {
 
   it("without Herdr on PATH: prints the manual command list, exits 0, spawns nothing", async () => {
     const { project, logPath, self } = makeProject(false); // .context-hub/ alone satisfies the guardrail
-    process.env.PATH = `${NODE_BIN_DIR}:/usr/bin:/bin`; // no fixture dir, no real herdr (/opt/homebrew/bin)
+    process.env.PATH = [NODE_BIN_DIR, "/usr/bin", "/bin"].join(path.delimiter); // no fixture dir, no real herdr (/opt/homebrew/bin)
     process.env.TUT_HERDR_LOG = logPath;
     process.chdir(project);
     const fetchMock = stubFetch(() => refused());
@@ -950,7 +961,7 @@ describe("tut up invariants-seed hint", () => {
 describe("tut up --url (non-default local hub)", () => {
   it("rejects a non-loopback --url before any probe, spawn, or pane read", async () => {
     const { project } = makeProject(true);
-    process.env.PATH = `${NODE_BIN_DIR}:/usr/bin:/bin`; // no herdr, no agents
+    process.env.PATH = [NODE_BIN_DIR, "/usr/bin", "/bin"].join(path.delimiter); // no herdr, no agents
     process.chdir(project);
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
@@ -970,7 +981,7 @@ describe("tut up --url (non-default local hub)", () => {
 
   it("rejects a loopback --url without an explicit port (serve needs a concrete port)", async () => {
     const { project } = makeProject(true);
-    process.env.PATH = `${NODE_BIN_DIR}:/usr/bin:/bin`;
+    process.env.PATH = [NODE_BIN_DIR, "/usr/bin", "/bin"].join(path.delimiter);
     process.chdir(project);
     const fetchMock = stubFetch(() => refused());
     const io = captureIo();
@@ -1317,7 +1328,7 @@ describe("up --event-port full chain (render/probe same source)", () => {
       expect(code).toBe(0);
       expect(io.err()).not.toContain("another notifier");
       // Non-blocking: the moved-port plan still prints.
-      expect(io.out()).toContain(`node ${self} notify --event-port 3105`);
+      expect(io.out()).toContain(`${process.platform === "win32" ? `'${process.execPath}' '${self}'` : `node ${self}`} notify --event-port 3105`);
     } finally {
       io.restore();
     }

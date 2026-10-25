@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { windowsPiEncodedCwd } from '../../../dist/core/run/windows-pi-session.js';
 import { createServer } from 'node:http';
 import { Store } from '../../../dist/core/hub/store.js';
 import { startServer } from '../../../dist/core/hub/server.js';
@@ -14,6 +15,8 @@ import { measure, readSession } from '../lib/sessions.mjs';
 import { run, collect, enabled, lock, lockPath, merge, writeUsage, loadUsage, source, validateUsage } from '../lib/audit.mjs';
 import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
 import { parse } from '../run.mjs';
+// Real native fixture directory: legacy POSIX encoding is not a Windows filename.
+const fixtureCwdDirectory = root => process.platform === 'win32' ? windowsPiEncodedCwd(root) : `--${root.slice(1).replaceAll('/', '-')}--`;
 const T = n => new Date(Date.UTC(2026,0,1,0,0,0,n)).toISOString();
 async function temp(t) { const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'usage-test-'))); t.after(() => fs.rm(dir,{recursive:true,force:true})); return dir; }
 const launch = (v, n, agent='pi', role='executor') => ({ version:v, timestamp:T(n), role:'human', content_type:'note', payload:{launch:{role, base_version:v-1,route:{agent,args:[]}}} });
@@ -26,6 +29,35 @@ const codexHead = root => ({type:'session_meta',timestamp:T(0),payload:{cwd:root
 const ev = (n,type,extra={}) => ({type:'event_msg',timestamp:T(n),payload:{type,...extra}});
 const count = (n,input,output) => ev(n,'token_count',{info:{total_token_usage:{input_tokens:input,output_tokens:output,total_tokens:input+output,cached_input_tokens:10,reasoning_output_tokens:2}}});
 async function session(dir,agent,rows,name='session.jsonl',tail='') { const file=path.join(dir,name); await fs.writeFile(file,rows.map(x=>JSON.stringify(x)).join('\n')+'\n'+tail); return readSession(file,agent); }
+
+for (const agent of ['pi','codex']) test(`${agent}: note-terminated round and subsequent code delivery both count, including same-session tails`, async t => {
+  const root=await temp(t);
+  const note=(v,n,role='executor',content_type='note')=>({...delivery(v,n,role),content_type});
+  const versions=[launch(1,5,agent),note(2,15,'human'),note(3,20,'reviewer'),note(4,25),
+    note(5,30),delivery(6,35),launch(7,50,agent),delivery(8,70)];
+  const rows=agent==='pi'
+    ? [piHead(root),user(10),pi(20),pi(40,'stop'),user(60),pi(80,'stop')]
+    : [codexHead(root),ev(10,'task_started',{turn_id:'a'}),count(20,100,10),count(40,150,20),ev(41,'task_complete',{turn_id:'a'}),
+      ev(60,'task_started',{turn_id:'b'}),count(80,180,25),ev(81,'task_complete',{turn_id:'b'})];
+  const s=await session(root,agent,rows);
+  const rounds=extract(task(root,versions),root);
+  assert.deepEqual(rounds.map(r=>[r.launch_version,r.delivery_version]),[[1,4],[7,8]]);
+  const value=validateUsage(merge(null,attribute(rounds,[s])));
+  assert.deepEqual(value.rounds.map(r=>[r.input_tokens,r.output_tokens,r.total_tokens]),
+    agent==='pi'?[[64,10,74],[32,5,37]]:[[150,20,170],[30,5,35]]);
+  assert.equal(value.total.rounds,2);
+  assert.equal(value.total.complete,true);
+  assert.deepEqual(value.unresolved,[]);
+});
+test('all worker publication types close a launch, but unlaunched notes and launch markers do not',()=>{
+  for (const role of ['architect','executor','reviewer']) for (const content_type of ['note','checkpoint','decision','review','code_changes']) {
+    const first={...delivery(1,1,role),content_type:'note'};
+    const done={...delivery(3,30,role),content_type};
+    const rounds=extract(task('/tmp/x',[first,launch(2,5,'codex',role),done]),'/tmp/x');
+    assert.equal(rounds.length,1);
+    assert.deepEqual([rounds[0].launch_version,rounds[0].delivery_version],[2,3]);
+  }
+});
 
 test('pi caches, multiple calls, duplicate message IDs, cost and post-delivery tail; same-file continuation', async t => {
   const root=await temp(t), rows=[piHead(root),user(10),pi(20),pi(40,'stop'),user(60),pi(80,'stop')];
@@ -137,6 +169,36 @@ test('zero-round task remains visible alongside measured tasks and respects task
   assert.equal(reports.find(r=>r.task_id===f.id).total.rounds,1);
   assert.deepEqual(await collect({...f.options,task:id},{hub:f.hub}),[{task_id:id,changed:false,reason:'no_matching_rounds'}]);
   assert.equal(await loadUsage(path.join(f.root,'.context-hub/tasks',id)),null);
+});
+test('collect writes note-only rounds and a later code round, then replays without double counting',async t=>{
+  const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const {task_id:id}=await store.createTask({title:'Note rounds',description:'test',role:'human',creator:'test',flow:'direct'});
+  const append=(role,content_type,payload={})=>store.append(id,{role,content_type,payload:{summary:'test',body:'test',...payload}});
+  const start=()=>append('human','note',{launch:{role:'executor',base_version:0,route:{agent:'pi',args:[]}}});
+  const pause=()=>new Promise(resolve=>setTimeout(resolve,5));
+  await start();await pause();await append('executor','note');
+  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,fixtureCwdDirectory(root));
+  await fs.mkdir(cwdDir,{recursive:true});
+  const hub={list:()=>store.listTasks(),read:id=>store.readTask(id)};
+  const options={root,piRoot,codexRoot:path.join(root,'codex'),watch:false};
+  const rows=[piHead(root)];
+  const addWindow=async()=>{
+    const task=await store.readTask(id),[L,D]=task.versions.slice(-2);
+    const kickoff=user(10),end=pi(20,'stop',`a${L.version}`);
+    kickoff.timestamp=L.timestamp;end.timestamp=new Date(Date.parse(D.timestamp)+1).toISOString();
+    rows.push(kickoff,end);await session(cwdDir,'pi',rows);
+  };
+  await addWindow();
+  const [noteOnly]=await collect(options,{hub});
+  assert.deepEqual(noteOnly.total,{rounds:1,total_tokens:37,cost_usd:0.125,complete:true});
+  await pause();await start();await pause();await append('executor','code_changes');await addWindow();
+  const [both]=await collect(options,{hub});
+  assert.deepEqual(both.total,{rounds:2,total_tokens:74,cost_usd:0.25,complete:true});
+  const value=await loadUsage(path.join(root,'.context-hub/tasks',id));
+  assert.deepEqual(value.rounds.map(r=>[r.launch_version,r.delivery_version,r.input_tokens,r.output_tokens]),[[1,2,32,5],[3,4,32,5]]);
+  const [replay]=await collect(options,{hub});assert.equal(replay.changed,false);
+  const [since]=await collect({...options,since:Date.parse(value.rounds[1].ts)},{hub});
+  assert.deepEqual(since.total,both.total);assert.equal(since.changed,false);
 });
 test('unchanged session files are not re-read between watch passes; changed ones are',async t=>{
   const f=await fixture(t);
@@ -271,6 +333,16 @@ test('headless unmeasured delivering round still anchors its replaced launches',
   assert.deepEqual(value.unresolved,[{delivery_version:3,launch_version:2,reason:'missing_session_or_end'},
     {delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
 });
+test('only a launch before publication is superseded; note publication ends the replacement chain',async t=>{
+  const root=await temp(t);
+  const note=(v,n)=>({...delivery(v,n),content_type:'note'});
+  const rounds=extract(task(root,[hlaunch(1,5),hlaunch(2,6),note(3,30),hlaunch(4,50),note(5,70)]),root);
+  const s=await session(root,'pi',[piHead(root),user(10),pi(40,'stop'),user(60),pi(80,'stop')]);
+  const value=validateUsage(merge(null,attribute(rounds,[s])));
+  assert.deepEqual(value.rounds.map(r=>[r.launch_version,r.delivery_version,r.total_tokens]),[[2,3,37],[4,5,37]]);
+  assert.deepEqual(value.unresolved,[{delivery_version:3,launch_version:1,reason:'superseded_launch'}]);
+  assert.equal(value.total.complete,false);
+});
 test('cross-task shared-cwd concurrency and same-session double claim stay honestly unattributed',async t=>{
   const root=await temp(t);
   // 2026-10-18 shape: two headless tasks launched seconds apart in the SAME
@@ -291,7 +363,7 @@ test('headless early exit without a native end: honest unresolved, ledger still 
   await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:0,launch_mode:'headless',route:{agent:'pi',args:[]}}}});
   await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
   const task=await store.readTask(id),Lts=Date.parse(task.versions[0].timestamp),D=Date.parse(task.versions[1].timestamp);
-  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,`--${root.slice(1).replaceAll('/','-')}--`);await fs.mkdir(cwdDir,{recursive:true});
+  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,fixtureCwdDirectory(root));await fs.mkdir(cwdDir,{recursive:true});
   // executor died mid-work: kickoff covered, no assistant stop covering the delivery
   const rows=[piHead(root),user(10),pi(20,'toolUse')];
   rows[0].timestamp=new Date(Lts-100).toISOString();rows[1].timestamp=new Date(Lts).toISOString();rows[2].timestamp=new Date(D-1000).toISOString();
@@ -316,7 +388,7 @@ async function headlessFixture(t) {
   await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:1,launch_mode:'headless',route:{agent:'pi',args:[]}}}});
   await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
   const task=await store.readTask(id),Lts=Date.parse(task.versions[1].timestamp),D=Date.parse(task.versions[2].timestamp);
-  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,`--${root.slice(1).replaceAll('/','-')}--`);await fs.mkdir(cwdDir,{recursive:true});
+  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,fixtureCwdDirectory(root));await fs.mkdir(cwdDir,{recursive:true});
   // real headless session shape: header cwd at the rig root, one kickoff user
   // message at the (winning) launch, assistant stop after the delivery
   const rows=[piHead(root),user(10),pi(40,'stop')];
@@ -409,7 +481,7 @@ async function fixture(t) {
   await store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:0,route:{agent:'pi',args:[]}}}});
   await store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'test'}});
   const task=await store.readTask(id),Lts=Date.parse(task.versions[0].timestamp),D=Date.parse(task.versions[1].timestamp);
-  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,`--${root.slice(1).replaceAll('/','-')}--`);await fs.mkdir(cwdDir,{recursive:true});
+  const piRoot=path.join(root,'pi'),cwdDir=path.join(piRoot,fixtureCwdDirectory(root));await fs.mkdir(cwdDir,{recursive:true});
   const rows=[piHead(root),user(10),pi(40,'stop')]; rows[0].timestamp=new Date(Lts-100).toISOString();rows[1].timestamp=new Date(Lts).toISOString();rows[2].timestamp=new Date(D+100).toISOString();
   const s=await session(cwdDir,'pi',rows);
   const options={root,piRoot,codexRoot:path.join(root,'codex'),watch:false,intervalMs:5,timeoutMs:1000};
@@ -462,7 +534,13 @@ test('watch process owns shared lock; second backfill process fails; SIGTERM rel
   const child=spawn(process.execPath,[...args,'--watch','--interval-ms','20'],{stdio:['ignore','pipe','pipe']});t.after(()=>child.kill());
   await once(child.stdout,'data');
   const second=spawn(process.execPath,[...args,'--backfill'],{stdio:['ignore','pipe','pipe']});let stderr='';second.stderr.on('data',b=>stderr+=b);const [code]=await once(second,'exit');assert.equal(code,1);assert.match(stderr,/audit_locked/);
-  const exited=once(child,'exit');child.kill('SIGTERM');await exited;await assert.rejects(fs.stat(lockPath(f.root)),{code:'ENOENT'});
+  const exited=once(child,'exit');
+  // Windows kill() is force termination, not delivery of POSIX SIGTERM.
+  // Exercise normal watcher shutdown via its real on→off config instead.
+  if(process.platform==='win32')await writeConfigKey(path.join(f.root,'.context-hub'),{key:'usage_audit',value:'off'});
+  else child.kill('SIGTERM');
+  const [exitCode]=await exited;if(process.platform==='win32')assert.equal(exitCode,0);
+  await assert.rejects(fs.stat(lockPath(f.root)),{code:'ENOENT'});
 });
 test('CLI rejects bad modes, unknown options and invalid dates',()=>{
   for (const args of [[],['--wat'],['--watch','--backfill'],['--since','yesterday'],['--since','2026-02-30T00:00:00Z'],['--watch','--interval-ms','0']]) assert.throws(()=>parse(args));
@@ -471,7 +549,7 @@ test('CLI rejects bad modes, unknown options and invalid dates',()=>{
 
 // A minimal HTTP peer lets each wait (including an unfinished response body)
 // fail independently. The rescue closes old-code hangs so red runs finish.
-async function auditPeer(t, root, intercept = () => false) {
+async function auditPeer(t, root, intercept = () => false, tasks = []) {
   const server=createServer(async (req,res)=>{
     if (req.method==='GET' && req.url!=='/state') { res.writeHead(405).end(); return; }
     let body=''; for await (const chunk of req) body+=chunk;
@@ -482,7 +560,7 @@ async function auditPeer(t, root, intercept = () => false) {
     if (phase==='notifications/initialized') { res.writeHead(202).end();return; }
     const result=phase==='initialize'
       ? {protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'test',version:'1'}}
-      : {content:[{type:'text',text:JSON.stringify(phase==='context.list' ? {tasks:[]} : {task_id:'one',versions:[]})}]};
+      : {content:[{type:'text',text:JSON.stringify(phase==='context.list' ? {tasks} : {task_id:'one',versions:[]})}]};
     res.setHeader('Content-Type','application/json');res.end(JSON.stringify({jsonrpc:'2.0',id:message.id,result}));
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -528,6 +606,42 @@ test('audit timeout aborts an MCP SSE response that never delivers its RPC resul
   const hub=await source(url,root,{requestTimeoutMs:60});
   await assert.rejects(hub.list(),/HUB_TIMEOUT.*60ms/);
 });
+
+for (const entry of ['collect', 'run']) for (const phase of ['context.list', 'context.read']) {
+  for (const response of ['headers', 'body', 'sse']) test(`${entry} preserves Hub timeout classification and aborts ${phase} stalled at ${response}`, async t => {
+    const root = await temp(t), ac = new AbortController(), lines = [], progress = [];
+    let intercepted = false, rescued = false, closed;
+    const disconnected = new Promise(resolve => { closed = resolve; });
+    const url = await auditPeer(t, root, (current, res) => {
+      if (current !== phase || intercepted) return false;
+      intercepted = true;
+      if (response === 'body') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.write('{'); }
+      if (response === 'sse') { res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.write(': waiting\n\n'); }
+      const rescue = setTimeout(() => { rescued = true; res.destroy(); }, 1000);
+      res.on('close', () => { clearTimeout(rescue); closed(); });
+      return true;
+    }, [{ task_id: 'one' }]);
+    const options = { root, url, watch: entry === 'run', requestTimeoutMs: 60, intervalMs: 5, timeoutMs: 2000,
+      signal: ac.signal, onProgress: value => progress.push(value) };
+    const expected = `HUB_TIMEOUT:${url}/mcp: read exceeded 60ms`;
+    if (entry === 'collect') {
+      await assert.rejects(collect(options), error => { assert.equal(error.message, expected); return true; });
+      assert.ok(progress.includes(phase === 'context.list' ? 'hub-list' : 'hub-read'));
+    } else {
+      const original = process.stderr.write;
+      process.stderr.write = text => { lines.push(String(text)); return true; };
+      let passes = 0;
+      try {
+        await run(options, { enabled: async () => true, report: () => { passes++; ac.abort(); } });
+      } finally { process.stderr.write = original; }
+      assert.equal(passes, 1, 'watch must retry the failed Hub read and complete a later pass');
+      assert.ok(lines.some(line => line.includes(`pass failed (${expected})`)));
+      assert.ok(lines.every(line => !line.includes('LOCAL_IO_TIMEOUT')), 'network waits must not be diagnosed as local filesystem waits');
+    }
+    await disconnected;
+    assert.equal(rescued, false, 'the Hub deadline must close the underlying network read before test rescue');
+  });
+}
 
 test('watch survives HTTP timeouts, retries at its interval and later completes a pass',async t=>{
   const root=await temp(t),ac=new AbortController(),lines=[],waits=[];let attempts=0,passes=0;

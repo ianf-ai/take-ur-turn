@@ -1,8 +1,7 @@
 /** Read-only projection of the wrapper's file protocol. No task or process writes. */
 import { lstat, readdir, realpath } from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { openRunFile } from "./run-file.js";
+import { openRunFile, withRunFileSession, type RunFile, type RunFileOpener } from "./run-file.js";
 import { validateId } from "../run/store.js";
 
 export const LOG_RANGE_LIMIT = 64 * 1024;
@@ -60,13 +59,13 @@ async function unchanged(dir: Directory): Promise<void> {
   const stat = await lstat(dir.file);
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== dir.dev || stat.ino !== dir.ino) throw unsafe();
 }
-async function regular(parent: Directory, name: string): Promise<FileHandle> {
+async function regular(parent: Directory, name: string, open: RunFileOpener = openRunFile): Promise<RunFile> {
   await unchanged(parent);
   const file = path.join(parent.file, name);
   const stat = await lstat(file);
   if (!stat.isFile() || stat.isSymbolicLink()) throw unsafe();
   // The actual open rejects links in all components; NONBLOCK avoids FIFO hangs.
-  const handle = await openRunFile(file);
+  const handle = await open(file);
   try {
     const opened = await handle.stat();
     if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) throw unsafe();
@@ -123,25 +122,28 @@ export class RunReadStore {
     catch (error) { if (codeOf(error) === "ENOENT") return []; throw error; }
     const names = await readdir(runs.file, { withFileTypes: true });
     const result: RunEntry[] = [];
-    // Sequential reads keep descriptors and memory bounded independently of run count.
-    for (const entry of names) {
-      if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
-      result.push(await this.readRun(runs, entry.name));
-    }
+    // Sequential reads bound handles/memory. Windows also compiles its bridge
+    // just once per snapshot, releasing each file's chain before the next open.
+    await withRunFileSession(async open => {
+      for (const entry of names) {
+        if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
+        result.push(await this.readRun(runs, entry.name, open));
+      }
+    });
     await unchanged(runs);
     return result.sort((a, b) => (b.started_at ? Date.parse(b.started_at) : -Infinity) -
       (a.started_at ? Date.parse(a.started_at) : -Infinity) || a.run_id.localeCompare(b.run_id));
   }
 
-  private async readRun(runs: Directory, id: string): Promise<RunEntry> {
+  private async readRun(runs: Directory, id: string, open: RunFileOpener): Promise<RunEntry> {
     const run: RunEntry = { run_id: id, pid_alive: null, degraded: false, issues: [], log_available: false, log_tail: [], log_truncated: false };
     const problem = (source: "meta" | "log", code: string): void => { run.degraded = true; run.issues.push({ source, code }); };
     let dir: Directory;
     try { await unchanged(runs); dir = await directory(path.join(runs.file, id)); }
     catch (error) { problem("meta", issueCode(error, "meta")); return run; }
-    let metaFile: FileHandle | undefined;
+    let metaFile: RunFile | undefined;
     try {
-      metaFile = await regular(dir, "meta.json");
+      metaFile = await regular(dir, "meta.json", open);
       // Metadata is small by protocol; reject unbounded/corrupt input.
       const metaSize = (await metaFile.stat()).size;
       if (metaSize > 1024 * 1024) throw new SyntaxError("oversized meta");
@@ -167,9 +169,9 @@ export class RunReadStore {
       }
     } catch (error) { problem("meta", error instanceof SyntaxError ? "meta_invalid" : issueCode(error, "meta")); }
     finally { await metaFile?.close(); }
-    let log: FileHandle | undefined;
+    let log: RunFile | undefined;
     try {
-      log = await regular(dir, "log");
+      log = await regular(dir, "log", open);
       const size = (await log.stat()).size;
       const start = Math.max(0, size - TAIL_BYTES);
       const buffer = Buffer.alloc(Math.min(size, TAIL_BYTES));

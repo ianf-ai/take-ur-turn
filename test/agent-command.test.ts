@@ -20,8 +20,7 @@ import { resolveLaunchTarget } from "../src/core/launcher/launch.js";
 
 const run = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
-const RESOLVER = path.join(ROOT, "scripts", "tut-resolve.mjs");
-const LAUNCHER = path.join(ROOT, "scripts", "launch.sh");
+const LAUNCH_ARGS = [path.resolve(import.meta.dirname, "../dist/cli.js"), "launch"];
 const FIXTURE_BIN = path.join(ROOT, "test", "bin");
 
 describe("AgentRoute parser", () => {
@@ -92,15 +91,13 @@ describe("CLI command routes", () => {
   });
 });
 
-describe("TS / plain-node route parser parity", () => {
-  it("preserves the same already-separated argv values", async () => {
+describe("agent invocation token contract", () => {
+  it("preserves already-separated argv values", async () => {
     const values = ["codex", "--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"];
-    const mjs = await run(process.execPath, [RESOLVER, "parse-invocation", ...values]);
-    expect(mjs.stdout.split("\n")).toEqual(values);
     expect(parseAgentInvocation(values)).toEqual({ agent: values[0], args: values.slice(1) });
   });
 
-  it("rejects the same empty, comment, and history tokens in both implementations", async () => {
+  it("rejects empty, comment, and history tokens with actionable errors", async () => {
     for (const value of ["", "   ", "#comment", "!history"]) {
       expect(() => parseAgentInvocation(["codex", value])).toThrow(AgentCommandError);
       const expected = value.length === 0
@@ -108,9 +105,7 @@ describe("TS / plain-node route parser parity", () => {
         : value.trim().length === 0
           ? "must not contain whitespace"
           : "not a shell-neutral token";
-      await expect(run(process.execPath, [RESOLVER, "parse-invocation", "codex", value])).rejects.toMatchObject({
-        stderr: expect.stringContaining(expected),
-      });
+      expect(() => parseAgentInvocation(["codex", value])).toThrow(expected);
     }
   });
 });
@@ -150,10 +145,6 @@ describe("route propagation through workspace and Store", () => {
       expect(await resolveAgent("executor", undefined, { projectRoot: project, userConfigDir: user })).toBe(
         "codex --model gpt-5.6 --search",
       );
-      const mjs = await run(process.execPath, [RESOLVER, "resolve", "executor"], {
-        env: { ...process.env, TUT_PROJECT_ROOT: project, TUT_USER_CONFIG_DIR: user },
-      });
-      expect(mjs.stdout).toBe("codex --model gpt-5.6 --search");
     } finally {
       rmSync(project, { recursive: true, force: true });
       rmSync(user, { recursive: true, force: true });
@@ -179,8 +170,8 @@ describe("route propagation through workspace and Store", () => {
 
 describe("launcher argv boundary", () => {
   const env = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-    ...process.env,
-    PATH: `${FIXTURE_BIN}:${process.env.PATH ?? ""}`,
+    ...process.env, TUT_PANE_SHELL: "posix",
+    PATH: [FIXTURE_BIN, process.env.PATH ?? ""].join(path.delimiter),
     TUT_DRY_RUN: "1",
     // Deterministic: hub down → degrade current/default. These are mechanical
     // argv-boundary tests with dummy task ids; a live hub on the default port
@@ -192,12 +183,12 @@ describe("launcher argv boundary", () => {
   });
 
   it("passes ordered args and appends codex suppression after user -c", async () => {
-    const result = await run(LAUNCHER, ["route-launch", "executor", "codex", "--model", "gpt-5.6", "--sandbox", "workspace-write", "--search", "-c", "check_for_update_on_startup=true"], { env: env() });
+    const result = await run(process.execPath, [...LAUNCH_ARGS, "route-launch", "executor", "codex", "--model", "gpt-5.6", "--sandbox", "workspace-write", "--search", "-c", "check_for_update_on_startup=true"], { env: env() });
     expect(result.stdout).toContain(agentFixture("pane run <root> cd -- '<cwd>' && 'codex' '--model' 'gpt-5.6' '--sandbox' 'workspace-write' '--search' '-c' 'check_for_update_on_startup=true' '-c' 'check_for_update_on_startup=false'", "<hub-root>", "http://127.0.0.1:1"));
   });
 
   it("supports a legacy raw command string and pi suppression", async () => {
-    const result = await run(LAUNCHER, ["route-launch", "executor", "pi --model fast --search"], { env: env() });
+    const result = await run(process.execPath, [...LAUNCH_ARGS, "route-launch", "executor", "pi --model fast --search"], { env: env() });
     expect(result.stdout).toContain(agentFixture("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'pi' '--model' 'fast' '--search'", "<hub-root>", "http://127.0.0.1:1"));
   });
 
@@ -207,7 +198,7 @@ describe("launcher argv boundary", () => {
       ["route-comment", "executor", "codex", "#comment"],
       ["route-history", "executor", "codex", "!history"],
     ]) {
-      await expect(run(LAUNCHER, args, { env: env() })).rejects.toMatchObject({
+      await expect(run(process.execPath, [...LAUNCH_ARGS, ...args], { env: env() })).rejects.toMatchObject({
         stderr: expect.stringContaining("invalid agent command"),
       });
     }
@@ -218,7 +209,7 @@ describe("launcher argv boundary", () => {
       ["route-empty", "executor", "codex", ""],
       ["route-space", "executor", "codex", "   "],
     ]) {
-      await expect(run(LAUNCHER, args, { env: env() })).rejects.toMatchObject({
+      await expect(run(process.execPath, [...LAUNCH_ARGS, ...args], { env: env() })).rejects.toMatchObject({
         stderr: expect.stringContaining("invalid agent command"),
       });
     }

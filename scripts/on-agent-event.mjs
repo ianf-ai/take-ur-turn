@@ -8,7 +8,7 @@
  * delivered via fetch with an AbortController (2s). The notifier is a latency
  * optimization, never a dependency: URL/connection failures, timeouts and
  * non-2xx replies only diagnose to stderr and exit 0 — a lost event is
- * acceptable because polling is the primary channel (system-design 6.1).
+ * acceptable because polling is the primary channel.
  * argv contract violations (wrong arity, event outside
  * working|blocked|done|delivery_giveup) exit 1.
  *
@@ -17,7 +17,7 @@
  * POSIX thin shim over this file; the Windows Herdr manifest points at this
  * file directly (absolute node + absolute script, no shell).
  *
- * delivery_giveup (7.2.1) is emitted by the LAUNCHER (not Herdr) when its
+ * delivery_giveup is emitted by the LAUNCHER (not Herdr) when its
  * bounded submit-retry window exhausts; the entry accepts it so every
  * emitter shares one event vocabulary and one endpoint resolution rule.
  */

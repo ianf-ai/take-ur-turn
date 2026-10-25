@@ -1,5 +1,7 @@
+import { psq, assertRawString, PaneCommandError } from "../../core/common/shell-quote.js";
+export { psq, PaneCommandError } from "../../core/common/shell-quote.js";
 /**
- * Shell dialect renderer (launcher port design §4; work unit 6).
+ * Shell dialect renderer.
  *
  * A PaneCommand is the raw, shell-neutral execution request for one pane.
  * The renderer turns it into exactly one `command_text` string for the
@@ -60,14 +62,6 @@ export class PaneShellError extends Error {
   }
 }
 
-/** A PaneCommand field violated the raw-input contract. */
-export class PaneCommandError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "PaneCommandError";
-  }
-}
-
 /** A trusted cmd runtime path failed the absolute + cmdq-safe policy. */
 export class CmdRuntimePathError extends Error {
   constructor(message: string) {
@@ -78,13 +72,6 @@ export class CmdRuntimePathError extends Error {
 
 const DIALECTS: ReadonlySet<string> = new Set(["posix", "powershell5", "pwsh", "cmd"]);
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
-
-/** Reject the characters no pane command may ever carry. */
-function assertRawString(value: string, field: string): void {
-  if (typeof value !== "string" || /[\u0000\r\n]/u.test(value)) {
-    throw new PaneCommandError(`${field} must be a string without NUL/CR/LF`);
-  }
-}
 
 /** Validate the raw input shape; quoting decisions stay with each dialect. */
 export function validatePaneCommand(command: PaneCommand): void {
@@ -115,12 +102,6 @@ export function validatePaneCommand(command: PaneCommand): void {
 export function sq(value: string): string {
   assertRawString(value, "sq input");
   return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-/** PowerShell single-quote: wrap in '…' and double each embedded '. */
-export function psq(value: string): string {
-  assertRawString(value, "psq input");
-  return `'${value.replaceAll("'", "''")}'`;
 }
 
 /**

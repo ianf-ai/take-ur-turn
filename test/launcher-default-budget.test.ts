@@ -100,7 +100,7 @@ describe("production default launcher budget through the Notifier boundary", () 
         readLaunchCatchup: async () => "off" as const,
         fetchState: async () => current,
         readLog: async (): Promise<never[]> => [],
-        resolveTargetWithSource: async () => ({ route: { agent: "codex", args: ["--model", "gpt-5.6"] }, source: "task-cast" }),
+        resolveTargetWithSource: async () => ({ route: { agent: "codex", args: ["--model", "gpt-5.6"] }, source: "task-cast", plan: { platform: "posix", posix_direct: invocation().posix_direct! } }),
         markLaunched: async (_taskId: string, _role: string, baseVersion: number) => ({ version: baseVersion + 1 }),
         now: () => 0,
         log: (line: string) => {

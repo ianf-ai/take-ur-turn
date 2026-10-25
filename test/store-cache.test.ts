@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -38,7 +38,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     readFile: (async (p: unknown, ...rest: unknown[]) => {
       const s = String(p);
       // record files only: v<digits>.<type>.json — NOT .recovered/.tmp/meta
-      if (/\/v\d+\.[a-zA-Z0-9._-]+\.json$/u.test(s)) fsm.recordReads += 1;
+      if (/[/\\]v\d+\.[a-zA-Z0-9._-]+\.json$/u.test(s)) fsm.recordReads += 1;
       if (s.endsWith("meta.json")) fsm.metaReads += 1;
       if (s.endsWith("workspace.json")) fsm.workspaceReads += 1;
       return (actual.readFile as (p: unknown, ...rest: unknown[]) => Promise<unknown>)(p, ...rest);
@@ -418,6 +418,55 @@ describe("cache protocol boundaries (pinned, by design)", () => {
 });
 
 describe("per-task mutation queues", () => {
+  it("repair, recovery and append share one lane in invocation order while another task progresses", async () => {
+    const store = new Store(root);
+    await store.createTask({ title: "Mixed Lane", description: "d", creator: "a", role: "human" });
+    await store.createTask({ title: "Other Lane", description: "d", creator: "a", role: "human" });
+    externalRecord("mixed-lane", 1, "design");
+    const original = recordPath("mixed-lane", 1, "design");
+    const snapshot = path.join(tmp, "snapshot.json");
+    writeFileSync(snapshot, readFileSync(original));
+    writeFileSync(original, "{ broken record");
+    const meta = path.join(root, "tasks", "mixed-lane", "meta.json");
+    writeFileSync(meta, "{ broken meta");
+
+    const gate = deferred();
+    const gatedTemp = `${meta}.${process.pid}.tmp`;
+    fsm.writeFileHits.length = 0;
+    fsm.slowWrites.set(gatedTemp, () => gate.promise);
+    // No await between calls: preparing recovery must not move admission
+    // behind the immediately following operation on the same task.
+    const repair = store.repairMeta("mixed-lane", { flow: "full" });
+    const recovery = store.recoverRecord("mixed-lane", { record_file: "v001.design.json", from_path: snapshot });
+    const append = store.append("mixed-lane", { role: "executor", content_type: "code_changes", payload });
+    const settled = Promise.allSettled([repair, recovery, append]);
+    try {
+      await vi.waitFor(() => expect(fsm.writeFileHits).toContain(gatedTemp));
+      await expect(store.append("other-lane", { role: "executor", content_type: "note", payload }))
+        .resolves.toMatchObject({ version: 1 });
+      expect(existsSync(`${original}.recovered`)).toBe(false);
+      expect(existsSync(recordPath("mixed-lane", 2, "code_changes"))).toBe(false);
+    } finally {
+      gate.resolve();
+      await settled;
+    }
+    await expect(repair).resolves.toMatchObject({ version: 1 });
+    await expect(recovery).resolves.toMatchObject({ seq: 1 });
+    await expect(append).resolves.toMatchObject({ version: 2, status: "reviewing" });
+    expect(readFileSync(original, "utf8")).toBe("{ broken record");
+    expect(await store.readTask("mixed-lane")).toEqual(await new Store(root).readTask("mixed-lane"));
+  });
+
+  it("a rejected repair releases the same task lane for a following append", async () => {
+    const store = new Store(root);
+    await store.createTask({ title: "Failed Repair", description: "d", creator: "a", role: "human" });
+    const repair = store.repairMeta("failed-repair", {});
+    const append = store.append("failed-repair", { role: "executor", content_type: "note", payload });
+    const results = await Promise.allSettled([repair, append]);
+    expect(results[0]).toMatchObject({ status: "rejected", reason: { code: "VALIDATION_ERROR" } });
+    expect(results[1]).toMatchObject({ status: "fulfilled", value: { version: 1 } });
+  });
+
   it("appends to DIFFERENT tasks do not queue behind each other", async () => {
     const store = new Store(root);
     await store.createTask({ title: "Lane One", description: "d", creator: "a", role: "human" });

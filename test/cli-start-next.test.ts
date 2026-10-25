@@ -153,7 +153,7 @@ async function withFixtureHerdr<T>(fn: () => Promise<T>): Promise<T> {
   const prevPath = process.env.PATH;
   const prevPanes = process.env.TUT_HERDR_PANES;
   const prevHub = process.env.TUT_HUB_URL;
-  process.env.PATH = `${FIXTURE_BIN}:${prevPath}`;
+  process.env.PATH = [FIXTURE_BIN, prevPath].join(path.delimiter);
   process.env.TUT_HERDR_PANES = "[]";
   process.env.TUT_HUB_URL = "http://127.0.0.1:1";
   try {
@@ -641,7 +641,7 @@ describe("start-next pre-check (resolve + PATH, BEFORE the launch marker)", () =
     expect(code).toBe(1);
     expect(io.err()).toContain("agent 'no-such-cli-x' (routed for executor on t-pre) is not on PATH");
     expect(io.err()).toContain("tut assign");
-    expect(io.err()).toContain("correct the task cast");
+    expect(io.err()).toContain(process.platform === "win32" ? "correct cast in a new task" : "correct the task cast");
     expect(io.err()).toContain("no default fallback");
     expect(vi.mocked(hubPublish)).not.toHaveBeenCalled(); // 无痕: no launch marker
     expect(io.out()).not.toContain("DRY-RUN");
@@ -855,7 +855,7 @@ describe("manual launch notifier endpoint selection", () => {
     process.env.TUT_HUB_ROOT = tmp;
     process.env.TUT_HUB_URL = "http://hub.test";
     process.env.TUT_USER_CONFIG_DIR = path.join(tmp, "user-config");
-    process.env.PATH = `${path.resolve(import.meta.dirname, "bin")}:${previousPath ?? ""}`;
+    process.env.PATH = [path.resolve(import.meta.dirname, "bin"), previousPath ?? ""].join(path.delimiter);
     process.env.TUT_HERDR_PANES = "[]";
     delete process.env.TUT_EVENT_PORT_URL;
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -909,3 +909,7 @@ describe("manual launch notifier endpoint selection", () => {
   });
 });
 import { realpathSync } from "node:fs";
+
+// This suite inspects POSIX command text; target discovery still uses the real host.
+beforeEach(() => { vi.stubEnv("TUT_PANE_SHELL", "posix"); });
+afterEach(() => { vi.unstubAllEnvs(); });

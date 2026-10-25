@@ -9,8 +9,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
+
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -409,20 +410,16 @@ describe("routing", () => {
 
 describe("error responses ", () => {
   it("unexpected /state failure → 500 with generic body, no path leak to the client", async () => {
-    // Make the tasks dir unreadable: listTasks' readdir throws EACCES (not a
-    // tolerated StoreError), so handleState rejects into the last-resort guard.
-    const tasksDir = path.join(root, "tasks");
-    chmodSync(tasksDir, 0o000);
+    // ACL semantics differ by host. Inject the same EACCES at the filesystem
+    // boundary; HTTP and Store exception handling still execute unchanged.
+    fsFailure.denied = path.join(root, "tasks");
     try {
       const res = await fetch(`${baseUrl}/state`);
-
       expect(res.status).toBe(500);
       const body = (await res.json()) as { error: string };
       expect(body.error).toBe("internal error");
-      expect(JSON.stringify(body)).not.toContain(tmp); // absolute paths stay server-side
-    } finally {
-      chmodSync(tasksDir, 0o755); // restore so afterEach cleanup can remove the dir
-    }
+      expect(JSON.stringify(body)).not.toContain(tmp);
+    } finally { fsFailure.denied = undefined; }
   });
 });
 
@@ -846,4 +843,13 @@ it("/state ignores repository-operation descriptions and preserves targeted reco
   ]) });
   await store.append(created.task_id, { role: "reviewer", content_type: "note", payload: { summary: "s", body: "correct role", ref_version: 1 } });
   expect(await readState()).toMatchObject({ needs_attention: false, warnings: [], waiting_for: "agent:executor" });
+});
+
+const fsFailure = vi.hoisted(() => ({ denied: undefined as string | undefined }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readdir: (file: unknown, ...args: unknown[]) => {
+    if (String(file) === fsFailure.denied) return Promise.reject(Object.assign(new Error(`denied ${file}`), { code: "EACCES" }));
+    return Reflect.apply(actual.readdir, actual, [file, ...args]);
+  } };
 });
