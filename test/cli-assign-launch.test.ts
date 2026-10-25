@@ -1,3 +1,4 @@
+import { fixtureExecutable } from "./helpers/executable.js";
 import { scopedFixture, agentFixture } from "./rig-fixtures.js";
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -216,15 +217,16 @@ describe("tut assign handler (temp project root, project-level .context-hub/work
 // running it. An explicitly empty fixture inventory pins the placeholder
 // anchor regardless of whether the developer has a live Herdr rig.
 
-const LAUNCH_SH = path.join(SCRIPTS_DIR, "launch.sh");
+const LAUNCH_ARGS = [path.resolve(import.meta.dirname, "../dist/cli.js"), "launch"];
 const runLaunch = promisify(execFile);
 // Dry-run env with a hermetic chain: no TUT_PROJECT_ROOT (L1 skipped — the
 // anchor is a dry-run placeholder), empty L2 — naming/roles fall to defaults.
 const CHAIN_L2 = mkdtempSync(path.join(os.tmpdir(), "tut-assign-chain-"));
 const dryRunEnv = {
-  ...process.env,
+  ...process.env, TUT_PANE_SHELL: "posix",
+  PATH: [path.resolve(import.meta.dirname, "bin"), path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter),
   TUT_DRY_RUN: "1",
-  TUT_HERDR_EXECUTABLE: path.resolve(import.meta.dirname, "bin/herdr"),
+  TUT_HERDR_EXECUTABLE: fixtureExecutable(path.resolve(import.meta.dirname, "bin/herdr")),
   TUT_HERDR_PANES: "[]",
   // Deterministic: hub down → degrade current/default; a live hub on the
   // default port must never leak its real /state (cast!) into these
@@ -236,8 +238,7 @@ const dryRunEnv = {
 describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_ROOT → TUT_USER_CONFIG_DIR → defaults)", () => {
   // Chain fixtures: L1 project root (partial roster — executor only, so
   // per-role fallback is exercisable) and an L2 user dir (full roster with
-  // distinct agents). The repo's seed file and the machine's real user
-  // config are never read.
+  // distinct agents). The machine's real user config is never read.
   const L1 = mkdtempSync(path.join(os.tmpdir(), "tut-res-l1-"));
   const L2 = mkdtempSync(path.join(os.tmpdir(), "tut-res-l2-"));
   const EMPTY_L2 = mkdtempSync(path.join(os.tmpdir(), "tut-res-empty-"));
@@ -257,7 +258,7 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
   });
 
   it("explicit agent (3rd arg, the form tut start-next / auto use): dry-run shows the agent, the tab template label, and the fixed pane label", async () => {
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor", "pi"], { env: chainEnv() });
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor", "pi"], { env: chainEnv() });
 
     expect(stdout).toContain("DRY-RUN");
     // With no anchor, labels use the placeholder Hub root, never the
@@ -271,14 +272,14 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
   });
 
   it("self-resolution without the 3rd arg: L1 hit (TUT_PROJECT_ROOT fixture)", async () => {
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor"], { env: chainEnv() });
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor"], { env: chainEnv() });
 
     expect(stdout).toContain("DRY-RUN");
     expect(stdout).toContain("(agent 'l1-agent',"); // L1 fixture: executor → l1-agent
   });
 
   it("L1 lacks the role → per-role fallback to L2 (architect not in L1, L2 has it)", async () => {
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "architect"], { env: chainEnv() });
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "architect"], { env: chainEnv() });
 
     expect(stdout).toContain("DRY-RUN");
     expect(stdout).toContain("(agent 'l2-agent',"); // per-role: architect falls to L2
@@ -289,7 +290,7 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
     mkdirSync(path.join(corruptL1, ".context-hub"), { recursive: true });
     writeFileSync(path.join(corruptL1, ".context-hub", "workspace.json"), "{ not json");
     try {
-      const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor"], {
+      const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor"], {
         env: chainEnv({ TUT_PROJECT_ROOT: corruptL1, TUT_USER_CONFIG_DIR: EMPTY_L2 }),
       });
 
@@ -300,8 +301,8 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
     }
   });
 
-  it("role in no level: unknown roles fall back to codex (parity with the chain's final fallback)", async () => {
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "boss"], {
+  it("role in no level: unknown roles use the chain's final codex fallback", async () => {
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "boss"], {
       env: chainEnv({ TUT_PROJECT_ROOT: EMPTY_L2, TUT_USER_CONFIG_DIR: EMPTY_L2 }),
     });
 
@@ -320,7 +321,7 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
       roles: { executor: { agent: "pi" } },
     })}\n`);
     try {
-      const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor", "pi"], { env: chainEnv({ TUT_PROJECT_ROOT: tplL1 }) });
+      const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor", "pi"], { env: chainEnv({ TUT_PROJECT_ROOT: tplL1 }) });
 
       expect(stdout).toContain("DRY-RUN");
       expect(stdout).toContain("--label [t1] pi --no-focus"); // template rendered ({task}/{agent})
@@ -335,7 +336,7 @@ describe("launch.sh agent resolution (cast → three-level chain: TUT_PROJECT_RO
 
 describe("launch.sh round entry (prompt delivery regression guard)", () => {
   it("delivers the round prompt with a placeholder Hub-root label when no anchor exists", async () => {
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "architect", "pi"], { env: dryRunEnv });
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "architect", "pi"], { env: dryRunEnv });
 
     expect(stdout).toContain("DRY-RUN");
     expect(stdout).toContain(scopedFixture("(agent 'pi', label 't1.architect')", "<hub-root>"));
@@ -364,7 +365,7 @@ describe("launch.sh round prompt embeds the absolute installed skill path", () =
       const tmp = mkdtempSync(path.join(os.tmpdir(), "tut-assign-cwd-"));
       TRASH.push(tmp);
 
-      const { stdout } = await runLaunch(LAUNCH_SH, ["t9", role], { env: dryRunEnv, cwd: tmp });
+      const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t9", role], { env: dryRunEnv, cwd: tmp });
 
       expect(stdout).toContain("DRY-RUN");
       // The existing round-prompt contract stays intact: task id, role, and
@@ -397,7 +398,7 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
   const HUB_PANE = { pane_id: "w11:p2", label: "tut-hub", workspace_id: "w11", cwd: "/repo", tab_id: "w11:t2", agent_status: "idle" };
   const fixtureEnv = (panes: unknown[], extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({
     ...dryRunEnv,
-    PATH: `${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
+    PATH: [FIXTURE_BIN, NODE_DIR, "/usr/bin", "/bin"].join(path.delimiter),
     TUT_HERDR_PANES: JSON.stringify(panes),
     TUT_USER_CONFIG_DIR: CHAIN_L2,
     ...extra,
@@ -405,7 +406,7 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
 
   it("no reuse: a same-agent pane is ignored; the round births a NEW `<task_id>.<role>` pane", async () => {
     // An agent-named pane exists (the pre-fresh mechanism would have reused it)
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor", "pi"], {
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor", "pi"], {
       env: fixtureEnv([HUB_PANE, { pane_id: "w2:p1", label: "pi", workspace_id: "w11", cwd: "/repo", agent_status: "idle" }]),
     });
 
@@ -418,7 +419,7 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
   });
 
   it("cleanup preview: non-continuity idle panes close; a live continuity seat is KEPT; working ones are skipped with a warning", async () => {
-    const { stdout, stderr } = await runLaunch(LAUNCH_SH, ["t1", "reviewer", "pi"], {
+    const { stdout, stderr } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "reviewer", "pi"], {
       env: fixtureEnv([
         HUB_PANE,
         { pane_id: "w11:p5", label: scopedFixture("t1.architect", "/repo"), workspace_id: "w11", cwd: "/repo", agent_status: "idle" },
@@ -432,7 +433,7 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
   });
 
   it("legacy labels (arch/exec/review) are no longer lookup keys — no rename hint, no hit", async () => {
-    const { stdout, stderr } = await runLaunch(LAUNCH_SH, ["t1", "executor", "pi"], {
+    const { stdout, stderr } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor", "pi"], {
       env: fixtureEnv([HUB_PANE, { pane_id: "w1:p1", label: "exec", workspace_id: "w11", cwd: "/repo", agent_status: "idle" }]),
     });
 
@@ -442,7 +443,13 @@ describe("launch.sh fresh-session round hand-off (cleanup + birth preview)", () 
   });
 
   it("agent not on PATH → dry-run tolerates with a skip note (real failure path errors)", async () => {
-    const { stdout } = await runLaunch(LAUNCH_SH, ["t1", "executor", "no-such-cli-x"], {
+    if (path.sep === "\\") {
+      await expect(runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor", "no-such-cli-x"], {
+        env: fixtureEnv([HUB_PANE]),
+      })).rejects.toMatchObject({ stderr: expect.stringContaining("agent 'no-such-cli-x' not found on PATH") });
+      return; // Windows validates its target before the POSIX dry-run birth gate.
+    }
+    const { stdout } = await runLaunch(process.execPath, [...LAUNCH_ARGS, "t1", "executor", "no-such-cli-x"], {
       env: fixtureEnv([HUB_PANE]),
     });
 
@@ -464,8 +471,8 @@ describe('launch.sh delivery confirmation v2 delivery integration', () => {
     const log = path.join(os.tmpdir(), `tut-launch-${role}-${process.pid}.log`);
     rmSync(log, { force: true });
     try {
-      const { stderr } = await runLaunch(LAUNCH_SH, ['t1', role, 'pi'], { env: {
-        ...process.env, PATH: `${fixtureBin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      const { stderr } = await runLaunch(process.execPath, [...LAUNCH_ARGS, 't1', role, 'pi'], { env: {
+        ...process.env, TUT_PANE_SHELL: "posix", PATH: [fixtureBin, path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter),
         TUT_HUB_URL: 'http://127.0.0.1:1', TUT_USER_CONFIG_DIR: CHAIN_L2,
         TUT_HERDR_PANES: JSON.stringify([{ pane_id: 'w9:p0', label: 'hub', workspace_id: 'w9', cwd: '/x', agent_status: 'idle' }]),
         TUT_SPLIT_BASE: 'w9:p0', TUT_HERDR_LOG: log,
@@ -504,8 +511,8 @@ it('delivery confirmation v2 producer sends the exact frozen evidence to stderr,
   const root = mkdtempSync(path.join(os.tmpdir(), 'tut-launch-event-'));
   const log = path.join(root, 'herdr.log');
   try {
-    const { stderr } = await runLaunch(LAUNCH_SH, ['t1', 'architect', 'pi'], { env: {
-      ...process.env, PATH: `${path.resolve(import.meta.dirname, 'bin')}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+    const { stderr } = await runLaunch(process.execPath, [...LAUNCH_ARGS, 't1', 'architect', 'pi'], { env: {
+      ...process.env, TUT_PANE_SHELL: "posix", PATH: [path.resolve(import.meta.dirname, 'bin'), path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter),
       TUT_HUB_URL: 'http://127.0.0.1:1', TUT_EVENT_PORT_URL: `http://127.0.0.1:${port}/agent-event`,
       TUT_USER_CONFIG_DIR: CHAIN_L2, TUT_PROJECT_ROOT: root,
       TUT_HERDR_PANES: JSON.stringify([{ pane_id: 'w9:p0', label: 'hub', workspace_id: 'w9', cwd: '/x', agent_status: 'idle' }]),

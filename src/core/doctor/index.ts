@@ -1,3 +1,4 @@
+import { probeDoctorPanes, probeDoctorShell } from "../../herdr/host-entry.js";
 /**
  * tut doctor — environment & assembly self-check. REPORT-ONLY: checks never
  * modify anything; every problem comes with actionable guidance (usually a
@@ -21,7 +22,7 @@
  *                    cross-checked when reachable. Whole-directory
  *                    disappearance (class C) is by construction invisible to
  *                    any indexless scanner — the Notifier's snapshot diff is
- *                    that detection path (system-design 4.3); doctor says so
+ *                    that detection path; doctor says so
  *                    instead of pretending.
  *  6 paths         — project/hub path safety (spaces/metacharacters/non-ASCII)
  *  7 platform      — OS / shell dialect / Node version / Windows code-page
@@ -43,8 +44,8 @@
  *                    probing it.
  *
  * Storage reads here are DIAGNOSTIC reads of the same files the Store owns
- * (the design routes "which file, which class" diagnosis to tut doctor,
- * system-design 4.3/6.1); doctor never writes and never bypasses Store for
+ * ("which file, which class" diagnosis goes to tut doctor); doctor never
+ * writes and never bypasses Store for
  * operational read/write — the authoritative classification of a task
  * remains the running hub's (see the storage cross-check). Artifact
  * classification reuses the Store's own validators (shared exports):
@@ -63,6 +64,7 @@ import { resolvePlatformExecutionPlan } from "../launcher/target-resolver.js";
 import { KNOWN_ROLES } from "../common/workspace.js";
 import type { DoctorCheck, DoctorContext, DoctorOptions, DoctorReport, DoctorStatus } from "./types.js";
 import { checkHub, type HubOutcome } from "./checks/hub.js";
+import { checkPower } from "./checks/power.js";
 import { checkNotifier } from "./checks/notifier.js";
 import { checkConfig, declaredWorkspaceRoles } from "./checks/config.js";
 import { checkAgents, type AgentProbe } from "./checks/agents.js";
@@ -71,6 +73,7 @@ import { checkPaths } from "./checks/paths.js";
 import { checkPlatform } from "./checks/platform.js";
 import { checkAgentChannel } from "./checks/agent-channel.js";
 import { preflightCheckout, type PreflightReport } from "../preflight/index.js";
+import { checkoutContainsCwd } from '../preflight/worktree.js';
 
 export { DOCTOR_HUB_TIMEOUT_MS, DOCTOR_EVENT_TIMEOUT_MS } from "./constants.js";
 export type { DoctorStatus, AgentChannelCode, AgentChannelReason, AgentChannelSeatVerdict, AgentChannelUdsVerdict, DoctorCheck, DoctorReport, DoctorOptions } from "./types.js";
@@ -149,34 +152,44 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     await guard("config", "config & workspace chain", () => checkConfig(ctx)),
     agents.check,
     await guard("storage", "storage health", () => checkStorage(ctx, hub)),
-    await guard("paths", "path safety", () => checkPaths(ctx)),
-    await guard("platform", "platform info", () => checkPlatform(ctx)),
+    await guard("paths", "path safety", () => checkPaths(ctx, probeDoctorPanes)),
+    await guard("platform", "platform info", () => checkPlatform(ctx, probeDoctorShell)),
     await guard("agent-channel", "agent channel network", () =>
       checkAgentChannel(ctx, declaredRoles, hub.check.status !== "fail", agents.probes),
     ),
-    await guard("preflight", "checkout preflight", () => checkPreflight(ctx)),
+    await guard("preflight", "checkout preflight", () => checkPreflight(ctx, hub)),
+    await guard("power", "standalone power registration", () => checkPower(ctx)),
   ];
   return { ok: !checks.some((c) => c.status === "fail"), checks };
 }
 
 /** Check 9: checkout preflight over ctx.checkout. Report-only — fixes
  *  run only behind the CLI's explicit --fix-preflight, never here. */
-function checkPreflight(ctx: DoctorContext): DoctorCheck {
-  const report = preflightCheckout(ctx.checkout);
+function checkPreflight(ctx: DoctorContext, hub: HubOutcome): DoctorCheck {
+  const expectations = (hub.checkouts ?? [])
+    .filter(checkout => {
+      try { return checkoutContainsCwd(checkout.path, ctx.checkout); }
+      catch { return false; } // unreadable paths cannot supply a task expectation
+    })
+    .map(checkout => ({ ref: checkout.ref, source: `task ${checkout.task_id} checkout.ref` }));
+  const report = preflightCheckout(ctx.checkout, expectations);
   return preflightCheckFrom(report);
 }
 
 export function preflightCheckFrom(report: PreflightReport): DoctorCheck {
   const problems = report.items.filter((item) => item.status === "missing" || item.status === "error");
   const applicable = report.items.filter((item) => item.status !== "not-applicable");
-  const status: DoctorStatus = problems.length > 0 ? "fail" : "ok";
-  const fixes = problems.map((item) => item.fix).filter((fix): fix is string => fix !== undefined);
+  const warnings = report.items.filter(item => item.status === 'warn');
+  const status: DoctorStatus = problems.length > 0 ? "fail" : warnings.length > 0 ? "warn" : "ok";
+  const fixes = [...problems, ...warnings].map((item) => item.fix).filter((fix): fix is string => fix !== undefined);
   return {
     name: "preflight",
     title: "checkout preflight",
     status,
     summary: problems.length > 0
       ? `${problems.length} failing item(s) in ${report.checkout}`
+      : warnings.length > 0
+        ? `${warnings.length} advisory warning(s) in ${report.checkout} (no automatic Git repair)`
       : applicable.length > 0
         ? `all applicable items present in ${report.checkout}`
         : `not applicable in ${report.checkout} (no Node manifest — arbitrary commands unaffected)`,

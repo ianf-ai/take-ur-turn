@@ -10,7 +10,11 @@ tut up
 tut down
 ```
 
-up 以同包绝对入口拉起 detached Hub、Notifier 及显式开启的 watcher，各服务独立进程组。PID、PGID、端口、启动时间与身份凭据落 `.context-hub/power.json`，日志留在本 rig 存储目录。复用前核对归属，只补缺服务；复用服务保留原 power session，没有本 rig 进程身份事实不授予发信号权限。
+up 以同包绝对入口拉起 detached Hub、Notifier 及显式开启的 watcher，POSIX 上各服务独立进程组。PID、PGID、端口、启动时间与身份凭据落 `.context-hub/power.json`，日志留在本 rig 存储目录。复用前核对归属，只补缺服务；复用服务保留原 power session，没有本 rig 进程身份事实不授予发信号权限。Windows 的身份与停止分支见下文。
+
+up 与 doctor 对账 power.json 和同根在线端点，在登记 PID 死亡、被复用或缺少管理事实时可见报告 power drift；发现范围包括标准端口范围、当前 URL 和已登记端点。报告与普通复用不授予新的停止权限，也不自动终止未注册进程。
+
+`tut up --adopt` 显式采纳所选同根 Hub / Notifier。采纳先以 `/state` 的 hub_root realpath 与 Notifier 的根 / Hub URL 核对归属，再从内核监听 socket 取得唯一 PID（macOS lsof / Linux procfs），要求 PID=PGID 与可复验的启动指纹；不明确、共享进程组或归属不符时拒绝。通过后经既有电源状态接口写入新 power_session、`adopted: true`、`session_inherited: false`，down 沿用原身份与停止协议。无法向既有进程注入 TUT_POWER_SESSION，新 session 只表示采纳登记，不证明子进程继承；leader 消失后的后代归属仍不可推定。重复 up 保留采纳事实，doctor 展示此弱化。`--adopt --dry-run` 仅核验并预览，不写状态；herdr 模式不支持采纳。watcher 没有服务归属握手，不纳入采纳。
 
 根定位与 Hub 身份发现见 [共享宿主契约](system-design.md#72-冻结计划与路由)。
 
@@ -18,9 +22,19 @@ up 以同包绝对入口拉起 detached Hub、Notifier 及显式开启的 watche
 
 非 dry-run up 一律先取得 `.context-hub/up.lock`，显式 --url 也不例外，供给结束 finally 清理。锁含 pid / started_at，活 PID 拒绝，确认 ESRCH 才接管；stale 回收以 .reclaim mkdir 互斥并复核身份，内容不明或回收中断不得猜死亡。dry-run 不取得锁。
 
-down 读取本 rig power.json，按 Notifier → watcher → Hub 逆序停服务。每组先 TERM，宽限复核后仍活才 KILL，再核对端口与原组消失；活 PID 不是归属证明，身份陈旧或不明不发信号。leader 已死而原组有成员时，仅存活成员经本 rig 登记和 TUT_POWER_SESSION 核验才可清理；标记绑定服务实例并由子进程继承，重复 up 不替换复用实例的会话。
+down 读取本 rig power.json，按 Notifier → watcher → Hub 逆序停服务。POSIX 每组先 TERM，宽限复核后仍活才 KILL，再核对端口与原组消失；活 PID 不是归属证明，身份陈旧或不明不发信号。leader 已死而原组有成员时，仅存活成员经本 rig 登记和 TUT_POWER_SESSION 核验才可清理；标记绑定服务实例并由子进程继承，重复 up 不替换复用实例的会话。
 
 down 失败不写已停止事实，重试仍重验，完全停机后重复调用幂等。run 使用独立进程组，down 列出活 run 并让其继续；Notifier 退出也不杀 detached run。
+
+### 1.1 Windows 电源分支
+
+Windows 使用 Node detached + 文件 stdio + unref 启动服务；`pgid: null`、`process_scope: "windows-tree"` 明确不宣称 POSIX 进程组。PowerShell 5.1+ 查询创建时间（UTC ticks，`windows:` token）与 Get-NetTCPConnection 的唯一 OwningProcess；新服务登记前必须同时通过创建 token、HTTP 归属和 TCP owner 核验。命令以 EncodedCommand 传输，带 15 秒超时与输出上限，探测失败不猜测身份。
+
+普通 up / doctor 报告缺登记、陈旧 PID 或 TCP owner 不符。`--adopt` 对同根监听者前后复验 HTTP、创建 token 和 TCP owner，Windows 无 PGID 检查；采纳只授予该创建实例的树清理权限。dry-run 不落盘，普通复用不新增权限。
+
+down 从 CIM 父子快照构建树，结合创建时间排除旧父 PID 的复用关系。通过 RunStore 读取 run 根与 supervisor 排除整个子树；尚未落 meta 的 `supervisor.js --supervise` 也排除。无法读取候选后代身份、命令行或损坏 run 元数据时拒绝。每次终止都以同一个原生 handle 核对 GetProcessTimes 后 TerminateProcess，避免核验与停止之间 PID 复用；不用 taskkill /T。父进程先停，随后有界补查已捕获实例的后代，最后检查端点。
+
+每项成功停止的服务单独保存 stopped_at，供部分失败重试；所有服务及端点均通过才写 rig 级 stopped_at。**documented-gap：没有 Job Object 容器、没有 POSIX TERM 宽限期。** leader 在初次捕获前已消失时拒绝推断孤儿树；捕获前已孤儿化、快照间逃逸的后代无法保证回收。此处只定义电源，Windows run / launch 仍按各自能力边界处理。
 
 ## 2. run 协议
 
@@ -128,13 +142,25 @@ cooperative 只说明根和原组收尾，真实 Codex 是否自行清理跨组�
 
 跨重启恢复、自动 GC、远程 run 均不属于 run 协议。
 
-## 3. headless 发车链
+### 2.5 安全读取
 
-本章对应共享宿主契约开关表中的 launch_mode=headless，独立于电源与 flow_mode 的选择。
+Hub 的 RunReadStore 与 Windows 的 ps/attach 通过只读安全入口消费 run 文件。POSIX 保持现有路径：Hub 在 macOS 使用 O_NOFOLLOW_ANY，在 Linux 逐组件经持有的目录 fd 打开；CLI 的 POSIX 文件路径不变。
+
+Windows 用系统 PowerShell 5.1 承载 P/Invoke，不把原生句柄传给 Node：从本地盘符根目录起，逐组件通过 NtCreateFile 的 RootDirectory 打开，指定 FILE_OPEN_REPARSE_POINT 并检查每个句柄的属性和磁盘类型，拒绝全部 reparse point。目录链和最终文件均只共享读写、不共享删除，直到本次读取能力关闭前都保持句柄，祖先删除/重命名或存在冲突的删除句柄均可见失败；最终文件的属性探测句柄与数据句柄核对 volume serial/file index，且只允许普通文件。不能退化为 lstat 后普通 open。
+
+入口拒绝 ADS、设备/扩展命名空间、UNC、相对路径、点段及 Win32 保留名称/尾点/尾空格。只允许固定的 open/stat/read/close 操作，单次读取至多 1 MiB（meta 上限），log range/tail 仍为 64 KiB；子进程只返回有界 base64、大小和身份等结果。参数经 UTF-8 JSON 标准输入传递，不插入 PowerShell/C# 代码。helper 不可用、启动/请求超时、协议错误都显式失败，无不安全降级；每次请求有 15 秒预算，关闭/EOF/失败释放整个句柄链。
+
+Windows 的一次 RunReadStore.snapshot 内复用一个已编译 helper，逐文件顺序 open/read/close；close 回复前释放整个文件句柄链，因此同时至多持有一个文件的链，内存和句柄数不随 run 数量增长。快照退出（含异常）即关闭 helper，不使用全局池、不缓存文件内容或句柄。原生失败的操作不重放；失败 helper 退出后，下一个独立文件可以启动新 helper。单独 range/attach 能力仍各自拥有 helper 的完整生命周期，board 的既有请求预算不变。
+
+RunReadStore 的字节游标、上限、只读和错误语义不变。attach 在背压等待期间也保持原生句柄；Windows 读取历史终态 run 时以 ended_at 完成围观，组存活仍显示 unknown，不据此发信号。
+
+## 3. detached 发车链
+
+本章对应共享宿主契约开关表中的 launch_mode=detached，独立于电源与 flow_mode 的选择。配置别名 `headless` 归一到同一后端，缺省仍为 `tui`。实现路径与历史协议保留 headless：marker 仍写 `launch_mode: "headless"` / `target_kind: "headless-posix"`，run 仍使用 `headless` 归属键；旧 marker、run、usage 与 resume 输入照读且不迁移。
 
 ### 3.1 计划与 checkout
 
-headless 由 Notifier 自动启动，手动 run / resume 使用同一运行库。计划由 src/standalone/launcher-headless 构造，直接调用同包 RunStore / startRun / stopRun，不调用 PATH 上其他 tut，也不使用终端 birth / 按键。
+detached 由 Notifier 自动启动，手动 run / resume 使用同一运行库。计划由 src/standalone/launcher-headless 构造，直接调用同包 RunStore / startRun / stopRun，不调用 PATH 上其他 tut，也不使用终端 birth / 按键。
 
 共享根目录与 route 定义见 [冻结计划契约](system-design.md#72-冻结计划与路由)。
 
@@ -168,11 +194,11 @@ macOS / Linux 支持 Codex 原生 exec / exec resume 加 JSONL，Pi 原生 --pri
 
 自动启动在 admission 锁内重验当前 state / 增量日志。日志读取失败不放行；日志比 state fold 新则有界刷新一次，仍不一致拒绝。close / pending_approval / approved、角色改变、attention 或另一 attempt 的 marker 已服务本代时，丢弃过期 plan，仅日志、不发 give-up、不重放候选。接缝由 HeadlessRuntimeDeps 的 hubUrl / revalidate 和 createHeadlessRevalidate 提供。
 
-`launch.catchup` 精确为 off / on，缺省 off；on 时仅 auto + headless 在启动基线完成 restore / syncNew / observe 后执行一次补判。每个在册 agent 等待任务复用门、白名单、launchBlocked 与自动启动，已有合法 marker 只记跳过，不补 marker 或通知。读取故障交同一路径重新检查并可见失败；配置不可读 / 非法只记 withholding，off 与 tui 不执行补判。该动作不参与后续常态轮询。
+`launch.catchup` 精确为 off / on，缺省 off；on 时仅 auto + detached 在启动基线完成 restore / syncNew / observe 后执行一次补判。每个在册 agent 等待任务复用门、白名单、launchBlocked 与自动启动，已有合法 marker 只记跳过，不补 marker 或通知。读取故障交同一路径重新检查并可见失败；配置不可读 / 非法只记 withholding，off 与 tui 不执行补判。该动作不参与后续常态轮询。
 
 ### 3.4 失败通知
 
-真实 spawn / 握手失败，或非主动停止的根非零 / 信号退出，产生 headless give-up。按 attempt 先占 key 再 await Channel，FIFO 上限 1024，去重限 Notifier 生命周期；主动 stop 不报意外失败，失联 / 坏元数据报 unconfirmed，不编造退出码。mode / 平台 / checkout / agent 预检拒绝不伪装 spawn 失败。
+真实 spawn / 握手失败，或非主动停止的根非零 / 信号退出，产生 detached give-up。按 attempt 先占 key 再 await Channel，FIFO 上限 1024，去重限 Notifier 生命周期；主动 stop 不报意外失败，失联 / 坏元数据报 unconfirmed，不编造退出码。mode / 平台 / checkout / agent 预检拒绝不伪装 spawn 失败。
 
 正文含 task_id / title、role、agent、attempt_id、reason、received_at，已知时加 run_id 和实际 exit_code / signal，指引 ps / attach / read。不含 Enter 指引、不自动重投；通知失败只保留本地日志。
 
@@ -228,10 +254,12 @@ tut live-view --layout <json-file>
 
 `scripts/usage-audit/` 是独立测量进程，usage_audit 为 off / on，缺省 off。Hub / launcher / Notifier / worker skills 不 import 或启动它；standalone up 在 on 时 detached 启动同包 --watch，日志为 .context-hub/usage-audit.log，脚本缺失或 spawn 失败提示但不阻断电源。
 
-off 的 watch 只读开关后退出，不读 Hub、原生会话或 usage，不建锁 / timer；运行中每 pass、操作间及提交快照前检查，关闭后结束并释放锁，重新开启须显式再启动。显式 since / backfill / recover 不受 watch 开关限制。任务及记录通过同根在线 Hub 接口读取，无离线直读回落。
+off 的 watch 只读开关后退出，不读 Hub、原生会话或 usage，不建锁 / 常驻心跳 timer；运行中每 pass、操作间及提交快照前检查，关闭后结束并释放锁，重新开启须显式再启动。显式 since / backfill / recover 不受 watch 开关限制。任务及记录通过同根在线 Hub 接口读取，无离线直读回落。
 
-canonical root 的 SHA-256 对应 OS tmpdir 中的单实例锁；仅 ESRCH 确认死 PID 后，以 .reclaim mkdir 互斥回收，空 / 坏 / EPERM 锁按活处理。每次 Hub 读取含握手和响应体限时默认 30s，TUT_USAGE_AUDIT_TIMEOUT_MS 可指定正整数；watch 的 --timeout-ms 限总寿命，到期不发起新 pass，在途 pass 可完成。
+canonical root 的 SHA-256 对应 OS tmpdir 中的单实例锁；仅 ESRCH 确认死 PID 后，以 .reclaim mkdir 互斥回收，空 / 坏 / EPERM 锁按活处理。每次 Hub 读取含握手和响应体限时默认 30s，TUT_USAGE_AUDIT_TIMEOUT_MS 可指定正整数；watch 的 --timeout-ms 限总寿命，到期不发起新 pass，在途 pass 可完成。同一 I/O deadline 覆盖 config、会话 readdir/stat/readFile、任务目录校验及 usage 读写/rename/清理；本地读超时报 LOCAL_IO_TIMEOUT 并计失败，含 pass 前后的开关检查，下一间隔重试。支持 signal 的读 API 同时收到 abort，迟到的只读结果不恢复旧 pass。已提交的写入超时立即计失败并报警，保留写锁等待结算后清理/重试，不在旧 mutation 未结算时启动下一 pass 或放锁。坏配置仍明确退出。
 
-初次协调已有交付，此后每 pass 重读 Hub 任务历史；原生文件按 mtime + size 缓存未变化项，消息正文解析即弃，只留元数据。重复相同失败首次及每第 20 次记日志，结果变化才重报。watch 每 60s 独立 stderr heartbeat，含 timestamp / last_successful_pass / consecutive_failures / in_request；结束移除 timer，off 和单次模式无 heartbeat。
+轮次以 launch → 同 worker 角色下一条发布记录配对，content_type 不限（含 note）；launch marker 本身不收轮，其他角色的记录不收轮。同角色下次 launch 前的后续发布不另计轮，token 仍统计到原生 session / turn 结束，避免 note 后正式交付重复计量。新 launch 仅在此前尚无同角色发布时覆盖旧 launch；headless 被覆盖 launch 的消耗以 superseded_launch unresolved 显式标为未计量，不并入救援轮。Hub 记录及 usage schema 不变。
+
+初次协调已有交付，此后每 pass 重读 Hub 任务历史；原生文件按 mtime + size 缓存未变化项，消息正文解析即弃，只留元数据。重复相同失败首次及每第 20 次记日志，结果变化才重报。watch 每 60s 独立 stderr heartbeat，保留 timestamp / last_successful_pass / consecutive_failures / in_request，增加 pid / pass_id / phase / last_progress_at / stalled。最近成功（首次成功前从启动计）或最近操作进展超过 max(120000ms, 2 × I/O deadline + poll interval)，下一心跳输出 stalled=true，并在停摆沿额外输出 PASS_STALLED；恢复后重新武装。phase 的 :draining 后缀表示超时 mutation 尚未结算。锁清理完成后移除 timer，off 和单次模式无 heartbeat；仅进程内可见化，不承诺强制取消 native I/O。
 
 只访问本机 Hub，不外传正文；诊断不含内容，usage 落盘剥离 cwd / task_id / launch_ts 路径信息。

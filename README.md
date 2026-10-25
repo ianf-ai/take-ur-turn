@@ -304,7 +304,7 @@ running for any other attach.
 
 ### Checkout preflight and close audit
 
-`tut run` / `tut resume` / auto headless launches check the execution checkout
+`tut run` / `tut resume` / auto detached launches check the execution checkout
 before spawning: a Node checkout declaring dependencies needs a readable
 `node_modules`, a TUT source checkout needs `dist/`. Missing items refuse the
 launch with the exact absolute path and repair guidance; directories without
@@ -351,7 +351,10 @@ Governs Hub and Notifier behavior. Changes take effect on the next polling cycle
 | `flow_mode` | `"manual"` / `"auto"` — who presses the start button at round handoffs (the human, or the Notifier auto-launching via the launcher). Prefer switching with `tut mode <manual\|auto>` | `manual` |
 | `notify` | Notification channels: `channels` (desktop / webhook, etc.) and `webhook_url` | unset = terminal bell plus notify-pane log |
 | `auto.launch_roles` | Launch whitelist for auto mode (keyed by role, e.g. `["executor","reviewer"]`). **Empty by default = every round falls back to notifying the human** — rounds not on the whitelist are never auto-launched and leave no launch trace; the human's manual starts are unaffected | `[]` |
+| `launch_mode` | Launch backend for `start-next` and Notifier: `"tui"` or `"detached"`. The compatibility alias `"headless"` selects the same backend; get returns `detached` without rewriting, and set writes `detached` for either spelling. Missing file/key defaults to `tui`; corrupt files and invalid values fail visibly | `tui` |
 | `power.mode` | Which power implementation `tut up` provisions: `"herdr"` (pane-provisioned rig, unchanged) or `"standalone"` — detached process groups raised by `tut up` itself (pid/pgid/port facts in `.context-hub/power.json`), stopped by `tut down`. Signals are identity-gated and group-scoped: a leftover group whose leader died is cleaned only when a live member verifies against this rig's power member registry (the session marker `TUT_POWER_SESSION` binds to the surviving service instance — reused services keep their session across repeated ups — and rides the services' launch children); stale or unverifiable groups are never signaled. Illegal values (or an unreadable config) fail `up`/`down` visibly before any provisioning | `herdr` |
+
+Use `tut config set launch_mode detached` to select detached agent launches; this is independent of `power.mode` and `flow_mode`. The `headless` alias has no scheduled removal and emits no periodic warning. Persisted marker values (`launch_mode: "headless"`, `target_kind: "headless-posix"`) and run `headless` ownership remain protocol identifiers; existing records, runs and usage files are not migrated.
 
 `flow_mode` and `auto.launch_roles` can also be managed without hand-editing JSON: `tut config get <key>` / `tut config set <key> <value>` (validated keys and value domains; `tut config set flow_mode auto` is the offline equivalent of `tut mode`, and it works with the Hub down — same discipline as `tut assign`). The Hub re-reads this file on every request, so writes take effect on the next poll cycle, no restart needed.
 
@@ -383,9 +386,9 @@ launcher. Codex receives TUT's update suppression after user args (`-c check_for
 
 `naming.tab_label` renders the human-facing **tab** label: placeholders `{role}` / `{task}` / `{agent}`, unknown placeholders preserved verbatim, default `TUT {role}`. The **pane** label is the machine addressing key and is never templated: round panes stay `<task_id>.<role>` (event reverse-lookup hits directly). Two fields, two jobs.
 
-`scripts/workspace.json` in the repo is a **seed** (shape example) — never read at runtime. `tut up` prints setup guidance when both L1 and L2 are missing.
+**Workspace setup**: use `tut assign <role> <agent>` to customize the project lineup, or adapt the JSON example above and save it as `.context-hub/workspace.json` (project) or `~/.config/tut/workspace.json` (user; create the parent directory first). `tut up` points to this documentation when both L1 and L2 are missing. The `label` fields are ignored on read; `scripts/routes.json` is not read at runtime.
 
-**Workspace setup**: copy the seed with `cp scripts/workspace.json .context-hub/workspace.json` (or use `~/.config/tut/` — `mkdir -p` first). The `label` fields are ignored on read; `scripts/routes.json` is not read at runtime. `tut assign` edits the project-level workspace file.
+**Upgrading from the bundled seed**: existing project/user workspace files remain valid and need no migration. If you edited only the example inside the installed package, save your customized JSON to one of the locations above before upgrading. Replace setup scripts that copy the bundled example with your own maintained config or `tut assign`; the package no longer ships a seed file.
 
 ### ③ Invocation parameters — CLI flags and environment variables
 
@@ -421,13 +424,17 @@ Behavioral instructions for the agent roles live in [skills/](skills/) (architec
 - [design/system-design.md](design/system-design.md) — **System design (root)**: host-independent core and host contracts
 - [design/context-design.md](design/context-design.md) — **Context design**: what goes in (scope / record types / body content requirements) and how it is managed
 - [design/herdr-host.md](design/herdr-host.md) — **Herdr host**: panes, power, hooks, terminal delivery and Enter remediation
-- [design/standalone-host.md](design/standalone-host.md) — **Standalone host**: service power, runs, headless launch, resume, seats and preflight
+- [design/standalone-host.md](design/standalone-host.md) — **Standalone host**: service power, runs, detached launch, resume, seats and preflight
 
 Design docs and skills are currently Chinese-language; code, CLI output, and commit conventions are English.
 
 ## Troubleshooting and Known Limitations
 
 ### Windows notes
+
+Standalone power (`tut config set power.mode standalone`) starts detached Hub and Notifier services with Node, without Herdr. PowerShell 5.1+ and the CIM/NetTCPIP providers supply process creation tokens and TCP listener ownership. `power.json` records `process_scope: "windows-tree"` and `pgid: null`; `up` and `doctor` report unregistered services, and `up --adopt` explicitly verifies and registers same-workspace listeners (`--dry-run` only previews).
+
+Windows `down` verifies creation identity through a native process handle, force-terminates the captured service tree, excludes recorded run roots/supervisors and in-flight run supervisors, and checks the endpoints afterward. It persists individual service completion so a partial failure can be retried. **Documented gap:** there is no Job Object container or POSIX signal grace period. A leader already gone before capture, unreadable identity or corrupt run metadata causes refusal; descendants orphaned before capture or escaping between snapshots cannot be guaranteed reclaimed. The run/launch Windows implementation is a separate capability; this power support does not enable it.
 
 Native Windows works end to end (hub, MCP, CLI, flow driving were verified against Herdr's Windows build and PowerShell 5.1). Setup boundaries worth knowing:
 

@@ -23,7 +23,7 @@
  *   6. spawns the sibling canonical entry on-agent-event.mjs with
  *      process.execPath, shell:false (package-relative absolute path).
  * Every degradation is stderr + exit 0: a lost event is acceptable because
- * polling is the primary channel (system-design 6.1).
+ * polling is the primary channel.
  *
  * scripts/hook.sh is the POSIX thin shim over this file; the Windows Herdr
  * manifest uses a command array of absolute node + absolute herdr-hook.mjs.

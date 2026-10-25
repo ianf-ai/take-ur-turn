@@ -156,6 +156,14 @@ describe("config get (effective values)", () => {
 });
 
 describe("config set (validated, key-preserving writes)", () => {
+  it.each(["headless", "detached"])("get normalizes %s without rewriting stored bytes", async (mode) => {
+    const original = JSON.stringify({ flow_mode: "auto", launch_mode: mode, unknown: { keep: true } }, null, 4) + "\n";
+    writeFileSync(configFile(), original);
+    expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
+    expect(io.out()).toBe("detached\n");
+    expect(readFileSync(configFile(), "utf8")).toBe(original);
+  });
+
   it("launch_mode defaults without writes, validates set and preserves siblings", async () => {
     expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
     expect(io.out()).toBe("tui\n");
@@ -170,15 +178,15 @@ describe("config set (validated, key-preserving writes)", () => {
     expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(1);
   });
 
-  it("launch_mode get echoes explicit tui and headless round-trips", async () => {
+  it.each(["detached", "headless"])("launch_mode set %s writes and returns the canonical value", async (mode) => {
     writeFileSync(configFile(), JSON.stringify({ flow_mode: "manual", launch_mode: "tui" }));
     expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
     expect(io.out()).toBe("tui\n");
-    expect(await main(["config", "set", "launch_mode", "headless", "--root", root])).toBe(0);
-    expect(JSON.parse(readFileSync(configFile(), "utf8"))).toEqual({ flow_mode: "manual", launch_mode: "headless" });
+    expect(await main(["config", "set", "launch_mode", mode, "--root", root])).toBe(0);
+    expect(JSON.parse(readFileSync(configFile(), "utf8"))).toEqual({ flow_mode: "manual", launch_mode: "detached" });
     expect(await main(["config", "get", "launch_mode", "--root", root])).toBe(0);
-    expect(io.out()).toContain("config: launch_mode = headless");
-    expect(io.out().endsWith("headless\n")).toBe(true);
+    expect(io.out()).toContain("config: launch_mode = detached");
+    expect(io.out().endsWith("detached\n")).toBe(true);
   });
 
   it("usage_audit defaults off without writing and round-trips on/off without losing keys", async () => {

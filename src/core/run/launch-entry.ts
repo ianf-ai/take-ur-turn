@@ -1,5 +1,5 @@
 /** Headless door for `tut start-next` — the manual-fallback twin of the
- *  Notifier's autoLaunchHeadless. A rig with launch_mode=headless must not
+ *  Notifier's autoLaunchHeadless. A rig with launch_mode=detached must not
  *  grow Herdr panes just because the Notifier is offline: planning, checkout
  *  preflight, launch-note and spawn semantics are launcher-headless's own
  *  (plan → mark → launch); no third launch implementation lives here. */
@@ -10,12 +10,13 @@ import { readLaunchMode } from "../common/config.js";
 import { readLaunchLog } from "../launcher/launch.js";
 import { buildHeadlessPlan, headlessGeneration } from "../../standalone/launcher-headless/plan.js";
 import { HeadlessRuntime, type HeadlessLaunchOutcome } from "../../standalone/launcher-headless/runtime.js";
-import { createHeadlessRevalidate, type StateResponse } from "../notifier/notifier.js";
+import { createHeadlessRevalidate } from "../notifier/launch-revalidate.js";
+import type { StateResponse } from "../notifier/contracts.js";
 import type { Cast, CheckoutRoute, ContextRecord } from "../common/types.js";
 
 /** Both launch doors use the same strict policy and shipped tui default. */
 export async function headlessLaunchSelected(rigRoot = resolveRigRoot()): Promise<boolean> {
-  return await readLaunchMode(path.join(rigRoot, ".context-hub")) === "headless";
+  return await readLaunchMode(path.join(rigRoot, ".context-hub")) === "detached";
 }
 
 /** Bounded /state fetch for the in-lock revalidation gate (same contract as
@@ -121,7 +122,7 @@ export async function runStartNextHeadless(input: HeadlessStartNextInput): Promi
       ...(input.fresh === true ? { fresh_session: true } : {}),
     });
   } catch (e) {
-    process.stderr.write(`tut: cannot plan headless launch for ${role} on ${taskId}: ${(e as Error).message}\n`);
+    process.stderr.write(`tut: cannot plan detached launch for ${role} on ${taskId}: ${(e as Error).message}\n`);
     return 1;
   }
 
@@ -144,13 +145,13 @@ export async function runStartNextHeadless(input: HeadlessStartNextInput): Promi
         // Keep the original marker error as the actionable failure.
       }
     }
-    process.stderr.write(`tut: cannot append the headless launch marker for ${taskId}: ${(e as Error).message}\n`);
+    process.stderr.write(`tut: cannot append the detached launch marker for ${taskId}: ${(e as Error).message}\n`);
     return 1;
   }
 
   if (process.env.TUT_DRY_RUN === "1") {
     process.stdout.write(
-      `headless start-next DRY-RUN for ${taskId} (${role}): marker appended; would spawn in ${plan.checkoutRoot}: ${plan.argv.join(" ")}\n`,
+      `detached start-next DRY-RUN for ${taskId} (${role}): marker appended; would spawn in ${plan.checkoutRoot}: ${plan.argv.join(" ")}\n`,
     );
     return 0;
   }
@@ -158,7 +159,7 @@ export async function runStartNextHeadless(input: HeadlessStartNextInput): Promi
   const outcome: HeadlessLaunchOutcome = await runtime.launchAndSettle(plan);
   if (outcome.kind === "launched") {
     process.stdout.write(
-      `start-next: headless launch attempt completed; delivery confirmation is not implied (${role} for ${taskId} via headless run ${outcome.run_id}; tut attach ${outcome.run_id})\n`,
+      `start-next: detached launch attempt completed; delivery confirmation is not implied (${role} for ${taskId} via detached run ${outcome.run_id}; tut attach ${outcome.run_id})\n`,
     );
     return 0;
   }
@@ -166,6 +167,6 @@ export async function runStartNextHeadless(input: HeadlessStartNextInput): Promi
     process.stderr.write(`tut: LAUNCH_SKIPPED: ${outcome.reason}\n`);
     return 1;
   }
-  process.stderr.write(`tut: headless launch failed: ${outcome.reason}; inspect tut ps and the task context\n`);
+  process.stderr.write(`tut: detached launch failed: ${outcome.reason}; inspect tut ps and the task context\n`);
   return 1;
 }

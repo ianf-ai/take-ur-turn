@@ -36,7 +36,7 @@
 
 import { launchBlocked } from "../launcher/launch.js";
 import type { ContextRecord } from "../common/types.js";
-import type { StateAuto, StateResponse, StateTask } from "./notifier.js";
+import type { StateAuto, StateResponse, StateTask } from "./contracts.js";
 
 /** The Notifier-owned seams the catchup pass runs on (all bound methods). */
 export interface LaunchCatchupSeams {

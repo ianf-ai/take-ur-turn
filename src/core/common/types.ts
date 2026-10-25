@@ -1,12 +1,11 @@
 /**
  * Frozen seam contract. Any change here goes back to the Architect.
- * Sources: system-design.md §3 / §4.2, context-design.md §2.
  */
 
-/** task_id of the project scope — derivation skips it (system-design 3.1). */
+/** task_id of the project scope — derivation skips it. */
 export const PROJECT_TASK_ID = "project";
 
-/** Known content types (context-design 2.2). Unknown types must stay representable in records. */
+/** Known content types. Unknown types must stay representable in records. */
 export type ContentType =
   | "design"
   | "code_changes"
@@ -14,7 +13,7 @@ export type ContentType =
   | "revision"
   | "note"
   | "decision"
-  | (string & {}); // accepts any string, keeps literal autocomplete (system-design 4.1: any content_type is accepted)
+  | (string & {}); // accepts any string, keeps literal autocomplete (any content_type is accepted)
 
 export type Status =
   | "designing"
@@ -25,11 +24,11 @@ export type Status =
   | "approved"
   | "closed";
 
-/** system-design 3.1 four-tier vocabulary. Only meaningful on review records (context-design 2.3). */
+/** Four-tier review vocabulary. Only meaningful on review records. */
 export type Verdict = "pass" | "blocked_external" | "fail_code" | "fail_design";
 
 /**
- * Workflow variant (system-design 3.1): selects the transition table.
+ * Workflow variant: selects the transition table.
  * Set at create time, immutable in meta.json afterwards; absent = "full"
  * (existing tasks and existing call sites need zero migration).
  */
@@ -158,7 +157,7 @@ export interface LaunchInvocation {
 }
 
 /**
- * Per-task cast (system-design 4.1): role → agent route, a ROUTING parameter
+ * Per-task cast: role → agent route, a ROUTING parameter
  * only — it tells the launcher which agent to raise for each role. Not a
  * participation roster (write freedom unchanged) and NOT consumed by
  * derivation (state-machine input signature untouched). Partial maps are
@@ -170,7 +169,7 @@ export type Cast = Partial<Record<"architect" | "executor" | "reviewer", AgentRo
 
 export type WaitingFor = "human" | "none" | `agent:${string}`;
 
-/** Payload envelope (context-design 2.3) + extension fields the plan consumes. */
+/** Payload envelope + extension fields the plan consumes. */
 export interface Payload {
   summary: string;
   body: string;
@@ -182,11 +181,11 @@ export interface Payload {
   ack?: boolean;
   /** Decision only: the value of a human decision. */
   decision?: "approve" | "reject" | "close";
-  /** Envelope is extend-only (context-design 2.3 / 5); derive ignores fields it does not consume. */
+  /** Envelope is extend-only; derive ignores fields it does not consume. */
   [key: string]: unknown;
 }
 
-/** Single record, system-design 4.2. Named ContextRecord to avoid shadowing TS's built-in Record<K, V>. */
+/** Single record. Named ContextRecord to avoid shadowing TS's built-in Record<K, V>. */
 export interface ContextRecord {
   /** Starts at 1 and increments; create produces no record (version 0). */
   version: number;
@@ -199,7 +198,7 @@ export interface ContextRecord {
   timestamp: string;
   payload: Payload;
   /** Serving build's package.json version, stamped by the store on append
-   *  (additive, system-design 4.2). Absent on records written before the
+   *  (additive). Absent on records written before the
    *  field existed and on recovered copies (verbatim bytes) — read and
    *  derive never require it. Approximate in a dev checkout: one manifest
    *  version covers uncommitted changes, no git-level precision. */
@@ -241,7 +240,7 @@ export interface Warning {
   correction?: { root_version: number; round: number; limit: 2; exhausted: boolean };
 }
 
-/** Derivation output, system-design 3.1/3.2. needs_attention is an overlay flag, not an 8th status. */
+/** Derivation output. needs_attention is an overlay flag, not an 8th status. */
 export interface DerivedState {
   status: Status;
   waiting_for: WaitingFor;
@@ -252,7 +251,7 @@ export interface DerivedState {
 /**
  * Exact signature of derive (frozen seam, additive flow parameter). Pure:
  * no IO, no timestamp consumption, idempotent. flow selects the transition
- * table (system-design 3.1); absent = "full" (backward compatible).
+ * table; absent = "full" (backward compatible).
  * Returns null for project scope (task_id "project").
  */
 export type DeriveFn = (

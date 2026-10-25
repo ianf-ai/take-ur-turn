@@ -1,5 +1,6 @@
-import * as fs from 'node:fs/promises';
+import { localFs } from './io.mjs';
 import path from 'node:path';
+import { sameCwd } from './paths.mjs';
 
 export function instant(value) {
   const n = Date.parse(value);
@@ -13,19 +14,21 @@ export function vector(v) {
 }
 function add(a, b) { return vector(Object.fromEntries(Object.keys(a).map(k => [k, a[k] + b[k]]))); }
 const zero = () => ({ input_tokens: 0, output_tokens: 0, total_tokens: 0 });
-export async function files(root) {
+export async function files(root, options = {}) {
+  const fs = localFs(options);
   let entries;
   try { entries = await fs.readdir(root, { withFileTypes: true }); }
   catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   const result = [];
   for (const e of entries.sort((a,b) => a.name.localeCompare(b.name))) {
-    if (e.isDirectory()) result.push(...await files(path.join(root, e.name)));
+    if (e.isDirectory()) result.push(...await files(path.join(root, e.name), options));
     else if (e.isFile() && e.name.endsWith('.jsonl')) result.push(path.join(root, e.name));
   }
   return result;
 }
 // Discard message text immediately. Never put private session bodies in diagnostics.
-export async function readSession(file, agent) {
+export async function readSession(file, agent, options = {}) {
+  const fs = localFs(options);
   const text = await fs.readFile(file, 'utf8');
   const lines = text.split('\n');
   const partial = lines.at(-1).length > 0;
@@ -38,15 +41,16 @@ export async function readSession(file, agent) {
       turn: p.turn_id, role: m.role, stop: m.stopReason, id: r.id,
       usage: agent === 'pi' ? m.usage : p.info?.total_token_usage,
       header: r.type === 'session_meta' ? { cwd: p.cwd, parent: p.parent_thread_id, source: p.source, version: p.cli_version }
-        : r.type === 'session' ? { cwd: r.cwd, version: r.version } : undefined };
+        : r.type === 'session' ? { cwd: r.cwd, version: r.version, id: r.id } : undefined };
   }).filter(Boolean);
   const header = rows[0]?.header;
   return { file, agent, rows, partial, header,
     excluded: !header || !!header.parent || header.source === 'subagent' || (typeof header.source === 'object' && header.source !== null && 'subagent' in header.source) };
 }
 
-export function measure(session, round) {
-  if (session.excluded || path.resolve(session.header.cwd ?? '/') !== round.cwd) return [];
+export function measure(session, round, options = {}) {
+  if (session.excluded || !sameCwd(session.header.cwd, round.cwd, options) ||
+      (round.pi_session && session.header.id !== round.pi_session.session_id)) return [];
   const { rows, agent } = session;
   if (agent === 'pi' && session.header.version !== 3) throw new Error('unsupported_pi_schema');
   const L = instant(round.launch_ts), D = instant(round.ts);
@@ -78,7 +82,7 @@ export function measure(session, round) {
           if (!Number.isSafeInteger(u[key]) || u[key] < 0) throw new Error('invalid_pi_usage');
         }
         tokens = add(tokens, vector({ input_tokens: u.input + u.cacheRead + u.cacheWrite, output_tokens: u.output, total_tokens: u.totalTokens }));
-        if (u.cost?.total === undefined) cost = null;
+        if (u.cost?.total === undefined || ((options.platform ?? process.platform) === 'win32' && u.cost?.total === null)) cost = null;
         else if (!Number.isFinite(u.cost.total) || u.cost.total < 0) throw new Error('invalid_cost');
         else if (cost !== null) cost += u.cost.total;
       }

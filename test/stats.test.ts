@@ -139,11 +139,14 @@ describe("local read-only stats", () => {
     expect(report.tasks[0]?.usage.by_agent.codex?.cost_usd).toBeNull();
   });
 
-  it("retains producer-measured direct reference designs without adding a quality delivery", async () => {
+  it.each(["design", "note", "checkpoint"])("accepts producer-measured %s anchors without adding quality deliveries", async anchorType => {
     const id = await task("reference-design");
-    await delivery(id, "architect", "design");
-    await delivery(id, "executor", "code_changes");
-    await delivery(id, "reviewer", "review", "codex", { verdict: "pass" });
+    await delivery(id, "architect", anchorType);
+    await delivery(id, "executor", "note");
+    await append(id, "executor", "note");
+    await append(id, "executor", "code_changes");
+    await delivery(id, "reviewer", "note");
+    await append(id, "reviewer", "review", { verdict: "pass" });
     const history = await store.readTask(id);
     // Generate the sidecar with the actual audit extractor/merger, including its full native source shape.
     const sidecar = execFileSync(process.execPath, ["--input-type=module", "-e", `
@@ -169,8 +172,23 @@ describe("local read-only stats", () => {
     expect(report.tasks[0]?.per_role).toEqual({ executor: 1, reviewer: 1 });
     expect(report.batch.review_count).toBe(1);
     expect(report.batch.per_role).toEqual({ executor: 1, reviewer: 1 });
-    expect((await store.snapshotTasks()).tasks[0]?.needs_attention).toBe(false);
+    // Unknown publication types still retain the Hub's workflow diagnostic;
+    // that warning must neither reject nor inflate their usage measurement.
+    expect((await store.snapshotTasks()).tasks[0]?.needs_attention).toBe(anchorType === "checkpoint");
     expect(fingerprint(root)).toEqual(before);
+  });
+
+  it("keeps preserved legacy anchors valid while exposing missing note-anchor coverage", async () => {
+    const id = await task("legacy-anchor");
+    const note = await delivery(id, "executor", "note");
+    const done = await append(id, "executor", "code_changes");
+    const history = await store.readTask(id);
+    const ts = history.versions.find(v => v.version === done.version)!.timestamp;
+    validateWithProducer(usage(id, [{ ...note, version: done.version, ts }]));
+    const report = await collectStats(root);
+    expect(report.tasks[0]?.usage).toMatchObject({ status: "incomplete", by_agent: { codex: { rounds: 1, total_tokens: 50 } } });
+    usage(id, [note]);
+    expect((await collectStats(root)).tasks[0]?.usage.status).toBe("complete");
   });
 
   it.each([

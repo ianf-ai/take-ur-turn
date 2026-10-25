@@ -1,13 +1,20 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, closeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { RunStore, type RunMeta } from '../src/core/run/store.js';
-import { stopRun, attachRun } from '../src/core/run/control.js';
+import { stopRun, attachRun } from '../src/core/run/control-posix.js';
 import { StopController } from '../src/core/run/stop-controller.js';
 import { CONTROL_PROTOCOL, STOP_SCOPE, type RootExit } from '../src/core/run/protocol.js';
 import { Writable } from 'node:stream';
 
+// These are injected POSIX-controller tests: no real process is signaled.
+// Select that contract explicitly even on Windows; native Windows controller
+// and transport coverage lives in windows-control/windows-native.test.ts.
+const hostPlatform = process.platform;
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+beforeEach(() => { if (hostPlatform === 'win32') Object.defineProperty(process, 'platform', { value: 'linux' }); });
+afterEach(() => { Object.defineProperty(process, 'platform', platformDescriptor); });
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
 async function fixture(request = true) {

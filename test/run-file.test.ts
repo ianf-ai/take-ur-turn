@@ -4,6 +4,20 @@ import * as files from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { openRunFile } from "../src/core/hub/run-file.js";
 
+// These are injected Darwin/Linux lookup tests, with no kernel opens. Supply
+// POSIX path/flag facts even when the runner itself is Windows.
+vi.mock("node:path", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:path")>();
+  return { ...actual, default: actual.posix };
+});
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, constants: { ...actual.constants,
+    O_NOFOLLOW: actual.constants.O_NOFOLLOW ?? 0x20000,
+    O_DIRECTORY: actual.constants.O_DIRECTORY ?? 0x10000,
+    O_NONBLOCK: actual.constants.O_NONBLOCK ?? 0x800,
+  } };
+});
 vi.mock("node:fs/promises", async importOriginal => ({ ...await importOriginal<typeof import("node:fs/promises")>() }));
 afterEach(() => vi.restoreAllMocks());
 function handle(fd: number) { return { fd, close: vi.fn(async () => {}) } as unknown as FileHandle; }
@@ -41,7 +55,10 @@ describe("run file OS lookup boundary", () => {
   });
   it("refuses unsupported platforms without opening data", async () => {
     const opened = vi.spyOn(files, "open");
-    await expect(openRunFile("/storage/runs/id/log", "win32")).rejects.toMatchObject({ code: "EUNSAFEPATH" });
+    await expect(openRunFile("/storage/runs/id/log", "freebsd")).rejects.toMatchObject({ code: "EUNSAFEPATH" });
     expect(opened).not.toHaveBeenCalled();
+  });
+  it.each(['C:\\runs\\log:stream', '\\\\?\\C:\\runs\\log', '\\\\.\\pipe\\log', 'C:\\NUL.txt', 'C:\\runs\\..\\log', 'C:\\runs\\log.', 'C:\\runs\\log ', 'C:log'])('rejects unsafe Windows syntax before starting a helper: %s', async file => {
+    await expect(openRunFile(file, 'win32')).rejects.toMatchObject({ code: 'EUNSAFEPATH' });
   });
 });

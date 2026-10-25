@@ -1,3 +1,5 @@
+import { planForPlatform } from '../src/core/launcher/target-resolver.js';
+import { fixtureExecutable } from "./helpers/executable.js";
 import { mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,7 +15,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-it.each(['tui', 'headless'] as const)('%s: ack returning waiting_for to reviewer cannot repeat a launched delivery; new content can', async mode => {
+it.each(['tui', 'detached'] as const)('%s: ack returning waiting_for to reviewer cannot repeat a launched delivery; new content can', async mode => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'tut-ack-dedup-'));
   vi.stubEnv('TUT_HUB_ROOT', root);
   vi.stubEnv('TUT_PROJECT_ROOT', root);
@@ -31,7 +33,7 @@ it.each(['tui', 'headless'] as const)('%s: ack returning waiting_for to reviewer
   const entry = {
     task_id: 't', title: 'ack fixture', status: 'reviewing', version: 2,
     waiting_for: 'human', needs_attention: true, updated_at: new Date(2000).toISOString(),
-    cast: { reviewer: path.resolve(import.meta.dirname, 'bin/codex') },
+    cast: { reviewer: fixtureExecutable(path.resolve(import.meta.dirname, 'bin/codex')).replaceAll('\\', '/') },
   };
   const state: StateResponse = { flow_mode: 'auto', auto: { launch_roles: ['reviewer'] }, tasks: [entry] };
   const runtime = new HeadlessRuntime(root, { log: () => {}, send: async () => {}, read: async () => [...records] });
@@ -44,7 +46,9 @@ it.each(['tui', 'headless'] as const)('%s: ack returning waiting_for to reviewer
     fetchState: async () => structuredClone(state), readLog: async () => [...records],
     readLaunchMode: async () => mode, headlessRuntime: runtime,
     launchInvocation: paneLaunch, markLaunched: paneMark,
-    resolveTarget: async () => entry.cast.reviewer,
+    // Dedup is the subject; supply an already-frozen modeled host plan.
+    resolveTargetWithSource: async () => ({ route: entry.cast.reviewer, source: 'task-cast', plan: await planForPlatform({ agent: entry.cast.reviewer, args: [] }, { platform: 'linux' }) }),
+    loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
     listAnchorPanes: async () => [{ pane_id: 'fixture:anchor', label: 'tut-hub', workspace_id: 'fixture', cwd: root }],
     channelsFor: () => [], log: line => logs.push(line),
   });
@@ -68,6 +72,6 @@ it.each(['tui', 'headless'] as const)('%s: ack returning waiting_for to reviewer
   records.push(record(5, 'revision', { summary: 'new delivery', body: 'new delivery' }));
   Object.assign(entry, { version: 5, status: 'reviewing', waiting_for: 'agent:reviewer' });
   await notifier.requestCompare();
-  expect(mode === 'tui' ? paneLaunch : headlessLaunch).toHaveBeenCalledTimes(1);
+  expect(mode === 'tui' ? paneLaunch : headlessLaunch, logs.join('\n')).toHaveBeenCalledTimes(1);
   expect(mode === 'tui' ? paneMark : mark).toHaveBeenCalledTimes(1);
 });

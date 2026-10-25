@@ -1,3 +1,4 @@
+import { agentFixture } from './rig-fixtures.js';
 /**
  * Routing-gap combination coverage: the create face and
  * the legacy positional launch door had only ever been tested apart. This
@@ -22,6 +23,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { hubCreate } from "../src/core/hub/hub-client.js";
 import { startServer, type RunningServer } from "../src/core/hub/server.js";
+import { rigLabel } from "../src/core/hub/rig.js";
 
 const runLaunch = promisify(execFile);
 const DIST_CLI = path.resolve(import.meta.dirname, "../dist/cli.js");
@@ -98,8 +100,8 @@ describe("combination: create with a worktree path → legacy positional launch 
         [DIST_CLI, "launch", taskId, "executor"],
         {
           env: {
-            ...process.env,
-            PATH: `${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
+            ...process.env, TUT_PANE_SHELL: "posix",
+            PATH: [FIXTURE_BIN, NODE_DIR, "/usr/bin", "/bin"].join(path.delimiter),
             TUT_HERDR_PANES: JSON.stringify([{
               pane_id: "w1:p0",
               label: "tut-hub",
@@ -107,7 +109,12 @@ describe("combination: create with a worktree path → legacy positional launch 
               cwd: ANCHOR_CWD,
               tab_id: "w1:t0",
               agent_status: "idle",
+            }, {
+              pane_id: "w1:old-worker",
+              label: rigLabel(`${taskId}.executor`, ANCHOR_CWD),
+              workspace_id: "w1", cwd: worktree, tab_id: "w1:old", agent_status: "idle",
             }]),
+            GIT_ALLOW_PROTOCOL: "file",
             TUT_HERDR_LOG: log,
             TUT_HERDR_READ_SCRIPT: BORN_SCREENS,
             TUT_HUB_URL: server.url,
@@ -136,6 +143,10 @@ describe("combination: create with a worktree path → legacy positional launch 
       expect(runLine).toBeDefined();
       expect(runLine).toContain(`cd -- '${worktree}'`);
       expect(runLine).not.toContain(`cd -- '${ANCHOR_CWD}'`);
+      expect(runLine).toContain("'GIT_ALLOW_PROTOCOL='");
+      // Old same-role processes cannot be retrofitted with the transport
+      // guard: the live launch must close this seat and birth a new process.
+      expect(lines).toContain("pane close w1:old-worker");
 
       // ⑤ The prompt was delivered to the born pane (closed-loop tail ran).
       const pane = runLine?.split(" ")[2] ?? "";
@@ -177,8 +188,8 @@ describe("legacy door: /state metadata failure modes", () => {
 
   function launchEnv(hubUrl: string, log: string): NodeJS.ProcessEnv {
     return {
-      ...process.env,
-      PATH: `${FIXTURE_BIN}:${NODE_DIR}:/usr/bin:/bin`,
+      ...process.env, TUT_PANE_SHELL: "posix",
+      PATH: [FIXTURE_BIN, NODE_DIR, "/usr/bin", "/bin"].join(path.delimiter),
       TUT_HERDR_PANES: JSON.stringify([{
         pane_id: "w1:p0",
         label: "tut-hub",
@@ -220,9 +231,9 @@ describe("legacy door: /state metadata failure modes", () => {
       const result = await runLaunch(process.execPath, [
         DIST_CLI, "launch", "cast-task", "executor", ...(explicit ? ["pi", "--model", "explicit-model"] : []),
       ], { env });
-      expect(result.stdout).toContain(explicit
+      expect(result.stdout).toContain(agentFixture(explicit
         ? "'pi' '--model' 'explicit-model'"
-        : "'codex' '-m' 'cast-model' '-c' 'model_reasoning_effort=high'");
+        : "'codex' '-m' 'cast-model' '-c' 'model_reasoning_effort=high'", "<hub-root>"));
       expect(result.stdout).not.toContain("model_reasoning_effort=max");
       if (explicit) expect(result.stdout).not.toContain("cast-model");
     } finally {
@@ -280,7 +291,7 @@ describe("legacy door: /state metadata failure modes", () => {
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toContain("no-such-cast-agent-x");
       expect(error.message).toContain("tut assign");
-      expect(error.message).toContain("correct the task cast");
+      expect(error.message).toContain(process.platform === "win32" ? "correct cast in a new task" : "correct the task cast");
       const lines = existsSync(log) ? readFileSync(log, "utf8").split("\n") : [];
       for (const prefix of MUTATION_PREFIXES) {
         expect(lines.some((line) => line.startsWith(prefix))).toBe(false);
@@ -333,7 +344,7 @@ describe("legacy door: /state metadata failure modes", () => {
       }).catch((error: unknown) => error) as Error;
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toContain("hub ownership mismatch");
-      expect(error.message).toContain("/srv/foreign-workspace");
+      expect(error.message).toContain(path.resolve("/srv/foreign-workspace"));
       expect(error.message).toContain(process.cwd());
       const lines = existsSync(log)
         ? readFileSync(log, "utf8").split("\n").filter((line) => line.length > 0)

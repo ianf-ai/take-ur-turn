@@ -2,18 +2,24 @@
  * creation and owner write, or report exactly what its competitor observes. */
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-const [moduleUrl, root, id, role, mode] = process.argv.slice(2);
+const [moduleUrl, root, id, role, mode, releaseFile] = process.argv.slice(2);
 const report = value => fs.writeSync(1, `${JSON.stringify(value)}\n`);
 if (role === 'owner') {
   const original = fs.openSync;
   fs.openSync = function(file, flags, ...rest) {
     const fd = original.call(this, file, flags, ...rest);
-    if (String(file).endsWith('/meta.lock') && (flags & fs.constants.O_EXCL)) {
+    if (/[/\\]meta\.lock$/.test(String(file)) && (flags & fs.constants.O_EXCL)) {
       // Positional write leaves the descriptor offset at zero, so the real
-      // owner publication overwrites this prefix after SIGCONT.
+      // owner publication overwrites this prefix after the explicit release handshake.
       if (mode === 'partial') fs.writeSync(fd, '{"pid":', 0, 'utf8');
       report({ kind: 'window' });
-      process.kill(process.pid, 'SIGSTOP');
+      // Block only the fixture at the exact O_EXCL window, on both hosts.
+      // This gate lives outside the run protocol and does not edit the lock.
+      const deadline = performance.now() + 10000;
+      while (!fs.existsSync(releaseFile)) {
+        if (performance.now() >= deadline) throw new Error('owner release timed out');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
     }
     return fd;
   };
@@ -21,7 +27,7 @@ if (role === 'owner') {
   const original = fs.readFileSync; let reported = false;
   fs.readFileSync = function(file, ...rest) {
     const value = original.call(this, file, ...rest);
-    if (!reported && String(file).endsWith('/meta.lock')) {
+    if (!reported && /[/\\]meta\.lock$/.test(String(file))) {
       reported = true; report({ kind: 'observed', raw: value.toString() });
     }
     return value;

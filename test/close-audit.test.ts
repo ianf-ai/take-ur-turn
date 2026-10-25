@@ -1,3 +1,5 @@
+import { stopWindowsFixtureRuns } from './helpers/run-cleanup.js';
+import { writeNodeExecutable } from './helpers/executable.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, closeSync } from 'node:fs';
 import os from 'node:os';
@@ -17,17 +19,24 @@ const builtControl = await import(path.resolve('dist/core/run/control.js')) as t
 
 const roots: string[] = []; const servers: RunningServer[] = []; const groups: number[] = [];
 afterEach(async () => {
-  for (const g of groups.splice(0)) { try { process.kill(-g, 'SIGKILL'); } catch { /* reaped */ } }
+  const ownedRoots = roots.splice(0);
+  try { if (process.platform === 'win32') await stopWindowsFixtureRuns(ownedRoots); }
+  finally {
+  for (const g of groups.splice(0)) { if(process.platform!=='win32')try { process.kill(-g, 'SIGKILL'); } catch { /* reaped */ } }
   for (const s of servers.splice(0)) await s.close();
+  }
 });
 function root(): string { const r = mkdtempSync(path.join(os.tmpdir(), 'tut-close-audit-')); roots.push(r); return r; }
-async function until(fn: () => boolean, ms = 8000): Promise<void> { const end = performance.now() + ms; while (!fn()) { if (performance.now() > end) throw new Error('condition timed out'); await new Promise(r => setTimeout(r, 25)); } }
+async function until(fn: () => boolean, ms = process.platform === 'win32' ? 45000 : 8000): Promise<void> { const end = performance.now() + ms; while (!fn()) { if (performance.now() > end) throw new Error('condition timed out'); await new Promise(r => setTimeout(r, 25)); } }
 function fixtureAgent(r: string): string {
   const bin = path.join(r, 'bin'); mkdirSync(bin, { recursive: true });
-  const file = path.join(bin, 'codex');
-  writeFileSync(file, `#!/bin/sh\nsleep 30\n`);
-  chmodSync(file, 0o755);
-  return file;
+  return writeNodeExecutable(path.join(bin, 'codex'), process.platform === 'win32' ? 'setTimeout(()=>{},120000)' : 'setTimeout(()=>{},30000)');
+}
+
+function heldAgent(r: string, name: string) {
+  const releaseFile = path.join(r, name + '-release');
+  const agent = writeNodeExecutable(path.join(r, name), `const fs=require('node:fs');setInterval(()=>{if(fs.existsSync(${JSON.stringify(releaseFile)}))process.exit(0)},20);setTimeout(()=>process.exit(124),120000).unref()`);
+  return { agent, release: () => writeFileSync(releaseFile, '') };
 }
 
 function ownership(role: string, taskId: string): HeadlessOwnership {
@@ -59,7 +68,7 @@ describe('the effective close version is the one that CLOSED the task', () => {
     const auditNote: ContextRecord = { version: 8, task_id: 't', role: 'human', content_type: 'note', timestamp: 't', payload: { summary: 's', body: 'b', operation: 'close-stop', audit_id: auditId } };
     expect(hasCloseStopAudit(laterView.concat([auditNote]), auditId)).toBe(true);
   });
-  it('real Hub: a repeated close keeps the audit pinned to the first close', { timeout: 30_000 }, async () => {
+  it('real Hub: a repeated close keeps the audit pinned to the first close', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
@@ -88,7 +97,7 @@ describe('the effective close version is the one that CLOSED the task', () => {
 });
 
 describe('close-stop audit (real Hub integration)', () => {
-  it('cooperative stop publishes an audited note with the close version, run facts, and no state change', { timeout: 30_000 }, async () => {
+  it('cooperative stop publishes an audited note with the close version, run facts, and no state change', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
@@ -122,8 +131,8 @@ describe('close-stop audit (real Hub integration)', () => {
     expect(payload.run_id).toBe(runId);
     expect(payload.close_version).toBe(closeVersion);
     expect(payload.stop_success).toBe(true);
-    expect(payload.scope).toBe('root-and-original-group');
-    expect(payload.descendants_check).toBe('not-performed');
+    expect(payload.scope).toBe(process.platform === 'win32' ? 'root-and-owned-job' : 'root-and-original-group');
+    expect(payload.descendants_check).toBe(process.platform === 'win32' ? 'job-members-only' : 'not-performed');
     expect(payload.ref_version).toBe(closeVersion);
     expect(audit[0]!.agent).toBe('tut');
     expect(audit[0]!.content_type).toBe('note');
@@ -132,7 +141,7 @@ describe('close-stop audit (real Hub integration)', () => {
     expect((await hubRead(server.url, created.task_id)).status).toBe('closed');
   });
 
-  it('a double observation neither double-stops nor double-audits (dedup by audit_id)', { timeout: 30_000 }, async () => {
+  it('a double observation neither double-stops nor double-audits (dedup by audit_id)', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
@@ -156,15 +165,13 @@ describe('close-stop audit (real Hub integration)', () => {
     expect(after.versions.filter(v => (v.payload as { operation?: string }).operation === 'close-stop')).toHaveLength(1);
   });
 
-  it('already-ended runs audit an honest already-ended outcome; failures audit errors without fabrication', { timeout: 30_000 }, async () => {
+  it('already-ended runs audit an honest already-ended outcome; failures audit errors without fabrication', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
     const created = await hubCreate(server.url, { title: 'ended', description: 'b', creator: 'test-user', role: 'executor' });
     await hubDecide(server.url, { task_id: created.task_id, decision: 'close', by: 'test-user' });
-    const agent = path.join(r, 'done-agent');
-    writeFileSync(agent, '#!/bin/sh\nsleep 0.4\n');
-    chmodSync(agent, 0o755);
+    const held = heldAgent(r, 'done-agent'); const agent = held.agent;
     const runId = await builtControl.startRun(store, [agent], r, created.task_id, { headless: ownership('executor', created.task_id) });
     const logs: string[] = [];
     const runtime = new HeadlessRuntime(r, {
@@ -172,7 +179,7 @@ describe('close-stop audit (real Hub integration)', () => {
       read: async id => (await hubRead(server.url, id)).versions, hubUrl: server.url,
     });
     runtime.restore();
-    expect(runtime.busy(created.task_id)).toBe(true);
+    expect(runtime.busy(created.task_id)).toBe(true); held.release();
     await until(() => store.read(runId).ended_at !== undefined); // occupied but already ended
     runtime.closeTask(created.task_id);
     await until(() => logs.some(l => l.includes('close-stop audit')));
@@ -182,7 +189,7 @@ describe('close-stop audit (real Hub integration)', () => {
     expect((audit.payload as { stop_success?: boolean }).stop_success).toBe(true);
   });
 
-  it('Hub failures keep the local stop and its log line; nothing retries blindly', { timeout: 30_000 }, async () => {
+  it('Hub failures keep the local stop and its log line; nothing retries blindly', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const store = new RunStore(r);
     const agent = fixtureAgent(r);
@@ -204,7 +211,7 @@ describe('close-stop audit (real Hub integration)', () => {
 });
 
 describe('syncNew discovers CLI-started managed resumes', () => {
-  it.each(['running', 'pending', 'after-close', 'unreadable-inventory'] as const)('closes the admitted winner while a local attempt waits for the lock (sync=%s)', { timeout: 30_000 }, async (syncAt) => {
+  it.each(['running', 'pending', 'after-close', 'unreadable-inventory'] as const)('closes the admitted winner while a local attempt waits for the lock (sync=%s)', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async (syncAt) => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
@@ -220,6 +227,14 @@ describe('syncNew discovers CLI-started managed resumes', () => {
     const unlock = await store.lockAdmission();
     let locked = true;
     let winner: string | undefined;
+    if (process.platform === 'win32') {
+      // This fixture deliberately holds admission across a real native spawn
+      // and Hub close, which can exceed the production 5s default. Give only
+      // its queued contender a bounded caller budget; use the real lock and
+      // keep all winner/stop/audit assertions below unchanged.
+      const lockAdmission = runtime.store.lockAdmission.bind(runtime.store);
+      vi.spyOn(runtime.store, 'lockAdmission').mockImplementation(() => lockAdmission(30_000));
+    }
     try {
       runtime.launch({ task_id: task, title: task, role: local.role, attempt_id: local.attempt_id,
         base_version: 0, trigger_version: 0, hubRoot: r, routingRoot: r, checkoutRoot: r, hubUrl: server.url,
@@ -239,7 +254,7 @@ describe('syncNew discovers CLI-started managed resumes', () => {
       if (syncAt === 'unreadable-inventory') {
         const inventory = runtime.store.list.bind(runtime.store);
         vi.spyOn(runtime.store, 'list').mockImplementation(() => {
-          if (logs.some(l => l.includes('headless launch skipped'))) throw new Error('inventory temporarily unreadable');
+          if (logs.some(l => l.includes('detached launch skipped'))) throw new Error('inventory temporarily unreadable');
           return inventory();
         });
       }
@@ -247,7 +262,14 @@ describe('syncNew discovers CLI-started managed resumes', () => {
       runtime.closeTask(task); // Same close while waiting must not duplicate consumption.
       unlock();
       locked = false;
-      await until(() => logs.some(l => l.includes('headless launch skipped')));
+      await until(() => logs.some(l => l.includes('detached launch skipped')));
+      if (process.platform === 'win32') {
+        // Await the actual stop observer, whose production terminal window is
+        // 60s. The fixture's 45s polling window must not race that observer or
+        // add synchronous native meta reads while it is still making progress.
+        await until(() => stop.mock.results.length === 1);
+        expect((await stop.mock.results[0]!.value).success).toBe(true);
+      }
       await until(() => logs.some(l => l.includes('close-stop audit') && l.includes('recorded at v')));
       expect(start).not.toHaveBeenCalled();
       expect(stop).toHaveBeenCalledTimes(1);
@@ -265,15 +287,16 @@ describe('syncNew discovers CLI-started managed resumes', () => {
       if (winner && !store.read(winner).ended_at) await builtControl.stopRun(store, winner);
     }
   });
-  it('restore misses them; syncNew picks the run up for observation and close', { timeout: 30_000 }, async () => {
+  it('restore misses them; syncNew picks the run up for observation and close', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
     const created = await hubCreate(server.url, { title: 'sync', description: 'b', creator: 'test-user', role: 'executor' });
     const agent = fixtureAgent(r);
     const logs: string[] = [];
+    const stop = vi.fn(builtControl.stopRun);
     const runtime = new HeadlessRuntime(r, {
-      stop: builtControl.stopRun, send: async () => {}, log: line => logs.push(line),
+      stop, send: async () => {}, log: line => logs.push(line),
       read: async id => (await hubRead(server.url, id)).versions, hubUrl: server.url,
     });
     runtime.restore();
@@ -286,6 +309,10 @@ describe('syncNew discovers CLI-started managed resumes', () => {
     // Close finds the CLI-started run through the synced ownership.
     const closed = await hubDecide(server.url, { task_id: created.task_id, decision: 'close', by: 'test-user' });
     runtime.closeTask(created.task_id);
+    if (process.platform === 'win32') {
+      await until(() => stop.mock.results.length === 1);
+      expect((await stop.mock.results[0]!.value).success).toBe(true);
+    }
     await until(() => store.read(runId).ended_at !== undefined);
     await until(() => logs.some(l => l.includes('close-stop audit')));
     const after = await hubRead(server.url, created.task_id);
@@ -294,7 +321,7 @@ describe('syncNew discovers CLI-started managed resumes', () => {
 });
 
 describe('closure: the production revalidate factory (state+log consistency)', () => {
-  it('a task log read failure is NOT permission to launch', { timeout: 30_000 }, async () => {
+  it('a task log read failure is NOT permission to launch', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const created = await hubCreate(server.url, { title: 'logfail', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
@@ -312,11 +339,11 @@ describe('closure: the production revalidate factory (state+log consistency)', (
       revalidate,
     });
     runtime.launch({ task_id: created.task_id, title: 't', role: 'executor', attempt_id: 'attempt-x', base_version: 0, trigger_version: 0, hubRoot: r, routingRoot: r, checkoutRoot: r, hubUrl: server.url, route: { agent: 'x', args: [] }, route_source: 'task-cast', argv: ['x'], prompt: 'p', env: {}, target_digest: 'sha256:x', ownership: ownership('executor', created.task_id) } as never);
-    await until(() => logs.some(l => l.includes('headless launch skipped')));
+    await until(() => logs.some(l => l.includes('detached launch skipped')));
     expect(started).toHaveLength(0);
   });
 
-  it('a close landing between the state read and the log read refuses (log carries the close)', { timeout: 30_000 }, async () => {
+  it('a close landing between the state read and the log read refuses (log carries the close)', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const created = await hubCreate(server.url, { title: 'closegap', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
@@ -337,7 +364,7 @@ describe('closure: the production revalidate factory (state+log consistency)', (
     expect(stateReads).toBeGreaterThanOrEqual(1);
   });
 
-  it('a healthy task with its own marker attempt passes the production gate', { timeout: 30_000 }, async () => {
+  it('a healthy task with its own marker attempt passes the production gate', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const created = await hubCreate(server.url, { title: 'healthy', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
@@ -354,13 +381,12 @@ describe('closure: the production revalidate factory (state+log consistency)', (
 });
 
 describe('seat takeover: a pending intent takes over a COMPLETED seat in the same poll as close', () => {
-  it('old run completes between polls; new pending arrives; syncNew hands the seat over and close audits the new reservation', { timeout: 30_000 }, async () => {
+  it('old run completes between polls; new pending arrives; syncNew hands the seat over and close audits the new reservation', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
     const created = await hubCreate(server.url, { title: 'seat handover', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
-    const shortAgent = path.join(r, 'short-agent');
-    writeFileSync(shortAgent, '#!/bin/sh\nsleep 1\n'); chmodSync(shortAgent, 0o755);
+    const held = heldAgent(r, 'short-agent'); const shortAgent = held.agent;
     const logs: string[] = [];
     const runtime = new HeadlessRuntime(r, {
       stop: builtControl.stopRun, send: async () => {}, log: line => logs.push(line),
@@ -373,7 +399,7 @@ describe('seat takeover: a pending intent takes over a COMPLETED seat in the sam
     expect(runtime.busy(created.task_id)).toBe(true);
     // Between polls: the old run COMPLETES and the CLI admits a NEW attempt
     // whose meta is not readable yet (pending headless-start intent).
-    await until(() => store.read(oldRun).ended_at !== undefined);
+    held.release(); await until(() => store.read(oldRun).ended_at !== undefined);
     const newOwn = ownership('executor', created.task_id);
     const pending = store.create();
     await store.writeStartIntent(pending, { task_id: created.task_id, headless: newOwn, cwd: r, startup: 'pending' });
@@ -393,7 +419,7 @@ describe('seat takeover: a pending intent takes over a COMPLETED seat in the sam
 });
 
 describe('an adopted pending intent that becomes KNOWN-FAILED releases the seat', () => {
-  it('pending adopted → known-failed → busy false, and a fresh candidate can launch; pending stays held otherwise', { timeout: 30_000 }, async () => {
+  it('pending adopted → known-failed → busy false, and a fresh candidate can launch; pending stays held otherwise', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root(); const store = new RunStore(r);
     const own = ownership('executor', 'failed-intent-task');
     const pending = store.create();
@@ -426,7 +452,7 @@ describe('an adopted pending intent that becomes KNOWN-FAILED releases the seat'
 });
 
 describe('online-created pending startup intents enter ownership via syncNew', () => {
-  it('a pending intent adopted after restore is closed with an honest unconfirmed audit; a later meta keeps ownership', { timeout: 30_000 }, async () => {
+  it('a pending intent adopted after restore is closed with an honest unconfirmed audit; a later meta keeps ownership', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
@@ -456,7 +482,7 @@ describe('online-created pending startup intents enter ownership via syncNew', (
     expect((audit.payload as { failure?: string }).failure).toContain('stop attempt failed');
     expect((audit.payload as { run_id?: string }).run_id).toBe(pending);
   });
-  it('a pending intent whose meta later appears transitions to normal observation', { timeout: 30_000 }, async () => {
+  it('a pending intent whose meta later appears transitions to normal observation', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const store = new RunStore(r);
     const own = ownership('executor', 'late-meta-task');
@@ -480,12 +506,18 @@ describe('online-created pending startup intents enter ownership via syncNew', (
 });
 
 describe('auto launch admission', () => {
-  it('a stale plan (state/generation changed while waiting for admission) is dropped with zero spawn', { timeout: 30_000 }, async () => {
+  it('a stale plan (state/generation changed while waiting for admission) is dropped with zero spawn', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
     const created = await hubCreate(server.url, { title: 'stale', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
-    const agent = fixtureAgent(r);
+    // The two accepted launches only prove that staleness is task-local.
+    // On Windows, serial default stops of timer-held agents also exercise
+    // native escalation and can consume this case's entire 120s budget.
+    // Release both fixtures together after the admission assertions instead;
+    // the winner/close cases above still exercise real stop + audit behavior.
+    const held = process.platform === 'win32' ? heldAgent(r, 'stale-agent') : undefined;
+    const agent = held?.agent ?? fixtureAgent(r);
     const logs: string[] = [];
     const started: string[] = [];
     const revalidations: { task: string; role: string; attempt: string }[] = [];
@@ -523,23 +555,39 @@ describe('auto launch admission', () => {
       ownership: own,
     } as Parameters<HeadlessRuntime['launch']>[0];
     runtime.launch(plan);
-    await until(() => logs.some(l => l.includes('headless launch skipped') && l.includes('stale')));
+    await until(() => logs.some(l => l.includes('detached launch skipped') && l.includes('stale')));
     expect(started).toHaveLength(0);
     expect(revalidations).toHaveLength(1);
     // A fresh plan with the CURRENT marker's own attempt passes revalidation.
     const fresh = { ...plan, attempt_id: '11111111-2222-3333-4444-555555555555', ownership: { ...own, attempt_id: '11111111-2222-3333-4444-555555555555' } } as Parameters<HeadlessRuntime['launch']>[0];
-    runtime.launch(fresh);
+    // These are positive controls, not competing admissions: a native spawn
+    // can hold the real lock longer than the next caller's default 5s wait.
+    // Await each terminal outcome so a refusal fails here instead of polling
+    // for two "started" lines that can never arrive. Keep POSIX as before.
+    if (held) expect(await runtime.launchAndSettle(fresh)).toMatchObject({ kind: 'launched' });
+    else runtime.launch(fresh);
     // An UNRELATED task's plan is not punished by this task's staleness.
     const otherTask = await hubCreate(server.url, { title: 'other', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
     const otherOwn = ownership('executor', otherTask.task_id);
     const otherPlan = { ...fresh, task_id: otherTask.task_id, title: 'other', ownership: otherOwn } as Parameters<HeadlessRuntime['launch']>[0];
-    runtime.launch(otherPlan);
-    await until(() => logs.filter(l => l.includes('headless started')).length >= 2);
+    if (held) expect(await runtime.launchAndSettle(otherPlan)).toMatchObject({ kind: 'launched' });
+    else runtime.launch(otherPlan);
+    await until(() => logs.filter(l => l.includes('detached started')).length >= 2);
     expect(started).toHaveLength(2);
-    await stopRun(store, started[0]!);
-    await stopRun(store, started[1]!);
+    if (held) {
+      held.release();
+      await until(() => started.every(id => store.read(id).ended_at !== undefined));
+      for (const id of started) {
+        const meta = store.read(id);
+        expect(meta.exit_code).toBe(0);
+        expect(meta.stop_request).toBeUndefined();
+      }
+    } else {
+      await stopRun(store, started[0]!);
+      await stopRun(store, started[1]!);
+    }
   });
-  it('a CLI-reserved task makes the auto launch skip without a give-up notification', { timeout: 30_000 }, async () => {
+  it('a CLI-reserved task makes the auto launch skip without a give-up notification', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
@@ -561,7 +609,7 @@ describe('auto launch admission', () => {
       ownership: ownership('executor', 'covered-task'),
     } as Parameters<HeadlessRuntime['launch']>[0];
     runtime.launch(plan);
-    await until(() => logs.some(l => l.includes('headless launch skipped')));
+    await until(() => logs.some(l => l.includes('detached launch skipped')));
     expect(started).toHaveLength(0);
     expect(messages).toHaveLength(0); // covered ≠ give-up
     await stopRun(store, runId);

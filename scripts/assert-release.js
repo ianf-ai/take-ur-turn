@@ -24,6 +24,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // need to exist, be regular files (symlinks to regular files count —
 // statSync follows them; a directory passes neither test), and be non-empty.
 const RUNTIME_ENTRIES = [
+  ...["broker.ps1", "native.cs"].map(name => ({
+    rel: path.join("scripts", "windows-run", name),
+    why: "Windows run broker loads this fixed native helper from the installed package",
+    minBytes: 1,
+  })),
   {
     rel: path.join("dist", "cli.js"),
     why: "bin entry (package.json bin)",

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import * as files from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
+import type { RunFile, RunFileOpener } from "../src/core/hub/run-file.js";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,22 @@ import { RunReadStore, type RunLogRange } from "../src/core/hub/run-store.js";
 // Faults are injected around real file handles, including the kernel-safe open.
 vi.mock("node:fs/promises", async original => ({ ...await original<typeof import("node:fs/promises")>() }));
 
+// Observe the kernel-safe opener itself: Windows native handles do not go
+// through node:fs.open. Every actual open/close still executes the product API.
+const nativeBoundary = vi.hoisted(() => ({
+  opened: undefined as ((file: string, handle: RunFile) => void) | undefined,
+  afterOpen: undefined as (() => Promise<void>) | undefined,
+}));
+vi.mock('../src/core/hub/run-file.js', async original => {
+  const actual = await original<typeof import('../src/core/hub/run-file.js')>();
+  const wrap = (open: RunFileOpener) => async (file: string) => {
+    try { const handle = await open(file); nativeBoundary.opened?.(file, handle); return handle; }
+    finally { await nativeBoundary.afterOpen?.(); }
+  };
+  return { ...actual, openRunFile: wrap(actual.openRunFile),
+    withRunFileSession: <T>(read: (open: RunFileOpener) => Promise<T>) => actual.withRunFileSession(open => read(wrap(open))),
+  };
+});
 const RUN = "20261017T010203004Z-1234abcd";
 let tmp: string, root: string, store: Store, running: RunningServer, client: Client;
 beforeEach(async () => {
@@ -30,6 +46,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  nativeBoundary.opened = undefined; nativeBoundary.afterOpen = undefined;
   await client?.close();
   await running?.close();
   await rm(tmp, { recursive: true, force: true });
@@ -178,7 +195,7 @@ it("uses a bounded default/max page, short tail, and a distinct successful empty
   expect(await page()).toEqual({ run_id: RUN, from: 0, next: 0, size: 0, eof: true, encoding: "base64", data: "" });
 });
 
-it.each(["running", "stopped", "exited"])("follows appended bytes with two independent cursors, even when meta status is %s", async status => {
+it.each(["running", "stopped", "exited"])("follows appended bytes with two independent cursors, even when meta status is %s", { timeout: process.platform === "win32" ? 60_000 : 5_000 }, async status => {
   const first = Buffer.concat([Buffer.from("line\n半行"), Buffer.from([0xf0, 0x9f])]);
   const added = Buffer.concat([Buffer.from([0x98, 0x80]), Buffer.from("后半\r\nend")]);
   const file = await seedLog(first);
@@ -292,19 +309,20 @@ it.each(["runs", "run", "log"])("rejects linked or non-ordinary %s paths without
 });
 
 // Instrument all handles, including Linux's pinned ancestor FDs.
-function instrumentOpen(onLog: (handle: FileHandle) => void) {
-  const original = files.open;
-  const handles: FileHandle[] = [];
-  vi.spyOn(files, "open").mockImplementation(async (...args) => {
-    const handle = await original(...args); handles.push(handle);
-    if (String(args[0]).endsWith("/log")) onLog(handle);
-    return handle;
-  });
+interface TrackedHandle { closed: boolean }
+function instrumentOpen(onLog: (handle: RunFile) => void) {
+  const handles: TrackedHandle[] = [];
+  nativeBoundary.opened = (file, handle) => {
+    const tracked = { closed: false }; handles.push(tracked);
+    const close = handle.close.bind(handle);
+    handle.close = async () => { await close(); tracked.closed = true; };
+    if (/[/\\]log$/.test(file)) onLog(handle);
+  };
   return handles;
 }
-function expectClosed(handles: FileHandle[]) {
+function expectClosed(handles: TrackedHandle[]) {
   expect(handles.length).toBeGreaterThan(0);
-  expect(handles.every(handle => handle.fd === -1)).toBe(true);
+  expect(handles.every(handle => handle.closed)).toBe(true);
 }
 
 it("bounds actual reads/allocations, handles legal short reads, and freezes size before concurrent append", async () => {
@@ -386,9 +404,9 @@ it("never leaks a target when the run directory is linked outside only during st
   const dir = path.dirname(file), saved = path.join(tmp, "saved");
   const outside = path.join(tmp, "outside"); await mkdir(outside);
   await writeFile(path.join(outside, "log"), "OUTSIDE_SECRET");
-  const target = await realpath(file), originalStat = files.lstat, originalOpen = files.open;
+  const target = await realpath(file), originalStat = files.lstat;
   let swapped = false, arranged = false, restored = false;
-  const handles: FileHandle[] = [];
+  const handles = instrumentOpen(() => {});
   async function restore() {
     if (swapped) { await rm(dir); await rename(saved, dir); swapped = false; restored = true; }
   }
@@ -398,14 +416,11 @@ it("never leaks a target when the run directory is linked outside only during st
     }
     return originalStat(...args);
   }) as typeof files.lstat);
-  vi.spyOn(files, "open").mockImplementation(async (...args) => {
-    try { const handle = await originalOpen(...args); handles.push(handle); return handle; }
-    finally { await restore(); }
-  });
+  nativeBoundary.afterOpen = restore;
   try {
     const response = await request(`/runs/${RUN}/log`);
     expect(arranged).toBe(true); expect(restored).toBe(true);
     expect(response.status).toBe(500); expect(response.text).toBe('{"error":"internal error"}');
-    expect(handles.every(handle => handle.fd === -1)).toBe(true);
-  } finally { await restore(); }
+    expect(handles.every(handle => handle.closed)).toBe(true);
+  } finally { nativeBoundary.afterOpen = undefined; await restore(); }
 });

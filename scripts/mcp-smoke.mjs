@@ -84,7 +84,7 @@ const run = async () => {
   assert(JSON.stringify(r.versions[1]?.payload?.commits) === JSON.stringify(["a1b2c3d"]),
     "commits round-trip: [\"a1b2c3d\"]", r.versions[1]?.payload);
 
-  // ref_version is a payload field (context-design 2.3/2.5), NOT a publish
+  // ref_version is a payload field, NOT a publish
   // input field — spreading it at the publish top level gets silently
   // stripped by zod and the reference chain never lands.
   r = await pub("review", "reviewer", {
@@ -108,7 +108,7 @@ const run = async () => {
   assert(r.status === "pending_approval" && r.needs_attention === false,
     "review(pass) → pending_approval, waiting for human", r);
 
-  // Reference chain (context-design 2.5) must actually land in the stored
+  // Reference chain must actually land in the stored
   // payloads — guards against ref_version sliding back to the wrong layer.
   r = await call(client, "context.read", { task_id: taskId });
   const codeChangesRec = r.versions.find((v) => v.version === codeChangesVersion);

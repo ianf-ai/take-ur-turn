@@ -156,9 +156,10 @@ describe("pane-runner exit codes and child fidelity (built dist entry)", () => {
     expect(r.code).toBe(42);
   }, 20_000);
 
-  it("signal termination maps to 128+N", async () => {
+  it("reports native termination and preserves the POSIX 128+N mapping", async () => {
     const r = await runBuilt(["--payload", tokenOf(nodePayload("process.kill(process.pid, 'SIGTERM')"))]);
-    expect(r.code).toBe(143);
+    expect(r.code).toBe(process.platform === "win32" ? 1 : 143);
+    expect(signalExitCode("SIGTERM")).toBe(143);
     expect(signalExitCode("SIGKILL")).toBe(137);
     expect(signalExitCode(null)).toBe(1);
   }, 20_000);
@@ -173,14 +174,24 @@ describe("pane-runner exit codes and child fidelity (built dist entry)", () => {
     expect(bad.stderr).toContain("pane-runner:");
   }, 20_000);
 
-  it("missing executable exits 127; non-executable target exits 126", async () => {
+  it("reports missing and non-executable targets using native spawn errors", async () => {
     const dir = tmpdir();
     const missing = { protocol_version: 1, cwd: dir, executable: path.join(dir, "no-such-exe"), args: [], env: {}, purpose: "agent" as const };
     expect((await runBuilt(["--payload", tokenOf(missing)])).code).toBe(127);
     const noExec = path.join(dir, "plain.txt");
     writeFileSync(noExec, "data", { mode: 0o644 });
     const denied = { protocol_version: 1, cwd: dir, executable: noExec, args: [], env: {}, purpose: "agent" as const };
-    expect((await runBuilt(["--payload", tokenOf(denied)])).code).toBe(126);
+    // Windows reports EFTYPE for this file, rather than POSIX EACCES.
+    expect((await runBuilt(["--payload", tokenOf(denied)])).code).toBe(process.platform === "win32" ? 1 : 126);
+    // Preserve the permission-denied contract independently of host chmod/ACLs.
+    for (const errorCode of ["EACCES", "EPERM"]) {
+      const spawnFn = (() => {
+        const child = new EventEmitter();
+        queueMicrotask(() => child.emit("error", Object.assign(new Error("fixture permission denied"), { code: errorCode })));
+        return child;
+      }) as never;
+      expect(await runPaneRunner(["--payload", tokenOf(denied)], { spawnFn })).toBe(126);
+    }
   }, 20_000);
 
   it(".ps1 shim refusal exits 126 before any spawn", async () => {

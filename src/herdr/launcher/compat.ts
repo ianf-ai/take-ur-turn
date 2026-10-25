@@ -33,6 +33,7 @@ import {
 } from "./delivery.js";
 import { DELIVERY_GIVEUP_EVENT, eventPortUrlOf, postAgentEvent, type GiveUpEvidence } from "./escalation.js";
 import { birthCwdOf } from "../../core/launcher/checkout.js";
+import { worktreeGitEnvironment } from "../../core/launcher/worktree-git.js";
 import {
   renderPaneCommand,
   resolvePaneShellDialect,
@@ -61,7 +62,7 @@ import type {
   LaunchRequest,
   LaunchRouteSource,
 } from "../../core/common/types.js";
-import type { LaunchEntry } from "../../core/launcher/entry.js";
+import type { LaunchEntry } from "../../core/launcher/entry-parse.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HerdrPane } from "./legacy-herdr-client.js";
@@ -126,7 +127,7 @@ export function renderInvocationPaneCommand(
     cwd: birthCwdOf(invocation.context),
     executable: plan.executable,
     args: plan.args,
-    env: { ...plan.env, ...rigEnvironment(invocation.context.hubRoot, invocation.hub_url, plan.env.TUT_EVENT_PORT_URL || process.env.TUT_EVENT_PORT_URL || "http://127.0.0.1:3002/agent-event") },
+    env: { ...plan.env, ...rigEnvironment(invocation.context.hubRoot, invocation.hub_url, plan.env.TUT_EVENT_PORT_URL || process.env.TUT_EVENT_PORT_URL || "http://127.0.0.1:3002/agent-event"), ...worktreeGitEnvironment(invocation.context) },
     dialect,
     purpose: "agent",
   };
@@ -264,7 +265,7 @@ async function buildLegacyInvocation(request: LaunchRequest, invocation?: Launch
     );
   }
   if (outcome.kind === "hub-unreadable") {
-    // Documented compat degradation (system-design 7.x): the legacy door
+    // Documented compat degradation: the legacy door
     // stays open when the hub is down/unreadable, but never silently —
     // one stderr line names the URL and the reason before current/default
     // is assumed.
@@ -470,7 +471,11 @@ async function runDeliveredRound(
   const birthCwd = birthCwdOf(invocation.context);
   const tabLabel = invocation.naming.tab_label;
   const paneLabel = invocation.naming.pane_label;
-  const continuitySetting = process.env.TUT_CONTINUITY_ROLES;
+  // An existing TUI process cannot acquire a new environment. Rebirth is
+  // required for isolated worktrees, including panes born before this policy.
+  const isolatedWorktree = worktreeGitEnvironment(invocation.context).GIT_ALLOW_PROTOCOL === "";
+  if (isolatedWorktree) process.stderr.write("launch: worktree Git transport isolation requires a new worker process; same-role pane continuation disabled\n");
+  const continuitySetting = isolatedWorktree ? "" : process.env.TUT_CONTINUITY_ROLES;
   const lifecycle = await runRoundLifecycle({
     invocation,
     client: lifecycleClient,

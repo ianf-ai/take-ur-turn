@@ -1,6 +1,6 @@
 {
   "name": "take-ur-turn",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "TUT (Take Ur Turn): multi coding-agent collaboration via a local Context Hub — append-only shared memory, derived task state, human approval gates",
   "license": "Apache-2.0",
   "keywords": [
@@ -31,13 +31,12 @@
     "dist/",
     "skills/",
     "scripts/launch.sh",
+    "scripts/windows-run/",
     "scripts/usage-audit/",
     "scripts/on-agent-event.sh",
     "scripts/on-agent-event.mjs",
     "scripts/herdr-hook.mjs",
     "scripts/hook.sh",
-    "scripts/workspace.json",
-    "scripts/tut-resolve.mjs",
     "README.md",
     "LICENSE",
     "AGENTS.md",
@@ -47,7 +46,7 @@
   "scripts": {
     "build": "tsc && node -e \"const fs=require('fs');const f='dist/cli.js';let s=fs.readFileSync(f,'utf8');if(!s.startsWith('#!')){s='#!/usr/bin/env node\\n'+s;fs.writeFileSync(f,s);}fs.chmodSync(f,0o755)\"",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "test": "vitest run && node --test scripts/usage-audit/test/audit.test.mjs",
+    "test": "vitest run && node --test scripts/usage-audit/test/audit.test.mjs scripts/usage-audit/test/windows.test.mjs scripts/usage-audit/lib/stall.test.mjs test/windows-run-file.test.mjs",
     "test:watch": "vitest",
     "prepack": "node scripts/assert-release.js"
   },

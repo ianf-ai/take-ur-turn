@@ -1,11 +1,16 @@
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { resolveRigRoot, resolveCliHubUrl } from '../hub/rig-discovery.js';
+import { HubSession, hubReadVia } from '../hub/hub-client.js';
+import { readLaunchCheckout } from '../common/config.js';
+import { requireDeclaration } from '../../standalone/launcher-headless/checkout-anchor.js';
 import { RunStore } from '../run/store.js';
 import { startRun, listRuns, attachRun, stopRun } from '../run/control.js';
 import { repairRun } from '../run/repair.js';
 import { planResume, executeResume, executeManagedResume, ResumeError } from '../run/resume.js';
 import { preflightCheckout, renderPreflightReport, fixPreflight, envPreflightFixRunner } from '../preflight/index.js';
+import { checkoutContainsCwd, reportWorktreeWarning, type WorktreeExpectation } from '../preflight/worktree.js';
 import type { ParsedArgs } from './args.js';
 
 async function optionalHub(root: string, action: 'associate' | 'stop' | 'resume', payload: Record<string, unknown>): Promise<void> {
@@ -23,8 +28,45 @@ async function optionalHub(root: string, action: 'associate' | 'stop' | 'resume'
  *  (a half-applied install can leave artifacts on disk while the command
  *  itself failed — existence green is NOT success); only after no failure is
  *  the re-check consulted. Never silently installs or builds. */
-async function preflightGate(checkout: string, fix: boolean): Promise<boolean> {
-  const report = preflightCheckout(checkout);
+async function taskExpectations(checkout: string, hubRoot: string, taskId?: string, anchoredSource = false): Promise<WorktreeExpectation[]> {
+  const unknown = (reason: string): void => {
+    process.stderr.write(`checkout preflight: task consistency unverified (${taskId ?? 'no task'}): ${reason}; incomplete task checks are advisory\n`);
+  };
+  if (taskId === undefined) { unknown('no associated task'); return []; }
+  const expectations: WorktreeExpectation[] = [];
+  try {
+    const url = await resolveCliHubUrl(process.env.TUT_HUB_URL ?? 'http://127.0.0.1:3001', process.env.TUT_HUB_URL !== undefined, hubRoot);
+    const session = new HubSession(url, { timeoutMs: 1000, clientName: 'tut-worktree-preflight' });
+    const task = await hubReadVia(session, taskId).finally(() => session.close());
+    if (task.task_id !== taskId) throw new Error('Hub returned a different task');
+    if (task.checkout?.kind === 'worktree' && task.checkout.path !== undefined && task.checkout.ref !== undefined
+      && checkoutContainsCwd(path.resolve(hubRoot, task.checkout.path), checkout)) {
+      expectations.push({ ref: task.checkout.ref, source: `task ${taskId} checkout.ref` });
+    }
+    // A plain run keeps its cwd. Only apply the existing declaration syntax
+    // when anchored policy (or the source run's anchored provenance) applies.
+    if (anchoredSource || await readLaunchCheckout(path.join(hubRoot, '.context-hub')) === 'anchored') {
+      const declared = requireDeclaration(task.description);
+      if (declared.status === 'declared' && declared.branch !== undefined && checkoutContainsCwd(declared.path, checkout)) {
+        expectations.push({ ref: declared.branch, source: `task ${taskId} declared branch` });
+      }
+    }
+    if (expectations.length === 0) unknown('no frozen ref or applicable declared branch for this checkout');
+  } catch (error) {
+    unknown((error as Error).message);
+  }
+  return expectations;
+}
+
+async function preflightGate(checkout: string, fix: boolean, hubRoot: string, taskId?: string, anchoredSource = false): Promise<boolean> {
+  let report = preflightCheckout(checkout);
+  // Main checkouts and non-Git commands have no worktree consistency check.
+  // Keep their existing offline latency/output and avoid new Hub requests.
+  if (report.items.find(item => item.check === 'worktree-consistency')?.status !== 'not-applicable') {
+    const expectations = await taskExpectations(checkout, hubRoot, taskId, anchoredSource);
+    if (expectations.length > 0) report = preflightCheckout(checkout, expectations);
+  }
+  report.items.forEach(item => reportWorktreeWarning(item));
   if (!report.applicable || report.ok) return true;
   if (fix) {
     const result = await fixPreflight(checkout, envPreflightFixRunner(process.env));
@@ -53,7 +95,7 @@ export async function runProcessCommand(p: Extract<ParsedArgs, { command: 'run' 
     return outcome.disposition === 'refused' ? 1 : 0;
   }
   if (p.command === 'run') {
-    if (!(await preflightGate(process.cwd(), p.fixPreflight))) return 1;
+    if (!(await preflightGate(process.cwd(), p.fixPreflight, store.hubRoot, p.task_id))) return 1;
     const id = await startRun(store, p.argv, process.cwd(), p.task_id);
     process.stdout.write(`${id}\n`);
     if (p.task_id !== undefined) await optionalHub(store.hubRoot, 'associate', { run_id: id, task_id: p.task_id });
@@ -64,7 +106,7 @@ export async function runProcessCommand(p: Extract<ParsedArgs, { command: 'run' 
     if (p.json) process.stdout.write(`${JSON.stringify(result)}\n`);
     else {
       process.stdout.write('RUN-ID  TASK  STATUS  PID/ALIVE  PGID/ALIVE  STOP-PHASE/OUTCOME/SCOPE  STARTED  COMMAND\n');
-      for (const m of result.runs) process.stdout.write(`${m.run_id}  ${m.task_id ?? '-'}  ${m.status}${m.stale ? ' (stale)' : ''}  ${m.pid}/${m.pid_alive ?? 'unknown'}  ${m.pgid}/${m.group_alive ?? 'unknown'}  ${m.stop_request?.phase ?? '-'}/${m.stop_request?.result?.outcome ?? '-'}/${m.stop_request?.result?.scope ?? 'root-and-original-group'}  ${m.started_at}  ${JSON.stringify(m.argv)}\n`);
+      for (const m of result.runs) process.stdout.write(`${m.run_id}  ${m.task_id ?? '-'}  ${m.status}${m.stale ? ' (stale)' : ''}  ${m.pid}/${m.pid_alive ?? 'unknown'}  ${m.pgid}/${m.group_alive ?? 'unknown'}  ${m.stop_request?.phase ?? '-'}/${m.stop_request?.result?.outcome ?? '-'}/${m.stop_request?.result?.scope ?? (m.control_protocol === 'windows-console-v1' ? 'root-and-owned-job' : 'root-and-original-group')}  ${m.started_at}  ${JSON.stringify(m.argv)}\n`);
       for (const q of result.quarantined) process.stdout.write(`${q.run_id}  -  quarantined  -/-  -/-  -/-/-  -  (isolated invalid meta; log preserved)\n`);
       for (const e of result.errors) process.stderr.write(`${e.run_id}: ${e.error}\n`);
     }
@@ -84,7 +126,7 @@ export async function runProcessCommand(p: Extract<ParsedArgs, { command: 'run' 
   const detail = `${p.run_id} pid=${stopped.meta.pid} pgid=${stopped.meta.pgid}: ${stopped.result}`;
   (stopped.success ? process.stdout : process.stderr).write(`${detail}\n`);
   if (stopped.requested && stopped.meta.stop_request?.result) await optionalHub(store.hubRoot, 'stop', { run_id: p.run_id, ...(stopped.meta.task_id ? { task_id: stopped.meta.task_id } : {}),
-    requested_at: stopped.meta.stopped_at, success: stopped.success, result: stopped.result, stop_request: stopped.meta.stop_request, scope: 'root-and-original-group', descendants_check: 'not-performed', pid: stopped.meta.pid, pgid: stopped.meta.pgid });
+    requested_at: stopped.meta.stopped_at, success: stopped.success, result: stopped.result, stop_request: stopped.meta.stop_request, scope: stopped.meta.stop_request.result.scope, descendants_check: stopped.meta.stop_request.result.descendants_check, pid: stopped.meta.pid, pgid: stopped.meta.pgid });
   return stopped.success ? 0 : 1;
 }
 
@@ -104,7 +146,7 @@ export async function runResumeCommand(p: Extract<ParsedArgs, { command: 'resume
     process.stderr.write(`tut: resume failed: ${(e as Error).message}${suffix}\n`);
     return 1;
   }
-  if (!(await preflightGate(plan.cwd, p.fixPreflight))) return 1;
+  if (!(await preflightGate(plan.cwd, p.fixPreflight, store.hubRoot, plan.task_id, plan.from.checkout !== undefined))) return 1;
   try {
     let runId: string;
     if (plan.managed) {

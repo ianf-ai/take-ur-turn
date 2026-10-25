@@ -1,6 +1,10 @@
+import { stopWindowsFixtureRuns } from './helpers/run-cleanup.js';
+import { writeNodeExecutable, fixtureHeadlessOwnership } from './helpers/executable.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, closeSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, closeSync } from 'node:fs';
 import os from 'node:os';
+import { rm } from 'node:fs/promises';
+import { resolveDetachedWindowsTarget } from '../src/standalone/launcher-headless/windows-target.js';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { RunStore, complete, type RunMeta, type HeadlessOwnership } from '../src/core/run/store.js';
@@ -14,8 +18,45 @@ import {
 
 // Source modules exercise policy; the actual detached supervisor is the built
 // same-package module used in installed execution (never a PATH tut).
+// Policy fixtures declare a dead source PID; do not recompile the native
+// reader for each modeled gate refresh. Actual live/CLI cases remain native.
+vi.mock('../src/core/hub/windows-run-file.js', async original => {
+  const actual = await original<typeof import('../src/core/hub/windows-run-file.js')>();
+  return { ...actual, readWindowsRunMeta: (file: string) => {
+    const raw = readFileSync(file);
+    try { if (JSON.parse(raw.toString()).pid === 2147483000) return raw; } catch { /* actual reader classifies malformed data */ }
+    return actual.readWindowsRunMeta(file);
+  } };
+});
+
 const builtControl = await import(path.resolve('dist/core/run/control.js')) as typeof import('../src/core/run/control.js');
-const { startRun } = builtControl;
+const { startRun: nativeStartRun } = builtControl;
+// Build the Windows producer envelope before the real native start. POSIX
+// fixtures keep their original ownership and argv exactly.
+async function startRun(...args: Parameters<typeof nativeStartRun>): Promise<string> {
+  const [store, argv, cwd, taskId, options = {}] = args;
+  if (process.platform !== 'win32' || !options.headless || 'windows' in options.headless) return nativeStartRun(...args);
+  const target = await resolveDetachedWindowsTarget(argv[0]!, options.env ?? process.env);
+  const headless = { ...options.headless, windows: { schema: 1, target, logical_argv: [target.agent, ...argv.slice(1)] } };
+  return nativeStartRun(store, argv, cwd, taskId, { ...options, headless });
+}
+/** Windows gate-policy input, not a claim of native session capture. Sources
+ * are already completed archives; live occupancy and the real dist-CLI case
+ * keep actual processes. POSIX retains its original real source execution. */
+async function completedPolicySource(...args: Parameters<typeof nativeStartRun>): Promise<string> {
+  const [store, argv, cwd, taskId, options = {}] = args;
+  if (process.platform !== 'win32' || !options.headless) return startRun(...args);
+  const headless = await fixtureHeadlessOwnership(options.headless, argv, options.env);
+  const id = store.create(); closeSync(store.openLog(id, true));
+  await store.initialize(id, { run_id: id, pid: 2147483000, pgid: 2147483000, supervisor_pid: 2147482999,
+    argv: [path.resolve(argv[0]!), ...argv.slice(1)], cwd, ...(taskId ? { task_id: taskId } : {}), headless,
+    control_protocol: 'windows-console-v1',
+    windows: { identity: { attempt_id: headless.attempt_id, broker_pid: 2147482998, broker_creation_time: '100', root_creation_time: '200', job_id: 'a'.repeat(32) },
+      observation: { root_exited: true, job_empty: true, exit_code: 0, observed_at: '2026-01-01T00:01:00.000Z' } },
+    started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:01:00.000Z', status: 'exited', exit_code: 0 });
+  return id;
+}
+
 import { CONTROL_PROTOCOL } from '../src/core/run/protocol.js';
 import type { ContextRecord } from '../src/core/common/types.js';
 import type { GateTaskLog } from '../src/core/run/resume.js';
@@ -24,16 +65,32 @@ import { hubCreate, hubRead, hubPublish, hubDecide } from '../src/core/hub/hub-c
 
 const roots: string[] = []; const groups: number[] = []; const servers: RunningServer[] = [];
 afterEach(async () => {
-  vi.restoreAllMocks();
-  for (const g of groups.splice(0)) { try { process.kill(-g, 'SIGKILL'); } catch { /* reaped */ } }
-  for (const s of servers.splice(0)) await s.close();
-  for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+  const ownedRoots = roots.splice(0);
+  let cleaned = false;
+  try { await stopWindowsFixtureRuns(ownedRoots); cleaned = true; }
+  finally {
+    vi.restoreAllMocks(); vi.unstubAllEnvs();
+    for (const g of groups.splice(0)) { if (process.platform !== 'win32') try { process.kill(-g, 'SIGKILL'); } catch { /* reaped */ } }
+    for (const s of servers.splice(0)) await s.close();
+    if (cleaned && process.platform !== 'win32') for (const r of ownedRoots) await rm(r, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  }
 });
 function root(): string { const r = mkdtempSync(path.join(os.tmpdir(), 'tut-resume-')); roots.push(r); return r; }
-async function until(fn: () => boolean, ms = 8000): Promise<void> { const end = performance.now() + ms; while (!fn()) { if (performance.now() > end) throw new Error('condition timed out'); await new Promise(r => setTimeout(r, 25)); } }
+async function until(fn: () => boolean, ms = process.platform === 'win32' ? 45_000 : 8000): Promise<void> { const end = performance.now() + ms; while (!fn()) { if (performance.now() > end) throw new Error('condition timed out'); await new Promise(r => setTimeout(r, 25)); } }
 
 /** A finished plain run fixture: real short-lived process, exited terminal state. */
 async function finishedPlainRun(store: RunStore, argv: string[], cwd: string, agent_session_id?: string): Promise<string> {
+  // Windows policy input is an explicitly completed legacy archive. Native
+  // plain runs without frozen ownership have the same refusal boundary; this
+  // does not claim native completion or plain-resume support. CLI callers in
+  // raceTwo remain real. POSIX keeps its original real producer below.
+  if (process.platform === 'win32') {
+    const id = store.create(); closeSync(store.openLog(id, true));
+    await store.initialize(id, { run_id: id, pid: 2147483000, pgid: 2147483000, supervisor_pid: 2147482999,
+      argv, cwd, started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:01:00.000Z', status: 'exited', exit_code: 0,
+      ...(agent_session_id ? { agent_session_id } : {}) });
+    return id;
+  }
   const id = await startRun(store, argv, cwd);
   await until(() => { try { return store.read(id).ended_at !== undefined; } catch { return false; } });
   await store.updateMeta(id, m => agent_session_id !== undefined ? { ...m, agent_session_id } : m);
@@ -47,22 +104,11 @@ function ownership(role = 'executor', taskId = 'task-1'): HeadlessOwnership {
 
 function fakeCodex(root: string): string {
   const bin = path.join(root, 'bin'); mkdirSync(bin, { recursive: true });
-  const file = path.join(bin, 'codex');
-  writeFileSync(file, `#!/bin/sh
-# fixture codex: prints its argv and exits 0
-for a in "$@"; do echo "arg:$a"; done
-`);
-  chmodSync(file, 0o755);
-  return file;
+  return writeNodeExecutable(path.join(bin, 'codex'), "for (const arg of process.argv.slice(2)) console.log('arg:' + arg);");
 }
 function fakePi(root: string): string {
   const bin = path.join(root, 'bin'); mkdirSync(bin, { recursive: true });
-  const file = path.join(bin, 'pi');
-  writeFileSync(file, `#!/bin/sh
-for a in "$@"; do echo "arg:$a"; done
-`);
-  chmodSync(file, 0o755);
-  return file;
+  return writeNodeExecutable(path.join(bin, 'pi'), "for (const arg of process.argv.slice(2)) console.log('arg:' + arg);");
 }
 
 describe('plain argv parsing', () => {
@@ -121,18 +167,28 @@ describe('pi session verification', () => {
   });
 });
 
+async function windowsPlainRefusal(store: RunStore, id: string): Promise<boolean> {
+  if (process.platform !== 'win32') return false;
+  const file = path.join(store.directory(id), 'meta.json'); const before = readFileSync(file);
+  const count = store.list().length;
+  await expect(planResume(store, id, {})).rejects.toMatchObject({ reason: 'windows-launch-unavailable' });
+  expect(readFileSync(file)).toEqual(before); expect(store.list()).toHaveLength(count);
+  return true;
+}
+
 describe('planResume', () => {
   it('refuses incomplete sources with classified reasons and never stops them', async () => {
     const r = root(); const store = new RunStore(r);
-    const id = await startRun(store, [process.execPath, '-e', 'setTimeout(()=>{},30000)'], r);
+    const id = await startRun(store, [process.execPath, '-e', `setTimeout(()=>{},${process.platform === 'win32' ? 180000 : 30000})`], r);
     await until(() => store.read(id).status === 'running');
     await expect(async () => await planResume(store, id, {})).rejects.toMatchObject({ reason: 'source-run-active' });
     await stopRun(store, id);
-  });
+  }, process.platform === 'win32' ? 180000 : 5000);
   it('codex plain run resumes with observed agent_session_id, same cwd, rebuilt resume argv', async () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const id = await finishedPlainRun(store, [codex, 'exec', '-s', 'read-only', '--json', 'old prompt'], r, 'thread-12345');
+    if (await windowsPlainRefusal(store, id)) return;
     const plan = await planResume(store, id, { instruction: '继续做 X' });
     expect(plan.cwd).toBe(r);
     expect(plan.session).toEqual({ agent: 'codex', session_id: 'thread-12345', source: 'observed' });
@@ -145,6 +201,7 @@ describe('planResume', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const id = await finishedPlainRun(store, [codex, 'exec', 'prompt'], r);
+    if (await windowsPlainRefusal(store, id)) return;
     await expect(async () => await planResume(store, id, {})).rejects.toMatchObject({ reason: 'codex-session-unavailable' });
   });
   it('pi plain run resumes only with a verified stored --session-id identity', async () => {
@@ -156,6 +213,7 @@ describe('planResume', () => {
     writeFileSync(path.join(dir, `t_${session}.jsonl`), `${JSON.stringify({ type: 'session', id: session, cwd: r })}\n`);
     const argv = [pi, '--print', '--mode', 'json', '--session-id', session, '--', 'first prompt'];
     const id = await finishedPlainRun(store, argv, r);
+    if (await windowsPlainRefusal(store, id)) return;
     const plan = await planResume(store, id, { piSessionsBase: base });
     expect(plan.argv).toEqual([pi, '--print', '--mode', 'json', '--session-id', session, '--', plan.prompt]);
     expect(plan.prompt).toContain('继续');
@@ -166,8 +224,9 @@ describe('planResume', () => {
   it('unknown agents and shell wrappers refuse explicitly', async () => {
     const r = root(); const store = new RunStore(r);
     const id = await finishedPlainRun(store, [process.execPath, '-e', ''], r);
+    if (await windowsPlainRefusal(store, id)) return;
     await expect(async () => await planResume(store, id, {})).rejects.toMatchObject({ reason: 'unsupported-agent' });
-    const sh = path.join(r, 'sh'); writeFileSync(sh, '#!/bin/sh\n:'); chmodSync(sh, 0o755);
+    const sh = writeNodeExecutable(path.join(r, 'sh'), '');
     const id2 = await finishedPlainRun(store, [sh, '-c', 'echo hi'], r);
     await expect(async () => await planResume(store, id2, {})).rejects.toMatchObject({ reason: 'unsupported-agent' });
   });
@@ -175,7 +234,7 @@ describe('planResume', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership();
-    const id = await startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-9', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-9', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-777' }));
     const plan = await planResume(store, id, {});
@@ -184,7 +243,7 @@ describe('planResume', () => {
     expect(plan.prompt).toContain('task-9');
     expect(plan.headless).toMatchObject({ role: 'executor', resume_from_run_id: id, session_reason: expect.stringContaining('resume') });
     expect(plan.headless!.attempt_id).not.toBe(own.attempt_id);
-    expect(plan.argv).toEqual(['codex', '-m', 'model-x', 'exec', 'resume', '--json', 'thread-777', plan.prompt]);
+    expect(plan.argv).toEqual([process.platform === 'win32' ? path.resolve(codex) : 'codex', '-m', 'model-x', 'exec', 'resume', '--json', 'thread-777', plan.prompt]);
   });
 });
 
@@ -217,12 +276,18 @@ describe('admission occupancy', () => {
     const argv = [pi, '--print', '--mode', 'json', '--session-id', session, '--', 'first'];
     const done = await finishedPlainRun(store, argv, r);
     expect(sessionOccupants(store, { agent: 'pi', session_id: session })).toHaveLength(0);
+    // Hold the second invocation explicitly; native monitor I/O can outlive
+    // a short-lived fixture, so 'incomplete' must not depend on a timing race.
+    const release = path.join(r, 'release-live-session');
+    writeNodeExecutable(path.join(r, 'bin', 'pi'), `const fs=require('node:fs');setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)}))process.exit(0)},20);setTimeout(()=>process.exit(124),180000).unref()`);
     const live = await startRun(store, argv.map((a, i) => i === argv.indexOf(session) ? session : a), r);
     groups.push(store.read(live).pgid);
     expect(sessionOccupants(store, { agent: 'pi', session_id: session })).toHaveLength(1);
+    writeFileSync(release, ''); await until(() => complete(store.read(live)));
+    expect(sessionOccupants(store, { agent: 'pi', session_id: session })).toHaveLength(0);
     await stopRun(store, live);
     void done;
-  });
+  }, process.platform === 'win32' ? 180000 : 5000);
   it('executeResume refuses a busy session and a busy managed task; failed intents do not block', async () => {
     const r = root(); const store = new RunStore(r);
     const pi = fakePi(r);
@@ -232,16 +297,17 @@ describe('admission occupancy', () => {
     writeFileSync(path.join(dir, `t_${session}.jsonl`), `${JSON.stringify({ type: 'session', id: session, cwd: r })}\n`);
     const argv = [pi, '--print', '--mode', 'json', '--session-id', session, '--', 'first'];
     const source = await finishedPlainRun(store, argv, r);
+    if (await windowsPlainRefusal(store, source)) return;
     // A pending resume intent (uncertain handshake) blocks the identity.
     const pending = store.create();
     await store.writeResumeIntent(pending, { schema: 1, from_run_id: source, agent: 'pi', session_id: session, cwd: r, startup: 'pending' });
-    await expect(executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: builtControl.startRun })).rejects.toMatchObject({ reason: 'session-busy' });
+    await expect(executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: startRun })).rejects.toMatchObject({ reason: 'session-busy' });
     // Mark it known-failed: no longer blocks.
     await store.writeResumeIntent(pending, { schema: 1, from_run_id: source, agent: 'pi', session_id: session, cwd: r, startup: 'failed' });
-    const result = await executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: builtControl.startRun });
+    const result = await executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: startRun });
     expect(store.read(result.run_id).resume).toMatchObject({ from_run_id: source, session_id: session, identity: 'argv' });
     // While that resume run is live, a second resume of the same session refuses.
-    await expect(executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: builtControl.startRun })).rejects.toMatchObject({ reason: 'session-busy' });
+    await expect(executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: startRun })).rejects.toMatchObject({ reason: 'session-busy' });
     await stopRun(store, result.run_id);
   });
 });
@@ -252,24 +318,17 @@ describe('two real CLI processes race one resume', () => {
   // invocation — completion is established by evidence, not timing luck.
   function sentinelPi(r: string): string {
     const bin = path.join(r, 'bin'); mkdirSync(bin, { recursive: true });
-    const file = path.join(bin, 'pi');
-    writeFileSync(file, `#!/bin/sh
-if [ -f "$TUT_SENTINEL" ]; then
-  echo "second invocation: staying alive"
-  while :; do sleep 1; done
-else
-  echo "first invocation: exiting"
-  touch "$TUT_SENTINEL"
-fi
-`);
-    chmodSync(file, 0o755);
-    return file;
+    return writeNodeExecutable(path.join(bin, 'pi'), `
+      const fs=require('node:fs');
+      if(fs.existsSync(process.env.TUT_SENTINEL)) { console.log('second invocation: staying alive');setInterval(()=>{},1000); }
+      else { console.log('first invocation: exiting');fs.writeFileSync(process.env.TUT_SENTINEL,''); }
+    `);
   }
 
   async function raceTwo(r: string, agent: string, sessionArgvTail: (session: string) => string[], session: string): Promise<void> {
     const store = new RunStore(r);
     const sentinel = path.join(r, 'race-sentinel');
-    process.env.TUT_SENTINEL = sentinel; // the source spawn inherits it from this process
+    vi.stubEnv('TUT_SENTINEL', sentinel); // the source spawn inherits it from this process
     const source = await finishedPlainRun(store, [agent, ...sessionArgvTail(session)], r, session);
     const cli = path.resolve('dist/cli.js');
     const env = { ...process.env, TUT_HUB_ROOT: r, TUT_HUB_URL: 'http://127.0.0.1:1', TUT_SENTINEL: sentinel };
@@ -280,6 +339,11 @@ fi
       p.stderr.on('data', d => { err += d; });
       p.once('exit', code => resolve({ code, out, err }));
     })));
+    if (process.platform === 'win32') {
+      expect(outcomes.every(o => o.code === 1 && o.err.includes('windows-launch-unavailable'))).toBe(true);
+      expect(store.list()).toEqual([source]); // no legacy/plain fallback or spawn
+      return;
+    }
     const winners = outcomes.filter(o => o.code === 0);
     const losers = outcomes.filter(o => o.code !== 0);
     expect(winners).toHaveLength(1);
@@ -289,7 +353,7 @@ fi
     expect(newId).not.toBe(source);
     // The winner's run must STILL be incomplete when we assert — the alive
     // barrier holds it — and it must be the session's single occupant.
-    const occupants = sessionOccupants(store, { agent: path.basename(agent), session_id: session });
+    const occupants = sessionOccupants(store, { agent: path.basename(agent).replace(/\.exe$/i, ''), session_id: session });
     expect(occupants).toHaveLength(1);
     expect(occupants[0]!.run_id).toBe(newId);
     expect(store.read(newId).ended_at).toBeUndefined();
@@ -318,12 +382,11 @@ fi
   it('codex without any session events: double CLI race still admits exactly one spawn', { timeout: 60_000 }, async () => {
     const r = root();
     const bin = path.join(r, 'bin'); mkdirSync(bin, { recursive: true });
-    const codex = path.join(bin, 'codex');
-    writeFileSync(codex, `#!/bin/sh
-# no JSONL output at all — never a thread.started
-if [ -f "$TUT_SENTINEL" ]; then while :; do sleep 1; done; else touch "$TUT_SENTINEL"; fi
-`);
-    chmodSync(codex, 0o755);
+    const codex = writeNodeExecutable(path.join(bin, 'codex'), `
+      const fs=require('node:fs');
+      if(fs.existsSync(process.env.TUT_SENTINEL))setInterval(()=>{},1000);
+      else fs.writeFileSync(process.env.TUT_SENTINEL,'');
+    `);
     await raceTwo(r, codex, s => ['exec', '--json', 'first prompt'], 'thread-cx-1');
   });
 });
@@ -332,7 +395,7 @@ describe('managed resume execution (admission critical section)', () => {
   function managedPlan(store: RunStore, r: string, codex: string, session: string) {
     const own = ownership('executor', 'task-g');
     return { store, r, codex, async source() {
-      const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+      const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
       await until(() => store.read(id).ended_at !== undefined);
       await store.updateMeta(id, m => ({ ...m, agent_session_id: session }));
       return id;
@@ -377,7 +440,7 @@ describe('managed resume execution (admission critical section)', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-g');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-url' }));
     const plan = await planResume(store, id, {});
@@ -396,7 +459,7 @@ describe('managed resume execution (admission critical section)', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-g');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-g1' }));
     const plan = await planResume(store, id, {});
@@ -418,7 +481,7 @@ describe('managed resume execution (admission critical section)', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-g');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-g2' }));
     const plan = await planResume(store, id, {});
@@ -437,7 +500,7 @@ describe('managed resume execution (admission critical section)', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-g');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-g3' }));
     const plan = await planResume(store, id, {});
@@ -459,7 +522,7 @@ describe('managed resume execution (admission critical section)', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-g');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-g4' }));
     const plan = await planResume(store, id, {});
@@ -468,7 +531,7 @@ describe('managed resume execution (admission critical section)', () => {
       fetchState: async () => ({ hub_root: r, tasks: [{ task_id: 'task-g', status: 'implementing', waiting_for: 'agent:executor', needs_attention: false }] }),
       readLog: async () => recs(3),
       publishMarker: async () => { events.push('marker'); return { version: 4 }; },
-      start: async (store2, argv, cwd, taskId, options) => { events.push('spawn'); expect(options?.headless).toMatchObject({ base_version: 3, trigger_version: 3, resume_from_run_id: id }); return await builtControl.startRun(store2, argv, cwd, taskId, options); },
+      start: async (store2, argv, cwd, taskId, options) => { events.push('spawn'); expect(options?.headless).toMatchObject({ base_version: 3, trigger_version: 3, resume_from_run_id: id }); return await startRun(store2, argv, cwd, taskId, options); },
     };
     const result = await executeManagedResume(store, plan, { hubUrl: 'http://127.0.0.1:3001', hubRoot: r }, deps);
     expect(events).toEqual(['marker', 'spawn']);
@@ -483,7 +546,7 @@ describe('managed resume execution (admission critical section)', () => {
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-g');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-g', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-g5' }));
     const plan = await planResume(store, id, {});
@@ -492,14 +555,14 @@ describe('managed resume execution (admission critical section)', () => {
 });
 
 describe('closure: version-consistent gate on a real Hub (interleaved writes)', () => {
-  it('a role-changing record landing between state and log reads refuses with zero spawn', { timeout: 30_000 }, async () => {
+  it('a role-changing record landing between state and log reads refuses with zero spawn', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
     const created = await hubCreate(server.url, { title: 'newer role', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
     const codex = fakeCodex(r);
     const own = ownership('executor', created.task_id);
-    const source = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, created.task_id, { headless: own });
+    const source = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, created.task_id, { headless: own });
     await until(() => store.read(source).ended_at !== undefined);
     await store.updateMeta(source, m => ({ ...m, agent_session_id: 'thread-nr1' }));
     const plan = await planResume(store, source, {});
@@ -526,14 +589,14 @@ describe('closure: version-consistent gate on a real Hub (interleaved writes)', 
     expect(stateReads).toBeGreaterThanOrEqual(2); // the refresh actually happened
   });
 
-  it('an attention-setting record landing between state and log reads refuses with zero spawn', { timeout: 30_000 }, async () => {
+  it('an attention-setting record landing between state and log reads refuses with zero spawn', { timeout: process.platform === 'win32' ? 120000 : 30_000 }, async () => {
     const r = root();
     const server = await startServer({ root: path.join(r, '.context-hub'), port: 0 }); servers.push(server);
     const store = new RunStore(r);
     const created = await hubCreate(server.url, { title: 'newer attention', description: 'b', creator: 'test-user', role: 'executor', flow: 'direct' });
     const codex = fakeCodex(r);
     const own = ownership('executor', created.task_id);
-    const source = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, created.task_id, { headless: own });
+    const source = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, created.task_id, { headless: own });
     await until(() => store.read(source).ended_at !== undefined);
     await store.updateMeta(source, m => ({ ...m, agent_session_id: 'thread-na1' }));
     const plan = await planResume(store, source, {});
@@ -561,7 +624,7 @@ describe('closure: version-consistent gate on a real Hub (interleaved writes)', 
     const r = root(); const store = new RunStore(r);
     const codex = fakeCodex(r);
     const own = ownership('executor', 'task-inc');
-    const id = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, 'task-inc', { headless: own });
+    const id = await completedPolicySource(store, [codex, 'exec', '--json', 'p'], r, 'task-inc', { headless: own });
     await until(() => store.read(id).ended_at !== undefined);
     await store.updateMeta(id, m => ({ ...m, agent_session_id: 'thread-inc' }));
     const plan = await planResume(store, id, {});
@@ -585,7 +648,7 @@ describe('closure: real Hub + dist CLI managed resume', () => {
     const created = await hubCreate(server.url, { title: 'managed resume task', description: 'body', creator: 'test-user', role: 'executor', flow: 'direct' });
     const codex = fakeCodex(r);
     const own = ownership('executor', created.task_id);
-    const source = await builtControl.startRun(store, [codex, 'exec', '--json', 'p'], r, created.task_id, { headless: own });
+    const source = await startRun(store, [codex, 'exec', '--json', 'p'], r, created.task_id, { headless: own });
     await until(() => store.read(source).ended_at !== undefined);
     await store.updateMeta(source, m => ({ ...m, agent_session_id: 'thread-real-1' }));
     const cli = path.resolve('dist/cli.js');
@@ -642,8 +705,9 @@ describe('resume meta persistence', () => {
     writeFileSync(path.join(dir, `t_${session}.jsonl`), `${JSON.stringify({ type: 'session', id: session, cwd: r })}\n`);
     const argv = [pi, '--print', '--mode', 'json', '--session-id', session, '--', 'first'];
     const source = await finishedPlainRun(store, argv, r);
+    if (await windowsPlainRefusal(store, source)) return;
     const before = store.read(source);
-    const result = await executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: builtControl.startRun });
+    const result = await executeResume(store, await planResume(store, source, { piSessionsBase: base }), { start: startRun });
     const intent = store.readResumeIntent(result.run_id);
     expect(intent).toMatchObject({ from_run_id: source, session_id: session, startup: 'pending' });
     expect(store.read(result.run_id).resume).toMatchObject({ from_run_id: source });

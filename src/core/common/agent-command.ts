@@ -11,7 +11,7 @@
 import type { AgentCommand, AgentRoute } from "./types.js";
 
 /**
- * Conservative shell-neutral token grammar shared with scripts/tut-resolve.mjs.
+ * Conservative shell-neutral token grammar for workspace and launch routes.
  *
  * An allowlist is deliberately used here instead of a denylist: a value that
  * is harmless in one shell can still be syntax in another (notably `#` and

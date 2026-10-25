@@ -80,7 +80,7 @@ describe("Herdr control-plane client", () => {
           stdout: JSON.stringify({
             result: {
               panes: [
-                { pane_id: "p1", label: "tut-hub", tab_id: "tab1", workspace_id: "w1", cwd: "/work", agent_status: "idle" },
+                { pane_id: "p1", label: "tut-hub", tab_id: "tab1", workspace_id: "w1", cwd: path.resolve("/work"), agent_status: "idle" },
                 { label: "malformed row" },
               ],
             },
@@ -107,7 +107,7 @@ describe("Herdr control-plane client", () => {
         label: "tut-hub",
         tab_id: "tab1",
         workspace_id: "w1",
-        cwd: "/work",
+        cwd: path.resolve("/work"),
         agent_status: "idle",
       }],
     });
@@ -277,7 +277,7 @@ describe("herdr command liveness backstop", () => {
     const client = new HerdrClient({ executable: process.execPath, timeoutMs: 400 });
     const result = await client.command([
       "-e",
-      "process.kill(process.pid, 'SIGSTOP'); setInterval(() => {}, 100);",
+      process.platform === "win32" ? "setInterval(() => {}, 100);" : "process.kill(process.pid, 'SIGSTOP'); setInterval(() => {}, 100);",
     ]);
     expect(result.timedOut).toBe(true);
     expect(result.code === null || result.code !== 0).toBe(true);
@@ -326,38 +326,38 @@ describe("workspace config planner snapshot", () => {
 });
 
 describe("Herdr anchor and execution context", () => {
-  const hub = pane({ pane_id: "hub-pane", label: "tut-hub", workspace_id: "hub-workspace", cwd: "/hub/project" });
-  const notify = pane({ pane_id: "notify-pane", label: "tut-notify", workspace_id: "notify-workspace", cwd: "/notify/project" });
-  const unrelated = pane({ pane_id: "foreign-pane", label: "unrelated-project", workspace_id: "foreign-workspace", cwd: "/foreign/project" });
+  const hub = pane({ pane_id: "hub-pane", label: "tut-hub", workspace_id: "hub-workspace", cwd: path.resolve("/hub/project") });
+  const notify = pane({ pane_id: "notify-pane", label: "tut-notify", workspace_id: "notify-workspace", cwd: path.resolve("/notify/project") });
+  const unrelated = pane({ pane_id: "foreign-pane", label: "unrelated-project", workspace_id: "foreign-workspace", cwd: path.resolve("/foreign/project") });
 
   it("selects only the exact fallback chain and keeps values from one pane row", () => {
     expect(selectAnchor([unrelated, hub, notify], "foreign-pane")).toEqual({ anchor: {
       workspace_id: "hub-workspace",
-      cwd: "/hub/project",
+      cwd: path.resolve("/hub/project"),
       pane_id: "hub-pane",
     }, source: "tut-hub" });
     expect(selectAnchor([unrelated, notify], "foreign-pane")).toEqual({ anchor: {
       workspace_id: "notify-workspace",
-      cwd: "/notify/project",
+      cwd: path.resolve("/notify/project"),
       pane_id: "notify-pane",
     }, source: "tut-notify" });
     expect(selectAnchor([unrelated], "foreign-pane")).toEqual({ anchor: {
       workspace_id: "foreign-workspace",
-      cwd: "/foreign/project",
+      cwd: path.resolve("/foreign/project"),
       pane_id: "foreign-pane",
     }, source: "split-base" });
     expect(selectAnchor([unrelated], "missing-pane")).toBeUndefined();
-    expect(selectAnchor([pane({ pane_id: "bad", label: "tut-hub", cwd: "/half-anchor" })], "bad")).toBeUndefined();
+    expect(selectAnchor([pane({ pane_id: "bad", label: "tut-hub", cwd: path.resolve("/half-anchor") })], "bad")).toBeUndefined();
   });
 
   it("captures caller cwd once, resolves routing independently, and reuses one pane-list result", async () => {
     const source = { paneList: vi.fn(async () => ({ panes: [unrelated, hub] })) };
     const snapshot = await resolveWorkspaceSnapshot({
       client: source,
-      caller_cwd: "/caller/root",
+      caller_cwd: path.resolve("/caller/root"),
       env: {
         TUT_PROJECT_ROOT: "routing-root",
-        TUT_USER_CONFIG_DIR: "/user/tut",
+        TUT_USER_CONFIG_DIR: path.resolve("/user/tut"),
         TUT_SPLIT_BASE: "foreign-pane",
       },
       dry_run: false,
@@ -365,10 +365,10 @@ describe("Herdr anchor and execution context", () => {
 
     expect(snapshot).toMatchObject({
       anchor: { workspace_id: hub.workspace_id, cwd: hub.cwd, pane_id: hub.pane_id },
-      caller_cwd: "/caller/root",
-      hubRoot: "/hub/project",
-      routingRoot: "/caller/root/routing-root",
-      checkoutRoot: "/hub/project",
+      caller_cwd: path.resolve("/caller/root"),
+      hubRoot: path.resolve("/hub/project"),
+      routingRoot: path.resolve("/caller/root/routing-root"),
+      checkoutRoot: path.resolve("/hub/project"),
       checkout: { kind: "current" },
       context: { kind: "shared" },
       source: "anchor",
@@ -381,28 +381,28 @@ describe("Herdr anchor and execution context", () => {
     const source = { paneList: vi.fn(async () => [unrelated]) };
     const live = await resolveExecutionContext({
       client: source,
-      caller_cwd: "/caller/root",
-      env: { TUT_PROJECT_ROOT: "/external/routing", TUT_SPLIT_BASE: "not-present" },
+      caller_cwd: path.resolve("/caller/root"),
+      env: { TUT_PROJECT_ROOT: path.resolve("/external/routing"), TUT_SPLIT_BASE: "not-present" },
       dry_run: false,
     });
     expect(live.anchor).toBeUndefined();
     expect(live.hubRoot).toBe("<hub-root>");
-    expect(live.routingRoot).toBe("/external/routing");
+    expect(live.routingRoot).toBe(path.resolve("/external/routing"));
     expect(live.checkoutRoot).toBe("<checkout-root>");
     expect(() => requireBirthAnchor(live)).toThrow("no anchor pane found");
 
     const broken = await resolveExecutionContext({
       client: { paneList: async () => { throw new Error("herdr unavailable"); } },
-      caller_cwd: "/caller/root",
-      env: { TUT_PROJECT_ROOT: "/external/routing" },
+      caller_cwd: path.resolve("/caller/root"),
+      env: { TUT_PROJECT_ROOT: path.resolve("/external/routing") },
       dry_run: false,
     });
     expect(broken.anchor).toBeUndefined();
-    expect(broken.routingRoot).toBe("/external/routing");
+    expect(broken.routingRoot).toBe(path.resolve("/external/routing"));
 
     const unparseable = await resolveExecutionContext({
       client: { paneList: async () => ({ panes: "not an array" } as never) },
-      caller_cwd: "/caller/root",
+      caller_cwd: path.resolve("/caller/root"),
       env: {},
       dry_run: false,
     });
@@ -412,15 +412,15 @@ describe("Herdr anchor and execution context", () => {
   it("uses a placeholder only for dry-run discovery and preserves caller cwd through invocation transport", async () => {
     const snapshot = await resolveWorkspaceSnapshot({
       client: { paneList: async () => [] },
-      caller_cwd: "/caller/root",
+      caller_cwd: path.resolve("/caller/root"),
       env: { TUT_PROJECT_ROOT: "routes" },
       dry_run: true,
     });
     expect(snapshot).toMatchObject({
       anchor: { workspace_id: "<workspace>", cwd: "<cwd>", pane_id: "<anchor>" },
-      caller_cwd: "/caller/root",
+      caller_cwd: path.resolve("/caller/root"),
       hubRoot: "<hub-root>",
-      routingRoot: "/caller/root/routes",
+      routingRoot: path.resolve("/caller/root/routes"),
       checkoutRoot: "<checkout-root>",
       source: "placeholder",
     });
@@ -438,7 +438,7 @@ describe("Herdr anchor and execution context", () => {
       prompt: "doorbell",
       posix_direct: { executable: "pi", args: [], env: {} },
     });
-    expect(deserializeLaunchInvocation(serializeLaunchInvocation(invocation)).context.caller_cwd).toBe("/caller/root");
+    expect(deserializeLaunchInvocation(serializeLaunchInvocation(invocation)).context.caller_cwd).toBe(path.resolve("/caller/root"));
   });
 
   it("supports the listPanes compatibility name and resolves it once", async () => {

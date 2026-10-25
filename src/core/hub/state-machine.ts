@@ -11,18 +11,18 @@ import {
 } from "../common/types.js";
 
 /**
- * Derivation (system-design 3.1-3.3). Pure function: no IO, no
+ * Derivation. Pure function: no IO, no
  * timestamp consumption, no mutation of inputs. Folding only ever reads
  * content_type + the payload fields ack / verdict / decision, plus the
- * record's role — solely for the reviewing-state executor-note exception row
- * (system-design 3.1); everything else in payload is ignored.
+ * record's role — solely for the reviewing-state executor-note exception row;
+ * everything else in payload is ignored.
  *
  * The transition table is selected by the task's flow ("full" | "direct"
- * | "solo", system-design 3.1 three-table definition); flow is absent = full,
+ * | "solo"); flow is absent = full,
  * so call sites that omit it are unchanged.
  */
 
-/** Base waiting_for map (system-design 3.1) — flow-independent. Exported for the store's cache-aware fold reconstruction. */
+/** Base waiting_for map — flow-independent. Exported for the store's cache-aware fold reconstruction. */
 export const WAITING_FOR_BASE: Record<Status, WaitingFor> = {
   designing: "agent:architect",
   implementing: "agent:executor",
@@ -42,8 +42,8 @@ const INITIAL_STATUS: Record<Flow, Status> = {
 
 /**
  * Full review verdict targets and the shared four-verdict vocabulary.
- * blocked_external targets pending_approval exactly like pass (system-design
- * 3.1 four-tier vocabulary: code fine, verification blocked on external
+ * blocked_external targets pending_approval exactly like pass (code fine,
+ * verification blocked on external
  * conditions — the external-verification decision belongs to the human at
  * the approval gate, so the derivation path is shared with pass).
  */
@@ -57,7 +57,7 @@ const VERDICT_TARGET: Record<string, Status> = {
 /**
  * direct review verdict targets: fail_design is ABSENT on purpose — direct has
  * no designing state, so a fail_design verdict is out-of-table there (the
- * human adjudicates at pending_approval); see system-design 3.1.
+ * human adjudicates at pending_approval).
  */
 const VERDICT_TARGET_DIRECT: Record<string, Status> = {
   pass: "pending_approval",
@@ -68,7 +68,7 @@ const VERDICT_TARGET_DIRECT: Record<string, Status> = {
 /** One fold step: next status plus an optional warning for this record. */
 function fold(status: Status, record: ContextRecord, flow: Flow): { status: Status; warning: WarningCode | null } {
   // note: never warns, in any state (including closed). The ONE transition
-  // exception (system-design 3.1): a non-ack note from the executor while
+  // exception: a non-ack note from the executor while
   // reviewing hands the round back — the worker speaking up during the
   // review wait IS reclaiming the turn. Constraints, all four enforced by
   // this guard order: only in reviewing (any other state's note is the usual
@@ -147,7 +147,7 @@ function fold(status: Status, record: ContextRecord, flow: Flow): { status: Stat
         : { status, warning: "OUT_OF_TABLE" };
     case "decision": {
       const decision = record.payload.decision;
-      // close is valid from ANY state (system-design 3.1); a decision record
+      // close is valid from ANY state; a decision record
       // with a missing/unknown value does not fit the table.
       if (decision === "close") {
         return { status: "closed", warning: null };
@@ -164,7 +164,7 @@ function fold(status: Status, record: ContextRecord, flow: Flow): { status: Stat
       return { status, warning: "OUT_OF_TABLE" };
     }
     default:
-      // Unknown content_type: accepted but never in-table (system-design 4.1).
+      // Unknown content_type: accepted but never in-table.
       return { status, warning: "OUT_OF_TABLE" };
   }
 }

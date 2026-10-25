@@ -1,3 +1,4 @@
+import { writePiPackageFixture } from './helpers/executable.js';
 // start-next × launch_mode routing — the headless side of the switch, plus
 // the discriminating tui-side cases, all against the REAL config-file read
 // (nothing mocked here): explicit headless routes to the headless door;
@@ -25,8 +26,10 @@ vi.mock("../src/core/run/control.js", async (importOriginal) => ({
   startRun: vi.fn(),
 }));
 
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
+import { rm } from "node:fs/promises";
+import { windowsPiSessionLocation } from "../src/core/run/windows-pi-session.js";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -77,7 +80,7 @@ function captureIo(): { out: () => string; err: () => string; restore: () => voi
 
 /** Rig configurations under test. "missing" = no config file at all;
  *  "flow-only" = a legal config without the launch_mode key. */
-type RigMode = "missing" | "flow-only" | "headless" | "tui" | "corrupt";
+type RigMode = "missing" | "flow-only" | "detached" | "headless" | "tui" | "corrupt";
 
 /** A real rig root whose .context-hub/config.json carries the switch under
  *  test, cwd + TUT_HUB_ROOT pinned to it, and a pi-only PATH: the headless
@@ -93,25 +96,30 @@ async function withRig<T>(mode: RigMode, fn: (rig: string) => Promise<T>, opts: 
           : `{"flow_mode":"manual","launch_mode":"${mode}"}\n`;
     writeFileSync(path.join(rig, ".context-hub", "config.json"), body, "utf8");
   }
+  // A semicolon is a PATH delimiter on Windows, even inside a valid cwd.
+  // Keep that checkout case, but install its fake agent in a separate bin.
+  const externalBin = process.platform === "win32" && rig.includes(";") ? mkdtempSync(path.join(os.tmpdir(), "tut-pi-bin-")) : undefined;
+  const fixtureBin = externalBin ?? path.join(rig, "bin");
   if (opts.piStub !== false) {
-    const bin = path.join(rig, "bin");
-    mkdirSync(bin);
-    writeFileSync(path.join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    mkdirSync(fixtureBin, { recursive: true });
+    writePiPackageFixture(fixtureBin, "process.exit(0)");
   }
   const prevCwd = process.cwd();
   const prevHubRoot = process.env.TUT_HUB_ROOT;
   const prevUserDir = process.env.TUT_USER_CONFIG_DIR;
   const prevProjectRoot = process.env.TUT_PROJECT_ROOT;
   const prevPath = process.env.PATH;
+  const prevPiDir = process.env.PI_CODING_AGENT_DIR;
   process.chdir(rig);
   process.env.TUT_HUB_ROOT = rig;
+  process.env.PI_CODING_AGENT_DIR = path.join(rig, "fixture-pi");
   process.env.TUT_USER_CONFIG_DIR = path.join(rig, "user-config");
   delete process.env.TUT_PROJECT_ROOT;
   // System bin dirs stay reachable (which/sh for preflights) without the
   // user's PATH — herdr is never installed there, so the headless door's
   // "no herdr contact" discriminator still holds.
-  const binDirs = [path.dirname(process.execPath), "/usr/bin", "/bin"];
-  if (opts.piStub !== false) binDirs.unshift(path.join(rig, "bin"));
+  const binDirs = process.platform === "win32" ? [path.join(process.env.SystemRoot ?? "C:\\Windows", "System32")] : [path.dirname(process.execPath), "/usr/bin", "/bin"];
+  if (opts.piStub !== false) binDirs.unshift(fixtureBin);
   process.env.PATH = binDirs.join(path.delimiter);
   try {
     return await fn(rig);
@@ -124,7 +132,10 @@ async function withRig<T>(mode: RigMode, fn: (rig: string) => Promise<T>, opts: 
     if (prevProjectRoot === undefined) delete process.env.TUT_PROJECT_ROOT;
     else process.env.TUT_PROJECT_ROOT = prevProjectRoot;
     process.env.PATH = prevPath;
-    rmSync(rig, { recursive: true, force: true });
+    if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+    await rm(rig, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    if (externalBin) await rm(externalBin, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 
@@ -206,10 +217,23 @@ function seedCompletedRun(rig: string, taskId: string): { runId: string; session
       route_source: "builtin-default",
       session_reason: "fresh: no previous headless role run",
       designated_session_id: sessionId,
+      ...(process.platform === "win32" ? { windows: {
+        schema: 1,
+        target: { agent: "pi", kind: "node-entry", executable: process.execPath,
+          prefix_args: [path.join(canonical, "bin/node_modules/@earendil-works/pi-coding-agent/dist/cli.js")],
+          source_path: path.join(canonical, "bin/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), version: "1.4.0" },
+        logical_argv: ["pi", "--print", "--mode", "json", "--session-id", sessionId, "--", "fixture"],
+        pi_session: { ...windowsPiSessionLocation(canonical, process.env), session_id: sessionId },
+      } } : {}),
     },
     ended_at: "2026-10-18T00:05:00.000Z",
     exit_code: 0,
   }), "utf8");
+  if (process.platform === "win32") {
+    const location = windowsPiSessionLocation(canonical, process.env);
+    mkdirSync(location.session_directory, { recursive: true });
+    writeFileSync(path.join(location.session_directory, `${sessionId}.jsonl`), JSON.stringify({ type: "session", id: sessionId, cwd: canonical }) + "\n");
+  }
   return { runId, sessionId };
 }
 
@@ -236,11 +260,13 @@ describe("start-next headless routing (real launch_mode reads)", () => {
   });
 
   it.each([
-    ["http://hub.test"],
-    ["http://hub.test/"],
+    ["detached", "http://hub.test"],
+    ["detached", "http://hub.test/"],
+    ["headless", "http://hub.test"],
+    ["headless", "http://hub.test/"],
   ] as const)(
-    "explicit headless routes start-next through the headless door (run on disk, no herdr reachable, url=%s)",
-    async (hubUrl) => {
+    "%s routes start-next through the detached door (run on disk, no herdr reachable, url=%s)",
+    async (mode, hubUrl) => {
       const requested = stubState([{ task_id: "hl-1", status: "implementing", waiting_for: "agent:executor", version: 1, title: "HL One" }]);
       vi.mocked(hubRead).mockResolvedValue({ task_id: "hl-1", title: "HL One", status: "implementing", versions: cleanRecords("hl-1") });
       vi.mocked(hubPublish).mockResolvedValue({ task_id: "hl-1", version: 2, status: "implementing", needs_attention: false });
@@ -248,7 +274,7 @@ describe("start-next headless routing (real launch_mode reads)", () => {
       let code: number | undefined;
       let rig: string | undefined;
       let runOnDisk = false;
-      await withRig("headless", async (r) => {
+      await withRig(mode, async (r) => {
         rig = realpathSync(r); // canonical form, as resolveRigRoot sees it (before cleanup)
         code = await main(["start-next", "hl-1", "--url", hubUrl]);
         runOnDisk = existsSync(path.join(r, ".context-hub", "runs", captured!.id));
@@ -262,10 +288,10 @@ describe("start-next headless routing (real launch_mode reads)", () => {
       expect(requested.every((url) => !url.includes("//state"))).toBe(true);
       expect(requested.some((url) => url.startsWith("http://hub.test/state"))).toBe(true); // revalidate gate reached
       expect(io.out()).toContain(
-        `start-next: headless launch attempt completed; delivery confirmation is not implied (executor for hl-1 via headless run ${captured!.id}`,
+        `start-next: detached launch attempt completed; delivery confirmation is not implied (executor for hl-1 via detached run ${captured!.id}`,
       );
       // The spawn is the routed headless agent argv in the checkout root.
-      expect(captured!.argv[0]).toContain("pi");
+      expect(captured!.argv[process.platform === "win32" ? 1 : 0]).toContain("pi");
       expect(captured!.argv).toContain("--print");
       expect(captured!.cwd).toBe(rig);
       expect(captured!.task_id).toBe("hl-1");
@@ -285,7 +311,7 @@ describe("start-next headless routing (real launch_mode reads)", () => {
         base_version: 1,
         via: "start-next",
         launch_mode: "headless",
-        target_kind: "headless-posix",
+        target_kind: process.platform === "win32" ? "headless-windows" : "headless-posix",
         trigger_version: 1,
       });
     },
@@ -387,7 +413,7 @@ describe("start-next headless routing (real launch_mode reads)", () => {
           const prevPanes = process.env.TUT_HERDR_PANES;
           const prevHub = process.env.TUT_HUB_URL;
           const prevDry = process.env.TUT_DRY_RUN;
-          process.env.PATH = `${FIXTURE_BIN}:${prevPath}`;
+          process.env.PATH = [FIXTURE_BIN, prevPath].join(path.delimiter);
           process.env.TUT_HERDR_PANES = "[]";
           process.env.TUT_HUB_URL = "http://127.0.0.1:1";
           process.env.TUT_DRY_RUN = "1";
@@ -410,7 +436,7 @@ describe("start-next headless routing (real launch_mode reads)", () => {
       const out = io.out();
       expect(out).toContain("DRY-RUN"); // the pane chain ran (fixture herdr, empty list)
       expect(out).toContain("launch attempt completed; delivery confirmation is not implied (executor for tui-1 via tut launch)");
-      expect(out).not.toContain("via headless run");
+      expect(out).not.toContain("via detached run");
       expect(captured).toBeUndefined(); // startRun never reached: no headless spawn
       const launch = (vi.mocked(hubPublish).mock.calls[0]![1].payload as { launch?: Record<string, unknown> }).launch;
       expect(launch).toMatchObject({ protocol_version: 2, role: "executor", base_version: 0, via: "start-next" });
@@ -449,14 +475,16 @@ describe("start-next headless routing (real launch_mode reads)", () => {
       // fixture independent of the invoking user's install policy.
       const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^npm_config_/iu.test(key)));
       for (const step of steps) {
-        await promisify(execFile)('/bin/sh', ['-c', step], {
+        const npmCli = path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
+        await promisify(execFile)(process.platform === 'win32' ? process.execPath : '/bin/sh', process.platform === 'win32' ? [npmCli, ...(step.endsWith('npm ci') ? ['ci'] : ['run','build'])] : ['-c', step], {
+          cwd: rig,
           env: {
-            ...childEnv, npm_config_cache: path.join(rig, 'npm-cache'), npm_config_offline: 'true', npm_config_audit: 'false', npm_config_fund: 'false',
+            ...childEnv, ...(process.platform === 'win32' ? { PATH: [path.dirname(process.execPath), childEnv.PATH].join(path.delimiter) } : {}), npm_config_cache: path.join(rig, 'npm-cache'), npm_config_offline: 'true', npm_config_audit: 'false', npm_config_fund: 'false',
             npm_config_userconfig: path.join(rig, 'empty-user-npmrc'), npm_config_globalconfig: path.join(rig, 'empty-global-npmrc'),
           },
         });
       }
-      expect(await main(['start-next', 'repair', '--url', 'http://hub.test'])).toBe(0);
+      expect(await main(['start-next', 'repair', '--url', 'http://hub.test']), io.err()).toBe(0);
       expect(captured).toBeDefined();
       expect(hubPublish).toHaveBeenCalledTimes(1);
     }, { prefix });
@@ -542,16 +570,19 @@ describe("start-next headless routing (real launch_mode reads)", () => {
     expect((publish[1].payload as { launch?: Record<string, unknown> }).launch).toMatchObject({ role: "executor", base_version: 2, via: "start-next" });
   });
 
-  it("without --fresh, a completed same-role run is continued (native session resume)", async () => {
+  it.each(["detached", "headless"] as const)("%s continues a legacy same-role run without rewriting its metadata", async (mode) => {
     stubState([{ task_id: "hl-cont", status: "implementing", waiting_for: "agent:executor", version: 1 }]);
     vi.mocked(hubRead).mockResolvedValue({ task_id: "hl-cont", title: "Cont", status: "implementing", versions: cleanRecords("hl-cont") });
     vi.mocked(hubPublish).mockResolvedValue({ task_id: "hl-cont", version: 2, status: "implementing", needs_attention: false });
 
     let code: number | undefined;
     let seeded: { runId: string; sessionId: string } | undefined;
-    await withRig("headless", async (r) => {
+    await withRig(mode, async (r) => {
       seeded = seedCompletedRun(r, "hl-cont");
+      const file = path.join(r, ".context-hub", "runs", seeded.runId, "meta.json");
+      const before = readFileSync(file);
       code = await main(["start-next", "hl-cont", "--url", "http://hub.test"]);
+      expect(readFileSync(file)).toEqual(before);
     });
 
     expect(code).toBe(0);
@@ -616,7 +647,7 @@ describe("start-next headless routing (real launch_mode reads)", () => {
     }, { piStub: false });
 
     expect(code).toBe(1);
-    expect(io.err()).toContain("headless executable not on PATH or not executable: pi");
+    expect(io.err()).toContain(process.platform === "win32" ? "not found on PATH" : "detached executable not on PATH or not executable: pi");
     expect(vi.mocked(hubPublish)).not.toHaveBeenCalled();
     expect(captured).toBeUndefined();
   });

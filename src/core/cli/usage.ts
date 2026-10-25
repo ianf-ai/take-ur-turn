@@ -72,7 +72,8 @@ Usage:
       Switch flow_mode (takes effect on the next poll cycle).
   tut config get <key> [--root <dir>]
   tut config set <key> <value> [--root <dir>]
-      launch_mode: tui (default) | headless; selects Notifier automatic launches.
+      launch_mode: tui (default) | detached; selects start-next / Notifier launches.
+      headless is a compatibility alias; get/set use detached.
       Read / write project runtime config (.context-hub/config.json — the
       file serve re-reads every request for runtime settings; works with
       the Hub down, same discipline as
@@ -161,7 +162,7 @@ Usage:
       currently effective lineup (all three roles) first; a corrupt file is
       never clobbered. User-level ~/.config/tut/workspace.json is maintained
       by hand (a low-frequency machine-wide declaration).
-  tut up [--url <u>] [--event-port <p>] [--root <dir>] [--dry-run]
+  tut up [--url <u>] [--event-port <p>] [--root <dir>] [--adopt] [--dry-run]
       Provision the workspace power switch (idempotent): hub + notify panes
       only — role/agent panes are no longer pre-provisioned: launchers
       raise agent panes on demand at hand-off time. --url targets a
@@ -178,10 +179,19 @@ Usage:
       plus the opt-in usage watcher), records their pid/pgid/port facts in
       .context-hub/power.json, and tut down stops them. Illegal power.mode
       values (or an unreadable config) fail visibly before any provisioning.
+      Standalone up and doctor report unregistered live services as power drift.
+      --adopt explicitly registers verified same-root listeners for tut down;
+      requires a unique listener PID and start token (plus an independent
+      process group on POSIX). Windows uses PowerShell creation-time and TCP
+      ownership queries; records pgid=null and process_scope=windows-tree.
+      Adopted services record adopted=true, session_inherited=false: an existing
+      process cannot inherit a new TUT_POWER_SESSION, so leaderless descendants
+      remain unattributable. Without --adopt, reuse grants no new signal rights.
+      --adopt --dry-run verifies and previews adoption without writing state.
   tut down [--root <dir>]
       Stop this rig's standalone services (power.mode=standalone): read
       .context-hub/power.json and stop in reverse start order (notifier →
-      usage watcher → hub) — SIGTERM to each recorded process group, grace
+      usage watcher → hub) — on POSIX, SIGTERM to each recorded process group, grace
       window, liveness re-check, SIGKILL escalation, final port re-check.
       Signals are identity-gated (a live pid is not ownership: recycled or
       unverifiable pids are never signaled) and group-scoped (a leader that
@@ -198,6 +208,12 @@ Usage:
       stopping services. In herdr mode (power.mode=herdr, the default) down
       refuses with the herdr shutdown pointer (stop the tut-sys panes) —
       never a silent no-op.
+      Windows stops a creation-token-verified process tree via native handles,
+      excluding recorded run roots/supervisors and in-flight run supervisors.
+      It force-terminates services; no POSIX signal/grace or Job Object container
+      is claimed. An absent leader before capture, unreadable identity, or
+      unreadable run metadata refuses cleanup. Already orphaned descendants
+      and descendants escaping between snapshots are a documented gap.
   tut ack <task_id> [--note <text>] [--url <u>]
       Acknowledge a task's anomalies as handled: appends a human note with
       ack=true — accumulated warnings clear and needs_attention resets on
@@ -212,6 +228,11 @@ Usage:
       reachability (/state), notifier event port, config & workspace chain,
       agent executables, storage health, path safety & probe endpoints,
       platform info, agent-channel network verdicts, checkout preflight.
+      Linked worktree HEAD/ref warnings are advisory, including without a
+      Node manifest. Git switch guidance is manual only; no Git repair is
+      automated, even with --fix-preflight. Main/non-worktree directories
+      are not applicable to this check. Matching task refs from a verified
+      Hub are checked when available; offline checks cannot infer task refs.
       Checks never modify anything; every problem comes with a fix command to
       run by hand. --checkout names the directory the preflight check
       inspects (default: cwd — the run/resume execution target; --root stays

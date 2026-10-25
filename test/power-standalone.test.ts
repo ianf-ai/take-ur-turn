@@ -3,8 +3,9 @@
  *
  * Real processes against the built dist CLI (the rig-isolation convention):
  * up's detached children are REAL `node dist/cli.js serve|notify` processes,
- * down's signals land on real process groups, runs are real `tut run`
- * process groups. No mocks of our own code; the only stubs are none.
+ * down addresses real process groups on POSIX and creation-verified service
+ * trees on Windows; runs use their native process container. Token-query gates
+ * delay the real OS query; they never invent process identities.
  * Requires `npm run build` before the suite (same as rig-isolation).
  *
  * Covers the acceptance scenarios:
@@ -17,15 +18,24 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFile, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, execFile, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { main } from "../src/cli.js";
-import { processStartToken } from "../src/standalone/power/standalone-up.js";
+import { runDoctor } from "../src/core/doctor/index.js";
+import { adoptService } from "../src/standalone/power/reconcile.js";
+import { type PowerState, readPowerState, writePowerState, processStartToken } from "../src/standalone/power/standalone-up.js";
 
+import { stopWindowsService, terminateWindowsProcess, windowsProcesses, type WindowsProcess } from "../src/standalone/power/windows.js";
+import * as windowsPower from "../src/standalone/power/windows.js";
+import { writeNodeExecutable } from "./helpers/executable.js";
+import { stopWindowsFixtureRuns } from "./helpers/run-cleanup.js";
+
+const WINDOWS = process.platform === "win32";
 const exec = promisify(execFile);
 const REPO = path.resolve(import.meta.dirname, "..");
 const CLI = path.join(REPO, "dist", "cli.js");
@@ -36,6 +46,23 @@ for (const key of ["TUT_UP_CLI_SELF", "TUT_UP_HUB_WAIT_MS", "TUT_UP_NOTIFY_WAIT_
 }
 const TRASH: string[] = [];
 const STRAY_PIDS: number[] = [];
+const OWNED_CHILDREN = new Map<number, ChildProcess>();
+const NATIVE_IDENTITIES = new Map<number, WindowsProcess>();
+
+// PGIDs describe POSIX groups only. Windows fixtures exercise the approved
+// creation-identity/tree contract; they must never fabricate a positive PGID.
+function serviceScope(pid: number | null): { pgid: number | null; process_scope?: "windows-tree" } {
+  return WINDOWS ? { pgid: null, process_scope: "windows-tree" } : { pgid: pid };
+}
+
+function rememberServices(state: PowerState): void {
+  if (!WINDOWS) return;
+  for (const facts of [state.hub, state.notifier, state.watcher]) {
+    if (facts?.pid && /^windows:[1-9]\d*$/.test(facts.start_token ?? "")) {
+      NATIVE_IDENTITIES.set(facts.pid, { pid: facts.pid, parent: 0, token: facts.start_token!, command: null });
+    }
+  }
+}
 
 /** A standalone-mode TUT project root with a realpath-safe path. */
 function makeRig(tag: string, usageAudit: "on" | "off" = "off"): string {
@@ -72,20 +99,38 @@ function alive(pid: number | null | undefined): boolean {
   }
 }
 
-function killPid(pid: number | null | undefined): void {
+async function killPid(pid: number | null | undefined): Promise<void> {
   if (pid === null || pid === undefined || !alive(pid)) return;
+  if (WINDOWS) {
+    const child = OWNED_CHILDREN.get(pid);
+    // Node's ChildProcess owns the original Windows process handle. For a
+    // detached service we only terminate a handle matching its recorded birth.
+    if (child) child.kill("SIGKILL");
+    else {
+      const identity = NATIVE_IDENTITIES.get(pid);
+      if (!identity) throw new Error(`power fixture cannot attribute cleanup PID ${pid}`);
+      await terminateWindowsProcess(identity);
+    }
+    for (let i = 0; i < 100 && alive(pid); i++) await new Promise(resolve => setTimeout(resolve, 25));
+    if (alive(pid)) throw new Error(`power fixture PID ${pid} did not exit`);
+    return;
+  }
   try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
 }
 
-function readState(root: string): { mode: string; started_at: string; hub: { url: string; port: number; pid: number; pgid: number; power_session?: string | null }; notifier: { event_port: number; pid: number; power_session?: string | null }; stopped_at?: string; watcher?: { pid: number } | null } {
-  return JSON.parse(readFileSync(path.join(root, ".context-hub", "power.json"), "utf8"));
+function readState(root: string): PowerState {
+  const state = JSON.parse(readFileSync(path.join(root, ".context-hub", "power.json"), "utf8")) as PowerState;
+  rememberServices(state);
+  return state;
 }
 
 /** A real detached sleeper as a stand-in service process group. */
 function sleeper(script: string): number {
-  const child = spawn(process.execPath, ["-e", script], { detached: true, stdio: "ignore" });
+  const finiteScript = WINDOWS ? script + ";setTimeout(() => process.exit(124), 180000).unref();" : script;
+  const child = spawn(process.execPath, ["-e", finiteScript], { detached: true, stdio: "ignore" });
   child.unref();
   STRAY_PIDS.push(child.pid!);
+  OWNED_CHILDREN.set(child.pid!, child);
   return child.pid!;
 }
 
@@ -97,6 +142,207 @@ function deadPid(): number {
   if (child.error) throw child.error;
   if (child.status !== 0 || !child.pid) throw new Error("dead-pid fixture did not exit successfully");
   return child.pid;
+}
+
+/** Windows counterpart of the POSIX group-leader matrix. A real live tree
+ * is captured and stopped; an already orphaned descendant cannot be attributed
+ * by a dead numeric parent. The completed-state shortcut only checks recorded
+ * leaders/endpoints, so it deliberately makes no orphan-container guarantee. */
+async function windowsLeaderMatrix(): Promise<void> {
+  const start = async (tag: string) => {
+    const root = makeRig(tag);
+    const handoff = path.join(root, "child.json");
+    const go = path.join(root, "leader-exit");
+    const script = path.join(root, "leader.cjs");
+    writeFileSync(script, `
+      const fs = require("node:fs"), cp = require("node:child_process");
+      const child = cp.spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(124),180000)"], {detached:true,stdio:"ignore"});
+      child.unref();
+      fs.writeFileSync(${JSON.stringify(handoff)}, JSON.stringify({pid:child.pid}));
+      setInterval(() => { if (fs.existsSync(${JSON.stringify(go)})) process.exit(0); }, 25);
+      setTimeout(()=>process.exit(124),180000).unref();
+    `);
+    const leader = spawn(process.execPath, [script], {detached:true,stdio:"ignore"});
+    leader.unref();
+    OWNED_CHILDREN.set(leader.pid!, leader);
+    STRAY_PIDS.push(leader.pid!);
+    let child: {pid:number} | undefined;
+    for (let i=0;i<200&&!child;i++) {
+      await new Promise(resolve=>setTimeout(resolve,25));
+      try { child=JSON.parse(readFileSync(handoff,"utf8")); } catch { /* pending */ }
+    }
+    expect(child).toBeDefined();
+    const rows = await windowsProcesses();
+    const descendant = rows.find(row=>row.pid===child!.pid)!;
+    expect(descendant?.parent).toBe(leader.pid);
+    expect(descendant.token).toMatch(/^windows:\d+$/);
+    NATIVE_IDENTITIES.set(descendant.pid,descendant);
+    STRAY_PIDS.push(descendant.pid);
+    const token=await processStartToken(leader.pid!);
+    expect(token).toMatch(/^windows:\d+$/);
+    return {root,go,leader:leader.pid!,child:descendant.pid,token};
+  };
+  const record = (tree: Awaited<ReturnType<typeof start>>, token: string|null, completed=false) => {
+    writeFileSync(path.join(tree.root,".context-hub","power.json"),JSON.stringify({
+      mode:"standalone",started_at:new Date().toISOString(),
+      hub:{url:"http://127.0.0.1:1",port:1,pid:tree.leader,...serviceScope(tree.leader),started_at:new Date().toISOString(),start_token:token},
+      notifier:{event_port:1,pid:null,pgid:null,started_at:new Date().toISOString(),start_token:null},
+      ...(completed?{stopped_at:"2026-01-01T00:00:00.000Z"}:{})
+    }));
+  };
+  const tree=await start("native-leader-live");
+  record(tree,tree.token);
+  const io=captureIo();
+  try {
+    expect(await main(["down"])).toBe(0);
+    expect(io.out()).toContain("Windows identity-verified tree");
+    expect(alive(tree.leader)).toBe(false);
+    expect(alive(tree.child)).toBe(false);
+  } finally {io.restore();}
+  for(const tokenKind of ["no-token","wrong-token","real-token"] as const) {
+    for(const completed of [false,true]) {
+      const orphan=await start(`native-leader-${tokenKind}-${completed}`);
+      writeFileSync(orphan.go,"exit original leader");
+      for(let i=0;i<200&&alive(orphan.leader);i++) await new Promise(resolve=>setTimeout(resolve,25));
+      expect(alive(orphan.leader)).toBe(false);
+      expect(alive(orphan.child)).toBe(true);
+      record(orphan,tokenKind==="no-token"?null:tokenKind==="wrong-token"?"windows:0":orphan.token,completed);
+      const io=captureIo();
+      try {
+        expect(await main(["down"])).toBe(completed?0:1);
+        if(completed) {
+          expect(io.out()).toContain("already stopped");
+          expect(readState(orphan.root).stopped_at).toBe("2026-01-01T00:00:00.000Z");
+        } else {
+          expect(io.err()).toContain(tokenKind==="no-token"?"no Windows creation token recorded":"no Job Object container to attribute orphan descendants (documented-gap)");
+          expect(io.out()).toContain("NOT recording a stop");
+          expect(readState(orphan.root).stopped_at).toBeUndefined();
+        }
+        expect(alive(orphan.child)).toBe(true);
+      } finally {io.restore();await killPid(orphan.child);}
+    }
+  }
+}
+
+/** Delay one native identity query while another real actor makes progress.
+ * Always release and join up before removing the spy or cleaning the rig. */
+async function overlapWindowsUp(pid: number, duringProbe: () => Promise<void>): Promise<void> {
+  const actual = windowsPower.windowsStartToken;
+  let entered = false;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let timedOut = false;
+  const deadline = setTimeout(() => { timedOut = true; release(); }, 30_000);
+  const probe = vi.spyOn(windowsPower, "windowsStartToken").mockImplementation(async candidate => {
+    if (candidate === pid) { entered = true; await gate; }
+    return actual(candidate);
+  });
+  const up = main(["up"]);
+  try {
+    for (let i = 0; i < 400 && !entered; i++) await new Promise(resolve => setTimeout(resolve, 25));
+    expect(entered).toBe(true);
+    await duringProbe();
+    expect(timedOut).toBe(false);
+    release();
+    expect(await up).toBe(0);
+  } finally {
+    release();
+    await up.catch(() => undefined);
+    clearTimeout(deadline);
+    probe.mockRestore();
+  }
+}
+
+/** Real notifier → launch --cleanup → native forwarder → neutral Node helper.
+ * The Windows power unit deliberately has no Job container for power services: after losing the
+ * leader, Windows must refuse the orphan tree rather than trust POSIX registry
+ * PGIDs. POSIX callers below retain their original registry-cleanup assertions. */
+async function windowsCleanupChain(phase: "single" | "before-registration" | "after-registration" | "overlap"): Promise<void> {
+  const root = makeRig(`native-chain-${phase}`);
+  const storage = path.join(root, ".context-hub");
+  const handoff = path.join(root, "native-helper.json");
+  const release = path.join(root, "helper-release");
+  const fixture = writeNodeExecutable(path.join(root, "herdr-fixture"), `
+    const fs = require("node:fs");
+    fs.writeFileSync(${JSON.stringify(handoff)}, JSON.stringify({pid:process.pid,ppid:process.ppid}));
+    const hold = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) { clearInterval(hold); process.exit(0); } }, 50);
+  `);
+  const oldExecutable = process.env.TUT_HERDR_EXECUTABLE;
+  process.env.TUT_HERDR_EXECUTABLE = fixture;
+  // Advisory POSIX history must remain byte-identical even with an overlap.
+  const registry = path.join(storage, "power-members.jsonl");
+  const originalRegistry = '{corrupt\n' + JSON.stringify({pid:1,pgid:2,power_session:"unrelated",kind:"x",registered_at:new Date().toISOString(),start_token:"ps:x"}) + "\n";
+  writeFileSync(registry, originalRegistry);
+  const io = captureIo();
+  try {
+    const { Store } = await import("../src/core/hub/store.js");
+    const { hubPublish } = await import("../src/core/hub/hub-client.js");
+    const task = await new Store(storage).createTask({ title: "native power cleanup fixture", description: "temporary", creator: "test", role: "human", flow: "direct" });
+    expect(await main(["up"])).toBe(0);
+    const first = readState(root);
+    expect(first.notifier.pgid).toBeNull();
+    expect(first.notifier.process_scope).toBe("windows-tree");
+    expect(first.notifier.power_session).toBeTruthy();
+    const repeat = async () => {
+      expect(await main(["up"])).toBe(0);
+      const next = readState(root);
+      expect(next.notifier.pid).toBe(first.notifier.pid);
+      expect(next.notifier.start_token).toBe(first.notifier.start_token);
+      expect(next.notifier.power_session).toBe(first.notifier.power_session);
+      expect(readFileSync(registry, "utf8")).toBe(originalRegistry);
+    };
+    if (phase === "before-registration") await repeat();
+    let chain!: { pid: number; ppid: number };
+    const closeAndCapture = async () => {
+      await hubPublish(first.hub.url, { task_id: task.task_id, role: "human", content_type: "decision", expected_version: 0,
+        payload: { summary: "close fixture", body: "exercise real notifier cleanup", decision: "close" } });
+      for (let i = 0; i < 300 && !chain; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        try { chain = JSON.parse(readFileSync(handoff, "utf8")); } catch { /* handoff pending */ }
+      }
+      expect(chain).toBeDefined();
+      // The native executable adds a parent. Verify the entire real ancestry
+      // while its leader lives, retaining each creation identity for cleanup.
+      const rows = await windowsProcesses();
+      let row = rows.find(candidate => candidate.pid === chain.pid)!;
+      expect(row?.parent).toBe(chain.ppid);
+      const lineage = new Set<number>();
+      while (row && row.pid !== first.notifier.pid && !lineage.has(row.pid)) {
+        lineage.add(row.pid);
+        expect(row.token).toMatch(/^windows:\d+$/);
+        NATIVE_IDENTITIES.set(row.pid, row);
+        STRAY_PIDS.push(row.pid);
+        const parent = rows.find(candidate => candidate.pid === row.parent)!;
+        expect(parent?.token).toMatch(/^windows:\d+$/);
+        expect(BigInt(row.token!.slice(8)) >= BigInt(parent.token!.slice(8))).toBe(true);
+        row = parent;
+      }
+      expect(row?.pid).toBe(first.notifier.pid);
+      expect(lineage.size).toBeGreaterThanOrEqual(3);
+      expect(readFileSync(registry, "utf8")).toBe(originalRegistry);
+    };
+    if (phase === "overlap") {
+      await overlapWindowsUp(first.notifier.pid!, closeAndCapture);
+      expect(readState(root).notifier.power_session).toBe(first.notifier.power_session);
+    } else {
+      await closeAndCapture();
+      if (phase === "after-registration") await repeat();
+    }
+    await killPid(first.notifier.pid); // verified original leader only
+    expect(alive(chain.pid)).toBe(true);
+    expect(await main(["down"])).toBe(1);
+    expect(io.err()).toContain("no Job Object container to attribute orphan descendants (documented-gap)");
+    expect(io.out()).toContain("NOT recording a stop");
+    expect(readState(root).stopped_at).toBeUndefined();
+    expect(alive(chain.pid)).toBe(true);
+    expect(readFileSync(registry, "utf8")).toBe(originalRegistry);
+  } finally {
+    io.restore();
+    if (oldExecutable === undefined) delete process.env.TUT_HERDR_EXECUTABLE;
+    else process.env.TUT_HERDR_EXECUTABLE = oldExecutable;
+    // Join the neutral fixture before the identity-verified fallback cleanup.
+    writeFileSync(release, "release");
+  }
 }
 
 beforeEach(() => {
@@ -111,23 +357,37 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  for (const root of TRASH.splice(0)) {
-    // Best-effort rig stop before deleting the state down would need.
+  const roots = TRASH.splice(0);
+  const errors: unknown[] = [];
+  try { await stopWindowsFixtureRuns(roots); } catch (error) { errors.push(error); }
+  for (const root of roots) {
+    // Public down runs before state deletion; the fallback addresses only
+    // service identities captured from this rig, never a numeric PID sweep.
     const io = captureIo();
     try {
       process.chdir(root);
       await main(["down"]).catch(() => undefined);
-    } catch { /* cleanup only */ }
-    finally { io.restore(); }
-    try {
-      const state = readState(root);
-      killPid(state.hub?.pid);
-      killPid(state.notifier?.pid);
-      killPid(state.watcher?.pid);
-    } catch { /* no state */ }
-    rmSync(root, { recursive: true, force: true });
+    } catch { /* fallback below */ }
+    finally { io.restore(); process.chdir(SAVED_CWD); }
+    let state: PowerState | undefined;
+    try { state = readState(root); } catch { /* absent/corrupt fixture state */ }
+    for (const pid of [state?.hub.pid, state?.notifier.pid, state?.watcher?.pid]) {
+      try { await killPid(pid); } catch (error) { errors.push(error); }
+    }
   }
-  for (const pid of STRAY_PIDS.splice(0)) killPid(pid);
+  // Owned sleepers include deliberately stale/null-token rejection fixtures.
+  for (const pid of STRAY_PIDS.splice(0)) {
+    try { await killPid(pid); } catch (error) { errors.push(error); }
+  }
+  OWNED_CHILDREN.clear();
+  NATIVE_IDENTITIES.clear();
+  if (errors.length) throw new AggregateError(errors, "power fixture cleanup unverified; roots retained");
+  for (const root of roots) {
+    // Let libuv drain original child-handle close callbacks while Windows
+    // releases cwd handles; synchronous retry loops prevent that progress.
+    if (WINDOWS) await rm(root, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 });
+    else rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+  }
 });
 
 describe("standalone full journey (real hub + notifier + down)", () => {
@@ -141,7 +401,13 @@ describe("standalone full journey (real hub + notifier + down)", () => {
       expect(first.hub.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       expect(alive(first.hub.pid)).toBe(true);
       expect(alive(first.notifier.pid)).toBe(true);
-      expect(first.hub.pgid).toBe(first.hub.pid); // detached ⇒ group leader
+      expect(first.hub.pgid).toBe(WINDOWS ? null : first.hub.pid);
+      if (WINDOWS) {
+        for (const facts of [first.hub, first.notifier, first.watcher!]) {
+          expect(facts.process_scope).toBe("windows-tree");
+          expect(facts.start_token).toMatch(/^windows:\d+$/);
+        }
+      }
       expect(first.watcher?.pid).toBeDefined();
       expect(alive(first.watcher?.pid ?? null)).toBe(true); // the third service is live too
       // Both services answer for THIS root (the probe discipline).
@@ -176,7 +442,7 @@ describe("standalone full journey (real hub + notifier + down)", () => {
       expect(await main(["down"])).toBe(0);
       expect(io.out()).toContain("already stopped");
     } finally { io.restore(); }
-  }, 90_000);
+  }, WINDOWS ? 180_000 : 90_000);
 });
 
 describe("multi-rig isolation (two roots)", () => {
@@ -201,10 +467,11 @@ describe("multi-rig isolation (two roots)", () => {
       expect(bEvent.status).toBe(405);
 
       process.chdir(rootB);
-      expect(await main(["down"])).toBe(0);
+      const downB = await main(["down"]);
+      expect(downB, JSON.stringify({ root: rootB, stdout: io.out(), stderr: io.err(), state: readState(rootB) })).toBe(0);
       expect(alive(b.hub.pid)).toBe(false);
     } finally { io.restore(); }
-  }, 120_000);
+  }, WINDOWS ? 240_000 : 120_000);
 });
 
 describe("run survival (down never stops runs)", () => {
@@ -224,9 +491,10 @@ describe("run survival (down never stops runs)", () => {
       expect(io.out()).toContain(runId);
       expect(alive(meta.pid)).toBe(true); // THE assertion: the run outlived the rig
       expect(existsSync(path.join(root, ".context-hub", "runs", runId, "meta.json"))).toBe(true);
-      killPid(meta.pid);
+      if (WINDOWS) await stopWindowsFixtureRuns([root]);
+      else await killPid(meta.pid);
     } finally { io.restore(); }
-  }, 90_000);
+  }, WINDOWS ? 180_000 : 90_000);
 });
 
 describe("down edges (injected state, no full rig)", () => {
@@ -270,7 +538,7 @@ describe("down edges (injected state, no full rig)", () => {
       mode: "standalone",
       started_at: new Date().toISOString(),
       hub: { url: "http://127.0.0.1:1", port: 1, pid: null, pgid: null, started_at: new Date().toISOString(), start_token: null }, // verified-but-not-ours: no facts to signal
-      notifier: { event_port: 1, pid: notifierPid, pgid: notifierPid, started_at: new Date().toISOString(), start_token: await processStartToken(notifierPid) },
+      notifier: { event_port: 1, pid: notifierPid, ...serviceScope(notifierPid), started_at: new Date().toISOString(), start_token: await processStartToken(notifierPid) },
     };
     writeFileSync(path.join(root, ".context-hub", "power.json"), JSON.stringify(state));
     process.env.TUT_DOWN_GRACE_MS = "400";
@@ -290,15 +558,15 @@ describe("down edges (injected state, no full rig)", () => {
     const state = {
       mode: "standalone",
       started_at: new Date().toISOString(),
-      hub: { url: "http://127.0.0.1:1", port: 1, pid: innocent, pgid: innocent, started_at: "2026-01-01T00:00:00.000Z", start_token: "ps:Wed Jan  1 00:00:00 2020" },
+      hub: { url: "http://127.0.0.1:1", port: 1, pid: innocent, ...serviceScope(innocent), started_at: "2026-01-01T00:00:00.000Z", start_token: WINDOWS ? "windows:0" : "ps:Wed Jan  1 00:00:00 2020" },
       notifier: { event_port: 1, pid: null, pgid: null, started_at: new Date().toISOString(), start_token: null },
     };
     writeFileSync(path.join(root, ".context-hub", "power.json"), JSON.stringify(state));
     const io = captureIo();
     try {
       expect(await main(["down"])).toBe(1);
-      expect(io.err()).toContain("no longer matches the recorded process");
-      expect(io.err()).toContain("NOT signaling");
+      expect(io.err()).toContain(WINDOWS ? "service PID identity changed" : "no longer matches the recorded process");
+      expect(io.err()).toContain(WINDOWS ? "stop unverified" : "NOT signaling");
       expect(io.out()).toContain("NOT recording a stop");
       expect(alive(innocent)).toBe(true); // THE assertion: the unrelated process survives
       expect(readState(root).stopped_at).toBeUndefined();
@@ -311,15 +579,15 @@ describe("down edges (injected state, no full rig)", () => {
     const state = {
       mode: "standalone",
       started_at: new Date().toISOString(),
-      hub: { url: "http://127.0.0.1:1", port: 1, pid: innocent, pgid: innocent, started_at: new Date().toISOString(), start_token: null },
+      hub: { url: "http://127.0.0.1:1", port: 1, pid: innocent, ...serviceScope(innocent), started_at: new Date().toISOString(), start_token: null },
       notifier: { event_port: 1, pid: null, pgid: null, started_at: new Date().toISOString(), start_token: null },
     };
     writeFileSync(path.join(root, ".context-hub", "power.json"), JSON.stringify(state));
     const io = captureIo();
     try {
       expect(await main(["down"])).toBe(1);
-      expect(io.err()).toContain("identity cannot be verified");
-      expect(io.err()).toContain("NOT signaling");
+      expect(io.err()).toContain(WINDOWS ? "no Windows creation token recorded" : "identity cannot be verified");
+      expect(io.err()).toContain(WINDOWS ? "stop unverified" : "NOT signaling");
       expect(alive(innocent)).toBe(true);
     } finally { io.restore(); }
   });
@@ -331,20 +599,21 @@ describe("down edges (injected state, no full rig)", () => {
     const state = {
       mode: "standalone",
       started_at: new Date().toISOString(),
-      hub: { url: "http://127.0.0.1:1", port: 1, pid: stubbornPid, pgid: stubbornPid, started_at: new Date().toISOString(), start_token: await processStartToken(stubbornPid) },
-      notifier: { event_port: 1, pid: deadNotifier, pgid: deadNotifier, started_at: new Date().toISOString(), start_token: "ps:Wed Jan  1 00:00:00 2020" },
+      hub: { url: "http://127.0.0.1:1", port: 1, pid: stubbornPid, ...serviceScope(stubbornPid), started_at: new Date().toISOString(), start_token: await processStartToken(stubbornPid) },
+      notifier: { event_port: 1, pid: deadNotifier, ...serviceScope(deadNotifier), ...(WINDOWS ? { stopped_at: new Date().toISOString() } : {}), started_at: new Date().toISOString(), start_token: WINDOWS ? "windows:0" : "ps:Wed Jan  1 00:00:00 2020" },
     };
     writeFileSync(path.join(root, ".context-hub", "power.json"), JSON.stringify(state));
     process.env.TUT_DOWN_GRACE_MS = "300";
     const io = captureIo();
     try {
       expect(await main(["down"])).toBe(0);
-      expect(io.out()).toContain("force-killed");
+      expect(io.out()).toContain(WINDOWS ? "Windows identity-verified tree" : "force-killed");
       expect(alive(stubbornPid)).toBe(false);
     } finally { io.restore(); }
   });
 
   it("a leader that exits first never masks stubborn group members (group-scoped stop)", async () => {
+    if (WINDOWS) { await windowsLeaderMatrix(); return; }
     const root = makeRig("inject-group");
     // A real detached service group: leader + a stubborn child in the SAME group.
     const handoff = path.join(root, "group.json");
@@ -371,7 +640,7 @@ describe("down edges (injected state, no full rig)", () => {
     const state = {
       mode: "standalone",
       started_at: new Date().toISOString(),
-      hub: { url: "http://127.0.0.1:1", port: 1, pid: leader, pgid: leader, started_at: new Date().toISOString(), start_token: await processStartToken(leader) },
+      hub: { url: "http://127.0.0.1:1", port: 1, pid: leader, ...serviceScope(leader), started_at: new Date().toISOString(), start_token: await processStartToken(leader) },
       notifier: { event_port: 1, pid: null, pgid: null, started_at: new Date().toISOString(), start_token: null },
     };
     writeFileSync(path.join(root, ".context-hub", "power.json"), JSON.stringify(state));
@@ -380,7 +649,7 @@ describe("down edges (injected state, no full rig)", () => {
     try {
       // Variant A: leader alive now, exits on TERM; the stubborn child forces escalation.
       expect(await main(["down"])).toBe(0);
-      expect(io.out()).toContain("force-killed");
+      expect(io.out()).toContain(WINDOWS ? "Windows identity-verified tree" : "force-killed");
       expect(alive(child)).toBe(false); // THE assertion: the masked member was escalated, not skipped
     } finally { io.restore(); }
     // Variant B — the reviewer's verification matrix (review v11): a live group whose
@@ -427,7 +696,7 @@ describe("down edges (injected state, no full rig)", () => {
           mode: "standalone",
           started_at: "2026-01-01T00:00:00.000Z",
           hub: { url: "http://127.0.0.1:1", port: 1, pid: null, pgid: null, started_at: "2026-01-01T00:00:00.000Z", start_token: null },
-          notifier: { event_port: 1, pid: leader2, pgid: leader2, started_at: "2026-01-01T00:00:00.000Z", ...(token !== null ? { start_token: token } : { start_token: null }) },
+          notifier: { event_port: 1, pid: leader2, ...serviceScope(leader2), started_at: "2026-01-01T00:00:00.000Z", ...(token !== null ? { start_token: token } : { start_token: null }) },
           ...(recordedStop ? { stopped_at: "2026-01-01T00:00:00.000Z" } : {}),
         }));
         const io2 = captureIo();
@@ -441,11 +710,11 @@ describe("down edges (injected state, no full rig)", () => {
           expect(alive(group2!.child)).toBe(true); // THE assertion: the member survives every stale-record combo
         } finally {
           io2.restore();
-          killPid(group2!.child);
+          await killPid(group2!.child);
         }
       }
     }
-  }, 60_000);
+  }, WINDOWS ? 180_000 : 60_000);
 
   it("a recorded stop with dead pids reports already stopped without side effects", async () => {
     const root = makeRig("already");
@@ -454,8 +723,8 @@ describe("down edges (injected state, no full rig)", () => {
     const state = {
       mode: "standalone",
       started_at: new Date().toISOString(),
-      hub: { url: "http://127.0.0.1:1", port: 1, pid: hubPid, pgid: hubPid, started_at: new Date().toISOString() },
-      notifier: { event_port: 1, pid: notifierPid, pgid: notifierPid, started_at: new Date().toISOString() },
+      hub: { url: "http://127.0.0.1:1", port: 1, pid: hubPid, ...serviceScope(hubPid), started_at: new Date().toISOString() },
+      notifier: { event_port: 1, pid: notifierPid, ...serviceScope(notifierPid), started_at: new Date().toISOString() },
       stopped_at: new Date().toISOString(),
     };
     writeFileSync(path.join(root, ".context-hub", "power.json"), JSON.stringify(state));
@@ -491,8 +760,8 @@ describe("a failed down never records completion; retries re-verify (real servic
         expect(readState(root).stopped_at).toBeUndefined();
       }
       // Manual stop of the real services, then down verifies and records.
-      killPid(real.notifier.pid);
-      killPid(real.hub.pid);
+      await killPid(real.notifier.pid);
+      await killPid(real.hub.pid);
       for (let i = 0; i < 50 && (alive(real.hub.pid) || alive(real.notifier.pid)); i++) {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
@@ -501,7 +770,7 @@ describe("a failed down never records completion; retries re-verify (real servic
       expect(await main(["down"])).toBe(0);
       expect(io.out()).toContain("already stopped");
     } finally { io.restore(); }
-  }, 90_000);
+  }, WINDOWS ? 180_000 : 90_000);
 });
 
 describe("a failed up reaps everything it raised (no unmanageable leftovers)", () => {
@@ -519,9 +788,9 @@ describe("a failed up reaps everything it raised (no unmanageable leftovers)", (
       const hubUrl = io.out().match(/hub serving on (\S+)/)?.[1];
       expect(hubUrl).toBeDefined();
       expect(await fetch(`${hubUrl}/state`).catch(() => undefined)).toBeUndefined();
-      expect(io.err()).toContain("EISDIR");
+      expect(io.err()).toMatch(WINDOWS ? /EISDIR|EPERM|EEXIST/ : /EISDIR/);
     } finally { io.restore(); }
-  }, 60_000);
+  }, WINDOWS ? 180_000 : 60_000);
 
   it("notifier log open failure: the already-spawned hub is reaped too", async () => {
     const root = makeRig("f3-log");
@@ -536,11 +805,12 @@ describe("a failed up reaps everything it raised (no unmanageable leftovers)", (
       const hubUrl = io.out().match(/hub serving on (\S+)/)?.[1];
       expect(await fetch(`${hubUrl}/state`).catch(() => undefined)).toBeUndefined();
     } finally { io.restore(); }
-  }, 60_000);
+  }, WINDOWS ? 180_000 : 60_000);
 });
 
 describe("real notifier leftover group (registry-attributed cleanup)", () => {
   it("a close-cleanup launch child survives its dead leader and down cleans it via the power registry", async () => {
+    if (WINDOWS) { await windowsCleanupChain("single"); return; }
     const root = makeRig("f4r1");
     // A harmless herdr fixture: reports its pid/ppid, ignores SIGTERM (the
     // hang shape), persists until killed — exactly the reviewer's chain.
@@ -581,7 +851,7 @@ describe("real notifier leftover group (registry-attributed cleanup)", () => {
       // The hang shape: freeze both children, kill ONLY the notifier leader.
       process.kill(launcher, "SIGSTOP");
       process.kill(helper, "SIGSTOP");
-      process.kill(state.notifier.pid, "SIGKILL");
+      process.kill(state.notifier.pid!, "SIGKILL");
       for (let i = 0; i < 100 && alive(state.notifier.pid); i++) await new Promise((resolve) => setTimeout(resolve, 25));
       expect(alive(state.notifier.pid)).toBe(false);
       expect(alive(launcher)).toBe(true); // the leftover group is leaderless
@@ -599,14 +869,14 @@ describe("real notifier leftover group (registry-attributed cleanup)", () => {
       delete process.env.TUT_HERDR_EXECUTABLE;
       delete process.env.TUT_TEST_HANDOFF;
     }
-  }, 120_000);
+  }, WINDOWS ? 240_000 : 120_000);
 
   it("registry round-trip tolerates corrupt lines; up never rewrites it (no lost-append window)", async () => {
     const root = makeRig("registry");
     const { appendPowerMember, readPowerMembers } = await import("../src/standalone/power/standalone-up.js");
     const storageDir = path.join(root, ".context-hub");
     writeFileSync(path.join(storageDir, "power-members.jsonl"), "{corrupt\n" + JSON.stringify({ pid: 1, pgid: 2, power_session: "other", kind: "x", registered_at: new Date().toISOString(), start_token: "ps:x" }) + "\n");
-    await appendPowerMember(storageDir, { pid: deadPid(), pgid: 1, power_session: "stale-dead", kind: "launch:cleanup", registered_at: new Date().toISOString(), start_token: "ps:Wed Jan  1 00:00:00 2020" }); // retireable junk — must still not be touched
+    await appendPowerMember(storageDir, { pid: deadPid(), pgid: 1, power_session: "stale-dead", kind: "launch:cleanup", registered_at: new Date().toISOString(), start_token: WINDOWS ? "windows:0" : "ps:Wed Jan  1 00:00:00 2020" }); // retireable junk — must still not be touched
     const members = await readPowerMembers(storageDir);
     expect(members).toHaveLength(2); // corrupt line skipped, both well-formed lines kept
     expect(members.filter((m: { power_session: string }) => m.power_session === "other")).toHaveLength(1);
@@ -624,6 +894,7 @@ describe("real notifier leftover group (registry-attributed cleanup)", () => {
 describe("an idempotent up keeps reused-service sessions and live member registration", () => {
   for (const phase of ["before-registration", "after-registration"] as const) {
     it(`repeat up ${phase} preserves attribution: leaderless leftover group still cleans up`, async () => {
+    if (WINDOWS) { await windowsCleanupChain(phase); return; }
       const root = makeRig(`f4r2-${phase === "before-registration" ? "before" : "after"}`);
       const handoff = path.join(root, "herdr-child.json");
       const fixture = path.join(root, "herdr-fixture");
@@ -693,7 +964,7 @@ describe("an idempotent up keeps reused-service sessions and live member registr
           process.kill(launcher, "SIGSTOP");
           process.kill(helper, "SIGSTOP");
         }
-        process.kill(first.notifier.pid, "SIGKILL");
+        process.kill(first.notifier.pid!, "SIGKILL");
         for (let i = 0; i < 100 && alive(first.notifier.pid); i++) await new Promise((resolve) => setTimeout(resolve, 25));
         expect(alive(launcher)).toBe(true); // the leftover group is leaderless
 
@@ -707,12 +978,13 @@ describe("an idempotent up keeps reused-service sessions and live member registr
         delete process.env.TUT_HERDR_EXECUTABLE;
         delete process.env.TUT_TEST_HANDOFF;
       }
-    }, 150_000);
+    }, WINDOWS ? 240_000 : 150_000);
   }
 });
 
 describe("an up overlapping a real launch registration never loses the member", () => {
   it("second up frozen mid-flight while the close-cleanup child registers: the line survives, the leaderless group still cleans up", async () => {
+    if (WINDOWS) { await windowsCleanupChain("overlap"); return; }
     const root = makeRig("f4r3");
     const handoff = path.join(root, "herdr-child.json");
     const fixture = path.join(root, "herdr-fixture");
@@ -756,7 +1028,7 @@ describe("an up overlapping a real launch registration never loses the member", 
         "})();\n", { mode: 0o755 });
 
       const savedPath = process.env.PATH;
-      process.env.PATH = `${binDir}:${savedPath}`;
+      process.env.PATH = [binDir, savedPath].join(path.delimiter);
       process.env.TUT_TEST_PS_PID = frozenPid;
       process.env.TUT_TEST_PS_READY = ready;
       process.env.TUT_TEST_PS_RELEASE = release;
@@ -795,7 +1067,7 @@ describe("an up overlapping a real launch registration never loses the member", 
       const helper = chain!.pid;
       process.kill(launcher, "SIGSTOP");
       process.kill(helper, "SIGSTOP");
-      process.kill(first.notifier.pid, "SIGKILL");
+      process.kill(first.notifier.pid!, "SIGKILL");
       for (let i = 0; i < 100 && alive(first.notifier.pid); i++) await new Promise((resolve) => setTimeout(resolve, 25));
       expect(await main(["down"])).toBe(0); // attribution held → safe escalation cleanup
       expect(io.out()).toContain("verifies against this rig's power registry");
@@ -807,7 +1079,7 @@ describe("an up overlapping a real launch registration never loses the member", 
       delete process.env.TUT_HERDR_EXECUTABLE;
       delete process.env.TUT_TEST_HANDOFF;
     }
-  }, 150_000);
+  }, WINDOWS ? 240_000 : 150_000);
 });
 
 describe("watcher lifecycle across down/up and standalone watcher exit", () => {
@@ -832,14 +1104,14 @@ describe("watcher lifecycle across down/up and standalone watcher exit", () => {
       expect(second.watcher?.pid).not.toBe(firstWatcher);
 
       // A lone watcher exit (rig otherwise up) also recovers on the next up.
-      killPid(second.watcher?.pid);
+      await killPid(second.watcher?.pid);
       for (let i = 0; i < 50 && alive(second.watcher?.pid ?? null); i++) await new Promise((resolve) => setTimeout(resolve, 50));
       expect(await main(["up"])).toBe(0);
       const third = readState(root);
       expect(third.watcher?.pid).not.toBe(second.watcher?.pid);
       expect(alive(third.watcher?.pid ?? null)).toBe(true);
     } finally { io.restore(); }
-  }, 120_000);
+  }, WINDOWS ? 240_000 : 120_000);
 
   it("a LIVE watcher keeps its facts when the token probe transiently fails (ps frozen)", async () => {
     const root = makeRig("f6-transient", "on");
@@ -849,6 +1121,16 @@ describe("watcher lifecycle across down/up and standalone watcher exit", () => {
       const first = readState(root);
       const watcherPid = first.watcher?.pid;
       expect(watcherPid).toBeDefined();
+      if (WINDOWS) {
+        await overlapWindowsUp(watcherPid!, async () => {
+          expect(alive(watcherPid)).toBe(true);
+          expect(readState(root).watcher?.start_token).toBe(first.watcher?.start_token);
+        });
+        expect(io.out()).toContain(`up: usage watcher already running (pid ${watcherPid})`);
+        expect(readState(root).watcher).toEqual(first.watcher);
+        expect(alive(watcherPid)).toBe(true);
+        return;
+      }
       // Same ps-delegate freeze as above, keyed on the watcher pid.
       const binDir = path.join(root, "bin");
       mkdirSync(binDir, { recursive: true });
@@ -866,7 +1148,7 @@ describe("watcher lifecycle across down/up and standalone watcher exit", () => {
         "  process.stdout.write(r.stdout || \"\"); process.stderr.write(r.stderr || \"\"); process.exitCode = r.status ?? 1;\n" +
         "})();\n", { mode: 0o755 });
       const savedPath = process.env.PATH;
-      process.env.PATH = `${binDir}:${savedPath}`;
+      process.env.PATH = [binDir, savedPath].join(path.delimiter);
       process.env.TUT_TEST_PS_PID = String(watcherPid);
       process.env.TUT_TEST_PS_READY = ready;
       process.env.TUT_TEST_PS_RELEASE = release;
@@ -888,5 +1170,153 @@ describe("watcher lifecycle across down/up and standalone watcher exit", () => {
       expect(readState(root).watcher?.pid).toBe(watcherPid);
       expect(alive(watcherPid ?? null)).toBe(true);
     } finally { io.restore(); }
-  }, 120_000);
+  }, WINDOWS ? 240_000 : 120_000);
+});
+
+
+describe("power drift detection and explicit adoption", () => {
+  it.each(["default", "custom"])("%s ports: reports dead registrations read-only, requires opt-in, preserves adoption facts, and down stops the services", async (ports) => {
+    const root = makeRig("drift");
+    const storage = path.join(root, ".context-hub");
+    const upArgs: string[] = [];
+    if (ports === "custom") {
+      const { createServer } = await import("node:net");
+      const servers = [createServer(), createServer()];
+      for (const server of servers) await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+      upArgs.push("--url", `http://127.0.0.1:${(servers[0]!.address() as { port: number }).port}`, "--event-port", String((servers[1]!.address() as { port: number }).port));
+      for (const server of servers) await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+    const io = captureIo();
+    try {
+      expect(await main(["up", ...upArgs])).toBe(0);
+      const original = (await readPowerState(storage))!;
+      rememberServices(original);
+      STRAY_PIDS.push(original.hub.pid!, original.notifier.pid!);
+      const dead = deadPid();
+      await writePowerState(storage, { ...original,
+        hub: { ...original.hub, pid: dead, ...serviceScope(dead) },
+        notifier: { ...original.notifier, pid: dead, ...serviceScope(dead) },
+      });
+      const before = readFileSync(path.join(storage, "power.json"), "utf8");
+      const report = await runDoctor({ root: storage, hubRoot: root, url: original.hub.url });
+      const power = report.checks.find(check => check.name === "power")!;
+      expect(power.status).toBe("warn");
+      expect(power.summary).toContain("power drift");
+      expect(power.details.join("\n")).toContain(`registered PID ${dead} is dead`);
+      expect(power.details.filter(line => line.includes("unregistered"))).toHaveLength(2);
+      expect(readFileSync(path.join(storage, "power.json"), "utf8")).toBe(before);
+
+      expect(await main(["up", "--adopt", "--dry-run"])).toBe(0);
+      expect(io.out()).toContain("[dry-run] would adopt");
+      expect(readFileSync(path.join(storage, "power.json"), "utf8")).toBe(before);
+      expect(alive(original.hub.pid)).toBe(true);
+      expect(await main(["up", ...upArgs])).toBe(0);
+      expect(io.err()).toContain("power drift");
+      const unowned = (await readPowerState(storage))!;
+      expect(unowned.hub.pid).toBeNull();
+      expect(unowned.notifier.pid).toBeNull();
+      expect(unowned.hub.adopted).toBeUndefined();
+      expect(await main(["down"])).toBe(1);
+      expect(alive(original.hub.pid)).toBe(true);
+      expect(alive(original.notifier.pid)).toBe(true);
+
+      expect(await main(["up", "--adopt"])).toBe(0);
+      const adopted = (await readPowerState(storage))!;
+      expect(adopted.hub.pid).toBe(original.hub.pid);
+      expect(adopted.notifier.pid).toBe(original.notifier.pid);
+      for (const name of ["hub", "notifier"] as const) {
+        expect(adopted[name].adopted).toBe(true);
+        expect(adopted[name].session_inherited).toBe(false);
+        expect(adopted[name].start_token).toBe(await processStartToken(original[name].pid!));
+        expect(adopted[name].power_session).toBeTruthy();
+        expect(adopted[name].power_session).not.toBe(original[name].power_session);
+      }
+      expect(io.out()).toContain("TUT_POWER_SESSION cannot be injected");
+      if (WINDOWS) {
+        expect(adopted.hub.pgid).toBeNull();
+        expect(adopted.notifier.pgid).toBeNull();
+        expect(adopted.hub.process_scope).toBe("windows-tree");
+        expect(adopted.notifier.process_scope).toBe("windows-tree");
+      }
+      expect(await main(["up", "--adopt"])).toBe(0);
+      expect((await readPowerState(storage))!.hub).toEqual(adopted.hub);
+      expect((await readPowerState(storage))!.notifier).toEqual(adopted.notifier);
+      const adoptedReport = await runDoctor({ root: storage, hubRoot: root, url: original.hub.url });
+      const adoptedCheck = adoptedReport.checks.find(check => check.name === "power")!;
+      expect(adoptedCheck.status).toBe("ok");
+      expect(adoptedCheck.details.join("\n")).toContain("session_inherited=false");
+      expect(await main(["down"])).toBe(0);
+      expect(alive(original.hub.pid)).toBe(false);
+      expect(alive(original.notifier.pid)).toBe(false);
+    } finally { io.restore(); }
+  }, WINDOWS ? 180_000 : 30_000);
+
+  it("refuses foreign-root adoption without writing state or stopping either service", async () => {
+    const owner = makeRig("adopt-owner");
+    const io = captureIo();
+    try {
+      expect(await main(["up"])).toBe(0);
+      const live = readState(owner);
+      const other = makeRig("adopt-foreign");
+      expect(await main(["up", "--adopt", "--url", live.hub.url])).toBe(1);
+      expect(io.err()).toMatch(/foreign hub.*workspace mismatch/);
+      expect(existsSync(path.join(other, ".context-hub", "power.json"))).toBe(false);
+      expect(alive(live.hub.pid)).toBe(true);
+      expect(alive(live.notifier.pid)).toBe(true);
+      await expect(adoptService("hub", live.hub.url, other, live.hub.url)).rejects.toThrow("ownership verification failed");
+    } finally { io.restore(); }
+  }, WINDOWS ? 60_000 : 15_000);
+
+  it("refuses adopting a same-root listener in the caller's shared group", async () => {
+    const root = makeRig("adopt-shared");
+    const { createServer } = await import("node:http");
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ hub_root: realpathSync(root) }));
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const url = `http://127.0.0.1:${port}`;
+      if (WINDOWS) {
+        // Windows has no caller PGID. Listener adoption records its actual
+        // creation identity; the stop boundary must still protect the caller.
+        const facts = await adoptService("hub", url, root, url);
+        expect(facts.pid).toBe(process.pid);
+        expect(facts.pgid).toBeNull();
+        expect(facts.process_scope).toBe("windows-tree");
+        expect(facts.start_token).toBe(await processStartToken(process.pid));
+        await expect(stopWindowsService(root, facts.pid!, facts.start_token)).rejects.toThrow("service PID belongs to a run or the caller");
+        expect(existsSync(path.join(root, ".context-hub", "power.json"))).toBe(false);
+      } else {
+        await expect(adoptService("hub", url, root, url)).rejects.toThrow("not an independent process-group leader");
+      }
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  it("requires the Hub handshake even when a notifier claims the requested root", async () => {
+    const root = makeRig("adopt-notifier-handshake");
+    const { createServer } = await import("node:http");
+    let url = "";
+    const server = createServer((req, res) => {
+      const event = req.url === "/agent-event";
+      res.writeHead(event ? 405 : 200, { "Content-Type": "application/json", ...(event ? { Allow: "POST" } : {}) });
+      res.end(JSON.stringify({ hub_root: event ? realpathSync(root) : path.join(root, "foreign"), hub_url: url }));
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+    url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      await expect(adoptService("notifier", `${url}/agent-event`, root, url)).rejects.toThrow("ownership verification failed");
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  it("rejects --adopt in herdr mode", async () => {
+    const root = makeRig("adopt-herdr");
+    writeFileSync(path.join(root, ".context-hub", "config.json"), JSON.stringify({ power: { mode: "herdr" } }));
+    const io = captureIo();
+    try {
+      expect(await main(["up", "--adopt", "--dry-run"])).toBe(1);
+      expect(io.err()).toContain("--adopt requires power.mode=standalone");
+    } finally { io.restore(); }
+  });
 });

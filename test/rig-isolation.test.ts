@@ -59,19 +59,21 @@ describe("rig isolation", () => {
         await writeFile(workerPath, worker);
         const invocation = buildLaunchInvocation({
           request: { kind: "round", task_id: "same-task", role: "executor", fresh: false, via: "legacy" },
-          base_version: 0, hub_url: hub.url, route: { agent: process.execPath, args: [workerPath] }, route_source: "builtin-default",
+          base_version: 0, hub_url: hub.url, route: { agent: "node", args: [workerPath.replaceAll("\\", "/")] }, route_source: "builtin-default",
           context: { anchor, hubRoot: root, routingRoot: root, checkoutRoot: root, checkout: { kind: "current" }, context: { kind: "shared" }, source: "anchor" },
           naming: { tab_label: "TUT executor", pane_label: rigLabel("same-task.executor", root) }, prompt: "test",
-          posix_direct: { executable: process.execPath, args: [workerPath], env: { TUT_EVENT_PORT_URL: eventUrl } },
+          ...(process.platform === "win32"
+            ? { effective_agent: { executable: process.execPath, args: [workerPath], env: { TUT_EVENT_PORT_URL: eventUrl } } }
+            : { posix_direct: { executable: "node", args: [workerPath], env: { TUT_EVENT_PORT_URL: eventUrl } } }),
         });
-        const commandText = renderInvocationPaneCommand(invocation, "posix").command_text;
+        const commandText = renderInvocationPaneCommand(invocation, process.platform === "win32" ? "powershell5" : "posix").command_text;
         const calls: string[][] = [];
         const paneId = await birthPane({
           anchor, birthCwd: root, tabLabel: "TUT executor", paneLabel: invocation.naming.pane_label,
           commandText, paneEnvironment: rigEnvironment(root, hub.url, eventUrl),
           client: { command: async (args: readonly string[]) => {
             calls.push([...args]);
-            if (args[0] === "pane" && args[1] === "run") await exec("/bin/sh", ["-c", args[3]!], { env: { ...process.env, TUT_HUB_URL: "http://127.0.0.1:1", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" } });
+            if (args[0] === "pane" && args[1] === "run") await exec(process.platform === "win32" ? "powershell.exe" : "/bin/sh", process.platform === "win32" ? ["-NoProfile", "-NonInteractive", "-Command", args[3]!] : ["-c", args[3]!], { env: { ...process.env, PATH: [path.dirname(process.execPath), process.env.PATH].join(path.delimiter), TUT_HUB_URL: "http://127.0.0.1:1", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" } });
             return { code: 0, signal: null, stderr: "", stdout: JSON.stringify({ result: { tab: { tab_id: `tab${i}` }, root_pane: { pane_id: `worker${i}` } } }) };
           } },
         });

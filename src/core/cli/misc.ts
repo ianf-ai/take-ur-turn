@@ -10,10 +10,10 @@ import { DEFAULT_HUB_URL, cliFetchInit, isHubUnreachable, hubUnreachableLine, pr
 import { type ParsedArgs } from "./args.js";
 import { readRepairSnapshot } from "./repair-snapshot.js";
 
-// --- tut repair-meta / recover-record (storage repair clients, 4.3) ----------------
+// --- tut repair-meta / recover-record (storage repair clients) ----------------
 
 /**
- * Shared client for the two repair endpoints (system-design 4.3): POST the
+ * Shared client for the two repair endpoints: POST the
  * JSON body to the running hub — repairs must go through the hub's
  * single-writer queue, never a second process writing files directly. Owns
  * the failure surface the same way tut mode does: a network-level failure
@@ -47,7 +47,7 @@ async function runRepairPost(pathname: string, url: string, body: unknown, comma
   return 0;
 }
 
-/** tut repair-meta — meta rebuild of a corrupt meta.json (system-design 4.3). */
+/** tut repair-meta — meta rebuild of a corrupt meta.json. */
 async function runRepairMeta(parsed: Extract<ParsedArgs, { command: "repair-meta" }>): Promise<number> {
   let prefill: Awaited<ReturnType<typeof readRepairSnapshot>> | undefined;
   if (parsed.fromSnapshot !== undefined) {
@@ -72,7 +72,7 @@ async function runRepairMeta(parsed: Extract<ParsedArgs, { command: "repair-meta
   }, "repair-meta");
 }
 
-/** tut recover-record — record-recovery registration (system-design 4.3). */
+/** tut recover-record — record-recovery registration. */
 async function runRecoverRecord(parsed: Extract<ParsedArgs, { command: "recover-record" }>): Promise<number> {
   return runRepairPost("/recover-record", parsed.url, {
     task_id: parsed.task_id,

@@ -107,7 +107,7 @@ describe("CLI launcher process boundaries", () => {
     process.env.TUT_DRY_RUN = "1";
     process.env.TUT_PROJECT_ROOT = temporary;
     process.env.TUT_USER_CONFIG_DIR = path.join(temporary, "user-config");
-    process.env.PATH = `${path.resolve(import.meta.dirname, "bin")}:${originalEnv.PATH ?? ""}`;
+    process.env.PATH = [path.resolve(import.meta.dirname, "bin"), originalEnv.PATH ?? ""].join(path.delimiter);
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       status: 200,

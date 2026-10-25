@@ -32,7 +32,7 @@ const paneSource = {
       pane_id: "w1:p0",
       label: "tut-hub",
       workspace_id: "w1",
-      cwd: "/hub/project",
+      cwd: path.resolve("/hub/project"),
       agent_status: "idle",
     }],
   }),
@@ -42,7 +42,7 @@ describe("task checkout metadata and execution routing", () => {
   it("freezes a worktree route in meta and exposes it through read/list", async () => {
     const root = tempRoot("tut-checkout-store-");
     const store = new Store(root);
-    const checkout = { kind: "worktree" as const, path: "/worktrees/task-a", ref: "task-a" };
+    const checkout = { kind: "worktree" as const, path: path.resolve("/worktrees/task-a"), ref: "task-a" };
     const created = await store.createTask({
       title: "Checkout Task",
       description: "d",
@@ -87,31 +87,31 @@ describe("task checkout metadata and execution routing", () => {
       description: "d",
       creator: "host",
       role: "human",
-      checkout: { kind: "worktree", path: "/worktrees/a", ref: "task-a" },
+      checkout: { kind: "worktree", path: path.resolve("/worktrees/a"), ref: "task-a" },
     });
-    expect((await store.readTask(created.task_id)).checkout).toEqual({ kind: "worktree", path: "/worktrees/a", ref: "task-a" });
+    expect((await store.readTask(created.task_id)).checkout).toEqual({ kind: "worktree", path: path.resolve("/worktrees/a"), ref: "task-a" });
   });
 
   it("routes two direct tasks concurrently to separate checkout roots with one shared Hub root", async () => {
     const root = tempRoot("tut-checkout-parallel-");
     const store = new Store(root);
     const [taskA, taskB] = await Promise.all([
-      store.createTask({ title: "Parallel A", description: "d", creator: "host", role: "human", flow: "direct", checkout: { kind: "worktree", path: "/worktrees/a" } }),
-      store.createTask({ title: "Parallel B", description: "d", creator: "host", role: "human", flow: "direct", checkout: { kind: "worktree", path: "/worktrees/b" } }),
+      store.createTask({ title: "Parallel A", description: "d", creator: "host", role: "human", flow: "direct", checkout: { kind: "worktree", path: path.resolve("/worktrees/a") } }),
+      store.createTask({ title: "Parallel B", description: "d", creator: "host", role: "human", flow: "direct", checkout: { kind: "worktree", path: path.resolve("/worktrees/b") } }),
     ]);
     const [metaA, metaB] = await Promise.all([
       store.readTask(taskA.task_id),
       store.readTask(taskB.task_id),
     ]);
     const [contextA, contextB] = await Promise.all([
-      resolveExecutionContext({ client: paneSource, caller_cwd: "/caller", env: {}, dry_run: false, ...(metaA.checkout !== undefined ? { checkout: metaA.checkout } : {}) }),
-      resolveExecutionContext({ client: paneSource, caller_cwd: "/caller", env: {}, dry_run: false, ...(metaB.checkout !== undefined ? { checkout: metaB.checkout } : {}) }),
+      resolveExecutionContext({ client: paneSource, caller_cwd: path.resolve("/caller"), env: {}, dry_run: false, ...(metaA.checkout !== undefined ? { checkout: metaA.checkout } : {}) }),
+      resolveExecutionContext({ client: paneSource, caller_cwd: path.resolve("/caller"), env: {}, dry_run: false, ...(metaB.checkout !== undefined ? { checkout: metaB.checkout } : {}) }),
     ]);
 
-    expect(contextA.hubRoot).toBe("/hub/project");
-    expect(contextB.hubRoot).toBe("/hub/project");
-    expect(contextA.checkoutRoot).toBe("/worktrees/a");
-    expect(contextB.checkoutRoot).toBe("/worktrees/b");
+    expect(contextA.hubRoot).toBe(path.resolve("/hub/project"));
+    expect(contextB.hubRoot).toBe(path.resolve("/hub/project"));
+    expect(contextA.checkoutRoot).toBe(path.resolve("/worktrees/a"));
+    expect(contextB.checkoutRoot).toBe(path.resolve("/worktrees/b"));
     expect(contextA.checkoutRoot).not.toBe(contextB.checkoutRoot);
     expect(contextA.checkout).toEqual(metaA.checkout);
     expect(contextB.checkout).toEqual(metaB.checkout);
@@ -120,10 +120,10 @@ describe("task checkout metadata and execution routing", () => {
   it("keeps a worktree route in the private child invocation and changes no marker fields", async () => {
     const context = await resolveExecutionContext({
       client: paneSource,
-      caller_cwd: "/caller",
+      caller_cwd: path.resolve("/caller"),
       env: {},
       dry_run: false,
-      checkout: { kind: "worktree", path: "/worktrees/a" },
+      checkout: { kind: "worktree", path: path.resolve("/worktrees/a") },
     });
     const invocation = buildLaunchInvocation({
       request: { kind: "round", task_id: "task-a", role: "executor", fresh: false, via: "start-next" },
@@ -136,7 +136,7 @@ describe("task checkout metadata and execution routing", () => {
       posix_direct: { executable: "node", args: [], env: {} },
     });
     const roundTrip = validateLaunchInvocation(JSON.parse(serializeLaunchInvocation(invocation)));
-    expect(roundTrip.context.checkout).toEqual({ kind: "worktree", path: "/worktrees/a" });
+    expect(roundTrip.context.checkout).toEqual({ kind: "worktree", path: path.resolve("/worktrees/a") });
     expect(roundTrip.marker_projection).not.toHaveProperty("checkoutRoot");
     expect(roundTrip.marker_projection).not.toHaveProperty("hubRoot");
   });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { closeSync, mkdtempSync, readFileSync, renameSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, lstatSync, mkdtempSync, readFileSync, renameSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -10,6 +10,17 @@ import { RunStore, type HeadlessOwnership, type RunMeta } from '../src/core/run/
 import { Store } from '../src/core/hub/store.js';
 import { Notifier, type StateResponse } from '../src/core/notifier/notifier.js';
 import type { Notification } from '../src/core/common/channels.js';
+
+// Policy/clock fixtures carry an explicit impossible PID. Keep that modeled
+// boundary cheap; the real supervisor case and native safety cases stay native.
+vi.mock('../src/core/hub/windows-run-file.js', async original => {
+  const actual = await original<typeof import('../src/core/hub/windows-run-file.js')>();
+  return { ...actual, readWindowsRunMeta: (file: string) => {
+    const raw = readFileSync(file);
+    try { if (JSON.parse(raw.toString()).pid === 2147483000) return raw; } catch { /* actual reader classifies malformed data */ }
+    return actual.readWindowsRunMeta(file);
+  } };
+});
 
 const START = '2026-01-01T00:00:00.000Z';
 const END = '2026-01-01T00:01:00.000Z';
@@ -166,7 +177,7 @@ describe('log mtime silence edges', () => {
       base_version: 0, trigger_version: 0, hubRoot: f.root, routingRoot: f.root, checkoutRoot: f.root,
       hubUrl: 'http://127.0.0.1:1', route: headless.route, route_source: 'task-cast', argv: ['fixture'],
       prompt: 'fixture', env: {}, ownership: headless, target_digest: 'sha256:fixture' });
-    await vi.waitFor(() => expect(f.logs.some(l => l.includes(outcome === 'success' ? 'headless started' :
+    await vi.waitFor(() => expect(f.logs.some(l => l.includes(outcome === 'success' ? 'detached started' :
       outcome === 'uncertain' ? 'reason=startup-unconfirmed' : 'reason=spawn-failed'))).toBe(true));
     for (const now of [100, 120, 150]) {
       runtime.syncNew();
@@ -189,13 +200,13 @@ describe('log mtime silence edges', () => {
       expect(f.runtime.busy(f.task)).toBe(true);
     });
     const id = await control.startRun(f.runtime.store, [process.execPath, '-e',
-      "process.on('SIGINT',()=>process.exit(0)); console.log('ready'); setInterval(()=>{},1000)"], f.root, f.task, { headless });
+      "process.on('SIGINT',()=>process.exit(0)); console.log('ready'); setInterval(()=>{},1000);setTimeout(()=>process.exit(124),120000).unref()"], f.root, f.task, { headless });
     try {
       await vi.waitFor(() => {
         const fd = f.runtime.store.openLog(id);
         try { expect(readFileSync(fd, 'utf8')).toContain('ready'); } finally { closeSync(fd); }
       }, { timeout: 3000 });
-      expect(f.runtime.store.read(id).control_protocol).toBe('cooperative-v1');
+      expect(f.runtime.store.read(id).control_protocol).toBe(process.platform === 'win32' ? 'windows-console-v1' : 'cooperative-v1');
       for (const now of [100, 120, 150]) {
         f.runtime.syncNew();
         await f.runtime.observe({ now, stallMs: 10, tasks: new Map([[f.task, { status: 'implementing' }]]) });
@@ -204,7 +215,7 @@ describe('log mtime silence edges', () => {
     } finally {
       expect((await control.stopRun(f.runtime.store, id)).success).toBe(true);
     }
-  });
+  }, process.platform === 'win32' ? 90000 : 5000);
   it.each(['identity', 'supervisor', 'unreadable'] as const)('keeps an adopted reservation unarmed with %s uncertainty', async kind => {
     const f = await fixture(); f.runtime.restore();
     const id = f.runtime.store.create();
@@ -298,7 +309,7 @@ describe('log mtime silence edges', () => {
     const tick = (now: number) => f.runtime.observe({ now, stallMs: 100, tasks: new Map([[f.task, { status: 'implementing' }]]) });
     await tick(0); renameSync(log, `${log}.saved`);
     await tick(1000); expect(f.reasons('suspected-blocked/silent')).toHaveLength(0);
-    expect(f.logs.some(l => l.includes('headless log observation failed') && l.includes('ENOENT'))).toBe(true);
+    expect(f.logs.some(l => l.includes('detached log observation failed') && l.includes('ENOENT'))).toBe(true);
     renameSync(`${log}.saved`, log); await tick(2000); await tick(2099);
     expect(f.reasons('suspected-blocked/silent')).toHaveLength(0);
     await tick(2100); expect(f.reasons('suspected-blocked/silent')).toHaveLength(1);
@@ -347,13 +358,15 @@ describe('log mtime silence edges', () => {
     `, f.root, f.task, m.run_id], { encoding: 'utf8', timeout: 3000, killSignal: 'SIGKILL' });
     const result = JSON.parse(output);
     expect(result.rejected).toContain('not a regular run file');
-    expect(result.logs.filter((l: string) => l.includes('headless log observation failed') && l.includes('not a regular'))).toHaveLength(2);
+    expect(result.logs.filter((l: string) => l.includes('detached log observation failed') && l.includes('not a regular'))).toHaveLength(2);
     expect(result.messages.some((m: Notification) => m.body.includes('reason=suspected-blocked/silent'))).toBe(false);
     expect(result.launches).toBe(1);
   });
   it('RunStore rejects a symlink and a non-regular log without reading content', async () => {
     const f = await fixture(); const id = f.runtime.store.create();
-    symlinkSync('/dev/null', path.join(f.runtime.store.directory(id), 'log'));
+    const target = path.join(f.root, 'real-log-target'); writeFileSync(target, 'must not be observed');
+    const linked = path.join(f.runtime.store.directory(id), 'log'); symlinkSync(target, linked);
+    expect(lstatSync(linked).isSymbolicLink()).toBe(true);
     expect(() => f.runtime.store.logInfo(id)).toThrow();
     const id2 = f.runtime.store.create();
     const { mkdirSync } = await import('node:fs'); mkdirSync(path.join(f.runtime.store.directory(id2), 'log'));
@@ -364,7 +377,7 @@ describe('log mtime silence edges', () => {
 async function notifierFixture(f: Awaited<ReturnType<typeof fixture>>) {
   vi.stubEnv('TUT_HUB_ROOT', f.root);
   let version = (await f.hub.readTask(f.task)).versions.length;
-  let mode: 'headless' | 'tui' = 'headless', present = true, now = NOW;
+  let mode: 'detached' | 'tui' = 'detached', present = true, now = NOW;
   const state = (): StateResponse => ({ flow_mode: 'manual', tasks: present ? [{ task_id: f.task, title: f.task, version, status: 'implementing', waiting_for: 'agent:executor', needs_attention: false, updated_at: String(version) }] : [], degraded: present ? [] : [f.task] });
   const read = vi.fn(async (id: string) => (await f.hub.readTask(id)).versions);
   const launch = vi.fn(async () => 'launched');
@@ -392,7 +405,7 @@ describe('delivery timeline and Notifier version intervals', () => {
       if (reset === 'mode') { h.mode('tui'); await h.tick(); }
       if (reset === 'missing') { h.present(false); await h.tick(); }
       if (reset === 'rollback') { h.version(0); await h.tick(); }
-      const later = await f.append('revision'); h.version(later.version); h.mode('headless'); h.present(true);
+      const later = await f.append('revision'); h.version(later.version); h.mode('detached'); h.present(true);
       if (reset === 'rollback') { // A rewind establishes a baseline at 0; a new version after it is a genuine new edge.
         h.version(0); await h.tick(); h.present(false); await h.tick(); h.present(true); h.version(later.version);
       }
@@ -496,12 +509,12 @@ describe('delivery timeline and Notifier version intervals', () => {
       h.now(NOW + step * 5000);
       if (step % 2880 === 0) {
         const phase = step / 2880;
-        h.mode(phase === 1 ? 'tui' : 'headless');
+        h.mode(phase === 1 ? 'tui' : 'detached');
         if (phase === 2) await f.append('note', 'human', { launch: { role: 'executor', base_version: (await f.hub.readTask(f.task)).versions.length } }); // legacy
         if (phase === 3) await f.append('note', 'human', { launch: { role: 'executor', base_version: (await f.hub.readTask(f.task)).versions.length, launch_mode: 'headless', attempt_id: foreignAttempt } });
         if (phase === 4) await f.run({ headless: undefined }, 0, false); // manual run proves no headless identity
         if (phase === 5) h.mode('tui');
-        if (phase === 6) h.mode('headless');
+        if (phase === 6) h.mode('detached');
         const r = await f.append('revision'); h.version(r.version);
       }
       await h.tick();

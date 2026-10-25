@@ -113,7 +113,7 @@ describe("space-path provisioning e2e (up → serve → notify)", () => {
     const self = path.join(project, "dist", "cli.js");
     const logPath = path.join(project, "herdr.log");
 
-    process.env.PATH = `${TEST_BIN}:${NODE_BIN_DIR}:/usr/bin:/bin`;
+    process.env.PATH = [TEST_BIN, NODE_BIN_DIR, "/usr/bin", "/bin"].join(path.delimiter);
     process.env.TUT_HERDR_LOG = logPath;
     process.env.TUT_HERDR_PANES = JSON.stringify([{ pane_id: "FIX:p0", label: "exec" }]);
     process.env.TUT_UP_CLI_SELF = self;
@@ -145,8 +145,8 @@ describe("space-path provisioning e2e (up → serve → notify)", () => {
       // THE assertion set: both pane-run lines quote the space-carrying cwd
       // and cli path as single words — the renderer's on-demand sq, with the
       // legacy `cd <cwd> && node <cli> …` shape otherwise intact.
-      expect(logLines(logPath)).toContain(`pane run FIX:p1 cd '${project}' && TUT_HUB_ROOT='${project}' TUT_HUB_URL=http://127.0.0.1:3001 TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event node '${self}' serve`);
-      expect(logLines(logPath)).toContain(`pane run FIX:p2 cd '${project}' && TUT_HUB_ROOT='${project}' TUT_HUB_URL=http://127.0.0.1:3001 TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event node '${self}' notify`);
+      expect(logLines(logPath)).toContain(`pane run FIX:p1 cd '${project}' && TUT_HUB_ROOT='${project}' TUT_HUB_URL=http://127.0.0.1:3001 TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event ${process.platform === 'win32' ? `'${process.execPath}'` : 'node'} '${self}' serve`);
+      expect(logLines(logPath)).toContain(`pane run FIX:p2 cd '${project}' && TUT_HUB_ROOT='${project}' TUT_HUB_URL=http://127.0.0.1:3001 TUT_EVENT_PORT_URL=http://127.0.0.1:3002/agent-event ${process.platform === 'win32' ? `'${process.execPath}'` : 'node'} '${self}' notify`);
       expect(io.out()).toContain("up: hub serving on http://127.0.0.1:3001");
       expect(io.out()).toContain("up: notify running");
     } finally {
@@ -185,3 +185,7 @@ describe("CP936-adjacent simulation: CJK paths cross every dialect byte-exactly"
     expect(command_text).toBe('cd /d "C:\\Users\\李四\\pro (x86)" && "C:\\Program Files (x86)\\nodejs\\node.exe" "notify"');
   });
 });
+
+// This suite inspects POSIX command text; target discovery still uses the real host.
+beforeEach(() => { vi.stubEnv("TUT_PANE_SHELL", "posix"); });
+afterEach(() => { vi.unstubAllEnvs(); });

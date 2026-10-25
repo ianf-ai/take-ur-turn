@@ -1,3 +1,4 @@
+import { writeNodeExecutable } from './helpers/executable.js';
 /**
  * launch.catchup (Notifier startup catchup) — the offline-window repair:
  * a waiting_for=agent:* edge that landed while the Notifier was down is
@@ -179,9 +180,8 @@ async function makeRig(opts: RigOpts = {}) {
   roots.push(root);
   const bin = path.join(root, "bin");
   mkdirSync(bin, { recursive: true });
-  const agent = path.join(bin, "codex");
-  writeFileSync(agent, `#!${process.execPath}\nconsole.log(JSON.stringify({type:'thread.started',thread_id:'11111111-1111-1111-1111-111111111111'}));\n`);
-  chmodSync(agent, 0o700);
+  const agentFile = path.join(bin, "codex");
+  const agent = writeNodeExecutable(agentFile, `console.log(JSON.stringify({type:'thread.started',thread_id:'11111111-1111-1111-1111-111111111111'}));`);
   mkdirSync(path.join(root, ".context-hub"), { recursive: true });
   writeFileSync(path.join(root, ".context-hub", "config.json"), JSON.stringify({
     flow_mode: "auto",
@@ -232,7 +232,7 @@ async function makeRig(opts: RigOpts = {}) {
   return { root, server, runtime, notifier, logs, messages, forbidden, taskId, runsOf, markers };
 }
 
-async function until(fn: () => boolean | Promise<boolean>, ms = 5000): Promise<void> {
+async function until(fn: () => boolean | Promise<boolean>, ms = process.platform === "win32" ? 45000 : 5000): Promise<void> {
   const end = performance.now() + ms;
   while (!await fn()) {
     if (performance.now() > end) throw new Error("condition timed out");
@@ -253,8 +253,8 @@ afterEach(async () => {
 });
 
 describe("launch.catchup wiring (headless-only repair)", () => {
-  it("headless + on: the missed offline edge gets its round — run + marker + audit line — exactly once", async () => {
-    const rig = await makeRig({ config: { launch_mode: "headless", launch: { catchup: "on" } } }); // subject is headless-only repair — pinned explicit
+  it.each(["detached", "headless"])("%s + on: the missed offline edge gets its round — run + marker + audit line — exactly once", async (mode) => {
+    const rig = await makeRig({ config: { launch_mode: mode, launch: { catchup: "on" } } }); // subject is headless-only repair — pinned explicit
     await rig.notifier.requestCompare(); // baseline folds the waiting edge; catchup must repair it
 
     await until(() => rig.runsOf().length === 1);

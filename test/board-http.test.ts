@@ -39,13 +39,14 @@ it("returns failures honestly, preserves healthy neighbors and never writes task
   await mkdir(path.join(root, "runs"));
   for (const id of ["healthy", "bad"]) await mkdir(path.join(root, "runs", id));
   const file = path.join(root, "runs", "healthy", "meta.json");
-  const bytes = JSON.stringify({ run_id: "healthy", pid: process.pid, pgid: process.pid, status: "running", argv: ["node"], started_at: new Date().toISOString() });
+  const startedAt = new Date().toISOString();
+  const bytes = JSON.stringify({ run_id: "healthy", pid: process.pid, pgid: process.pid, status: "running", argv: ["node"], started_at: startedAt });
   await writeFile(file, bytes); await writeFile(path.join(root, "runs", "healthy", "log"), "tail");
   const append = vi.spyOn(Store.prototype, "append");
   try {
     const before = await store.readTask("board-task");
     const body = await (await fetch(running.url + "/runs")).json() as { runs: unknown[] };
-    expect(body.runs).toHaveLength(2); expect(body.runs[0]).toMatchObject({ run_id: "healthy", degraded: false });
+    expect(body.runs).toHaveLength(2); expect(body.runs[0]).toMatchObject({ run_id: "healthy", degraded: false, started_at: startedAt });
     expect(body.runs[1]).toMatchObject({ run_id: "bad", degraded: true });
     expect(await readFile(file, "utf8")).toBe(bytes); expect(await store.readTask("board-task")).toEqual(before);
     expect(append).not.toHaveBeenCalled();

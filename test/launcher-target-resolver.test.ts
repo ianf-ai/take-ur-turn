@@ -1,3 +1,5 @@
+import { spawnFactProbeDefault } from "../src/core/launcher/target/windows-facts.js";
+import { fixtureExecutable } from "./helpers/executable.js";
 // Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
 vi.mock("../src/core/hub/rig-discovery.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/core/hub/rig-discovery.js")>()),
@@ -19,7 +21,8 @@ import { rigLabel } from "../src/core/hub/rig.js";
  * which results only for distro-variance rows (non-executable, directory).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -56,6 +59,18 @@ import {
 import { buildLaunchInvocation, deserializeLaunchInvocation, serializeLaunchInvocation, targetDigest } from "../src/core/launcher/invocation.js";
 import { runLaunchEntry } from "../src/core/launcher/entry.js";
 import type { AgentCommand, LaunchInvocation } from "../src/core/common/types.js";
+
+/** Native Windows paths in the VM; literal win32 names on POSIX hosts.
+ * Both forms reach the real filesystem adapters without touching a drive root. */
+function fixtureCandidate(dir: string, name: string): string {
+  return path.sep === "\\" ? path.join(dir, ...name.split("\\")) : `C:\\${name}`;
+}
+function fixtureFile(dir: string, name: string): string {
+  const candidate = fixtureCandidate(dir, name);
+  const file = path.sep === "\\" ? candidate : path.join(dir, candidate);
+  mkdirSync(path.dirname(file), { recursive: true });
+  return file;
+}
 
 // --- Windows fixtures --------------------------------------------------------------
 
@@ -111,10 +126,10 @@ describe("Windows executable target resolver", () => {
     // already a win32 absolute path, so path.win32.resolve keeps it byte-for-byte
     // while the production fs.stat/fs.open adapters find it relative to cwd.
     const dir = mkdtempSync(path.join(os.tmpdir(), "tut-mz-default-"));
-    const candidate = "C:\\pi-mz";
+    const candidate = fixtureCandidate(dir, "pi-mz");
     const prevCwd = process.cwd();
     try {
-      writeFileSync(path.join(dir, candidate), Buffer.from([0x4d, 0x5a, 0x00, 0x01, 0x00, 0x00]));
+      writeFileSync(fixtureFile(dir, "pi-mz"), Buffer.from([0x4d, 0x5a, 0x00, 0x01, 0x00, 0x00]));
       process.chdir(dir);
       // ONLY candidates is injected (no FS enumeration happens on POSIX
       // hosts); stat and readHeader run the production defaults against the
@@ -129,7 +144,8 @@ describe("Windows executable target resolver", () => {
       });
     } finally {
       process.chdir(prevCwd);
-      rmSync(dir, { recursive: true, force: true });
+      if (process.platform === 'win32') await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      else rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     }
   });
 
@@ -137,16 +153,19 @@ describe("Windows executable target resolver", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "tut-mz-negative-"));
     const prevCwd = process.cwd();
     try {
-      writeFileSync(path.join(dir, "C:\\pi-elf"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
-      writeFileSync(path.join(dir, "C:\\pi-empty"), Buffer.alloc(0));
+      writeFileSync(fixtureFile(dir, "pi-elf"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+      writeFileSync(fixtureFile(dir, "pi-empty"), Buffer.alloc(0));
       process.chdir(dir);
-      await expect(resolveWindowsExecutableTarget("pi", { candidates: cands("C:\\pi-elf") }))
-        .rejects.toThrowError(/C:\\pi-elf.*no PE header/u);
-      await expect(resolveWindowsExecutableTarget("pi", { candidates: cands("C:\\pi-empty") }))
-        .rejects.toThrowError(/C:\\pi-empty.*no PE header/u);
+      await expect(resolveWindowsExecutableTarget("pi", { candidates: cands(fixtureCandidate(dir, "pi-elf")) }))
+        .rejects.toThrowError(/no PE header/u);
+      await expect(resolveWindowsExecutableTarget("pi", { candidates: cands(fixtureCandidate(dir, "pi-empty")) }))
+        .rejects.toThrowError(/no PE header/u);
     } finally {
       process.chdir(prevCwd);
-      rmSync(dir, { recursive: true, force: true });
+      // Yield while original filesystem handles close; synchronous retries
+      // prevent libuv callbacks from making progress on Windows.
+      if (process.platform === 'win32') await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      else rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     }
   });
 
@@ -276,7 +295,7 @@ describe("Windows executable target resolver", () => {
 
   it("PATH-less environment falls back to the where.exe probe and reports its failure bounded", async () => {
     await expect(
-      resolveWindowsExecutableTarget("pi", { environment: { PATH: "" }, stat: async () => regularFile() }),
+      resolveWindowsExecutableTarget("tut-fixture-agent-never-installed", { environment: { PATH: "" }, stat: async () => regularFile() }),
     ).rejects.toThrowError(/where\.exe fallback/u);
   });
 });
@@ -347,10 +366,12 @@ describe("probe subprocess timeout (a hung where/which cannot stall the loop)", 
     const bin = mkdtempSync(path.join(os.tmpdir(), "tut-which-hang-"));
     const savedPath = process.env.PATH;
     writeFileSync(path.join(bin, "which"), "#!/bin/sh\nsleep 60\n", { mode: 0o755 });
-    process.env.PATH = `${bin}:${savedPath ?? ""}`;
+    process.env.PATH = [bin, savedPath ?? ""].join(path.delimiter);
     process.env.TUT_PROBE_TIMEOUT_MS = "300";
     try {
-      const error = await resolvePosixTargetPresence("pi").catch((e: unknown) => e);
+      const error = await resolvePosixTargetPresence("pi", path.sep === "\\" ? {
+        which: () => probeExecutable(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { timeoutMs: 300 }),
+      } : {}).catch((e: unknown) => e);
       expect(error).toBeInstanceOf(AgentTargetError);
       expect((error as Error).message).toMatch(/which failed: probe timed out after 300ms/u);
       expect((error as AgentTargetError).hint).toContain("install");
@@ -481,23 +502,31 @@ describe("Windows filesystem probe budget (dead-UNC stat/header cannot stall the
   it("production fact-probe child classifies real MZ/ELF/empty/dir/fifo candidates byte-exactly", async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "tut-fact-probe-"));
     const prevCwd = process.cwd();
+    const exits: Promise<void>[] = [];
+    const factProbe: NonNullable<WindowsTargetDeps["factProbe"]> = argv => {
+      const child = spawnFactProbeDefault(argv);
+      let done!: () => void;
+      exits.push(new Promise<void>(resolve => { done = resolve; }));
+      return { ...child, onEnd(callback) { child.onEnd(outcome => { done(); callback(outcome); }); } };
+    };
     try {
-      writeFileSync(path.join(dir, "C:\\fact"), Buffer.from([0x4d, 0x5a, 0x00, 0x01]));
-      writeFileSync(path.join(dir, "C:\\fact-elf"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
-      writeFileSync(path.join(dir, "C:\\fact-empty"), Buffer.alloc(0));
-      mkdirSync(path.join(dir, "C:\\fact-dir"));
+      writeFileSync(fixtureFile(dir, "fact"), Buffer.from([0x4d, 0x5a, 0x00, 0x01]));
+      writeFileSync(fixtureFile(dir, "fact-elf"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+      writeFileSync(fixtureFile(dir, "fact-empty"), Buffer.alloc(0));
+      mkdirSync(fixtureFile(dir, "fact-dir"));
       process.chdir(dir);
-      await expect(resolveWindowsExecutableTarget("fact", { environment: { PATH: "C:\\" } }))
-        .resolves.toEqual({ kind: "native", executable: "C:\\fact", prefix_args: [], source_path: "C:\\fact" });
-      await expect(resolveWindowsExecutableTarget("fact-elf", { environment: { PATH: "C:\\" } }))
+      await expect(resolveWindowsExecutableTarget("fact", { environment: { PATH: path.win32.dirname(fixtureCandidate(dir, "fact")) }, factProbe }))
+        .resolves.toEqual({ kind: "native", executable: fixtureCandidate(dir, "fact"), prefix_args: [], source_path: fixtureCandidate(dir, "fact") });
+      await expect(resolveWindowsExecutableTarget("fact-elf", { environment: { PATH: path.win32.dirname(fixtureCandidate(dir, "fact")) }, factProbe }))
         .rejects.toThrowError(/no PE header/u);
-      await expect(resolveWindowsExecutableTarget("fact-empty", { environment: { PATH: "C:\\" } }))
+      await expect(resolveWindowsExecutableTarget("fact-empty", { environment: { PATH: path.win32.dirname(fixtureCandidate(dir, "fact")) }, factProbe }))
         .rejects.toThrowError(/no PE header/u);
-      await expect(resolveWindowsExecutableTarget("fact-dir", { environment: { PATH: "C:\\" } }))
+      await expect(resolveWindowsExecutableTarget("fact-dir", { environment: { PATH: path.win32.dirname(fixtureCandidate(dir, "fact")) }, factProbe }))
         .rejects.toThrowError(/non-file/u);
     } finally {
       process.chdir(prevCwd);
-      rmSync(dir, { recursive: true, force: true });
+      await Promise.all(exits); // Release native cwd handles before removing the fixture.
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     }
   });
 
@@ -782,18 +811,29 @@ describe("POSIX which presence preflight", () => {
 
   afterEach(() => {
     process.env.PATH = savedPath;
-    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   });
 
   function fixtureBin(setup: (bin: string) => void): string {
     const bin = mkdtempSync(path.join(os.tmpdir(), "tut-posix-target-"));
     tempDirs.push(bin);
     setup(bin);
-    process.env.PATH = `${bin}:${savedPath}`;
+    process.env.PATH = [bin, savedPath].join(path.delimiter);
     return bin;
   }
 
-  it("accepts an extensionless shebang script, a symlink, and a native stub — via the real which", async () => {
+  it("resolves real host fixtures: POSIX scripts/symlink via which, Windows native entries", async () => {
+    if (path.sep === "\\") {
+      const bin = fixtureBin(dir => {
+        copyFileSync(fixtureExecutable(path.resolve(import.meta.dirname, "bin/pi")), path.join(dir, "native-agent.exe"));
+        symlinkSync(path.join(dir, "native-agent.exe"), path.join(dir, "linked-agent.exe"));
+      });
+      for (const agent of ["native-agent", "linked-agent"]) {
+        const target = await resolveWindowsExecutableTarget(agent, { environment: { PATH: bin, PATHEXT: ".EXE" } });
+        expect(target.executable).toBe(path.join(bin, `${agent}.exe`));
+      }
+      return;
+    }
     const bin = fixtureBin((dir) => {
       writeFileSync(path.join(dir, "shebang-agent"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       writeFileSync(path.join(dir, "real-native"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -808,7 +848,7 @@ describe("POSIX which presence preflight", () => {
 
   it("fails a missing agent with the agent name, which result, and a fix hint", async () => {
     fixtureBin(() => { /* empty bin */ });
-    const error = await resolvePosixTargetPresence("ghost-agent-x").catch((e: unknown) => e);
+    const error = await resolvePosixTargetPresence("ghost-agent-x", { which: async () => ({ code: 1, stdout: "" }) }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(AgentTargetError);
     expect((error as Error).message).toContain("agent 'ghost-agent-x' not on PATH");
     expect((error as Error).message).toContain("which");
@@ -850,7 +890,7 @@ describe("POSIX which presence preflight", () => {
       writeFileSync(path.join(dir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     });
     const route: AgentCommand = { agent: "pi", args: ["--flag", "with space"] };
-    const plan = await resolvePlatformExecutionPlan(route, { environment: {} });
+    const plan = await resolvePlatformExecutionPlan(route, { platform: "darwin", environment: {}, ...(path.sep === "\\" ? { posixDeps: { which: async () => ({code: 0, stdout: `${path.join(bin, "pi")}\n`}), stat: async () => regularFile() } } : {}) });
     expect(plan).toEqual({
       platform: "posix",
       posix_direct: { executable: "pi", args: ["--flag", "with space"], env: { PI_SKIP_VERSION_CHECK: "1" } },
@@ -859,7 +899,7 @@ describe("POSIX which presence preflight", () => {
   });
 
   it("fails the POSIX door plan before returning when presence fails", async () => {
-    await expect(resolvePlatformExecutionPlan({ agent: "ghost-door", args: [] }, { environment: {} }))
+    await expect(resolvePlatformExecutionPlan({ agent: "ghost-door", args: [] }, { platform: "darwin", environment: {} }))
       .rejects.toBeInstanceOf(AgentTargetError);
   });
 });
@@ -992,10 +1032,11 @@ describe("compat boundary with a Windows platform plan", () => {
       return true;
     });
     process.env.TUT_SUPPRESS_AGENT_UPDATE = "1";
-    process.env.TUT_HERDR_EXECUTABLE = path.join(FIXTURE_BIN, "herdr"); // any accidental call lands in the fixture log
+    process.env.TUT_HERDR_EXECUTABLE = fixtureExecutable(path.join(FIXTURE_BIN, "herdr")); // any accidental call lands in the fixture log
     process.env.TUT_HERDR_PANES = "[]";
     process.env.TUT_HERDR_LOG = herdrLog;
     process.env.TUT_DELIVERY_DIAG = "0";
+    process.env.TUT_PANE_SHELL = "posix";
     delete process.env.TUT_DRY_RUN;
   });
 
@@ -1070,7 +1111,7 @@ describe("compat boundary with a Windows platform plan", () => {
     process.env.TUT_PANE_SHELL = "fish";
     // The explicit route keeps even a regressed run off the Hub fetch; the
     // PATH prepend keeps the fixture herdr first if anything does run.
-    process.env.PATH = `${FIXTURE_BIN}:${savedPath ?? ""}`;
+    process.env.PATH = [FIXTURE_BIN, savedPath ?? ""].join(path.delimiter);
     try {
       const code = await runLaunchEntry({
         kind: "round",
@@ -1109,7 +1150,7 @@ describe("compat boundary with a Windows platform plan", () => {
       return true;
     });
     const userConfig = mkdtempSync(path.join(os.tmpdir(), "tut-legacy-dialect-"));
-    process.env.PATH = `${FIXTURE_BIN}:${saved.PATH ?? ""}`; // fixture `pi` satisfies the legacy preflight
+    process.env.PATH = [FIXTURE_BIN, saved.PATH ?? ""].join(path.delimiter); // fixture `pi` satisfies the legacy preflight
     process.env.TUT_DRY_RUN = "1";
     // Deterministic: hub down → degrade current/default (dummy task id; a
     // live hub on the default port must not leak its real /state here).
@@ -1140,7 +1181,7 @@ describe("compat boundary with a Windows platform plan", () => {
       expect(JSON.parse(Buffer.from(token, "base64url").toString("utf8"))).toEqual({
         protocol_version: 1,
         cwd: "<cwd>", // dry-run placeholder anchor — honest preview
-        executable: "pi",
+        executable: path.sep === "\\" ? fixtureExecutable(path.join(FIXTURE_BIN, "pi")) : "pi",
         args: ["--model", "glm"],
         env: { PI_SKIP_VERSION_CHECK: "1", TUT_HUB_ROOT: "<hub-root>", TUT_HUB_URL: "http://127.0.0.1:1", TUT_EVENT_PORT_URL: "http://127.0.0.1:1/agent-event" },
         purpose: "agent",
@@ -1177,16 +1218,16 @@ describe("start-next Windows target pre-check (before the marker)", () => {
     for (const key of ["PATH", "TUT_DRY_RUN", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR"]) {
       savedEnv[key] = process.env[key];
     }
-    writeFileSync(path.join(bin, "C:\\npm\\pi.cmd"), "npm shim\n", "utf8");
+    writeFileSync(fixtureFile(bin, "npm\\pi.cmd"), "npm shim\n", "utf8");
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const err = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
       errText += String(chunk);
       return true;
     });
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    process.env.PATH = `C:\\npm;${savedEnv.PATH ?? ""}`; // enumeration hits C:\npm first; herdr still resolvable
+    process.env.PATH = `${path.win32.dirname(fixtureCandidate(bin, "npm\\pi.cmd"))};${savedEnv.PATH ?? ""}`; // enumeration hits C:\npm first; herdr still resolvable
     process.env.TUT_DRY_RUN = "1";
-    process.env.TUT_HERDR_EXECUTABLE = path.join(FIXTURE_BIN, "herdr");
+    process.env.TUT_HERDR_EXECUTABLE = fixtureExecutable(path.join(FIXTURE_BIN, "herdr"));
     process.env.TUT_HERDR_PANES = "[]";
     process.env.TUT_HUB_URL = "http://127.0.0.1:1";
     process.env.TUT_USER_CONFIG_DIR = path.join(bin, "no-config");
@@ -1203,7 +1244,7 @@ describe("start-next Windows target pre-check (before the marker)", () => {
       const code = await main(["start-next", "t-win", "--url", "http://hub.test"]);
       expect(code).toBe(1);
       expect(errText).toContain("cannot resolve launch target");
-      expect(errText).toContain("C:\\npm\\pi.cmd");
+      expect(errText).toContain(fixtureCandidate(bin, "npm\\pi.cmd"));
       expect(errText).toContain("native executable");
       expect(vi.mocked(hubPublish)).not.toHaveBeenCalled(); // 无痕: the marker never lands
     } finally {
@@ -1228,14 +1269,14 @@ describe("start-next Windows target pre-check (before the marker)", () => {
     // tui-side pin of the start-next launch_mode switch (these are the pane-door pre-checks).
     mkdirSync(path.join(mzDir, ".context-hub"), { recursive: true });
     writeFileSync(path.join(mzDir, ".context-hub", "config.json"), '{"flow_mode":"manual","launch_mode":"tui"}\n', "utf8");
-    for (const key of ["PATH", "TUT_DRY_RUN", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HERDR_LOG", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR", "TUT_DELIVERY_DIAG"]) {
+    for (const key of ["PATH", "TUT_DRY_RUN", "TUT_PANE_SHELL", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HERDR_LOG", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR", "TUT_DELIVERY_DIAG"]) {
       savedEnv[key] = process.env[key];
     }
     // Self-enumeration generates `C:\pi(.COM|.EXE|…|extensionless)` from
     // PATH="C:\" — the literal `C:\pi` file in mzDir (backslashes are legal
     // macOS filename bytes) is found by the PRODUCTION stat/readHeader
     // adapters with cwd=mzDir; its MZ header classifies it native.
-    writeFileSync(path.join(mzDir, "C:\\pi"), Buffer.from([0x4d, 0x5a, 0x00, 0x01]));
+    writeFileSync(fixtureFile(mzDir, "pi"), Buffer.from([0x4d, 0x5a, 0x00, 0x01]));
     const herdrLog = path.join(mzDir, "herdr.log");
     const outText: string[] = [];
     const out = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
@@ -1247,14 +1288,15 @@ describe("start-next Windows target pre-check (before the marker)", () => {
       return true;
     });
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    process.env.PATH = `C:\\;${savedEnv.PATH ?? ""}`; // C:\ enumerates first; herdr/node still resolvable
+    process.env.PATH = `${path.win32.dirname(fixtureCandidate(mzDir, "pi"))};${savedEnv.PATH ?? ""}`; // C:\ enumerates first; herdr/node still resolvable
     process.env.TUT_DRY_RUN = "1";
-    process.env.TUT_HERDR_EXECUTABLE = path.join(FIXTURE_BIN, "herdr");
+    process.env.TUT_HERDR_EXECUTABLE = fixtureExecutable(path.join(FIXTURE_BIN, "herdr"));
     process.env.TUT_HERDR_PANES = "[]";
     process.env.TUT_HERDR_LOG = herdrLog;
     process.env.TUT_HUB_URL = "http://127.0.0.1:1";
     process.env.TUT_USER_CONFIG_DIR = path.join(mzDir, "no-config");
     process.env.TUT_DELIVERY_DIAG = "0";
+    process.env.TUT_PANE_SHELL = "posix";
     const prevCwd = process.cwd();
     process.chdir(mzDir);
     vi.stubGlobal(
@@ -1278,7 +1320,7 @@ describe("start-next Windows target pre-check (before the marker)", () => {
       // The real chain: the enumerated extensionless candidate C:\pi + suppression env,
       // rendered by the platform-default dialect (posix here) from the placeholder anchor.
       expect(childOut).toContain(
-        agentFixture("pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' 'C:\\pi'", "<hub-root>", "http://hub.test"),
+        agentFixture(`pane run <root> cd -- '<cwd>' && env 'PI_SKIP_VERSION_CHECK=1' '${fixtureCandidate(mzDir, "pi")}'`, "<hub-root>", "http://hub.test"),
       );
       // Read-only discovery (pane list) is legal; NO mutation command anywhere.
       const herdrLines = (existsSync(herdrLog) ? readFileSync(herdrLog, "utf8") : "")
@@ -1309,16 +1351,16 @@ describe("start-next Windows target pre-check (before the marker)", () => {
     for (const key of ["PATH", "TUT_DRY_RUN", "TUT_HERDR_EXECUTABLE", "TUT_HERDR_PANES", "TUT_HUB_URL", "TUT_USER_CONFIG_DIR"]) {
       savedEnv[key] = process.env[key];
     }
-    writeFileSync(path.join(elfDir, "C:\\pi"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+    writeFileSync(fixtureFile(elfDir, "pi"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const err = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
       errText += String(chunk);
       return true;
     });
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    process.env.PATH = `C:\\;${savedEnv.PATH ?? ""}`;
+    process.env.PATH = path.win32.dirname(fixtureCandidate(elfDir, "pi"));
     process.env.TUT_DRY_RUN = "1";
-    process.env.TUT_HERDR_EXECUTABLE = path.join(FIXTURE_BIN, "herdr");
+    process.env.TUT_HERDR_EXECUTABLE = fixtureExecutable(path.join(FIXTURE_BIN, "herdr"));
     process.env.TUT_HERDR_PANES = "[]";
     process.env.TUT_HUB_URL = "http://127.0.0.1:1";
     process.env.TUT_USER_CONFIG_DIR = path.join(elfDir, "no-config");
@@ -1336,7 +1378,7 @@ describe("start-next Windows target pre-check (before the marker)", () => {
       expect(code).toBe(1);
       expect(errText).toContain("cannot resolve launch target");
       expect(errText).toContain("no PE header");
-      expect(errText).toContain("C:\\pi");
+      expect(errText).toContain(fixtureCandidate(elfDir, "pi"));
       expect(vi.mocked(hubPublish)).not.toHaveBeenCalled(); // 无痕
     } finally {
       process.chdir(prevCwd);

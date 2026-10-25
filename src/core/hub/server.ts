@@ -16,7 +16,7 @@ import { Store } from "./store.js";
 export interface StartServerOptions {
   /** Storage root directory (`.context-hub` by default in cli.ts). */
   root: string;
-  /** Default 3001 (system-design 6.1); 0 = ephemeral port for tests. */
+  /** Default 3001; 0 = ephemeral port for tests. */
   port?: number;
   /** Default 127.0.0.1 — localhost only, no auth/CORS. */
   host?: string;

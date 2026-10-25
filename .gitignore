@@ -26,3 +26,7 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Native test fixture entries compiled locally on Windows
+test/bin/*.exe
+test/bin/.node-path

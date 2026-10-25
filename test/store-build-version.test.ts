@@ -9,7 +9,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
-      if (String(args[0]).endsWith("/package.json")) {
+      if (/[/\\]package\.json$/u.test(String(args[0]))) {
         if (manifest.mode === "corrupt") return "{broken";
         throw Object.assign(new Error(manifest.mode), { code: manifest.mode === "missing" ? "ENOENT" : "EACCES" });
       }

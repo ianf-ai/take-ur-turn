@@ -25,16 +25,17 @@
 import { spawn } from "node:child_process";
 import { constants as FsConstants, accessSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { inspectWorktree, type WorktreeExpectation } from './worktree.js';
 
-export type PreflightCheckName = "node-manifest" | "node-modules" | "tut-dist";
-export type PreflightStatus = "ok" | "missing" | "error" | "not-applicable";
+export type PreflightCheckName = "node-manifest" | "node-modules" | "tut-dist" | "worktree-consistency";
+export type PreflightStatus = "ok" | "missing" | "error" | "not-applicable" | "warn";
 
 export interface PreflightItem {
   check: PreflightCheckName;
   status: PreflightStatus;
   /** Absolute target path and the evidence behind the verdict. */
   detail: string;
-  /** Suggested repair for a human (fix mode automates exactly this). */
+  /** Guidance for a human; fix mode only automates npm install/build items. */
   fix?: string;
 }
 
@@ -113,12 +114,12 @@ export function defaultPreflightFixRunner(log: (line: string) => void = (line) =
 }
 
 /** Inspect one checkout. Pure diagnostics; never writes. */
-export function preflightCheckout(checkout: string): PreflightReport {
+export function preflightCheckout(checkout: string, expectations: readonly WorktreeExpectation[] = []): PreflightReport {
   const absolute = path.resolve(checkout);
   // Human repair commands are POSIX shell text. Keep the checkout as one
   // literal word, including spaces, apostrophes and shell metacharacters.
   const checkoutWord = `'${absolute.replaceAll("'", "'\\''")}'`;
-  const items: PreflightItem[] = [];
+  const items: PreflightItem[] = [inspectWorktree(absolute, expectations)];
   let isTutCheckout = false;
   let manifest: ManifestShape | undefined;
   let hasDeps = false;
@@ -134,7 +135,7 @@ export function preflightCheckout(checkout: string): PreflightReport {
       items.push(notApplicable("node-manifest", `no package.json in ${absolute}`));
       items.push(notApplicable("node-modules", "no Node manifest — nothing to install"));
       items.push(notApplicable("tut-dist", "no package.json — not a TUT source checkout"));
-      return { checkout: absolute, isTutCheckout, applicable: false, ok: true, items };
+      return { checkout: absolute, isTutCheckout, applicable: items.some(item => item.status !== 'not-applicable'), ok: true, items };
     }
     items.push({ check: "node-manifest", status: "error", detail: `cannot read ${manifestPath}: ${(e as Error).message}`, fix: "repair the package.json permissions/path and retry" });
     items.push({ check: "node-modules", status: "error", detail: "manifest unreadable — dependency applicability unknown" });
@@ -272,13 +273,14 @@ export async function fixPreflight(
 
 /** Human-readable one-liner block for CLI rejection paths. */
 export function renderPreflightReport(report: PreflightReport, options: { manualOnly?: boolean } = {}): string {
-  const lines = [`checkout preflight failed for ${report.checkout}:`];
+  const lines = [`checkout preflight ${report.ok ? 'warnings' : 'failed'} for ${report.checkout}:`];
   for (const item of report.items) {
     if (item.status === "ok" || item.status === "not-applicable") continue;
     lines.push(`  [${item.check}] ${item.status}: ${item.detail}`);
     if (item.fix !== undefined) lines.push(`    fix: ${item.fix}`);
   }
-  lines.push(options.manualOnly
+  if (report.ok) lines.push('  warnings are advisory; Git changes are manual only, including with --fix-preflight');
+  else lines.push(options.manualOnly
     ? "  follow the fix steps above by hand in the checkout, then retry the launch"
     : "  repair with an explicit --fix-preflight (supported steps only) or by hand, then retry");
   return lines.join("\n");

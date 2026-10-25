@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, readFileSync } from 'node:fs';
+import * as fixtureFs from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   preflightCheckout, nextPreflightFixStep, fixPreflight, renderPreflightReport,
   type PreflightFixRunner, type PreflightFixStep,
 } from '../src/core/preflight/index.js';
+
+vi.mock("node:fs", async importOriginal => ({ ...await importOriginal<typeof import("node:fs")>() }));
 
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -83,14 +86,14 @@ describe('preflight inspection', () => {
     const r2 = dir();
     write(path.join(r2, 'package.json'), JSON.stringify({ name: 'a', dependencies: { b: '1' } }));
     mkdirSync(path.join(r2, 'node_modules'));
-    chmodSync(path.join(r2, 'node_modules'), 0o000);
-    try {
-      if (process.getuid?.() === 0) return; // root ignores permission bits
-      const report2 = preflightCheckout(r2);
-      expect(report2.items.find(i => i.check === 'node-modules')!.status).toBe('error');
-    } finally {
-      chmodSync(path.join(r2, 'node_modules'), 0o755);
-    }
+    // Simulate the access boundary: Windows ACLs and root do not honor chmod(0).
+    const access = fixtureFs.accessSync;
+    vi.spyOn(fixtureFs, 'accessSync').mockImplementation((file, mode) => {
+      if (String(file) === path.join(r2, 'node_modules')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      return access(file, mode);
+    });
+    const report2 = preflightCheckout(r2);
+    expect(report2.items.find(i => i.check === 'node-modules')!.status).toBe('error');
   });
 });
 
@@ -151,7 +154,12 @@ describe('preflight fix loop', () => {
     // npx/vitest leak npm_config_* into the environment; a clean env keeps the
     // child npm from inheriting this repo's script-allowance policy.
     const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('npm_config_')));
-    const run = (args: string[], cwd: string) => execFileSync('npm', args, { cwd, stdio: 'ignore', env: cleanEnv });
+    // npm.cmd is not a shell:false executable. Invoke npm's installed JS entry.
+    const npmCli = process.env.npm_execpath?.endsWith('npm-cli.js') ? process.env.npm_execpath
+      : path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    const run = (args: string[], cwd: string) => process.platform === 'win32'
+      ? execFileSync(process.execPath, [npmCli, ...args], { cwd, stdio: 'ignore', env: cleanEnv })
+      : execFileSync('npm', args, { cwd, stdio: 'ignore', env: cleanEnv });
     run(['pack', './lib-pkg'], r);
     run(['install', '--package-lock-only', '--ignore-scripts', '--offline'], r);
     const before = preflightCheckout(r);

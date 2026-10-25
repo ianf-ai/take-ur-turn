@@ -1,3 +1,5 @@
+import { normalizeAgentRoute } from "../src/core/common/agent-command.js";
+import { posixDirectPlanFor } from "../src/core/launcher/target-resolver.js";
 import { createRemediationAudit, promptTailEvidence } from '../src/herdr/launcher/delivery.js';
 import { createEnterRepress } from '../src/core/remediator.js';
 import { canonicalRoot, resolveRigRoot } from "../src/core/hub/rig-discovery.js";
@@ -130,6 +132,16 @@ interface HarnessOpts {
 
 const openNotifiers: Notifier[] = [];
 
+// Unit routing fixtures already stand in for executable discovery. Supply the
+// frozen plan too, so fake-clock state tests never start native PATH probes.
+// Real launch integration keeps the actual platform resolver below.
+function resolvedFixture(route: AgentRoute) {
+  return { route, source: "builtin-default" as const, plan: {
+    platform: "posix" as const,
+    posix_direct: posixDirectPlanFor(normalizeAgentRoute(route), process.env),
+  } };
+}
+
 function makeHarness(opts: HarnessOpts = {}) {
   let current: StateResponse = state([], {
     ...(opts.flowMode !== undefined ? { flow_mode: opts.flowMode } : {}),
@@ -182,7 +194,9 @@ function makeHarness(opts: HarnessOpts = {}) {
             }),
       // launch pre-check (hermetic): the real default hits GET /state of the hub
       // url + `which` — tests inject a fixed resolution instead.
-      resolveTarget: async () => opts.route ?? opts.agent ?? "pi",
+      ...(opts.realLaunch === true
+        ? { resolveTarget: async () => opts.route ?? opts.agent ?? "pi" }
+        : { resolveTargetWithSource: async () => resolvedFixture(opts.route ?? opts.agent ?? "pi") }),
       // Auto-launch provenance is exercised with dedicated injected-deps
       // tests below; the legacy state-only harness keeps an empty log so its
       // synthetic state transitions remain independently focused.
@@ -1049,7 +1063,7 @@ describe("auto-mode gate", () => {
           launches.push(role);
           return "launched";
         },
-        resolveTarget: async () => "pi",
+        resolveTargetWithSource: async () => resolvedFixture("pi"),
         now: () => 0,
         log: (line) => h.sent.push({ name: "log", msg: { title: line, body: "" } }),
         listAnchorPanes: async () => [TEST_ANCHOR],
@@ -1081,7 +1095,7 @@ describe("auto-mode gate", () => {
           order.push("spawn");
           return "launched";
         },
-        resolveTarget: async () => "pi",
+        resolveTargetWithSource: async () => resolvedFixture("pi"),
         now: () => 0,
         log: () => undefined,
         listAnchorPanes: async () => [TEST_ANCHOR],
@@ -1127,7 +1141,7 @@ describe("auto-mode gate", () => {
           launches.push("spawn");
           return "launched";
         },
-        resolveTarget: async () => "pi",
+        resolveTargetWithSource: async () => resolvedFixture("pi"),
         now: () => 0,
         log: () => undefined,
         listAnchorPanes: async () => [TEST_ANCHOR],
@@ -1227,7 +1241,7 @@ describe("auto-mode gate", () => {
         launch: async () => {
           throw new Error("herdr not found");
         },
-        resolveTarget: async () => "pi",
+        resolveTargetWithSource: async () => resolvedFixture("pi"),
         now: () => 0,
         log: (l: string) => {
           logs.push(l);
@@ -1245,6 +1259,9 @@ describe("auto-mode gate", () => {
 
   it("TUT_DRY_RUN=1: real launch.sh prints the herdr command; auto-launched notify fires", async () => {
     vi.useRealTimers(); // real child process, no clock needed
+    vi.stubEnv("PATH", [path.resolve(import.meta.dirname, "bin"), process.env.PATH ?? ""].join(path.delimiter));
+    vi.stubEnv("TUT_HERDR_PANES", "[]");
+    vi.stubEnv("TUT_PANE_SHELL", "posix");
     const previous = process.env.TUT_DRY_RUN;
     process.env.TUT_DRY_RUN = "1";
     try {
@@ -1256,7 +1273,7 @@ describe("auto-mode gate", () => {
       // the real dry-run child to finish and its notify to land.
       await vi.waitFor(() => {
         expect(hz.logs.some((l) => l.includes("tut launch (t1, executor)"))).toBe(true);
-      });
+      }, { timeout: 5000 });
       // launch.sh TUT_DRY_RUN output: the pre-check resolved executor →
       // agent 'pi' (passed as the 3rd arg); the prompt names the task id;
       // delivery is send-text + Enter (not pane run). Dry-run may open with
@@ -1270,7 +1287,7 @@ describe("auto-mode gate", () => {
       expect(sendText).toContain("t1");
       await vi.waitFor(() => {
         expect(titlesMatching("auto-launched executor")).toHaveLength(1);
-      });
+      }, { timeout: 5000 });
     } finally {
       if (previous === undefined) delete process.env.TUT_DRY_RUN;
       else process.env.TUT_DRY_RUN = previous;
@@ -1666,10 +1683,10 @@ describe("unmatched agent-event rate limit", () => {
     await hz.notifier.requestCompare();
     // Test-only window into the bookkeeping under review: the timer set must
     // not retain spent handles and the source map must not retain idle entries.
-    const internals = hz.notifier as unknown as {
+    const internals = (hz.notifier as unknown as { tui: {
       timers: Set<ReturnType<typeof setTimeout>>;
       unmatchedSources: Map<string, unknown>;
-    };
+    } }).tui;
     let clock = 0;
     const tick = async (to: number): Promise<void> => {
       hz.at(to);
@@ -1698,10 +1715,10 @@ describe("unmatched agent-event rate limit", () => {
   it("a source that emits once and goes silent is evicted at window expiry (bounded bookkeeping without any suppression)", async () => {
     const hz = makeHarness();
     await hz.notifier.requestCompare();
-    const internals = hz.notifier as unknown as {
+    const internals = (hz.notifier as unknown as { tui: {
       timers: Set<ReturnType<typeof setTimeout>>;
       unmatchedSources: Map<string, unknown>;
-    };
+    } }).tui;
     hz.notifier.receiveEvent({ event: "blocked", agent: "codex", pane: "loner" });
     await hz.flush();
     expect(internals.unmatchedSources.size).toBe(1); // alive inside the window
@@ -1913,7 +1930,7 @@ describe("launcher child liveness (post-marker stage off the compare queue)", ()
     const hz = makeHarness();
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare();
-    const internals = hz.notifier as unknown as { timers: Set<ReturnType<typeof setTimeout>> };
+    const internals = (hz.notifier as unknown as { tui: { timers: Set<ReturnType<typeof setTimeout>> } }).tui;
     hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
     await hz.flush();
     await vi.advanceTimersByTimeAsync(5_001); // interval 5s recheck delay elapses
@@ -2190,7 +2207,7 @@ describe("done-event pane sweep: final screens archived into the notify log", ()
   ];
 
   it.each(['headless', 'invalid'])('skips every pane operation in %s mode, keeping compare and recheck', async mode => {
-    const hz = makeHarness({ panes: INVENTORY, readLaunchMode: async () => { if (mode === 'invalid') throw new Error('bad config'); return 'headless'; } });
+    const hz = makeHarness({ panes: INVENTORY, readLaunchMode: async () => { if (mode === 'invalid') throw new Error('bad config'); return 'detached'; } });
     hz.set(state([task({ task_id: 't1', status: 'implementing', waiting_for: 'agent:executor' })]));
     await hz.notifier.requestCompare();
     hz.notifier.receiveEvent({ event: 'done', agent: 'pi', pane: 't1.executor' }); await hz.flush();
@@ -3047,7 +3064,7 @@ describe("spawnLaunch stderr tee (delivery diagnostics reach the notify pane)", 
       try {
         const out = await spawnLaunch("t-tee", "executor", "pi", [], {
           ...process.env,
-          PATH: `${FIXTURE_BIN}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+          PATH: [FIXTURE_BIN, path.dirname(process.execPath), "/usr/bin", "/bin"].join(path.delimiter),
           TUT_HERDR_LOG: log,
           TUT_HERDR_PANES: JSON.stringify([
             { pane_id: "w9:p0", label: "hub", workspace_id: "w9", cwd: "/x", agent_status: "idle" },
@@ -3458,7 +3475,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     };
   };
   const logCacheOf = (notifier: Notifier): Map<string, { version: number; records: ContextRecord[]; sig: string | null }> =>
-   (notifier as unknown as { logCache: Map<string, { version: number; records: ContextRecord[]; sig: string | null }> }).logCache;
+   (notifier as unknown as { logs: { logCache: Map<string, { version: number; records: ContextRecord[]; sig: string | null }> } }).logs.logCache;
 
   it("the cursor is EXCLUSIVE against the inclusive wire — quiet rounds pull nothing, a new version pulls since=cached+1", async () => {
     let tail: ContextRecord[] = [note("t1", 1), note("t1", 2), marker("t1", 3, 2)];
@@ -3612,7 +3629,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     // syncs the cache under the attention-set entry.
     hz.set(anomalous());
     await hz.notifier.requestCompare();
-    await (hz.notifier as unknown as { fullLog(t: string, e?: StateTask): Promise<ContextRecord[]> }).fullLog("t7", anomalous().tasks[0]!);
+    await (hz.notifier as unknown as { logs: { fullLog(t: string, e?: StateTask): Promise<ContextRecord[]> } }).logs.fullLog("t7", anomalous().tasks[0]!);
     expect(hub.calls).toEqual([0]);
     const poisoned = logCacheOf(hz.notifier).get("t7")!;
 
@@ -3677,7 +3694,7 @@ describe("incremental auto-gate readLog (exclusive cursor, quiet-round skip, ide
     hz.at(10_000);
     await hz.notifier.requestCompare();
     expect(sinceValues).toEqual([0]); // gate withheld — nothing pulled
-    expect((hz.notifier as unknown as { logCache: Map<string, unknown> }).logCache.has("t3")).toBe(false);
+    expect((hz.notifier as unknown as { logs: { logCache: Map<string, unknown> } }).logs.logCache.has("t3")).toBe(false);
     // An ack lands (v3, clean again — candidate): the pull is a FULL re-sync.
     hz.set(t3({ version: 3 }));
     hz.at(15_000);
@@ -3796,7 +3813,7 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
         const notifier = new Notifier({ url: running.url, interval: 5, eventPort: 3998, stallTimeoutMin: 30 }, {
           launch: async () => { spawns++; return "launched"; },
           readLaunchMode: async () => "tui" as const, // pin the TUI backend: the merged autoLaunch consults the launch mode (the real default is tui since 0.9.0)
-          resolveTarget: async () => "pi",
+          resolveTargetWithSource: async () => resolvedFixture("pi"),
           loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
           listPanes: async () => [],
           listAnchorPanes: async () => [TEST_ANCHOR],
@@ -3857,7 +3874,7 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
         {
           launch: async () => "launched",
           markLaunched: async () => ({ version: 1 }),
-          resolveTarget: async () => "pi",
+          resolveTargetWithSource: async () => resolvedFixture("pi"),
           loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
           listPanes: async () => [],
           listAnchorPanes: async () => [],
@@ -3943,7 +3960,7 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
         {
           launch: async () => "launched",
           markLaunched: async () => ({ version: 1 }),
-          resolveTarget: async () => "pi",
+          resolveTargetWithSource: async () => resolvedFixture("pi"),
           loadRouting: async () => ({ labelToAgent: new Map(), roleToAgent: new Map() }),
           listPanes: async () => [],
           listAnchorPanes: async () => [],
@@ -3954,9 +3971,9 @@ describe("governed readLog against a REAL hub (integration: real Store, real MCP
       );
       openNotifiers.push(notifier);
       const fullLogOf = (entry: unknown) =>
-       (notifier as unknown as { fullLog(t: string, e?: unknown): Promise<ContextRecord[]> }).fullLog("gov-clear", entry);
+       (notifier as unknown as { logs: { fullLog(t: string, e?: unknown): Promise<ContextRecord[]> } }).logs.fullLog("gov-clear", entry);
       const cacheOf = () =>
-       (notifier as unknown as { logCache: Map<string, { records: ContextRecord[] }> }).logCache.get("gov-clear")?.records ?? [];
+       (notifier as unknown as { logs: { logCache: Map<string, { records: ContextRecord[] }> } }).logs.logCache.get("gov-clear")?.records ?? [];
 
       // Warm: v1 executor marker (dedup=launched@v1).
       await notifier.requestCompare();
@@ -4051,7 +4068,7 @@ describe("notifier rig isolation", () => {
       readLaunchMode: async () => "tui" as const,
       fetchState: async () => current,
       readLog: async () => [],
-      resolveTarget: async () => "pi",
+      resolveTargetWithSource: async () => resolvedFixture("pi"),
       listAnchorPanes: async () => [TEST_ANCHOR],
       markLaunched: async () => ({ version: 1 }),
       launchInvocation: async invocation => { plans.push(invocation); return "launched"; },
@@ -4492,7 +4509,7 @@ describe("0.8.4 note wake and approval aggregation", () => {
     // the old executor note must not create any additional attempt.
     expect(hz.bases).toEqual(change === "role" ? [4] : []);
     if (change === "role") expect(hz.launches).toEqual([{ taskId: "t1", role: "reviewer", agent: "pi" }]);
-    expect((hz.notifier as unknown as { pendingNoteScans: Map<string, unknown> }).pendingNoteScans.size).toBe(0);
+    expect((hz.notifier as unknown as { engine: { pendingNoteScans: Map<string, unknown> } }).engine.pendingNoteScans.size).toBe(0);
   });
 
   it("an appended marker consumes the wake even when the launcher fails", async () => {
@@ -4758,7 +4775,7 @@ describe("0.8.4 note wake and approval aggregation", () => {
     const hz = makeHarness();
     hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
     await hz.notifier.requestCompare();
-    const keys = (hz.notifier as unknown as { giveUpNotifications: Set<string> }).giveUpNotifications;
+    const keys = (hz.notifier as unknown as { tui: { giveUpNotifications: Set<string> } }).tui.giveUpNotifications;
     const send = async (attemptId: string) => {
       hz.notifier.receiveEvent({ event: "delivery_giveup", agent: "pi", pane: "t1.executor", delivery_v2: alertEvidence(attemptId) });
       await hz.flush();
@@ -4773,5 +4790,86 @@ describe("0.8.4 note wake and approval aggregation", () => {
     expect(keys.size).toBe(1024);
     await hz.notifier.close();
     expect(keys.size).toBe(0);
+  });
+});
+
+// Split ownership: public imports stay stable while lifecycle state lives in its owner.
+describe("Notifier module seams", () => {
+  beforeEach(() => vi.useFakeTimers());
+
+  it("engine and contracts cannot import a host implementation or the facade", () => {
+    for (const name of ["engine", "contracts"]) {
+      const source = readFileSync(new URL(`../src/core/notifier/${name}.ts`, import.meta.url), "utf8");
+      const imports = [...source.matchAll(/(?:from\s*|import\s*\()\s*["']([^"']+)["']/g)].map(match => match[1]!);
+      expect(imports.length).toBeGreaterThan(0);
+      expect(imports.filter(specifier => /(?:herdr|standalone|notifier\.js)/.test(specifier))).toEqual([]);
+    }
+  });
+
+  it("retains the old function exports as forwards to their sole implementation", async () => {
+    const facade = await import("../src/core/notifier/notifier.js");
+    const tui = await import("../src/herdr/notifier/tui-lane.js");
+    const revalidate = await import("../src/core/notifier/launch-revalidate.js");
+    const relay = await import("../src/core/notifier/host-relay.js");
+    const hostRelay = await import("../src/herdr/notifier/host-relay.js");
+    const remediation = await import("../src/core/remediator.js");
+    const hostRemediation = await import("../src/herdr/launcher/remediator.js");
+    expect(facade.spawnLaunch).toBe(tui.spawnLaunch);
+    expect(facade.spawnLaunchInvocation).toBe(tui.spawnLaunchInvocation);
+    expect(facade.spawnCleanupPanes).toBe(tui.spawnCleanupPanes);
+    expect(facade.defaultLoadRouting).toBe(tui.defaultLoadRouting);
+    expect(facade.createHeadlessRevalidate).toBe(revalidate.createHeadlessRevalidate);
+    expect(relay.relayHostStatus).toBe(hostRelay.relayHostStatus);
+    expect(remediation.createEnterRepress).toBe(hostRemediation.createEnterRepress);
+    expect(remediation.RemediationAttempts).toBe(hostRemediation.RemediationAttempts);
+  });
+
+  it("close prevents a late child completion from rearming the working timer", async () => {
+    let finish!: (output: string) => void;
+    const launch = vi.fn(() => new Promise<string>(resolve => { finish = resolve; }));
+    const hz = makeHarness({ flowMode: "auto", autoRoles: ["executor"], launch });
+    await hz.notifier.requestCompare();
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })], { flow_mode: "auto", auto: ALL_ROLES }));
+    await hz.notifier.requestCompare();
+    await hz.flush();
+    expect(launch).toHaveBeenCalledTimes(1);
+    await hz.notifier.close();
+    finish("launched");
+    await hz.flush();
+    await vi.advanceTimersByTimeAsync(301_000);
+    expect(titlesMatching("no working signal")).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("close during a done sweep cannot create a late recheck or unmatched-event timer", async () => {
+    const hz = makeHarness({ sweepDelayMs: 100 });
+    hz.set(state([task({ task_id: "t1", status: "implementing", waiting_for: "agent:executor" })]));
+    await hz.notifier.requestCompare();
+    hz.notifier.receiveEvent({ event: "done", agent: "pi", pane: "t1.executor" });
+    await hz.flush();
+    await hz.notifier.close();
+    hz.notifier.receiveEvent({ event: "blocked", agent: "pi", pane: "missing" });
+    await vi.advanceTimersByTimeAsync(100);
+    await hz.flush();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(titlesMatching("stopped without publishing")).toHaveLength(0);
+  });
+
+  it("the sole log cache drops an in-flight reply after close and closes its resident session", async () => {
+    const { NotifierLogCache } = await import("../src/core/notifier/log-cache.js");
+    let finish!: (value: { versions: ContextRecord[] }) => void;
+    const cache = new NotifierLogCache("http://127.0.0.1:3001", {
+      readLogSince: () => new Promise(resolve => { finish = resolve; }),
+    });
+    const owner = cache as unknown as { logCache: Map<string, unknown>; hubSession: { close(): Promise<void> } | null };
+    const closeSession = vi.fn(async () => {});
+    owner.hubSession = { close: closeSession };
+    const pending = cache.fullLog("t1");
+    await cache.close();
+    finish({ versions: [] });
+    await pending;
+    expect(closeSession).toHaveBeenCalledTimes(1);
+    expect(owner.hubSession).toBeNull();
+    expect(owner.logCache.size).toBe(0);
   });
 });

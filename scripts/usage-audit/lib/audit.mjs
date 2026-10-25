@@ -5,13 +5,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readConfigFile } from '../../../dist/core/common/config.js';
 import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
-import { source } from './hub.mjs';
+import { source, requestTimeout } from './hub.mjs';
+import { localIO, localFs } from './io.mjs';
 export { source } from './hub.mjs';
 import { extract, attribute } from './rounds.mjs';
 import { files, readSession, vector, instant } from './sessions.mjs';
+import { bindWindowsPi, piDirectory } from './paths.mjs';
 
-export async function enabled(root) {
-  const result = await readConfigFile(path.join(root, '.context-hub'));
+export async function enabled(root, options = {}) {
+  const result = await localIO('config', options, () => readConfigFile(path.join(root, '.context-hub')));
   if (result.status === 'invalid') throw new Error('invalid_config');
   const v = result.status === 'ok' && result.config.usage_audit !== undefined ? result.config.usage_audit : 'off';
   if (v !== 'on' && v !== 'off') throw new Error('invalid_usage_audit');
@@ -47,7 +49,7 @@ async function claimLock(file, root) {
 }
 
 // Serialize stale retirement across healers (the .reclaim mkdir mutex is the
-// same pattern as rig-lock.ts, per system-design stale-lock rule): two
+// same pattern as rig-lock.ts): two
 // healers must not both see a dead owner and unlink each other's replacement.
 async function healStale(file, root) {
   const reclaim = `${file}.reclaim`;
@@ -107,7 +109,8 @@ async function recoveryLock(root, log) {
   return lock(root);
 }
 
-export async function taskDir(root, id) {
+export async function taskDir(root, id, options = {}) {
+  const fs = localFs(options);
   if (!/^[a-z0-9][a-z0-9._-]*$/.test(id) || id === 'project') throw new Error('unsafe_task_id');
   let current = root;
   for (const component of ['.context-hub','tasks',id]) {
@@ -143,7 +146,8 @@ export function validateUsage(v) {
   if (!v.total || Object.keys(expected).some(k => v.total[k] !== expected[k])) throw new Error('invalid_usage_total');
   return v;
 }
-export async function loadUsage(dir) {
+export async function loadUsage(dir, options = {}) {
+  const fs = localFs(options);
   const file = path.join(dir, 'usage.json');
   try {
     const st = await fs.lstat(file);
@@ -157,7 +161,7 @@ export function merge(previous, matches, since) {
   for (const m of matches) {
     const r = m.round, selected = since === undefined || instant(r.ts) >= since;
     if (selected && !m.reason) {
-      const { cwd, task_id, launch_ts, problem, superseded_versions, ...identity } = r;
+      const { cwd, task_id, launch_ts, problem, superseded_versions, windows_attempt, route_args, pi_session, ...identity } = r;
       rounds.set(r.launch_version, { ...identity, ...m.candidates[0] });
     } else if (selected || !rounds.has(r.launch_version)) {
       unresolved.push({ delivery_version: r.delivery_version, ...(r.launch_version ? { launch_version: r.launch_version } : {}),
@@ -178,35 +182,56 @@ export function merge(previous, matches, since) {
   const sorted = [...rounds.values()].sort((a,b) => a.launch_version-b.launch_version);
   return { schema_version: 1, rounds: sorted, unresolved, total: total(sorted, unresolved) };
 }
-export async function writeUsage(root, id, value, mayCommit = async () => true, rename = fs.rename) {
-  const dir = await taskDir(root, id), file = path.join(dir, 'usage.json');
-  await loadUsage(dir); // Refuse corrupt or symlink replacements, including races since merge.
+export async function writeUsage(root, id, value, mayCommit = async () => true, rename = fs.rename, options = {}) {
+  const fs = localFs(options);
+  const dir = await taskDir(root, id, options), file = path.join(dir, 'usage.json');
+  await loadUsage(dir, options); // Refuse corrupt or symlink replacements, including races since merge.
   const bytes = JSON.stringify(validateUsage(value), null, 2) + '\n';
   try { if (await fs.readFile(file, 'utf8') === bytes) return false; } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  if (!await mayCommit()) return false;
+  if (!await localIO('config', options, mayCommit)) return false;
   const tmp = path.join(dir, `.usage-${process.pid}-${randomUUID()}.tmp`);
   try {
     await fs.writeFile(tmp, bytes, { flag: 'wx', mode: 0o600 });
-    if (!await mayCommit()) return false;
-    await taskDir(root, id);
-    await rename(tmp, file);
+    if (!await localIO('config', options, mayCommit)) return false;
+    await taskDir(root, id, options);
+    await localIO('rename', options, () => rename(tmp, file), true);
     return true;
   } finally { await fs.unlink(tmp).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
 }
 export async function collect(options, deps = {}) {
-  const allowed = deps.allowed ?? (() => options.watch ? enabled(options.root) : Promise.resolve(true));
+  const fs = localFs(options);
+  const allowed = () => localIO('config', options, deps.allowed ?? (() => options.watch ? enabled(options.root, options) : Promise.resolve(true)));
   if (!await allowed()) return [];
   const hub = deps.hub ?? await source(options.url, options.root, options);
+  // Hub reads already own their deadline and network cancellation. A second
+  // local-I/O timer would win the race and misclassify the original failure.
+  options.onProgress?.('hub-list');
   const entries = await hub.list(), tasks = [];
   for (const e of entries.filter(e => e.task_id !== 'project')) {
     if (!await allowed()) return [];
+    options.onProgress?.('hub-read');
     tasks.push(await hub.read(e.task_id));
   }
-  const rounds = tasks.flatMap(t => extract(t, options.root));
+  const rounds = tasks.flatMap(t => extract(t, options.root, options));
   const targets = tasks.filter(t => !options.task || t.task_id === options.task);
   if (!targets.length) return [];
-  const sessions = [], diagnostics = [];
-  const discover = deps.files ?? files, read = deps.readSession ?? readSession;
+  if (rounds.some(r => r.windows_attempt && !r.problem)) {
+    try {
+      const runs = await localIO('run-read', options, async () => {
+        if (deps.runs) return deps.runs();
+        const { RunStore } = await import('../../../dist/core/run/store.js');
+        const store = new RunStore(options.root);
+        return store.list().map(id => store.read(id));
+      });
+      bindWindowsPi(rounds, runs);
+    } catch (e) {
+      if (e.code === 'LOCAL_IO_TIMEOUT') throw e;
+      for (const r of rounds.filter(r => r.windows_attempt && !r.problem)) r.problem = 'unreadable_windows_runs';
+    }
+  }
+  const sessions = [], diagnostics = [], piCandidates = new Map();
+  const discover = deps.files ? root => localIO('session-discover', options, () => deps.files(root)) : root => files(root, options);
+  const read = deps.readSession ? (file, agent) => localIO('session-read', options, () => deps.readSession(file, agent)) : (file, agent) => readSession(file, agent, options);
   // Watch passes rescan the same trees; a file whose mtime and size are
   // unchanged since the previous pass reuses its parse instead of re-reading
   // multi-MB histories (cached rows are metadata only — bodies were already
@@ -218,21 +243,47 @@ export async function collect(options, deps = {}) {
     if (!await allowed()) return [];
     const relevant = rounds.filter(r => r.agent === agent && !r.problem);
     if (!relevant.length) continue;
-    const roots = agent === 'pi' ? [...new Set(relevant.map(r => path.join(options.piRoot, `--${r.cwd.replace(/^\//,'').replaceAll('/','-')}--`)))] : [options.codexRoot];
-    for (const root of roots) for (const file of await discover(root)) {
-      if (!await allowed()) return [];
-      listed.add(file);
+    const roots = new Map();
+    if (agent === 'pi') for (const r of relevant) {
       try {
-        const st = await fs.stat(file), key = `${agent}\u0000${file}`, hit = cache.get(key);
-        if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) { sessions.push(hit.session); continue; }
-        const session = await read(file, agent);
-        cache.set(key, { mtimeMs: st.mtimeMs, size: st.size, session });
-        sessions.push(session);
-      } catch (e) { diagnostics.push({ agent, file, reason: e.message }); cache.delete(`${agent}\u0000${file}`); }
+        const directory = await piDirectory(r, options);
+        if (!roots.has(directory)) roots.set(directory, []);
+        roots.get(directory).push(r);
+        piCandidates.set(r, new Set());
+      }
+      catch (e) { if (e.code === 'LOCAL_IO_TIMEOUT') throw e; r.problem = 'invalid_pi_session_directory'; }
+    } else roots.set(options.codexRoot, []);
+    const discovered = new Set();
+    for (const [root, sourceRounds] of roots) {
+      let discoveredFiles;
+      try { discoveredFiles = await discover(root); }
+      catch (e) {
+        if ((options.platform ?? process.platform) !== 'win32' || e.code === 'LOCAL_IO_TIMEOUT') throw e;
+        diagnostics.push({ agent, file: root, reason: e.code ?? 'unreadable_session_directory' });
+        continue;
+      }
+      for (const file of discoveredFiles) {
+        if (!await allowed()) return [];
+        for (const r of sourceRounds) piCandidates.get(r).add(file);
+        if ((options.platform ?? process.platform) === 'win32' && discovered.has(file)) continue;
+        discovered.add(file);
+        listed.add(file);
+        try {
+          const st = await fs.stat(file), key = `${agent}\u0000${file}`, hit = cache.get(key);
+          if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) { sessions.push(hit.session); continue; }
+          const session = await read(file, agent);
+          cache.set(key, { mtimeMs: st.mtimeMs, size: st.size, session });
+          sessions.push(session);
+        } catch (e) {
+          cache.delete(`${agent}\u0000${file}`);
+          if (e.code === 'LOCAL_IO_TIMEOUT') throw e;
+          diagnostics.push({ agent, file, reason: e.message });
+        }
+      }
     }
   }
   for (const key of [...cache.keys()]) if (!listed.has(key.slice(key.indexOf('\u0000') + 1))) cache.delete(key); // files that disappeared
-  const matches = attribute(rounds, sessions), reports = [];
+  const matches = attribute(rounds, sessions, { ...options, piCandidates }), reports = [];
   // An unreadable candidate cannot be silently discarded to make another
   // candidate appear unique. Its cwd may itself be unreadable.
   for (const m of matches) if (diagnostics.some(d => d.agent === m.round.agent)) m.reason = 'unreadable_session_candidate';
@@ -245,78 +296,116 @@ export async function collect(options, deps = {}) {
       continue;
     }
     if (!own.some(m => options.since === undefined || instant(m.round.ts) >= options.since)) continue;
-    const dir = await taskDir(options.root, task.task_id);
-    const previous = await loadUsage(dir);
+    const dir = await taskDir(options.root, task.task_id, options);
+    const previous = await loadUsage(dir, options);
     const value = merge(previous, own, options.since);
-    const changed = await writeUsage(options.root, task.task_id, value, allowed);
+    const changed = await writeUsage(options.root, task.task_id, value, allowed, undefined, options);
     reports.push({ task_id: task.task_id, changed, total: value.total, unresolved: value.unresolved });
   }
   return [...reports, ...diagnostics.map(d => ({ diagnostic: d }))];
 }
 export async function run(options, deps = {}) {
-  options = { ...options, root: canonicalRoot(options.root) };
-  const on = deps.enabled ?? enabled;
-  const allowed = () => options.signal?.aborted ? Promise.resolve(false) : options.watch ? on(options.root) : Promise.resolve(true);
-  if (!await allowed()) return;
-  const log = text => process.stderr.write(text);
-  const release = options.recover ? await recoveryLock(options.root, log) : await (deps.lock ?? lock)(options.root);
-  const started = Date.now();
-  let failStreak = 0, lastFail = '';
-  // Keep log deduplication's existing counter separate from the heartbeat's
-  // actual consecutive failures (all errors, reset after a successful pass).
-  let consecutiveFailures = 0, lastSuccessfulPass = null, inRequest = false, heartbeat;
+  options = { intervalMs: 5000, timeoutMs: Infinity, ...options, root: canonicalRoot(options.root),
+    requestTimeoutMs: options.requestTimeoutMs ?? requestTimeout() };
+  const started = Date.now(), log = text => process.stderr.write(text);
+  let failStreak = 0, lastFail = '', consecutiveFailures = 0, lastSuccessfulPass = null;
+  let inRequest = false, heartbeat, release, passId = 0, phase = 'config', progressAt = started;
+  let stallReported = false, reportFailed = false;
+  let countedFailure = false;
+  const progress = next => { phase = next; progressAt = Date.now(); };
+  const failed = e => {
+    if (countedFailure) return;
+    countedFailure = true;
+    consecutiveFailures++;
+    failStreak = e.message === lastFail ? failStreak + 1 : 0;
+    lastFail = e.message;
+    if (failStreak % 20 === 0) {
+      log(`usage-audit: pass failed (${e.message})${failStreak ? ` — ${failStreak + 1} consecutive failures` : ''}; ${e.fatalConfig ? 'stopping: invalid configuration' : 'retrying next interval'}\n`);
+    }
+  };
+  options.onProgress = progress;
+  options.onIOTimeout = e => {
+    failed(e);
+    log(`usage-audit: ${e.message}; waiting for submitted mutation; writer lock retained\n`);
+  };
   options.onRequest = value => { inRequest = value; };
+  const on = deps.enabled ?? enabled;
+  const allowed = async () => {
+    if (options.signal?.aborted) return false;
+    if (!options.watch) return true;
+    try { return await localIO('config', options, () => on(options.root, options)); }
+    catch (e) { if (e.code !== 'LOCAL_IO_TIMEOUT') e.fatalConfig = true; throw e; }
+  };
+  // A disabled watcher still does no lock, session, Hub or heartbeat work.
+  // Transient startup config timeouts enter the same observable retry loop.
+  let initiallyAllowed = false;
+  try { initiallyAllowed = await allowed(); if (!initiallyAllowed) return; }
+  catch (e) { if (!options.watch || e.fatalConfig) throw e; failed(e); }
   const lastReport = new Map();
   try {
     if (options.watch) heartbeat = (deps.setInterval ?? setInterval)(() => {
-      log(JSON.stringify({ event: 'heartbeat', timestamp: new Date().toISOString(),
-        last_successful_pass: lastSuccessfulPass, consecutive_failures: consecutiveFailures, in_request: inRequest }) + '\n');
-    }, 60_000);
-    do {
-      if (options.signal?.aborted || !await allowed()) break;
-      let reports;
-      try { reports = await (deps.collect ?? collect)(options, { ...deps, allowed }); }
-      catch (e) {
-        // Watch survives transient pass failures (hub restart window, one
-        // corrupt usage.json): log to stderr, back off, keep measuring. Bad
-        // config and switch-off remain fatal via allowed() above. An identical
-        // failure every interval would flood the log (~17k lines/day at the
-        // default interval): log the first occurrence, then every 20th.
-        if (!options.watch) throw e;
-        consecutiveFailures++;
-        failStreak = e.message === lastFail ? failStreak + 1 : 0;
-        lastFail = e.message;
-        if (failStreak % 20 === 0) {
-          process.stderr.write(`usage-audit: pass failed (${e.message})${failStreak ? ` — ${failStreak + 1} consecutive failures` : ''}; retrying next interval\n`);
-        }
-        if (options.signal?.aborted || Date.now() - started >= options.timeoutMs) break;
-        const wait = Math.max(0, Math.min(options.intervalMs, options.timeoutMs - (Date.now() - started)));
-        try { await (deps.sleep ?? sleep)(wait, undefined, { signal: options.signal }); } catch (se) { if (se.name !== 'AbortError') throw se; }
-        continue;
+      const now = Date.now();
+      const stalledMs = options.stallTimeoutMs ?? Math.max(120_000, 2 * options.requestTimeoutMs + options.intervalMs);
+      const successAge = now - (lastSuccessfulPass === null ? started : Date.parse(lastSuccessfulPass));
+      const stalled = successAge >= stalledMs || now - progressAt >= stalledMs;
+      const status = { timestamp: new Date(now).toISOString(), pid: process.pid, pass_id: passId, phase,
+        last_progress_at: new Date(progressAt).toISOString(), last_successful_pass: lastSuccessfulPass,
+        consecutive_failures: consecutiveFailures, in_request: inRequest };
+      log(JSON.stringify({ event: 'heartbeat', ...status, stalled }) + '\n');
+      if (stalled && !stallReported) {
+        log(JSON.stringify({ event: 'PASS_STALLED', ...status, threshold_ms: stalledMs }) + '\n');
       }
-      // A permanently-unresolved task would otherwise re-emit the identical
-      // report every pass (~17k lines/day at the default interval): a report
-      // emits when it first appears or its content changes, not every pass.
-      const visible = options.watch ? reports.filter(v => {
-        if (!(v.changed || v.diagnostic || v.reason || v.unresolved?.length)) return false;
-        const key = v.diagnostic ? `d:${v.diagnostic.agent}:${v.diagnostic.file}` : String(v.task_id);
-        const serialized = JSON.stringify(v);
-        if (lastReport.get(key) === serialized) return false;
-        lastReport.set(key, serialized);
-        return true;
-      }) : reports;
-      (deps.report ?? (r => { for (const v of r) process.stdout.write(JSON.stringify(v) + '\n'); }))(visible);
-      // Reporting is part of the pass: a fatal output error (e.g. EPIPE)
-      // must not leave telemetry claiming that the pass completed.
-      lastSuccessfulPass = new Date().toISOString();
-      consecutiveFailures = 0;
-      if (!options.watch || options.signal?.aborted || Date.now()-started >= options.timeoutMs || !await allowed()) break;
-      try { await (deps.sleep ?? sleep)(Math.min(options.intervalMs, options.timeoutMs-(Date.now()-started)), undefined, { signal: options.signal }); }
+      stallReported = stalled;
+    }, 60_000);
+    if (initiallyAllowed) {
+      progress('lock');
+      release = options.recover ? await recoveryLock(options.root, log) : await (deps.lock ?? lock)(options.root);
+    }
+    do {
+      if (options.signal?.aborted) break;
+      passId++;
+      countedFailure = false;
+      try {
+        // Both boundary config reads belong to the pass failure accounting.
+        if (!await allowed()) break;
+        if (!release) {
+          progress('lock');
+          release = await (deps.lock ?? lock)(options.root);
+        }
+        progress('collect');
+        const reports = await (deps.collect ?? collect)(options, { ...deps, allowed });
+        const visible = options.watch ? reports.filter(v => {
+          if (!(v.changed || v.diagnostic || v.reason || v.unresolved?.length)) return false;
+          const key = v.diagnostic ? `d:${v.diagnostic.agent}:${v.diagnostic.file}` : String(v.task_id);
+          const serialized = JSON.stringify(v);
+          if (lastReport.get(key) === serialized) return false;
+          lastReport.set(key, serialized);
+          return true;
+        }) : reports;
+        progress('report');
+        try { (deps.report ?? (r => { for (const v of r) process.stdout.write(JSON.stringify(v) + '\n'); }))(visible); }
+        catch (e) { reportFailed = true; throw e; }
+        lastSuccessfulPass = new Date().toISOString();
+        consecutiveFailures = 0;
+        if (!options.watch || options.signal?.aborted || Date.now() - started >= options.timeoutMs || !await allowed()) break;
+      } catch (e) {
+        // Output failures remain fatal and never claim a successful pass.
+        if (!options.watch || reportFailed) throw e;
+        failed(e);
+        if (e.fatalConfig) throw e;
+        if (options.signal?.aborted || Date.now() - started >= options.timeoutMs) break;
+      }
+      progress('sleep');
+      const wait = Math.max(0, Math.min(options.intervalMs, options.timeoutMs - (Date.now() - started)));
+      try { await (deps.sleep ?? sleep)(wait, undefined, { signal: options.signal }); }
       catch (e) { if (e.name !== 'AbortError') throw e; }
-    } while (true);
+    } while (!options.signal?.aborted && Date.now() - started < options.timeoutMs);
   } finally {
-    if (heartbeat !== undefined) (deps.clearInterval ?? clearInterval)(heartbeat);
-    await release();
+    // Keep progress observation alive through cleanup, which may itself wait
+    // for local I/O. Never hand the lock to another writer during a mutation.
+    progress('release-lock');
+    try { if (release) await release(); }
+    finally { if (heartbeat !== undefined) (deps.clearInterval ?? clearInterval)(heartbeat); }
   }
   if (options.recover && !options.signal?.aborted) {
     log('usage-audit: recovery backfill complete; inspect stdout coverage/unresolved diagnostics. To resume monitoring, enable usage_audit if off and rerun --watch with the same --root, --url and session roots.\n');

@@ -52,6 +52,7 @@ function fixtureReport(statuses: Partial<Record<string, "ok" | "warn" | "fail">>
     ["platform", "platform info"],
     ["agent-channel", "agent channel network"],
     ["preflight", "checkout preflight"],
+    ["power", "standalone power registration"],
   ];
   const checks = titles.map(([name, title]) => ({
     name,
@@ -153,7 +154,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
     const options = vi.mocked(runDoctor).mock.calls[0]![0]!;
     expect(options.hubRoot).toBe("/owning/rig");
     await expect(options.fetchImpl!("http://127.0.0.1:3001/state")).rejects.toBe(error);
-    expect(JSON.parse(io.out()).checks).toHaveLength(9);
+    expect(JSON.parse(io.out()).checks).toHaveLength(10);
   });
 
   it("defaults to .context-hub and the default hub URL", async () => {
@@ -187,7 +188,7 @@ describe("tut doctor handler (runDoctor mocked: wiring + output contract)", () =
     expect(JSON.parse(io.out())).toEqual(report);
     // the check names, in runner order, are the machine surface
     expect((JSON.parse(io.out()) as DoctorReport).checks.map((c) => c.name)).toEqual([
-      "hub", "notifier", "config", "agents", "storage", "paths", "platform", "agent-channel", "preflight",
+      "hub", "notifier", "config", "agents", "storage", "paths", "platform", "agent-channel", "preflight", "power",
     ]);
   });
 

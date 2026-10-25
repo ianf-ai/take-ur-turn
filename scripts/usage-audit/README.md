@@ -31,7 +31,8 @@ lists and full record histories come through the Hub's existing MCP tools.
 Optional flags:
 
 - `--task ID`: limits output, still reads other tasks to detect competing rounds.
-- `--pi-root DIR`: defaults to `~/.pi/agent/sessions`.
+- `--pi-root DIR`: TUT's session parent (defaults to `~/.pi/agent/sessions`
+  on POSIX). Windows discovery rules and flat-directory overrides are below.
 - `--codex-root DIR`: defaults to `~/.codex/sessions`. Note: codex sessions are
   scanned machine-wide, so one unreadable/corrupt rollout from any project can
   mark that round unresolved for all codex rounds in the same pass (conservative:
@@ -44,15 +45,31 @@ Optional flags:
 All modes bound each Hub read (`/state`, MCP list and each task history) to
 30 seconds, including initialization, response headers and response body/SSE.
 Set `TUT_USAGE_AUDIT_TIMEOUT_MS` to an integer in 1..2147483647 to override this
-request deadline; invalid values fail visibly. This is separate from the
+I/O deadline; invalid values fail visibly. This is separate from the
 `--timeout-ms` watch lifetime. A timed-out read aborts its HTTP I/O and reports
 `HUB_TIMEOUT` with the endpoint and deadline. Watch uses the existing failure
 logging and interval retry path; one-shot modes exit nonzero and release the lock.
 
+The same deadline covers local config reads, session discovery/stat/read, task
+directory checks, and usage snapshot reads/writes/rename/cleanup. A pending
+local read rejects with `LOCAL_IO_TIMEOUT`, counts as a failed pass (including
+config checks at both pass boundaries), and retries on the next interval.
+Read APIs that accept an abort signal receive one; an uninterruptible native
+read can still finish later, but its result cannot resume the failed pass or
+commit a snapshot. Ordinary malformed configuration remains fatal.
+
+A submitted mutation cannot safely be abandoned. At its deadline the watcher
+counts the failed pass and immediately warns on stderr, keeps the writer lock,
+and waits for that operation to settle before cleanup/retry. It never starts a
+second pass or releases the lock while a late write/rename can still execute.
+If the filesystem remains stuck, the warning and heartbeat remain visible;
+when it recovers, cleanup and collection resume. This is an in-process guard,
+not a forced native-I/O cancellation or a cross-process watchdog.
+
 `usage_audit` is a top-level `"off" | "on"` config key, absent means off.
 It controls **only watch**. Explicit since/backfill/recover requests run while off.
 Starting watch while off reads configuration once, then returns without Hub,
-private session, usage, lock or timer work. Bad configuration stops visibly.
+private session, usage, lock or resident heartbeat work. Bad configuration stops visibly.
 Running watch checks the switch each pass, between measurement operations,
 and immediately before committing a snapshot; off ends it and releases its
 lock. An already submitted filesystem operation may finish. Re-enabling
@@ -77,14 +94,26 @@ While enabled, watch emits a JSON heartbeat to **stderr every 60 seconds**,
 independently of pass completion and retry sleeps:
 
 ```json
-{"event":"heartbeat","timestamp":"2026-10-16T00:01:00.000Z","last_successful_pass":null,"consecutive_failures":2,"in_request":true}
+{"event":"heartbeat","timestamp":"2026-10-16T00:01:00.000Z","pid":1234,"pass_id":3,"phase":"hub-read","last_progress_at":"2026-10-16T00:00:59.000Z","last_successful_pass":null,"consecutive_failures":2,"in_request":true,"stalled":false}
 ```
 
 `last_successful_pass` is the completion time of the most recent successful
 pass (null until the first); `consecutive_failures` counts all failed passes
 since then and resets on success. `in_request` covers the current Hub read,
 including its MCP handshake and body consumption. The heartbeat timer is
-removed when watch ends; disabled watch and one-shot modes emit no heartbeat.
+removed after cleanup when watch ends; disabled watch and one-shot modes emit
+no heartbeat. `pid`, `pass_id`, `phase` and `last_progress_at` identify the
+process, attempted pass and latest operation boundary. A phase ending in
+`:draining` means a timed-out mutation still owns the writer lock.
+
+If no pass has succeeded, the success-age clock starts at watcher startup.
+If the last success or operation progress is older than
+`max(120000, 2 × I/O deadline + poll interval)` milliseconds, the next heartbeat
+sets `stalled: true` and emits a separate `PASS_STALLED` stderr alarm once per
+stall episode. Successful progress clears it and arms a future alarm. This
+also detects repeated failures whose changing pass IDs would otherwise look
+healthy. With default settings the threshold is two minutes, checked every
+60 seconds; local I/O timeouts report sooner, at 30 seconds.
 Missing heartbeats indicate that the watcher is no longer responding. A
 pending HTTP read still emits heartbeats: detect lack of progress using the
 success time, failure count and request flag as well as missing heartbeats.
@@ -93,7 +122,7 @@ success time, failure count and request flag as well as missing heartbeats.
 
 If usage stops advancing, inspect `.context-hub/usage-audit.log` (for watchers
 started by `tut up`) or the manual watcher's stderr for heartbeats and
-`HUB_TIMEOUT` / pass failures. Verify that the Hub is running at the specified
+`HUB_TIMEOUT`, `LOCAL_IO_TIMEOUT`, `PASS_STALLED` and pass failures. Verify that the Hub is running at the specified
 URL and belongs to the project root, then run:
 
 ```sh
@@ -123,11 +152,24 @@ advice. Recovery does not start watch automatically or change configuration.
 Round ordinal is the ordered launch-marker number, including unfulfilled
 launches (gaps are meaningful). Marker role, frozen route agent, launch time,
 delivery version/time and task checkout cwd define a candidate. Legacy markers
-may use the delivery's recorded agent, never today's workspace cast. Only
-architect/design, executor/code_changes|revision, reviewer/review pair.
-Repeated outstanding launches are diagnosed (mode-split: see dispositions
-below). Missing markers, missing route, identity conflicts and unsupported
-agents cannot produce numbers.
+may use the publication's recorded agent, never today's workspace cast. A
+launch pairs with the **next publication by the same worker role**, regardless
+of content type (including checkpoint notes, scope-check notes and custom
+types). Human notes and other roles' publications do not close it; launch
+markers are control records, not publications closing another round.
+Further publications before that role's next launch belong to the same native
+session and do not create additional rounds or missing-launch diagnostics.
+The first publication is only the attribution anchor: measurement still runs
+through the native end, so later notes and a subsequent formal delivery in
+that session are included exactly once. Ordinary notes without a launch are
+ignored; formal deliveries by a role with no launch history retain the legacy
+`missing_launch` diagnostic. Repeated outstanding launches are diagnosed only
+when a new launch arrives before any same-role publication (mode-split: see
+dispositions below). Missing markers, missing route, identity conflicts and
+unsupported agents cannot produce numbers. `tut stats` accepts these anchors
+without counting notes as workflow deliveries; preserved v1 formal-delivery
+anchors remain readable, with new note-anchor coverage shown as incomplete
+until recomputed.
 
 ### Unresolved-shape dispositions (2026-10-18 headless findings)
 
@@ -139,15 +181,17 @@ round at all writes nothing). The three headless-era unattributed shapes and
 their dispositions:
 
 - `superseded_launch` — a re-launch replaced an outstanding launch before any
-  delivery. Tui markers keep the conservative whole-round diagnostic. Headless
-  markers (`launch_mode: "headless"`) split the accounting: the delivering
+  same-role publication. A note already published ends the round and cannot
+  be superseded by the next launch. Tui markers keep the conservative
+  whole-round diagnostic. Headless markers (`launch_mode: "headless"`)
+  split the accounting: the delivering
   (rescue) round measures its own session normally; every launch it replaced
   stays unaccounted and is anchored as an `unresolved[]` entry
   (`{delivery_version, launch_version, reason}`, all existing schema-v1
   fields; the disclosure also survives `--since` replays that preserve the
   delivering round's measurement). Usage is never merged from a replaced
-  launch into the round; whether to account replaced launches' burned usage
-  at all is an open human decision.
+  launch into the round; its burned usage is explicitly unmeasured rather
+  than silently discarded or represented by the rescue round's tokens.
 - `overlapping_rounds` (including `ambiguous_sessions`) — concurrent rounds
   sharing one cwd (the 0.9.0 default `launch.checkout: "rig"` mode runs all
   headless agents in the rig root, so a parallel task batch's sessions become
@@ -160,10 +204,38 @@ their dispositions:
 - `missing_session_or_end` — no native end covering the delivery (for example
   an executor that exited early). Retried every pass, never zero-filled.
 
-Pi discovery uses `--<cwd without leading slash, slash replaced by hyphen>--`
-(POSIX-path shaped; on Windows pi's own directory naming differs and pi
-discovery yields nothing — codex discovery is path-shape independent) and
-checks the session header cwd. Codex discovery recursively checks
+Pi discovery checks the session header cwd. POSIX retains its existing
+`--<cwd without leading slash, slash replaced by hyphen>--` directory and
+`--pi-root` behavior (including ignoring `PI_CODING_AGENT_SESSION_DIR`).
+On Windows, the default parent is `%USERPROFILE%\.pi\agent\sessions`
+(or `PI_CODING_AGENT_DIR\sessions`); pi's shared path leaf encodes the cwd
+by removing one leading slash/backslash and replacing `/`, `\` and `:`
+with `-`. For example `C:\repo` becomes `--C--repo--`.
+
+Windows pi's nonempty `--session-dir` takes precedence over
+`PI_CODING_AGENT_SESSION_DIR`. Both name the **final** session directory,
+without another cwd component. Relative native overrides resolve against
+the launch cwd; tilde and supported MSYS/WSL/Cygwin drive paths follow the
+same rules as Windows resume. Unknown effective settings/trust and file URLs
+are refused as `invalid_pi_session_directory`, rather than guessed.
+Windows detached launches use the exact task/role/attempt/base-version run
+association from RunStore, then its frozen `pi_session` directory, layout,
+UUID and cwd. Later environment changes do not redirect their lookup.
+Missing, duplicate, unreadable or inconsistent run evidence stays unresolved
+(`missing_windows_run`, `ambiguous_windows_run`, `unreadable_windows_runs`,
+`invalid_windows_launch`, `invalid_windows_session`). No current-environment
+fallback replaces missing frozen evidence.
+
+An explicit Windows `--pi-root` changes only this audit's lookup: for default
+or frozen `cwd-encoded` storage it is a parent with the cwd slug appended;
+for native CLI/env overrides or a frozen `flat` session it is the final
+directory. It never changes the
+run's UUID/cwd association. Header cwd comparison is normalized and exact;
+case/junction aliases are not guessed. Repeated discoveries of one file are
+parsed once per pass, including shared flat roots. Native null pi cost is
+unknown (`null`) on Windows; absent/invalid token usage remains unresolved.
+
+Codex discovery recursively checks
 session_meta.cwd and excludes parent_thread_id/subagent sources. Files need
 not be newly created or have the latest mtime. Each candidate must have a
 native kickoff between launch and delivery, and a native end covering delivery.

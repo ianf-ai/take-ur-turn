@@ -271,7 +271,7 @@ attach 围观。
 
 ### checkout preflight 与 close 审计
 
-`tut run` / `tut resume` / auto headless 启动在 spawn 前检查执行 checkout：声明了
+`tut run` / `tut resume` / auto detached 启动在 spawn 前检查执行 checkout：声明了
 依赖的 Node checkout 需要可读的 `node_modules`，TUT 源码 checkout 需要 `dist/`。
 缺失项以精确绝对路径与修复指引拒绝启动；无 Node manifest 的目录永不受门禁。
 `--fix-preflight`（run/resume/doctor）只执行受支持修复——锁文件下 `npm ci`、TUT
@@ -314,7 +314,10 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 | `flow_mode` | `"manual"` / `"auto"`——轮次交接时谁按启动键（人 / Notifier 经启动器自动启动）。推荐用 `tut mode <manual\|auto>` 切换 | `manual` |
 | `notify` | 通知渠道：`channels`（desktop / webhook 等）与 `webhook_url` | 未配置 = 终端 bell 与 notify pane 日志 |
 | `auto.launch_roles` | auto 模式的启动白名单（按 role 键控，如 `["executor","reviewer"]`）。**缺省空 = 全部回落通知人**——不在白名单的轮次不自动启动、不落启动痕，人的手动启动不受影响 | `[]` |
+| `launch_mode` | `start-next` 与 Notifier 的发车后端：`"tui"` 或 `"detached"`。兼容别名 `"headless"` 选择同一后端；get 返回规范值且不回写，set 两种拼写都写 `detached`。缺文件/键默认 `tui`，坏档和非法值明确失败 | `tui` |
 | `power.mode` | `tut up` 的电源实现：`"herdr"`（pane 供给，行为不变）或 `"standalone"`——`tut up` 自行拉起 detached 进程组（pid/pgid/port 事实落 `.context-hub/power.json`），`tut down` 关停。停机信号身份门控且按组作用域：leader 已亡的残留组仅在有存活成员通过本 rig 的电源成员登记（会话标记 `TUT_POWER_SESSION` 绑定存活服务实例，复用服务在重复 up 后保留原会话，并随服务自身的 launch 子进程继承）核验时才清理；陈旧或无法归属的组永不发信号。非法值（或配置不可读）会让 up/down 在任何供给动作前显式失败 | `herdr` |
+
+用 `tut config set launch_mode detached` 选择 detached 发车，与 `power.mode`、`flow_mode` 独立。兼容别名 `headless` 无预定删除日期、不产生周期告警。marker 的 `launch_mode: "headless"` / `target_kind: "headless-posix"` 和 run 的 `headless` 归属键仍是协议标识；旧记录、run 和 usage 文件不迁移。
 
 `flow_mode` 与 `auto.launch_roles` 无需手编 JSON：`tut config get <key>` / `tut config set <key> <value>`（键与值域均校验；`tut config set flow_mode auto` 即 `tut mode` 的离线等价，Hub 未起也能用——与 `tut assign` 同纪律）。Hub 每次请求现读此文件，写入下个轮询周期即生效，无需重启。
 
@@ -343,9 +346,9 @@ Hub 与 Notifier 的行为。改后下个轮询周期生效，无需重启：
 
 `naming.tab_label` 渲染**tab** 标签（人读侧）：占位符 `{role}` / `{task}` / `{agent}`，未知占位符原样保留，默认 `TUT {role}`。**pane** 标签是机器寻址键、不可模板化：轮次 pane 恒为 `<task_id>.<role>`（事件反查直接命中）。双字段各司其职。
 
-仓库内 `scripts/workspace.json` 是**种子**（形状示例），运行时不读取。`tut up` 检测 L1/L2 均缺时打印配置指引。
+**工作区配置**：用 `tut assign <role> <agent>` 定制项目阵容，或修改上面的 JSON 示例并保存到 `.context-hub/workspace.json`（项目级）或 `~/.config/tut/workspace.json`（用户级，先创建父目录）。`tut up` 检测 L1/L2 均缺时指向本文档。读取时忽略 `label` 字段，运行时不读取 `scripts/routes.json`。
 
-**工作区配置**：用 `cp scripts/workspace.json .context-hub/workspace.json` 复制种子，也可放到 `~/.config/tut/`（先 `mkdir -p`）。读取时忽略 `label` 字段，运行时不读取 `scripts/routes.json`；`tut assign` 修改项目级 workspace 文件。
+**从旧版种子升级**：已有的项目级或用户级 workspace 文件继续有效，无需迁移。若只修改了安装包里的示例，请在升级前把定制后的 JSON 保存到上述配置位置。自动化脚本若仍复制包内示例，应改为使用自行维护的配置或 `tut assign`；安装包不再附带种子文件。
 
 ### ③ 调用参数 — CLI flags 与环境变量
 
@@ -381,11 +384,15 @@ Agent 角色的行为指令在 [skills/](skills/) 目录（architect / executor 
 - [design/system-design.md](design/system-design.md) — **系统设计（根文档）**：宿主无关核心与宿主契约
 - [design/context-design.md](design/context-design.md) — **上下文设计**：放什么（scope / 记录类型 / 正文内容要求）、怎么管理
 - [design/herdr-host.md](design/herdr-host.md) — **Herdr 宿主**：pane、电源、hook、终端投递与 Enter 补救
-- [design/standalone-host.md](design/standalone-host.md) — **Standalone 宿主**：服务电源、run、headless、续跑、座位与 preflight
+- [design/standalone-host.md](design/standalone-host.md) — **Standalone 宿主**：服务电源、run、detached 发车、续跑、座位与 preflight
 
 ## 故障排查与已知限制
 
 ### Windows 说明
+
+Standalone 电源（`tut config set power.mode standalone`）通过 Node 启动 detached Hub / Notifier，无需 Herdr。要求 PowerShell 5.1+ 及 CIM / NetTCPIP provider，用于创建时间 token 与 TCP 监听者核验。`power.json` 保存 `process_scope: "windows-tree"`、`pgid: null`；`up` / `doctor` 报告未注册服务，`up --adopt` 显式核验并采纳同 workspace 监听者（`--dry-run` 仅预览）。
+
+Windows `down` 用原生进程 handle 核验创建身份并强制终止捕获到的服务树，排除已登记 run 根 / supervisor 及启动中的 run supervisor，最后复验端点。每项服务的完成事实单独保存，允许部分失败后重试。**已知缺口（documented-gap）**：没有 Job Object 容器或 POSIX 信号宽限期。捕获前 leader 已亡、身份不可读或 run 元数据损坏时拒绝清理；捕获前已孤儿化或在快照间逃逸的后代无法保证回收。Windows run / 发车实现属于独立能力，本电源支持不启用它们。
 
 原生 Windows 端到端可用（hub、MCP、CLI、流转驱动均已对照 Herdr Windows 版与 PowerShell 5.1 验证）。安装边界须知：
 

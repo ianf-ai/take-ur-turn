@@ -1,3 +1,4 @@
+import path from "node:path";
 import { parseDeliveryV2 } from "../src/herdr/launcher/escalation.js";
 import { describe, expect, it, vi } from "vitest";
 import { createDelivery, parseDeliveryKnobs, createDeliveryDiagnostics, createRemediationAudit, diagEnabled, DELIVERY_LOG_MAX_BYTES, type DiagnosticsFs, type DeliveryEvidenceV2 } from "../src/herdr/launcher/delivery.js";
@@ -24,7 +25,7 @@ function memoryFs(): {
     sizeOverrides,
     failAppendAfter: (count: number) => { failFrom = count; },
     fs: {
-      isDirectory: (target) => target === "/proj" || target === "/anchor",
+      isDirectory: (target) => target === path.resolve("/proj") || target === path.resolve("/anchor"),
       mkdir: async (dir) => { dirs.push(dir); },
       append: async (file, text) => {
         appendCalls += 1;
@@ -56,7 +57,7 @@ describe("delivery diagnostics: decoupled dual sink", () => {
     const stderr: string[] = [];
     const mem = memoryFs();
     const sink = createDeliveryDiagnostics({
-      env: { TUT_PROJECT_ROOT: "/proj" },
+      env: { TUT_PROJECT_ROOT: path.resolve("/proj") },
       task_id: "t-pr",
       role: "architect",
       stderr: (text) => stderr.push(text),
@@ -70,7 +71,7 @@ describe("delivery diagnostics: decoupled dual sink", () => {
       "tut-delivery t=1700000000000 gate-start pane=p1\n",
       "tut-delivery t=1700000000000 send-text pane=p1 branch=born len=9\n",
     ]);
-    const file = mem.files.get("/proj/.context-hub/delivery.log") ?? "";
+    const file = mem.files.get(path.resolve("/proj/.context-hub/delivery.log")) ?? "";
     expect(file).toBe(
       "tut-delivery t=1700000000000 task=t-pr role=architect gate-start pane=p1\n" +
       "tut-delivery t=1700000000000 task=t-pr role=architect send-text pane=p1 branch=born len=9\n",
@@ -80,14 +81,14 @@ describe("delivery diagnostics: decoupled dual sink", () => {
   it("lazy persistence: nothing is created on disk until the first line; a silenced run touches nothing", async () => {
     const mem = memoryFs();
     const silent = createDeliveryDiagnostics({
-      env: { TUT_DELIVERY_DIAG: "0", TUT_PROJECT_ROOT: "/proj" },
+      env: { TUT_DELIVERY_DIAG: "0", TUT_PROJECT_ROOT: path.resolve("/proj") },
       fs: mem.fs,
     });
     silent.emit("gate-start pane=p1");
     await silent.flush();
     expect(mem.dirs).toHaveLength(0);
     // Enabled but never emitting: still nothing (lazy setup).
-    const quiet = createDeliveryDiagnostics({ env: { TUT_PROJECT_ROOT: "/proj" }, fs: mem.fs });
+    const quiet = createDeliveryDiagnostics({ env: { TUT_PROJECT_ROOT: path.resolve("/proj") }, fs: mem.fs });
     await quiet.flush();
     expect(mem.dirs).toHaveLength(0);
   });
@@ -95,8 +96,8 @@ describe("delivery diagnostics: decoupled dual sink", () => {
   it("TUT_PROJECT_ROOT must be a real directory — otherwise the anchor-root fallback serves the durable tail", async () => {
     const mem = memoryFs();
     const sink = createDeliveryDiagnostics({
-      env: { TUT_PROJECT_ROOT: "/not-a-dir" },
-      persistRootFallback: "/anchor",
+      env: { TUT_PROJECT_ROOT: path.resolve("/not-a-dir") },
+      persistRootFallback: path.resolve("/anchor"),
       task_id: "t",
       role: "executor",
       stderr: () => undefined,
@@ -104,8 +105,8 @@ describe("delivery diagnostics: decoupled dual sink", () => {
     });
     sink.emit("gate-release pane=p1");
     await sink.flush();
-    expect(mem.files.has("/anchor/.context-hub/delivery.log")).toBe(true);
-    expect(mem.files.has("/not-a-dir/.context-hub/delivery.log")).toBe(false);
+    expect(mem.files.has(path.resolve("/anchor/.context-hub/delivery.log"))).toBe(true);
+    expect(mem.files.has(path.resolve("/not-a-dir/.context-hub/delivery.log"))).toBe(false);
   });
 
   it("no resolvable root → stderr only, never a delivery failure", async () => {
@@ -121,7 +122,7 @@ describe("delivery diagnostics: decoupled dual sink", () => {
     const mem = memoryFs();
     mem.failAppendAfter(0);
     const sink = createDeliveryDiagnostics({
-      env: { TUT_PROJECT_ROOT: "/proj" },
+      env: { TUT_PROJECT_ROOT: path.resolve("/proj") },
       stderr: (t) => stderr.push(t),
       fs: mem.fs,
     });
@@ -136,14 +137,14 @@ describe("delivery diagnostics: decoupled dual sink", () => {
   it("task/role default to ? when unknown (the persisted line stays parseable)", async () => {
     const mem = memoryFs();
     const sink = createDeliveryDiagnostics({
-      env: { TUT_PROJECT_ROOT: "/proj" },
+      env: { TUT_PROJECT_ROOT: path.resolve("/proj") },
       clock: () => 42,
       stderr: () => undefined,
       fs: mem.fs,
     });
     sink.emit("gate-start pane=p1");
     await sink.flush();
-    expect(mem.files.get("/proj/.context-hub/delivery.log")).toBe(
+    expect(mem.files.get(path.resolve("/proj/.context-hub/delivery.log"))).toBe(
       "tut-delivery t=42 task=? role=? gate-start pane=p1\n",
     );
   });
@@ -152,10 +153,10 @@ describe("delivery diagnostics: decoupled dual sink", () => {
 describe("delivery diagnostics: rotation and the never-rejecting chain", () => {
   it("delivery.log rotates by size — one .1 generation kept, the active file restarts", async () => {
     const mem = memoryFs();
-    mem.files.set("/proj/.context-hub/delivery.log", "OLD");
-    mem.sizeOverrides.set("/proj/.context-hub/delivery.log", DELIVERY_LOG_MAX_BYTES + 10); // already over cap
+    mem.files.set(path.resolve("/proj/.context-hub/delivery.log"), "OLD");
+    mem.sizeOverrides.set(path.resolve("/proj/.context-hub/delivery.log"), DELIVERY_LOG_MAX_BYTES + 10); // already over cap
     const sink = createDeliveryDiagnostics({
-      env: { TUT_PROJECT_ROOT: "/proj" },
+      env: { TUT_PROJECT_ROOT: path.resolve("/proj") },
       clock: () => 7,
       stderr: () => undefined,
       fs: mem.fs,
@@ -164,10 +165,10 @@ describe("delivery diagnostics: rotation and the never-rejecting chain", () => {
     sink.emit("second");
     await sink.flush();
     expect(mem.renames).toEqual([
-      { from: "/proj/.context-hub/delivery.log", to: "/proj/.context-hub/delivery.log.1" },
+      { from: path.resolve("/proj/.context-hub/delivery.log"), to: path.resolve("/proj/.context-hub/delivery.log.1") },
     ]);
-    expect(mem.files.get("/proj/.context-hub/delivery.log.1")).toBe("OLD");
-    expect(mem.files.get("/proj/.context-hub/delivery.log")).toBe(
+    expect(mem.files.get(path.resolve("/proj/.context-hub/delivery.log.1"))).toBe("OLD");
+    expect(mem.files.get(path.resolve("/proj/.context-hub/delivery.log"))).toBe(
       "tut-delivery t=7 task=? role=? first\ntut-delivery t=7 task=? role=? second\n",
     );
   });
@@ -178,10 +179,10 @@ describe("delivery diagnostics: rotation and the never-rejecting chain", () => {
     // BYTES (fs.size semantics), or a multibyte-heavy log overshoots the
     // cap before rotation fires.
     const mem = memoryFs();
-    mem.files.set("/proj/.context-hub/delivery.log", "OLD");
-    mem.sizeOverrides.set("/proj/.context-hub/delivery.log", DELIVERY_LOG_MAX_BYTES - 10); // 10 bytes left
+    mem.files.set(path.resolve("/proj/.context-hub/delivery.log"), "OLD");
+    mem.sizeOverrides.set(path.resolve("/proj/.context-hub/delivery.log"), DELIVERY_LOG_MAX_BYTES - 10); // 10 bytes left
     const sink = createDeliveryDiagnostics({
-      env: { TUT_PROJECT_ROOT: "/proj" },
+      env: { TUT_PROJECT_ROOT: path.resolve("/proj") },
       clock: () => 7,
       stderr: () => undefined,
       fs: mem.fs,
@@ -191,10 +192,10 @@ describe("delivery diagnostics: rotation and the never-rejecting chain", () => {
     sink.emit(`tail='あ${"い".repeat(29)}'`);
     await sink.flush();
     expect(mem.renames).toEqual([
-      { from: "/proj/.context-hub/delivery.log", to: "/proj/.context-hub/delivery.log.1" },
+      { from: path.resolve("/proj/.context-hub/delivery.log"), to: path.resolve("/proj/.context-hub/delivery.log.1") },
     ]);
-    expect(mem.files.get("/proj/.context-hub/delivery.log.1")).toBe("OLD");
-    const active = mem.files.get("/proj/.context-hub/delivery.log") ?? "";
+    expect(mem.files.get(path.resolve("/proj/.context-hub/delivery.log.1"))).toBe("OLD");
+    const active = mem.files.get(path.resolve("/proj/.context-hub/delivery.log")) ?? "";
     expect(active).toContain("あ"); // the multibyte line itself survived
     expect(Buffer.byteLength(active, "utf8")).toBeLessThanOrEqual(DELIVERY_LOG_MAX_BYTES);
 
@@ -206,7 +207,7 @@ describe("delivery diagnostics: rotation and the never-rejecting chain", () => {
     await sink.flush();
     expect(mem.renames).toHaveLength(2);
     expect(new Set(mem.renames.map((r) => r.to)).size).toBe(1); // one .1 target
-    expect((mem.files.get("/proj/.context-hub/delivery.log") ?? "")).toContain("t=7 task=? role=? z");
+    expect((mem.files.get(path.resolve("/proj/.context-hub/delivery.log")) ?? "")).toContain("t=7 task=? role=? z");
   });
 
   it("a throwing fs seam never rejects flush — the exit-0 invariant survives diagnostics faults", async () => {
@@ -217,7 +218,7 @@ describe("delivery diagnostics: rotation and the never-rejecting chain", () => {
       size: async () => -1,
       rename: async () => undefined,
     };
-    const sink = createDeliveryDiagnostics({ env: { TUT_PROJECT_ROOT: "/proj" }, stderr: () => undefined, fs: boom });
+    const sink = createDeliveryDiagnostics({ env: { TUT_PROJECT_ROOT: path.resolve("/proj") }, stderr: () => undefined, fs: boom });
     sink.emit("gate-start pane=p1");
     await expect(sink.flush()).resolves.toBeUndefined();
   });
