@@ -1,4 +1,4 @@
-import type { AgentCommand } from "../common/types.js";
+import type { AgentCommand } from "../../protocol/types.js";
 import type { PlatformExecutionPlan } from "../launcher/target-resolver.js";
 
 export type DoctorStatus = "ok" | "warn" | "fail";
@@ -99,3 +99,10 @@ interface DoctorContext {
 }
 
 export type { DoctorContext };
+
+/** Host evidence is supplied at the existing diagnostic positions. */
+export interface DoctorHostProbes {
+  power: (ctx: DoctorContext) => Promise<DoctorCheck>;
+  paths: (ctx: DoctorContext, check: DoctorCheck) => Promise<void>;
+  shell: (ctx: DoctorContext, check: DoctorCheck, statuses: DoctorStatus[]) => void;
+}

@@ -8,4 +8,5 @@ export { relayHostStatus } from "./notifier/host-relay.js";
 export type { Remediator } from "./launcher/remediator.js";
 export type { DeliveryDiagnostics } from "./launcher/delivery.js";
 export { parseDeliveryV2 } from "./launcher/escalation.js";
-export { probeDoctorPanes, probeDoctorShell } from "./doctor/probes.js";
+export { probeDoctorPanes, probeDoctorPaths, probeDoctorShell } from "./doctor/probes.js";
+export { cleanupTaskPanes } from "./launcher/close.js";

@@ -13,7 +13,7 @@
 #   - label via `herdr pane get` from HERDR_BIN_PATH, fallback raw pane_id;
 #   - best-effort everywhere, exit 0.
 set -u
-EV_SCRIPT="${TUT_ON_AGENT_EVENT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/scripts/on-agent-event.sh}"
+EV_SCRIPT="${TUT_ON_AGENT_EVENT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/scripts/agent-event/on-agent-event.sh}"
 [ -x "$EV_SCRIPT" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
@@ -75,6 +75,6 @@ try:
         stderr=subprocess.DEVNULL,
     )
 except Exception:
-    pass  # a lost event is acceptable: polling is the primary channel (6.1)
+    pass  # a lost event is acceptable: polling is the primary channel
 PY
 exit 0

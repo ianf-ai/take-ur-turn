@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { canonicalRoot, discoverWorkspaceNotifiers, eventEndpoint, notifierMatches, probeHub, probeNotifier, probeNotifierEvidence } from "../../core/hub/rig-discovery.js";
-import { processAlive, processPgid, processStartToken, type PowerState, type ServiceFacts } from "./standalone-up.js";
+import { canonicalRoot, discoverWorkspaceNotifiers, eventEndpoint, notifierMatches, probeHub, probeNotifier, probeNotifierEvidence } from "../../hub/rig-discovery.js";
+import { processAlive, processPgid, processStartToken } from "./process.js";
+import type { PowerState, ServiceFacts } from "./types.js";
 import { listenerPid } from "./listener.js";
 
 export interface PowerDrift {

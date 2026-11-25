@@ -1,6 +1,8 @@
 # Standalone 宿主
 
-本文实现 [宿主契约](system-design.md#7-宿主契约)。
+本文回答独立服务与 run 如何启动、观察、停止、续跑及计量，实现 [共享宿主契约](system-design.md#7-宿主契约)。
+
+第 1 章说明服务电源，第 2 章说明执行单元的身份与生命周期，第 3 章说明发车链；其余章节说明宿主专有能力：第 4–6 章为精确续跑、close 停止审计与只读座位，第 7–8 章为 checkout preflight 与用量 watcher。
 
 ## 1. 服务电源
 
@@ -156,11 +158,11 @@ RunReadStore 的字节游标、上限、只读和错误语义不变。attach 在
 
 ## 3. detached 发车链
 
-本章对应共享宿主契约开关表中的 launch_mode=detached，独立于电源与 flow_mode 的选择。配置别名 `headless` 归一到同一后端，缺省仍为 `tui`。实现路径与历史协议保留 headless：marker 仍写 `launch_mode: "headless"` / `target_kind: "headless-posix"`，run 仍使用 `headless` 归属键；旧 marker、run、usage 与 resume 输入照读且不迁移。
+本章对应共享宿主契约开关表中的 launch_mode=detached，独立于电源与 flow_mode 的选择。配置别名 `headless` 归一到同一后端，缺省为 `tui`。实现路径与记录协议使用 headless：marker 写 `launch_mode: "headless"` / `target_kind: "headless-posix"`，run 使用 `headless` 归属键；所有已存 marker、run、usage 与 resume 输入均可读取，无需迁移。
 
 ### 3.1 计划与 checkout
 
-detached 由 Notifier 自动启动，手动 run / resume 使用同一运行库。计划由 src/standalone/launcher-headless 构造，直接调用同包 RunStore / startRun / stopRun，不调用 PATH 上其他 tut，也不使用终端 birth / 按键。
+detached 由 Notifier 自动启动，手动 run / resume 使用同一运行库。计划由 src/standalone/launcher-detached 构造，直接调用同包 RunStore / startRun / stopRun，不调用 PATH 上其他 tut，也不使用终端 birth / 按键。
 
 共享根目录与 route 定义见 [冻结计划契约](system-design.md#72-冻结计划与路由)。
 
@@ -176,9 +178,9 @@ anchored 只读取 description 的「工作区：<绝对路径>（分支 <分支
 
 ### 3.2 原生命令与会话
 
-macOS / Linux 支持 Codex 原生 exec / exec resume 加 JSONL，Pi 原生 --print --mode json --session-id。prompt 保持单个参数，route 的模型 / 配置 / 权限参数保留，不自动增加 bypass 或批准参数；已含 exec 不重复插入，不能确认子命令或 session selector 则拒绝。其他 agent 报 unsupported-headless-agent，Windows 在 marker / spawn 前拒绝，不自动换后端。
+macOS / Linux 支持 Codex 原生 exec / exec resume 加 JSONL，Pi 原生 --print --mode json --session-id。prompt 保持单个参数，route 的模型 / 配置 / 权限参数保留，不自动增加 bypass 或批准参数；已含 exec 不重复插入，不能确认子命令或 session selector 则拒绝。OpenCode 2.2 使用 run --auto --format json -- <prompt>，--auto 必须显式提供；在最终 checkout 确定后对齐局部环境 PWD，避免原生入口覆盖进程 cwd。其他 agent 报 unsupported-headless-agent，OpenCode 的 Windows 车道在 marker / spawn 前拒绝，不自动换后端。
 
-每轮新 run / 进程组。Architect 总是新会话；Executor / Reviewer 按逗号分隔的 TUT_CONTINUITY_ROLES（缺省 executor,reviewer）只复用同 rig / task / role / route / checkout 且前轮完整结束的精确身份。Codex 用本 run thread.started 的已观测 ID；Pi 用首次指定的独占 UUID designated_session_id，不冒充 observed 身份。缺身份 fresh 并记原因，resume 失败不静默 fresh 重试，不猜 --last / --continue。
+每轮新 run / 进程组。Architect 总是新会话；Executor / Reviewer 按逗号分隔的 TUT_CONTINUITY_ROLES（缺省 executor,reviewer）只复用同 rig / task / role / route / checkout 且前轮完整结束的精确身份。Codex 用本 run thread.started 的已观测 ID；OpenCode 用本 run JSONL sessionID 捕获到 agent_session_id 的有效 ses_ 身份，以 --session 精确续接；Pi 用首次指定的独占 UUID designated_session_id，不冒充 observed 身份。缺身份 fresh 并记原因，resume 失败不静默 fresh 重试，不猜 --last / --continue。
 
 ### 3.3 代次、准入与恢复
 
@@ -212,6 +214,7 @@ tut resume <run-id> [instruction] [--fix-preflight]
 - 每次续跑生成**新 run-id、log、PID/PGID 与 attempt**；新 meta 记录 `resume` 溯源（schema、from_run_id、agent、session_id、身份来源 observed/designated/argv、requested_at/by）。旧 run 证据字节不动。
 - 会话身份：
   - codex：只用源 meta 观测到的 `agent_session_id`，构造 `codex exec resume <id>`；不用 `--last`，不做 fresh 回退。
+  - opencode：只用源 meta 观测到的有效 `agent_session_id`（ses_…），构造 `opencode run --session <id> -- <prompt>`，保留显式 --auto 和 JSON 输出要求。普通 run 仅恢复 TUT 构造的可区分 argv 形状；受管 run 从冻结 route 重建。两者均将局部 PWD 对齐源 cwd，缺失或非法身份拒绝，不做 fresh 回退。
   - pi：`headless.designated_session_id` 或 TUT 构造 argv 中的 `--session-id <uuid>`；**必须**在本项目 pi 会话库（`~/.pi/agent/sessions/--<cwd-slug>--`，支持 `PI_CODING_AGENT_SESSION_DIR`）头部核验到精确 id+cwd。pi 的 `--session-id` 缺失时会**新建会话**，故核验失败=拒绝（`pi-session-not-found`），绝不伪造恢复。
   - 其他 agent / shell 包装 / 不可区分 positional：显式 `unsupported`。
 - 指令是单个字符串参数（`--` 后可传连字符开头内容）；不提供指令时普通 run 用继续提示、受管 run 用 role 门铃。指令不被解释为 approve/ack/扩围证据。

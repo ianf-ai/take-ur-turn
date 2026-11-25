@@ -2,19 +2,22 @@
  * Reuses HeadlessRuntime and the engine's log cache; owns no poll or timers.
  * close() drops observer state, never stops managed runs. */
 import path from 'node:path';
+import { RepeatedDiagnostics, diagnosticLedger } from '../../core/logging/repeated-diagnostics.js';
 import { readLaunchCheckout, type LaunchMode, type LaunchCatchup } from '../../core/common/config.js';
-import { HubError } from '../../core/hub/hub-client.js';
-import type { ContextRecord } from '../../core/common/types.js';
-import type { NoteWake } from '../../core/launcher/launch.js';
-import type { StateTask, StateResponse, NotifyOptions, NotifierDeps, LaneContext } from '../../core/notifier/contracts.js';
-import { autoWhitelisted } from '../../core/notifier/contracts.js';
+import { HubError } from '../../hub/hub-client.js';
+import type { ContextRecord } from '../../protocol/types.js';
+import { launchBlocked, type NoteWake } from '../../core/launcher/launch.js';
+import type { StateTask, StateResponse, NotifyOptions, SharedNotifierDeps } from '../../core/notifier/shared-contracts.js';
+import { autoWhitelisted } from '../../core/notifier/shared-contracts.js';
 import { runLaunchCatchup } from '../../core/notifier/launch-catchup.js';
-import { buildHeadlessPlan, headlessGeneration, humanInstruction } from '../launcher-headless/plan.js';
-import type { HeadlessRuntime } from '../launcher-headless/runtime.js';
+import { buildHeadlessPlan, headlessGeneration, humanInstruction } from '../launcher-detached/plan.js';
+import type { StandaloneLaneContext } from './contracts.js';
+import type { HeadlessRuntime } from '../launcher-detached/runtime.js';
 
 export class DetachedLane {
   /** One-shot guard for the startup catchup pass (launch.catchup); disarmed on first use. */
   private catchupArmed = true;
+  private readonly diagnostics: RepeatedDiagnostics;
 
   private readonly humanWakeVersions = new Map<string, number>();
 
@@ -24,25 +27,27 @@ export class DetachedLane {
 
   /** Independent of /state snapshot so a failed Hub read keeps its lower bound. */
   private deliveryVersions = new Map<string, { processed: number; seen: number }>();
+  private detachedMode = false;
 
   constructor(
     private readonly options: NotifyOptions,
     private readonly rigRoot: string,
-    private readonly context: Pick<LaneContext,
-      'log' | 'fullLog' | 'awaitSweepBarrier' | 'autoLaunchFailed' | 'autoLaunchSkipped' |
-      'autoGateReason' | 'autoLaunch'>,
-    private readonly deps: Pick<NotifierDeps, 'now' | 'readLog'>,
+    private readonly context: StandaloneLaneContext,
+    private readonly deps: Pick<SharedNotifierDeps, 'now' | 'readLog'>,
     private readonly headless: HeadlessRuntime,
     private readonly launchModeReader: (root: string) => Promise<LaunchMode>,
     private readonly catchupReader: (root: string) => Promise<LaunchCatchup>,
     private readonly readTaskDescription: (taskId: string) => Promise<string | undefined>,
-  ) { }
+  ) {
+    this.diagnostics = new RepeatedDiagnostics(line => this.context.log(line), () => this.deps.now(), undefined, undefined, diagnosticLedger(rigRoot, 'detached-lane'));
+  }
   private readonly checkoutModeReader = readLaunchCheckout;
   private get stateUrl(): string { return this.options.url.replace(/\/+$/, '') + '/state'; }
   private get eventPort(): number { return this.options.eventPort; }
   private closed = false;
   close(): void {
     this.closed = true;
+    this.diagnostics.clear();
     this.catchupArmed = false;
     this.humanWakeVersions.clear(); this.headlessStopBoundaries.clear();
     this.headlessPending.clear(); this.deliveryVersions.clear();
@@ -54,6 +59,8 @@ export class DetachedLane {
     const headlessObserved = await this.headless.observe({
       now: this.deps.now(), stallMs: Math.max(0, this.options.stallTimeoutMin) * 60_000,
       tasks: new Map(state.tasks.map(t => [t.task_id, t])),
+      completeView: state.truncated === false, // Engine also requests include=closed.
+      degraded: new Set(state.degraded ?? []),
     });
     if (this.closed) return;
     for (const stop of headlessObserved.stopped) {
@@ -79,6 +86,19 @@ export class DetachedLane {
       if (!this.humanWakeVersions.has(taskId)) wakes.delete(taskId);
     }
   }
+  /** A catch-up launch obeys the same stop cancellation as a note wake,
+   *  scoped to the round the stop interrupted: withheld only while the
+   *  CURRENT round is the stopped one — a genuinely new round (its flip
+   *  record landed strictly after the stop, so the deliveries that produced
+   *  it postdate the cancellation) or a later human instruction re-arms
+   *  acting. A plain new version or progress note never lifts the
+   *  cancellation: neither starts a new round. */
+  catchupAllowed(taskId: string, currentRoundStartedAt?: number): boolean {
+    const stop = this.headlessStopBoundaries.get(taskId);
+    if (stop === undefined) return true;
+    if (this.humanWakeVersions.has(taskId)) return true;
+    return currentRoundStartedAt !== undefined && currentRoundStartedAt > stop;
+  }
   takeReadyWake(task: StateTask, state: StateResponse): NoteWake | undefined {
     const pending = this.headlessPending.get(task.task_id);
     if (pending && (state.flow_mode !== 'auto' || task.needs_attention || task.waiting_for !== `agent:${pending.role}` || !autoWhitelisted(state.auto, pending.role))) this.headlessPending.delete(task.task_id);
@@ -96,6 +116,11 @@ export class DetachedLane {
     return true;
   }
   allowsNoteWake(taskId: string): boolean { return this.humanWakeVersions.has(taskId); }
+  completedLaunches(task: StateTask, records: readonly ContextRecord[]): ReadonlySet<number> {
+    const role = task.waiting_for.slice('agent:'.length);
+    if (!this.detachedMode || !launchBlocked(records, role, undefined, task.flow).blocked) return new Set();
+    return this.headless.recoverableLaunches(task.task_id, records);
+  }
   /** Returns whether historical resource ownership also calls for TUI cleanup. */
   async closeTask(after: StateTask): Promise<boolean> {
     this.headlessPending.delete(after.task_id);
@@ -121,10 +146,12 @@ export class DetachedLane {
     let mode: LaunchMode;
     try { mode = await this.launchModeReader(path.join(this.rigRoot, '.context-hub')); }
     catch (e) {
+      this.detachedMode = false;
       this.deliveryVersions.clear();
       this.context.log(`detached delivery observation skipped: ${(e as Error).message}`); return;
     }
-    if (mode !== 'detached') { this.deliveryVersions.clear(); return; }
+    this.detachedMode = mode === 'detached';
+    if (!this.detachedMode) { this.deliveryVersions.clear(); return; }
     const present = new Set(state.tasks.map(t => t.task_id));
     for (const id of this.deliveryVersions.keys()) if (!present.has(id)) this.deliveryVersions.delete(id);
     for (const task of state.tasks) {
@@ -139,13 +166,18 @@ export class DetachedLane {
       // Occupancy can outlive an unreadable completion. Keep the interval,
       // but do not repeatedly pull Hub history while evidence is pending.
       if (this.headless.busy(task.task_id)) continue;
+      let readingContext = true;
       try {
         const records = await this.context.fullLog(task.task_id, task);
+        await this.diagnostics.recover(`delivery-context:${task.task_id}`);
+        readingContext = false;
         if (await this.headless.reconcileDeliveries(task.task_id, records, boundary.processed, version, now)) {
           boundary.processed = version;
         }
       } catch (e) {
-        this.context.log(`detached delivery context check failed task=${task.task_id}: ${(e as Error).message}; retry next poll`);
+        // The runtime already owns the run-inventory diagnostic. Do not emit
+        // a second copy of that same fault at the caller boundary.
+        if (readingContext) await this.diagnostics.repeat(`delivery-context:${task.task_id}`, (e as Error).message, `detached delivery context check failed task=${task.task_id}: ${(e as Error).message}; retry next poll`);
       }
     }
   }
@@ -198,6 +230,8 @@ export class DetachedLane {
       gateOf: (task) => this.context.autoGateReason(task),
       whitelisted: autoWhitelisted,
       readLog: (taskId, task) => this.context.fullLog(taskId, task),
+      completedLaunches: (task, records) => this.completedLaunches(task, records),
+      catchupAllowed: (taskId, at) => this.catchupAllowed(taskId, at),
       launch: (task, role) => this.context.autoLaunch(task, role),
       log: (line) => this.context.log(line),
     });
@@ -208,18 +242,19 @@ export class DetachedLane {
     try {
       const records = await this.context.fullLog(task.task_id, task);
       const onlineHumanVersion = this.humanWakeVersions.get(task.task_id) ?? 0;
-      const generation = headlessGeneration(records, role, onlineHumanVersion);
+      const completedWithoutDelivery = this.headless.recoverableLaunches(task.task_id, records);
+      const generation = headlessGeneration(records, role, onlineHumanVersion, task.flow, completedWithoutDelivery);
       if (generation.blocked) {
         await this.context.autoLaunchSkipped(task, role, generation.marker);
         return;
       }
-      // Anchored checkout (design 7.6): freeze launch.checkout once for this
+      // Anchored checkout: freeze launch.checkout once for this
       // decision, and fetch the description only when anchoring needs it —
       // rig (default) keeps the exact pre-existing plan path.
       const launchCheckout = await this.checkoutModeReader(path.join(this.rigRoot, '.context-hub'));
       const description = launchCheckout === 'anchored' ? await this.readTaskDescription(task.task_id) : undefined;
       const plan = await buildHeadlessPlan({
-        task, role, records, onlineHumanVersion, hubRoot: this.rigRoot,
+        task, role, records, onlineHumanVersion, completedWithoutDelivery, hubRoot: this.rigRoot,
         hubUrl: this.stateUrl.replace(/\/state$/u, ''), eventUrl: `http://127.0.0.1:${this.eventPort}/agent-event`, runs: this.headless.runs(), description, launchCheckout
       });
       await this.context.awaitSweepBarrier(task.task_id);
@@ -228,7 +263,7 @@ export class DetachedLane {
       catch (e) {
         if ((e instanceof HubError && e.code === "VERSION_CONFLICT") || (e as Error).message.includes("VERSION_CONFLICT")) {
           const latest = await this.deps.readLog(task.task_id);
-          const covered = headlessGeneration(latest, role, onlineHumanVersion);
+          const covered = headlessGeneration(latest, role, onlineHumanVersion, task.flow, this.headless.recoverableLaunches(task.task_id, latest));
           if (covered.blocked) { await this.context.autoLaunchSkipped(task, role, covered.marker); return; }
         }
         throw e;

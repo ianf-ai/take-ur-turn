@@ -9,8 +9,8 @@
  * execution context.
  */
 
-import { rigLabel, unscopedLabel } from "../../core/hub/rig.js";
-import type { LaunchInvocation } from "../../core/common/types.js";
+import { rigLabel, unscopedLabel } from "../../hub/rig-identity.js";
+import type { LaunchInvocation } from "../../protocol/types.js";
 import type { HerdrPane } from "./legacy-herdr-client.js";
 
 export type LifecyclePane = HerdrPane;

@@ -3,16 +3,19 @@ import { requestTimeout } from './hub.mjs';
 
 // Read-only awaits may be abandoned. Mutations must settle before releasing
 // the writer lock or starting another pass: a timeout cannot undo a rename.
-export async function localIO(phase, options, action, mutation = false) {
+export async function localIO(phase, options, action, mutation = false, target = phase) {
   const timeoutMs = options.requestTimeoutMs ?? requestTimeout();
   const controller = new AbortController();
   let timer, expired;
+  const started = performance.now();
   options.onProgress?.(phase);
   const pending = Promise.resolve().then(() => action(controller.signal));
   try {
     const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => {
-        expired = Object.assign(new Error(`LOCAL_IO_TIMEOUT:${phase}: exceeded ${timeoutMs}ms`), { code: 'LOCAL_IO_TIMEOUT' });
+        expired = Object.assign(new Error(`LOCAL_IO_TIMEOUT:${phase}: exceeded ${timeoutMs}ms`), {
+          code: 'LOCAL_IO_TIMEOUT', phase, target: String(target), elapsed_ms: Math.round(performance.now() - started), timeout_ms: timeoutMs,
+        });
         reject(expired);
         controller.abort(expired);
         if (mutation) {
@@ -40,6 +43,6 @@ export function localFs(options = {}) {
         args[index] = { ...(typeof args[index] === 'string' ? { encoding: args[index] } : args[index]), signal };
       }
       return fs[method](...args);
-    }, ['writeFile', 'rename', 'unlink'].includes(method)),
+    }, ['writeFile', 'rename', 'unlink'].includes(method), args[0]),
   ]));
 }

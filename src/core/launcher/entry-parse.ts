@@ -1,10 +1,8 @@
 /** Internal `tut launch` entry boundary. */
 
-import {
-  deserializeLaunchInvocation,
-  requestFromLegacyArgs,
-} from "./invocation.js";
-import type { LaunchInvocation, LaunchRequest } from "../common/types.js";
+import { deserializeLaunchInvocation } from "../../protocol/launch-codec.js";
+import { requestFromLegacyArgs } from "../../protocol/launch-policy.js";
+import type { LaunchInvocation, LaunchRequest } from "../../protocol/types.js";
 
 export type LaunchEntry =
   | { kind: "cleanup"; task_id: string }

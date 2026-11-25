@@ -1,28 +1,16 @@
-/**
- * Workspace lineup resolution — three-level chain.
- *
- * Single source for "which agent serves each role". Chain (per-field,
- * never-throw — a missing or corrupt file counts as that level being
- * absent, and reads fall through):
- *
- *   L1 project  <projectRoot>/.context-hub/workspace.json
- *   L2 user     <userConfigDir>/workspace.json   (TUT_USER_CONFIG_DIR, else ~/.config/tut)
- *   L3 built-in DEFAULT_ROLES
- *
- * roles fall back per role key (L1 defining executor only leaves architect
- * to L2/L3); `naming.tab_label` falls back independently (L1 → L2 →
- * "TUT {role}"). Entries may carry extra keys (the legacy {label, agent}
- * shape included); `{agent,args}` entries preserve ordered arguments.
- *
- * All consumers (assign / up / start-next / Notifier / legacy launch)
- * resolve through this module. Configuration examples live in README.md.
- */
+/** Rig intent resolution. config.roles is a complete authoritative roster;
+ * workspace's legacy chain remains readable only while config.roles is absent. */
 
+import {resolveBindingReference,type InvocationBinding} from '../../agents/public/declarations.js';
+import {normalizeAgentRoute} from '../../protocol/agent-command.js';
 import { readFile } from "node:fs/promises";
+import { readConfigFile, configPath } from "./config.js";
+import { parseConfigRoles } from "./config-intent.js";
+export { KNOWN_ROLES } from "./config-intent.js";
 import { homedir } from "node:os";
 import path from "node:path";
-import { AgentCommandError, formatAgentRoute, parseAgentRoute, validateAgentRoute } from "./agent-command.js";
-import type { AgentCommand, AgentRoute, Cast } from "./types.js";
+import { AgentCommandError, formatAgentRoute, parseAgentRoute, validateAgentRoute } from "../../protocol/agent-command.js";
+import type { AgentCommand, AgentRoute, Cast } from "../../protocol/types.js";
 
 /** Built-in default lineup (L3). Role → agent; values frozen. */
 export const DEFAULT_ROLES: Record<string, string> = {
@@ -34,12 +22,13 @@ export const DEFAULT_ROLES: Record<string, string> = {
 /** Final fallback for a role DEFAULT_ROLES does not know. Visible face: `tut create` warns (non-blocking) when the creator role is outside the conventional set — this fallback is what the warning explains. */
 export const UNKNOWN_ROLE_AGENT = "codex";
 
-export const KNOWN_ROLES = ["architect", "executor", "reviewer"] as const;
 
 /** Default tab-label template (naming.tab_label absent everywhere). */
 export const DEFAULT_TAB_LABEL = "TUT {role}";
 
 export interface ResolveOptions {
+  /** Owning rig for config intent; independent of legacy workspace fallback. */
+  rigRoot?: string;
   /** L1 project root (default: process cwd — same assumption as tut up's guardrail). */
   projectRoot?: string;
   /** Optional shared Hub root whose L1 declaration supplements the checkout L1. */
@@ -53,7 +42,8 @@ export interface ResolveOptions {
 /** Route plus the level that supplied it, for launch audit projections. */
 export interface ResolvedAgentRoute {
   route: AgentRoute;
-  source: "task-cast" | "workspace-project" | "workspace-user" | "builtin-default";
+  binding?: InvocationBinding;
+  source: "task-cast" | "config-project" | "workspace-project" | "workspace-user" | "builtin-default";
 }
 
 /** Default L2 dir: env override, else ~/.config/tut. */
@@ -70,6 +60,8 @@ export function defaultUserConfigDir(environment: NodeJS.ProcessEnv = process.en
  * never enter the Context Hub marker.
  */
 export interface WorkspaceConfigSnapshot {
+  readonly authoritative?: boolean;
+  readonly bindings?: unknown;
   readonly projectRoot: string;
   readonly userConfigDir: string;
   readonly roles: readonly [Readonly<Record<string, AgentRoute>>, Readonly<Record<string, AgentRoute>>];
@@ -100,7 +92,7 @@ async function readJson(file: string): Promise<Record<string, unknown> | null> {
  * routes make only that role absent so the chain can fall through.
  */
 function parseRoles(raw: Record<string, unknown> | null): Record<string, AgentRoute> {
-  const out: Record<string, AgentRoute> = {};
+  const out: Record<string, AgentRoute> = Object.create(null);
   const roles = raw?.roles;
   if (roles === undefined || typeof roles !== "object" || roles === null || Array.isArray(roles)) return out;
   for (const [role, entry] of Object.entries(roles as Record<string, unknown>)) {
@@ -115,6 +107,7 @@ function parseRoles(raw: Record<string, unknown> | null): Record<string, AgentRo
     } catch (e) {
       // Workspace files are external declarations: a malformed role is
       // treated as absent and that role falls through to the next level.
+      if (typeof agent === "string" && agent.startsWith("binding:")) throw e;
       if (!(e instanceof AgentCommandError)) continue;
     }
   }
@@ -152,6 +145,17 @@ async function readLevels(
   };
 }
 
+function freezeData<T>(value:T):T {
+  if(value && typeof value === 'object') {for(const v of Object.values(value)) freezeData(v);Object.freeze(value);}
+  return value;
+}
+
+/** Resolve a selected logical route, retaining its identity for status/audit. */
+export function resolveRouteBinding(route:AgentRoute, bindings:unknown):InvocationBinding|undefined {
+  const command=normalizeAgentRoute(route);
+  return resolveBindingReference(command.agent,command.args,bindings);
+}
+
 function freezeRoute(route: AgentRoute): AgentRoute {
   if (typeof route === "string") return route;
   const frozen: AgentCommand = {
@@ -162,7 +166,7 @@ function freezeRoute(route: AgentRoute): AgentRoute {
 }
 
 function freezeRoleMap(routes: Record<string, AgentRoute>): Readonly<Record<string, AgentRoute>> {
-  const frozen: Record<string, AgentRoute> = {};
+  const frozen: Record<string, AgentRoute> = Object.create(null);
   for (const [role, route] of Object.entries(routes)) frozen[role] = freezeRoute(route);
   return Object.freeze(frozen);
 }
@@ -176,8 +180,20 @@ export async function readWorkspaceConfigSnapshot(
     ? undefined
     : path.resolve(opts.fallbackProjectRoot);
   const userConfigDir = path.resolve(opts.userConfigDir ?? defaultUserConfigDir());
-  const levels = await readLevels(projectRoot, userConfigDir, fallbackProjectRoot);
+  // The shared rig selects intent; an execution checkout cannot replace it.
+  const intentRoot = path.join(path.resolve(opts.rigRoot ?? fallbackProjectRoot ?? projectRoot), ".context-hub");
+  const outcome = await readConfigFile(intentRoot);
+  if (outcome.status === "invalid") throw new Error(`cannot read rig intent: ${configPath(intentRoot)} is unreadable or corrupt; repair it before launching`);
+  const config = outcome.status === "ok" ? outcome.config : undefined;
+  const authoritative = config !== undefined && Object.hasOwn(config, "roles");
+  const levels: WorkspaceLevels = authoritative
+    ? { roles: [parseConfigRoles(config.roles), {}], tabLabel: [parseTabLabel(config), undefined] }
+    : await readLevels(projectRoot, userConfigDir, fallbackProjectRoot);
+  // Display intent can move independently; the config section wins as a whole.
+  if (config && Object.hasOwn(config, "naming")) levels.tabLabel = [parseTabLabel(config), undefined];
   return Object.freeze({
+    authoritative,
+    bindings: freezeData(structuredClone(config?.agent_bindings)),
     projectRoot,
     userConfigDir,
     roles: Object.freeze([freezeRoleMap(levels.roles[0]), freezeRoleMap(levels.roles[1])]) as readonly [
@@ -213,19 +229,24 @@ export async function resolveAgentRouteWithSource(
   cast?: Cast,
   opts: ResolveOptions = {},
 ): Promise<ResolvedAgentRoute> {
+  const snapshot = opts.workspaceSnapshot ?? await readWorkspaceConfigSnapshot(opts);
+  const selected=(route:AgentRoute,source:ResolvedAgentRoute["source"]):ResolvedAgentRoute => {
+    const binding=resolveRouteBinding(route,snapshot.bindings);
+    return {route,source,...(binding?{binding:freezeData(binding)}:{})};
+  };
   const fromCast = cast?.[role as keyof Cast];
   if (fromCast !== undefined) {
     // A task cast is an explicit routing decision. Invalid input must stop at
     // the launch pre-check; silently falling through to a workspace/default
     // agent could launch the wrong executable and leave a misleading marker.
-    return { route: parseRouteForResolution(fromCast, `cast role '${role}'`), source: "task-cast" };
+    return selected(parseRouteForResolution(fromCast, `cast role '${role}'`), "task-cast");
   }
-  const snapshot = opts.workspaceSnapshot ?? await readWorkspaceConfigSnapshot(opts);
-  const project = snapshot.roles[0][role];
-  if (project !== undefined) return { route: project, source: "workspace-project" };
+  const project = Object.hasOwn(snapshot.roles[0], role) ? snapshot.roles[0][role] : undefined;
+  if (project !== undefined) return selected(project, snapshot.authoritative ? "config-project" : "workspace-project");
+  if (snapshot.authoritative) throw new Error(`config.roles has no role '${role}'; assign it explicitly or supply a task cast`);
   const user = snapshot.roles[1][role];
-  if (user !== undefined) return { route: user, source: "workspace-user" };
-  return { route: DEFAULT_ROLES[role] ?? UNKNOWN_ROLE_AGENT, source: "builtin-default" };
+  if (user !== undefined) return selected(user, "workspace-user");
+  return selected(DEFAULT_ROLES[role] ?? UNKNOWN_ROLE_AGENT, "builtin-default");
 }
 
 /** Resolve an already-snapshotted route without touching the filesystem. */
@@ -249,8 +270,8 @@ export async function resolveAgent(role: string, cast?: Cast, opts: ResolveOptio
 
 /**
  * Resolve the tab-label naming template (independent chain: L1 → L2 →
- * default "TUT {role}"). Herdr launch planners render the template from
- * the same frozen workspace snapshot as the route.
+ * default "TUT {role}"). The consuming launch adapter renders the template
+ * from the same frozen workspace snapshot as the route.
  */
 export async function resolveTabLabelTemplate(opts: ResolveOptions = {}): Promise<string> {
   const snapshot = opts.workspaceSnapshot ?? await readWorkspaceConfigSnapshot(opts);

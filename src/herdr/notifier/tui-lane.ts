@@ -9,19 +9,20 @@ import { parseDeliveryV2, giveUpGuidance } from '../launcher/escalation.js';
 import { runInternalLaunch, runInternalLaunchInvocation, DEFAULT_CHILD_TIMEOUT_MS } from '../launcher/process.js';
 import { requireBirthAnchor, resolveExecutionContext } from '../launcher/anchor.js';
 import { HerdrClient } from '../launcher/legacy-herdr-client.js';
-import { rigLabel, rigEnvironment, unscopedLabel } from '../../core/hub/rig.js';
-import { commandHead, commandArgs } from '../../core/common/agent-command.js';
+import { resolveRigRoot } from '../../hub/rig-discovery.js';
+import { rigLabel, rigEnvironment, unscopedLabel } from '../../hub/rig-identity.js';
+import { commandHead, commandArgs } from '../../protocol/agent-command.js';
 import { launchBlocked, resolveLaunchTargetWithSource, type NoteWake } from '../../core/launcher/launch.js';
-import { buildLaunchInvocation } from '../../core/launcher/invocation.js';
+import { buildLaunchInvocation } from "../../protocol/launch-codec.js";
 import { AgentTargetError, UnsupportedWindowsShimError, planForPlatform, resolvePosixTargetPresence, type PlatformExecutionPlan } from '../../core/launcher/target-resolver.js';
 import { KNOWN_ROLES, defaultUserConfigDir, readWorkspaceConfigSnapshot, resolveAgentRouteFromSnapshot, resolveTabLabelTemplateFromSnapshot, type WorkspaceConfigSnapshot } from '../../core/common/workspace.js';
-import type { AgentCommand, AgentRoute, Cast, ContextRecord, ExecutionContext, LaunchInvocation, LaunchRequest, LaunchRouteSource } from '../../core/common/types.js';
+import type { AgentCommand, AgentRoute, Cast, ContextRecord, ExecutionContext, LaunchInvocation, LaunchRequest, LaunchRouteSource } from '../../protocol/types.js';
 import type { LaunchMode } from '../../core/common/config.js';
-import type { AgentEvent, PaneSnapshot, StateTask, RoutingMaps, NotifyOptions, NotifierDeps, LaneContext, HostStatusReport } from '../../core/notifier/contracts.js';
-type TuiDeps = Pick<NotifierDeps<unknown, Remediator, DeliveryDiagnostics>,
-  'now' | 'fetchState' | 'launch' | 'launchInvocation' | 'markLaunched' | 'cleanupPanes' |
-  'relayHostStatus' | 'loadRouting' | 'resolveTarget' | 'resolveTargetWithSource' |
-  'listPanes' | 'listAnchorPanes' | 'readPane' | 'remediator' | 'remediationAudit'>;
+import type { StateTask, NotifyOptions, SharedNotifierDeps, HostStatusReport } from '../../core/notifier/shared-contracts.js';
+import type { AgentEvent, PaneSnapshot, RoutingMaps, HerdrNotifierDeps, HerdrLaneContext } from './contracts.js';
+import { remediationModeOf } from './interactive-port.js';
+type TuiDeps = Pick<SharedNotifierDeps, 'now' | 'fetchState' | 'markLaunched'> &
+  HerdrNotifierDeps<Remediator, DeliveryDiagnostics>;
 
 /** Only a complete v2 block explains the outcome; legacy fields are diagnostic. */
 function deliveryGiveUpHint(evt: Pick<AgentEvent, "delivery_v2">): string {
@@ -264,15 +265,17 @@ const UNMATCHED_EVENT_WINDOW_MS = 60_000;
  * the same disk files every 5s). Optional root overrides keep tests hermetic.
  */
 export async function defaultLoadRouting(
-  opts?: { projectRoot?: string; userConfigDir?: string },
+  opts?: { rigRoot?: string; projectRoot?: string; userConfigDir?: string },
 ): Promise<RoutingMaps> {
   const labelToAgent = new Map<string, string>();
   const roleToAgent = new Map<string, string>();
   const snapshot = await readWorkspaceConfigSnapshot({
+    rigRoot: opts?.rigRoot ?? resolveRigRoot(opts?.projectRoot),
     ...(opts?.projectRoot !== undefined ? { projectRoot: opts.projectRoot } : {}),
     ...(opts?.userConfigDir !== undefined ? { userConfigDir: opts.userConfigDir } : {}),
   });
   for (const role of KNOWN_ROLES) {
+    if (snapshot.authoritative && !Object.hasOwn(snapshot.roles[0], role)) continue;
     const resolved = await resolveAgentRouteFromSnapshot(role, undefined, snapshot); // never touches the filesystem again
     const agent = commandHead(resolved.route);
     roleToAgent.set(role, agent);
@@ -394,9 +397,7 @@ export class TuiLane {
   constructor(
     private readonly options: NotifyOptions,
     private readonly rigRoot: string,
-    private readonly context: Pick<LaneContext,
-      'snapshot' | 'log' | 'sendAll' | 'fullLog' | 'requestCompare' | 'markProgress' |
-      'autoLaunchFailed' | 'autoLaunchSkipped' | 'deferNoteWake'>,
+    private readonly context: HerdrLaneContext,
     private readonly deps: TuiDeps,
     private readonly launchModeReader: (root: string) => Promise<LaunchMode>,
   ) {
@@ -404,7 +405,7 @@ export class TuiLane {
     this.workingTimeoutMs = Math.max(0, Number.isFinite(workingTimeoutSec) ? workingTimeoutSec : 300) * 1000;
     this.remediator = deps.remediator ?? createEnterRepress();
     this.remediationAudit = deps.remediationAudit ?? ((taskId, role) => createRemediationAudit({ env: { ...process.env, TUT_PROJECT_ROOT: rigRoot }, task_id: taskId, role, stderr: text => this.context.log(text.trimEnd()) }));
-    this.routingLoader = deps.loadRouting ?? defaultLoadRouting;
+    this.routingLoader = deps.loadRouting ?? (() => defaultLoadRouting({ rigRoot: this.rigRoot }));
     this.targetResolver = deps.resolveTarget ?? (async (taskId, role) => (await defaultResolveTargetWithSource(options.url, taskId, role)).route);
     this.targetSourceResolver = deps.resolveTargetWithSource !== undefined
       ? (taskId, role, projectRoot, workspaceSnapshot) => deps.resolveTargetWithSource!(taskId, role, projectRoot, workspaceSnapshot)
@@ -674,7 +675,7 @@ export class TuiLane {
           // Read through HTTP without running another compare/launch cycle.
           // Notes may advance version while the same role round remains active.
           const latest = await this.deps.fetchState(`${this.stateUrl}?include=closed`);
-          const enabled = (latest.auto?.remediate ?? (latest.flow_mode === 'auto' ? 'enter-repress' : 'off')) === 'enter-repress';
+          const enabled = remediationModeOf({ flow_mode: latest.flow_mode, auto: latest.auto }) === 'enter-repress';
           stopped = this.closed || this.remediationMode !== 'enter-repress' || !enabled || (latest.degraded ?? []).includes(taskId) ||
             !eligible(latest.tasks.find(t => t.task_id === taskId)) || !eligible(this.context.snapshot?.get(taskId));
         } catch { stopped = true; }
@@ -687,7 +688,7 @@ export class TuiLane {
           this.context.log(`[${taskId}] remediation attempt capacity reached; escalating manually without another key`);
         } else try {
           const sink = this.remediationAudit(taskId, paneRole);
-          const recordAction = async (remediation: import('../launcher/remediator.js').RemediationEvidence) => {
+          const recordAction = async (remediation: import('../launcher/remediation-contracts.js').RemediationEvidence) => {
             sink.emit(`remediation pane=${evidence.pane_id} delivery_v2=${JSON.stringify({ ...evidence, remediation })}`);
             await sink.flush();
           };
@@ -775,7 +776,7 @@ export class TuiLane {
    * Event→task mapping. The event pane is resolved as
    *   (a) pane label IS a task_id (legacy work-pane convention; validated
    *       against the snapshot, not string-guessed) → full mapping, else
-   *   (a½) fresh-session round pane `<task_id>.<role>` (4.4): task_ids carry
+   *   (a½) fresh-session round pane `<task_id>.<role>`: task_ids carry
    *       no dots (slug alphabet [a-z0-9-]), so the prefix before the LAST
    *       dot is the task_id; validated against the snapshot like (a) →
    *       direct hit — sharper than the identity chain (role is in the label,
@@ -785,14 +786,14 @@ export class TuiLane {
    *       whose routed agent (task cast ?? default lineup) IS that identity;
    *       unique → use it, several → latest updated_at with an ambiguity log
    *       line, none → no mapping.
-   * Edge (4.4 note): an agent named exactly like a live task_id wins level
+   * Edge: an agent named exactly like a live task_id wins level
    * (a) — accepted, priority declared, no anti-collision mechanism.
    */
   private resolveEventTask(pane: string): string | null {
     const snap = this.context.snapshot;
     if (snap === null) return null;
     const label = unscopedLabel(pane.trim(), this.rigRoot) ?? pane.trim();
-    if (snap.has(label)) return label; // (a) 4.4: work pane named after its task
+    if (snap.has(label)) return label; // (a) work pane named after its task
     // (a½) round pane <task_id>.<role>. Slugs do not contain dots, but walk
     // every dot from the right so a legacy label with an extra suffix still
     // gets the strongest task-prefix hit instead of falling through to the
@@ -934,7 +935,7 @@ export class TuiLane {
         // No stall refresh: a blocked event is not progress — this
         // stuck alert is the timely signal, and the stall watchdog stays the
         // stallMs backstop instead of being renewed by status flapping.
-        // blocked is an追加触发 immediate compare (system-design 6.1):
+        // blocked also triggers an immediate compare:
         // the stuck agent may have just published; a compare picks it up now.
         // The UNMATCHED degradation (log + notify) is rate-limited
         // per source — the immediate compare above is never suppressed.
@@ -975,7 +976,7 @@ export class TuiLane {
    * per-task sweep barrier (see sweepBarriers) additionally parks any
    * concurrently-running compare's autoLaunch for this task until the sweep
    * settles, closing the poll-races-the-sweep window. Then the event pane is
-   * resolved to a task (4.4 naming, or the role-pane reverse lookup); if
+   * resolved to a task (task-named pane or role-pane reverse lookup); if
    * that task's waiting_for did not advance, wait one interval (or ≥2s) and
    * recheck — only still-no-advance notifies "Agent stopped but did not
    * publish context". Unresolvable pane degrades to a single compare.
@@ -1056,7 +1057,7 @@ export class TuiLane {
    * line carries the same parseable ISO timestamp and the pane label (the
    * header is a separator, never the lines' only timestamp carrier — lines
    * must stay self-describing when read away from their header). Scoped
-   * strictly to the task's round-pane namespace (4.4): panes of other
+   * strictly to the task's round-pane namespace: panes of other
    * tasks, system panes (tut-hub/tut-notify), and unlabeled panes are never
    * read. Best-effort: a failed inventory logs a note; a failed read logs
    * per pane and moves on — the sweep must never break the done flow (and
@@ -1209,7 +1210,7 @@ export class TuiLane {
    * desktop notification (the human closed the task themselves; this is
    * housekeeping, not news) and no Hub writes (a cleanup record would
    * re-trigger compares and notification loops). Failure is terminal for
-   * the panes — orphan recovery does not exist (4.4) — so the line carries
+   * the panes — orphan recovery does not exist — so the line carries
    * the manual retry command.
    */
   cleanupClosedTask(taskId: string): void {
@@ -1249,6 +1250,7 @@ export class TuiLane {
     let workspaceSnapshot: WorkspaceConfigSnapshot;
     try {
       workspaceSnapshot = await readWorkspaceConfigSnapshot({
+        rigRoot: this.rigRoot,
         projectRoot,
         userConfigDir: defaultUserConfigDir(environment),
         ...(executionContext.checkout.kind === "worktree" && !executionContext.hubRoot.startsWith("<")
@@ -1329,7 +1331,7 @@ export class TuiLane {
       // incremental since cached.version + 1 and therefore sees the marker.
       try {
         const after = await this.context.fullLog(task.task_id);
-        const afterBlocked = launchBlocked(after, role, noteWake);
+        const afterBlocked = launchBlocked(after, role, noteWake, task.flow);
         if (afterBlocked.blocked) {
           await this.context.autoLaunchSkipped(task, role, afterBlocked.noteVersion);
           return;

@@ -47,8 +47,8 @@ const WINDOWS_TOAST_APP_ID = "TUT.Notifier";
 const WINDOWS_TOAST_DISPLAY_NAME = "TUT Notifier";
 
 /**
- * Windows toast text must pass psq, whose raw-input contract rejects NUL/CR/LF
- * (src/herdr/launcher/shell-renderer.ts). Letting that throw here degraded the whole
+ * Windows toast text must pass psq, whose single-line PowerShell input contract
+ * rejects NUL/CR/LF. Letting that throw here degraded the whole
  * toast to a silent bell: notification text — task titles included —
  * legitimately carries newlines, so every such message was lost without a
  * trace on Windows only. Fold every CR/LF run (LF-LF, CR-CR, mixed CRLF-LF…)

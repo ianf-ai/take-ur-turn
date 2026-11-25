@@ -1,3 +1,4 @@
+import {runSessionIdentities,contractSource,type ProfileSourceSnapshot} from '../../agents/public/index.js';
 /**
  * Startup admission: cross-process exclusive admission for
  * resume and headless auto launches, built ONLY on RunStore facts —
@@ -18,7 +19,6 @@
  * (single-process only), or process-table liveness (the run protocol owns that domain).
  */
 import { RunStore, complete, type RunMeta } from './store.js';
-import path from 'node:path';
 
 export interface SessionIdentity { agent: string; session_id: string }
 
@@ -37,33 +37,20 @@ export interface AdmissionOccupant {
  *  <prompt>` may carry options between `resume` and the id; the id can never
  *  be the trailing prompt position. Agent names compare by basename (routes
  *  may carry absolute paths). */
-export function metaCarriesSession(meta: RunMeta, identity: SessionIdentity): boolean {
-  const id = identity.session_id;
-  if (meta.agent_session_id === id) return true;
-  if (meta.headless?.designated_session_id === id) return true;
-  if (meta.resume !== undefined && path.basename(meta.resume.agent) === path.basename(identity.agent) && meta.resume.session_id === id) return true;
-  const argv = meta.argv;
-  const resumeIndex = argv.indexOf('resume');
-  for (let i = 1; i < argv.length; i++) {
-    if (argv[i] !== id) continue;
-    if (argv[i - 1] === '--session-id') return true;
-    if (resumeIndex !== -1 && i > resumeIndex && i < argv.length - 1) return true;
-  }
-  return false;
+export function metaCarriesSession(meta: RunMeta, identity: SessionIdentity, snapshot=contractSource()): boolean {
+  // Keep the legacy conservative cross-agent check for recorded native IDs.
+  return runSessionIdentities(meta,snapshot).some(s=>s.session_id===identity.session_id);
 }
 
 /** Incomplete runs + pending intents holding the session identity. */
 export function sessionOccupants(store: RunStore, identity: SessionIdentity): AdmissionOccupant[] {
   const occupants: AdmissionOccupant[] = [];
-  for (const id of store.list()) {
-    let meta: RunMeta | undefined;
-    try {
-      meta = store.read(id);
-    } catch {
-      meta = undefined;
-    }
+  const snapshot=contractSource(store.hubRoot);
+  for (const result of store.readManyMetas(store.list())) {
+    const { id } = result;
+    const meta = result.kind === 'meta' ? result.meta : undefined;
     if (meta !== undefined) {
-      if (metaCarriesSession(meta, identity) && !complete(meta)) {
+      if (!complete(meta) && metaCarriesSession(meta, identity,snapshot)) {
         occupants.push({ run_id: id, via: 'meta', detail: `incomplete run (status=${meta.status}${meta.ended_at ? '' : ', no ended_at'})` });
       }
       continue;
@@ -71,17 +58,16 @@ export function sessionOccupants(store: RunStore, identity: SessionIdentity): Ad
     // Unreadable meta: a persisted intent keeps the reservation attributable.
     try {
       const intent = store.readResumeIntent(id);
-      if (intent.agent === identity.agent && intent.session_id === identity.session_id && intent.startup === 'pending') {
+      if (intent.session_id === identity.session_id && intent.startup === 'pending') {
         occupants.push({ run_id: id, via: 'intent', detail: `pending resume startup intent from ${intent.from_run_id}` });
       }
       continue;
     } catch { /* no resume intent */ }
-    try {
-      const intent = store.readStartIntent(id);
-      if (intent.startup === 'pending' && intent.headless.designated_session_id === identity.session_id) {
-        occupants.push({ run_id: id, via: 'intent', detail: `pending headless startup intent (task ${intent.task_id})` });
-      }
-    } catch { /* legacy/manual incomplete run: not attributable to a session */ }
+    let startIntent:import('./meta.js').HeadlessStartIntent|undefined;
+    try {startIntent=store.readStartIntent(id);}catch {/* No start intent. */}
+    if(startIntent?.startup==='pending'&&intentHoldsSession(startIntent,identity,snapshot)) {
+      occupants.push({run_id:id,via:'intent',detail:`pending headless startup intent (task ${startIntent.task_id})`});
+    }
   }
   return occupants;
 }
@@ -89,13 +75,9 @@ export function sessionOccupants(store: RunStore, identity: SessionIdentity): Ad
 /** Incomplete runs + pending intents attached to a task (any role). */
 export function taskOccupants(store: RunStore, taskId: string): AdmissionOccupant[] {
   const occupants: AdmissionOccupant[] = [];
-  for (const id of store.list()) {
-    let meta: RunMeta | undefined;
-    try {
-      meta = store.read(id);
-    } catch {
-      meta = undefined;
-    }
+  for (const result of store.readManyMetas(store.list())) {
+    const { id } = result;
+    const meta = result.kind === 'meta' ? result.meta : undefined;
     if (meta !== undefined) {
       if (meta.task_id === taskId && !complete(meta)) {
         occupants.push({ run_id: id, via: 'meta', detail: `incomplete run (status=${meta.status}${meta.ended_at ? '' : ', no ended_at'})` });
@@ -139,4 +121,9 @@ export async function withAdmissionLock<T>(store: RunStore, fn: () => Promise<T>
   } finally {
     unlock();
   }
+}
+
+function intentHoldsSession(intent:import('./meta.js').HeadlessStartIntent,identity:SessionIdentity,snapshot:ProfileSourceSnapshot):boolean {
+ const run={run_id:'pending',cwd:intent.cwd,argv:[],headless:intent.headless};
+ return runSessionIdentities(run,snapshot).some(s=>s.session_id===identity.session_id);
 }

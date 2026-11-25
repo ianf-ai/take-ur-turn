@@ -1,3 +1,5 @@
+import {validateInput,type InvocationInput} from './input.js';
+import {captureContract,contractSource,decodeContract} from '../../agents/public/index.js';
 import { fork } from 'node:child_process';
 import { closeSync, fstatSync, readSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -13,15 +15,20 @@ import { assertRunIdentity } from './validation.js';
 export function requirePosix(platform = process.platform): void {
   if (platform !== 'darwin' && platform !== 'linux') throw new Error('run/stop require POSIX process groups (macOS/Linux)');
 }
-export interface StartOptions { env?: NodeJS.ProcessEnv; headless?: HeadlessOwnership; resume?: ResumeSource; checkout?: string }
+export interface StartOptions { invocation?:import('../../agents/public/index.js').ReadyInvocation; input?:InvocationInput; profile?: string; env?: NodeJS.ProcessEnv; headless?: HeadlessOwnership; resume?: ResumeSource; checkout?: string }
 export class StartRunError extends Error {
   constructor(message: string, readonly runId: string, readonly uncertain: boolean) { super(message); this.name = "StartRunError"; }
 }
 export async function startRun(store: RunStore, argv: string[], cwd: string, task_id?: string, options: StartOptions = {}): Promise<string> {
   requirePosix();
+  validateInput(options.input);
   if (!argv[0] || argv.some(s => s.includes('\0'))) throw new Error('command executable required; NUL is not permitted');
   if (options.headless) { validateHeadlessOwnership(options.headless); if (!task_id) throw new Error("headless ownership requires task_id"); }
   if (options.resume && !/^(\d{8}T\d{9}Z-[a-f0-9]{8})$/.test(options.resume.from_run_id)) throw new Error('resume source requires the original run id');
+  const contract=options.profile??options.headless?.contract??captureContract(argv[0]!,contractSource(store.hubRoot));
+  if(contract)decodeContract(contract);
+  const headless=options.headless?{...options.headless,...(contract?{contract}:{})}:undefined;
+  options={...options,...(headless?{headless}:{})};
   const id = store.create();
   // Test writability before any command process can be started.
   closeSync(store.openLog(id, true));
@@ -29,7 +36,7 @@ export async function startRun(store: RunStore, argv: string[], cwd: string, tas
   // Resume reservations persist before spawn under every flow: an
   // uncertain handshake must remain attributable to its session identity.
   if (options.resume) {
-    await store.writeResumeIntent(id, { schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent,
+    await store.writeResumeIntent(id, { contract,schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent,
       session_id: options.resume.session_id, cwd, startup: 'pending' });
   }
   const supervisor = fork(fileURLToPath(new URL('./supervisor.js', import.meta.url)), ['--supervise'], {
@@ -42,7 +49,7 @@ export async function startRun(store: RunStore, argv: string[], cwd: string, tas
       supervisor.once('error', e => finish(new StartRunError(e.message,id,false)));
       supervisor.once('exit', (code, signal) => finish(new StartRunError(`supervisor exited before startup confirmation (${code ?? signal}); inspect ${id}`, id, true)));
       supervisor.once('message', (message: { ok?: boolean; error?: string; uncertain?: boolean }) => finish(message.ok ? undefined : new StartRunError(`run ${id}: ${message.error ?? 'startup failed'}`, id, message.uncertain === true)));
-      supervisor.send({ root: store.hubRoot, id, argv, cwd, ...(task_id !== undefined ? { task_id } : {}), ...(options.env ? {env:options.env} : {}), ...(options.headless ? {headless:options.headless} : {}), ...(options.resume ? {resume:options.resume} : {}), ...(options.checkout !== undefined ? {checkout:options.checkout} : {}) }, error => { if (error) finish(new StartRunError(error.message,id,true)); });
+      supervisor.send({ ...(options.invocation?{invocation:options.invocation}:{}), ...(options.input?{input:options.input}:{}), profile:contract, root: store.hubRoot, id, argv, cwd, ...(task_id !== undefined ? { task_id } : {}), ...(options.env ? {env:options.env} : {}), ...(options.headless ? {headless:options.headless} : {}), ...(options.resume ? {resume:options.resume} : {}), ...(options.checkout !== undefined ? {checkout:options.checkout} : {}) }, error => { if (error) finish(new StartRunError(error.message,id,true)); });
     });
     return id;
   } catch (e) {
@@ -50,7 +57,7 @@ export async function startRun(store: RunStore, argv: string[], cwd: string, tas
       await store.writeStartIntent(id,{task_id:task_id!,headless:options.headless,cwd,startup:'failed'});
     }
     if (options.resume && e instanceof StartRunError && !e.uncertain) {
-      await store.writeResumeIntent(id, { schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent,
+      await store.writeResumeIntent(id, { contract,schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent,
         session_id: options.resume.session_id, cwd, startup: 'failed' }).catch(() => undefined);
     }
     throw e;

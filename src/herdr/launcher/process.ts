@@ -9,8 +9,8 @@
 
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { serializeLaunchInvocation } from "../../core/launcher/invocation.js";
-import type { LaunchInvocation } from "../../core/common/types.js";
+import { serializeLaunchInvocation } from "../../protocol/launch-codec.js";
+import type { LaunchInvocation } from "../../protocol/types.js";
 
 export interface DirectSpawnOptions {
   cwd?: string;

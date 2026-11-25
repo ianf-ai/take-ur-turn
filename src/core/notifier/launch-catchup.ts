@@ -17,10 +17,16 @@
  *       → autoLaunch (which re-runs every gate internally, appends the
  *         marker, and hands the launcher child off exactly like an edge).
  *
- * dedup semantics are unchanged: a task holding a valid launch marker is
- * NOT a catchup candidate — it is skipped with an audit line only (no
- * notification, no second marker, launchBlocked stays the single source of
- * truth). A task whose log cannot be read still gets the launch attempt:
+ * dedup semantics: round-scoped — a task holding a valid CURRENT-ROUND
+ * launch marker is NOT a catchup candidate — it is skipped
+ * with an audit line only (no notification, no second marker, launchBlocked
+ * stays the single source of truth); a previous round's marker never blocks,
+ * and the boundary follows the task's real flow from /state. A candidate
+ * cancelled by an observed stop is withheld with a visible line — scoped to
+ * the round the stop interrupted: a later human instruction or a genuinely
+ * new round (flip strictly after the stop) re-arms the candidate, so the
+ * startup pass neither revives a round the operator explicitly stopped nor
+ * starves a legitimate new one. A task whose log cannot be read still gets the launch attempt:
  * autoLaunch re-reads the log inside its own dedup stage and its failure
  * path is the fail-visible notification ("intervene manually").
  *
@@ -34,9 +40,9 @@
  * before running it); nothing here ever joins the steady-state poll.
  */
 
-import { launchBlocked } from "../launcher/launch.js";
-import type { ContextRecord } from "../common/types.js";
-import type { StateAuto, StateResponse, StateTask } from "./contracts.js";
+import { launchBlocked, currentRoundStartedAt } from "../launcher/launch.js";
+import type { ContextRecord } from "../../protocol/types.js";
+import type { StateAuto, StateResponse, StateTask } from "./shared-contracts.js";
 
 /** The Notifier-owned seams the catchup pass runs on (all bound methods). */
 export interface LaunchCatchupSeams {
@@ -46,6 +52,12 @@ export interface LaunchCatchupSeams {
   whitelisted(auto: StateAuto | undefined, role: string): boolean;
   /** Cached/incremental task log read — the same merged view the edge path dedups on. */
   readLog(taskId: string, task: StateTask): Promise<ContextRecord[]>;
+  completedLaunches?(task: StateTask, records: readonly ContextRecord[]): ReadonlySet<number>;
+  /** Stop-cancellation gate for catch-up acting: false = the round's candidate
+   *  was cancelled by an observed stop and neither a later human instruction
+   *  nor a genuinely new round (flip strictly after the stop) re-armed it.
+   *  Optional for seams without stop observation (default: allowed). */
+  catchupAllowed?(taskId: string, currentRoundStartedAt?: number): boolean;
   /** The edge launch path itself (gate + dedup + marker re-checked inside). */
   launch(task: StateTask, role: string): Promise<void>;
   log(line: string): void;
@@ -72,21 +84,31 @@ export async function runLaunchCatchup(state: StateResponse, seams: LaunchCatchu
       whitelistField = whitelisted ? "pass" : `fail ('${role}' not in launch_roles)`;
     }
     let dedup = gate !== null ? "n/a (gate withheld)" : whitelisted ? "pending" : "n/a (not whitelisted)";
+    let roundStartedAt: number | undefined;
     if (gate === null && whitelisted) {
       try {
         const records = await seams.readLog(task.task_id, task);
-        const blocked = launchBlocked(records, role);
+        // The current round's start scopes stop-cancellation: a flip strictly
+        // after an observed stop is a genuinely new round.
+        roundStartedAt = currentRoundStartedAt(records, task.flow);
+        const blocked = launchBlocked(records, role, undefined, task.flow, seams.completedLaunches?.(task, records));
         dedup = blocked.blocked ? `launched@v${blocked.noteVersion}` : "fresh";
       } catch (e) {
         dedup = `unreadable (${(e as Error).message})`;
       }
     }
+    // A stop cancels the round's candidate unless a later human instruction
+    // or a genuinely new round re-armed it; the withheld verdict is visible
+    // in the audit line.
+    const stopCancelled = seams.catchupAllowed !== undefined && !seams.catchupAllowed(task.task_id, roundStartedAt);
     let action: string;
     let launch = false;
     if (gate !== null) {
       action = `none (gate: ${gate})`;
     } else if (!whitelisted) {
       action = `none (role '${role}' not in launch whitelist)`;
+    } else if (stopCancelled) {
+      action = "none (an observed stop cancelled this round's launch; a new human instruction or round re-arms it)";
     } else if (dedup === "fresh") {
       action = "launch (startup catchup)";
       launch = true;

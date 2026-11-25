@@ -1,15 +1,9 @@
-import type { RunMeta } from './store.js';
+import type { RunMeta, WindowsState } from './meta.js';
+export type { WindowsIdentity, WindowsObservation, WindowsState } from './meta.js';
 export const WINDOWS_PROTOCOL = 'windows-console-v1';
 export const WINDOWS_SCOPE = 'root-and-owned-job';
 export const WINDOWS_ACTIONS = ['break', 'taskkill-tree', 'taskkill-tree-force'] as const;
 export type WindowsAction = typeof WINDOWS_ACTIONS[number];
-export interface WindowsIdentity {
-    attempt_id: string;
-    broker_pid: number;
-    broker_creation_time: string;
-    root_creation_time: string;
-    job_id: string;
-}
 export interface BrokerBinding {
     protocol: typeof WINDOWS_PROTOCOL;
     run_id: string;
@@ -17,11 +11,6 @@ export interface BrokerBinding {
     broker_pid: number;
     broker_creation_time: string;
     nonce: string;
-}
-export interface WindowsObservation {
-    root_exited: boolean;
-    job_empty: boolean;
-    exit_code?: number;
 }
 export interface WindowsReceipt {
     targets: {
@@ -38,13 +27,6 @@ export interface WindowsActionAttempt {
     delivery: 'uncertain' | 'sent' | 'error';
     elapsed_ms?: number;
     receipt?: WindowsReceipt;
-    error?: string;
-}
-export interface WindowsState {
-    identity: WindowsIdentity;
-    observation?: WindowsObservation & {
-        observed_at: string;
-    };
     error?: string;
 }
 export interface WindowsStopResult {

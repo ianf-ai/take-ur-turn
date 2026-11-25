@@ -1,0 +1,952 @@
+/**
+ * Routing + assembly tests (adds /mode, the /state notify
+ * key, and the Host-guard edge cases): a REAL
+ * startServer on an ephemeral port (port 0) backed by a temp-dir Store.
+ *
+ * Scope: HTTP routing and the frozen /state shape. POST /mcp is asserted
+ * purely at the routing level (not 404/405) — full MCP-over-HTTP is
+ * covered by e2e.mcp.test.ts (and hub-client.test.ts from the client side).
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import { realpath } from 'node:fs/promises';
+
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
+import { startServer, type RunningServer } from "../../../src/hub/server.js";
+import { Store } from "../../../src/hub/store.js";
+import { writeConfigKey } from "../../../src/core/common/config.js";
+
+let tmp: string;
+let root: string;
+let store: Store;
+let running: RunningServer;
+let baseUrl: string;
+let stderrWrite: MockInstance<typeof process.stderr.write>;
+
+beforeEach(async () => {
+  tmp = mkdtempSync(path.join(os.tmpdir(), "tut-http-"));
+  root = path.join(tmp, ".context-hub");
+  store = new Store(root);
+  // One real task (create + one record) so /state has derived content …
+  const created = await store.createTask({
+    title: "Routing Task",
+    description: "task created via the store for /state assertions",
+    creator: "tester",
+    role: "executor",
+    cast: { executor: "pi" }, // exercises the cast? field on /state entries
+  });
+  await store.append(created.task_id, {
+    role: "executor",
+    content_type: "text/plain",
+    payload: { summary: "note", body: "a record so the task has derived state" },
+  });
+  // … plus a project-scope record, to prove project is EXCLUDED from /state.
+  await store.append("project", {
+    role: "human",
+    content_type: "text/markdown",
+    payload: { summary: "project note", body: "project scope must not appear in /state" },
+  });
+
+  stderrWrite = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+  running = await startServer({ root, port: 0 });
+  baseUrl = running.url;
+});
+
+afterEach(async () => {
+  stderrWrite.mockRestore();
+  await running.close().catch(() => undefined);
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+describe("GET /state (frozen shape)", () => {
+  it.each(["full", "direct", "solo"] as const)("projects stable launch anchors through notes and round changes (%s)", async flow => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      let tick = 0;
+      const time = () => vi.setSystemTime(new Date(Date.UTC(2026, 9, 27, 0, 0, tick++)));
+      time();
+      const { task_id } = await store.createTask({ title: "Round anchor", description: "board run window", creator: "tester", role: "human", flow });
+      const state = async () => {
+        const res = await fetch(`${baseUrl}/state`);
+        const body = await res.json() as { tasks: Array<{task_id: string; current_round_started_at: string; updated_at: string; status: string}> };
+        const entry = body.tasks.find(t => t.task_id === task_id)!;
+        // A fresh process must replay the same anchor as the incremental cache.
+        const cold = (await new Store(root).snapshotTasks()).tasks.find(t => t.task_id === task_id)!;
+        expect(entry.current_round_started_at).toBe(cold.current_round_started_at);
+        return entry;
+      };
+      const append = async (role: string, content_type: string, extra = {}) => {
+        time();
+        await store.append(task_id, { role, content_type, payload: { summary: "s", body: "b", ...extra } });
+        return new Date().toISOString();
+      };
+      const launch = (role: string) => append("human", "note", { launch: { role, base_version: 0, via: "auto" } });
+      expect((await state()).current_round_started_at).toBe(new Date().toISOString());
+      if (flow === "full") {
+        const architect = await launch("architect");
+        expect((await state()).current_round_started_at).toBe(architect);
+        const design = await append("architect", "design");
+        expect((await state()).current_round_started_at).toBe(design);
+      }
+      const executor = await launch("executor");
+      expect((await state()).current_round_started_at).toBe(executor);
+      for (const extra of [{}, { ack: true }, { launch: { role: "reviewer" } }, { launch: { role: 42 } }]) {
+        const note = await append("human", "note", extra);
+        expect(await state()).toMatchObject({ updated_at: note, current_round_started_at: executor });
+      }
+      const progress = await append("executor", "note");
+      expect(await state()).toMatchObject({ updated_at: progress, current_round_started_at: executor });
+      const relaunched = await launch("executor");
+      expect((await state()).current_round_started_at).toBe(relaunched);
+      const delivery = await append("executor", "code_changes");
+      expect((await state()).current_round_started_at).toBe(delivery);
+      if (flow !== "solo") {
+        const reviewer = await launch("reviewer");
+        expect((await state()).current_round_started_at).toBe(reviewer);
+        await append("reviewer", "note");
+        expect((await state()).current_round_started_at).toBe(reviewer);
+        const revision = await append("reviewer", "review", { verdict: "fail_code" });
+        expect(await state()).toMatchObject({ status: "revising", current_round_started_at: revision });
+        await append("human", "note");
+        // The previous executor marker must not be reused in its next turn.
+        expect((await state()).current_round_started_at).toBe(revision);
+        const nextExecutor = await launch("executor");
+        expect((await state()).current_round_started_at).toBe(nextExecutor);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns 200 application/json with flow_mode manual and eight-field task entries (flow always present)", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const body = (await res.json()) as { flow_mode: string; tasks: Record<string, unknown>[] };
+
+    expect(body.flow_mode).toBe("manual");
+    // Frozen fields plus explicit completeness; notify/auto remain optional.
+    expect(Object.keys(body).sort()).toEqual(["flow_mode", "hub_root", "tasks", "truncated"]);
+    expect(Array.isArray(body.tasks)).toBe(true);
+    expect(body.tasks).toHaveLength(1);
+
+    const entry = body.tasks[0]!;
+    expect(Object.keys(entry).sort()).toEqual([
+      "cast",
+      "current_round_started_at",
+      "flow",
+      "needs_attention",
+      "pending_since",
+      "round_count",
+      "status",
+      "task_id",
+      "title",
+      "updated_at",
+      "version",
+      "waiting_for",
+      "warnings",
+    ]);
+    expect(entry.task_id).toBe("routing-task");
+    expect(entry.title).toBe("Routing Task");
+    expect(typeof entry.status).toBe("string");
+    expect(typeof entry.updated_at).toBe("string");
+    expect(typeof entry.needs_attention).toBe("boolean");
+    expect(typeof entry.waiting_for).toBe("string");
+    expect(entry.version).toBe(1); // one record appended in beforeEach → meta.version
+    expect(entry.flow).toBe("full"); // always present, normalized
+    expect(entry.cast).toEqual({ executor: "pi" }); // present when created with one
+  });
+
+  it("never includes the project scope entry", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as { tasks: { task_id: string }[] };
+
+    expect(body.tasks.map((t) => t.task_id)).not.toContain("project");
+  });
+
+  it("never exposes record tut_version (store-added field stays out of the /state shape)", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const text = JSON.stringify(await res.json());
+
+    expect(text).not.toContain("tut_version");
+  });
+
+  it("HEAD /state runs the same state build: 200, JSON content-type, no body", async () => {
+    const res = await fetch(`${baseUrl}/state`, { method: "HEAD" });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.text()).toBe("");
+  });
+
+  it("POST /state → 405 with Allow: GET, HEAD", async () => {
+    const res = await fetch(`${baseUrl}/state`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("GET, HEAD");
+  });
+
+  it("exposes parameterized cast argv unchanged on the HTTP state seam", async () => {
+    const cast = { executor: { agent: "codex", args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] } };
+    const created = await store.createTask({
+      title: "Parameterized HTTP task",
+      description: "state route",
+      creator: "tester",
+      role: "architect",
+      cast,
+    });
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { tasks: Array<{ task_id: string; cast?: unknown }> };
+    expect(body.tasks.find((task) => task.task_id === created.task_id)?.cast).toEqual(cast);
+  });
+
+  it("exposes an explicit task checkout route on the HTTP state seam", async () => {
+    const checkout = { kind: "worktree" as const, path: "/worktrees/http-task", ref: "http-task" };
+    const created = await store.createTask({
+      title: "Parameterized HTTP checkout",
+      description: "state route",
+      creator: "tester",
+      role: "architect",
+      checkout,
+    });
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { tasks: Array<{ task_id: string; checkout?: unknown }> };
+    expect(body.tasks.find((task) => task.task_id === created.task_id)?.checkout).toEqual(checkout);
+  });
+
+  it("degrades a task with a corrupt record file: absent from tasks[], present in degraded[], never a 500", async () => {
+    // A second, healthy task so the listing still has derived content.
+    const created = await store.createTask({
+      title: "Healthy Task",
+      description: "must survive a sibling task's corrupt record file",
+      creator: "tester",
+      role: "executor",
+    });
+    await store.append(created.task_id, {
+      role: "executor",
+      content_type: "text/plain",
+      payload: { summary: "note", body: "healthy record" },
+    });
+
+    // Corrupt the routing task's only record file.
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+    writeFileSync(path.join(dir, recordFile), "{ not json");
+
+    const res = await fetch(`${baseUrl}/state`);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(body.tasks.map((t) => t.task_id)).toEqual([created.task_id]);
+    expect(body.degraded).toEqual(["routing-task"]); // visible, not silently gone
+
+    // The degradation is visible server-side: a one-line stderr warning naming the task.
+    const stderr = stderrWrite.mock.calls.flat().join("");
+    expect(stderr).toContain("routing-task");
+  });
+
+  it("omits the degraded key entirely when every task folds (absence = healthy)", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect("degraded" in body).toBe(false);
+  });
+});
+
+describe("GET /state optional notify key", () => {
+  it("omits the key when config.json has no notify field", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(body).not.toHaveProperty("notify");
+  });
+
+  it("echoes the config notify field when present", async () => {
+    const notify = { channels: ["desktop", "webhook"], webhook_url: "http://127.0.0.1:9/hook" };
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", notify }, null, 2) + "\n", "utf8");
+
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(body.notify).toEqual(notify);
+    expect(body.flow_mode).toBe("manual");
+  });
+
+  it("omits the key (and stays 200) when config.json is corrupt", async () => {
+    writeFileSync(path.join(root, "config.json"), "{ not json", "utf8");
+
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body.flow_mode).toBe("manual"); // single readConfig call → null → "manual" fallback
+    expect(body).not.toHaveProperty("notify");
+  });
+});
+
+describe("GET /state optional auto key", () => {
+  it("omits the key when config.json has no auto section", async () => {
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body).not.toHaveProperty("auto");
+  });
+
+  it("echoes the validated auto section when present", async () => {
+    writeFileSync(
+      path.join(root, "config.json"),
+      JSON.stringify({ flow_mode: "auto", auto: { launch_roles: ["executor", "reviewer"] } }, null, 2) + "\n",
+      "utf8",
+    );
+
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(body.auto).toEqual({ launch_roles: ["executor", "reviewer"] });
+    expect(body.flow_mode).toBe("auto");
+  });
+
+  it("omits the key (and stays 200) when config.json is corrupt", async () => {
+    writeFileSync(path.join(root, "config.json"), "{ not json", "utf8");
+
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body.flow_mode).toBe("manual");
+    expect(body).not.toHaveProperty("auto");
+  });
+
+  it("omits the key on a malformed section while the rest of the config still applies", async () => {
+    writeFileSync(
+      path.join(root, "config.json"),
+      JSON.stringify({ flow_mode: "auto", auto: { launch_roles: "executor" } }, null, 2) + "\n",
+      "utf8",
+    );
+
+    const res = await fetch(`${baseUrl}/state`);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body.flow_mode).toBe("auto"); // a bad auto section does not invalidate the file
+    expect(body).not.toHaveProperty("auto"); // …but its whitelist is not exposed either
+  });
+
+  it("picks up tut config set writes on the NEXT request — no restart (serve stays a compatible reader)", async () => {
+    const before = (await (await fetch(`${baseUrl}/state`)).json()) as { flow_mode: string; auto?: unknown };
+    expect(before.flow_mode).toBe("manual");
+    expect(before.auto).toBeUndefined();
+
+    // `tut config set` engine writes the file directly (no Hub round-trip);
+    // the running serve must reflect it on the very next /state read.
+    await writeConfigKey(root, { key: "flow_mode", value: "auto" });
+    await writeConfigKey(root, { key: "auto.launch_roles", value: ["executor", "reviewer"] });
+
+    const after = (await (await fetch(`${baseUrl}/state`)).json()) as { flow_mode: string; auto?: { launch_roles: string[] } };
+    expect(after.flow_mode).toBe("auto");
+    expect(after.auto).toEqual({ launch_roles: ["executor", "reviewer"] });
+  });
+});
+
+describe("POST /mode", () => {
+  function postMode(body: string): Promise<Response> {
+    return fetch(`${baseUrl}/mode`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+  }
+
+  it("switches flow_mode, echoes {flow_mode}, and /state reflects it on the next request", async () => {
+    const res = await postMode('{"flow_mode":"auto"}');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.json()).toEqual({ flow_mode: "auto" });
+
+    const state = (await (await fetch(`${baseUrl}/state`)).json()) as { flow_mode: string };
+    expect(state.flow_mode).toBe("auto");
+  });
+
+  it("preserves unknown config keys (notify survives the switch)", async () => {
+    const notify = { channels: ["desktop"] };
+    writeFileSync(path.join(root, "config.json"), JSON.stringify({ flow_mode: "manual", notify }, null, 2) + "\n", "utf8");
+
+    const res = await postMode('{"flow_mode":"auto"}');
+
+    expect(res.status).toBe(200);
+    const onDisk = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8")) as Record<string, unknown>;
+    expect(onDisk).toEqual({ flow_mode: "auto", notify });
+    expect(readdirSync(root).filter((name) => name.endsWith(".tmp"))).toEqual([]); // temp+rename, no leftovers
+  });
+
+  it("rejects an invalid flow_mode value with 400 and changes nothing", async () => {
+    const res = await postMode('{"flow_mode":"banana"}');
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(typeof body.error).toBe("string");
+    const onDisk = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8")) as { flow_mode: string };
+    expect(onDisk.flow_mode).toBe("manual");
+  });
+
+  it("rejects invalid JSON bodies with 400", async () => {
+    const res = await postMode("{ not json");
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(typeof body.error).toBe("string");
+  });
+
+  it("GET /mode → 405 with Allow: POST", async () => {
+    const res = await fetch(`${baseUrl}/mode`);
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST");
+  });
+
+  it("corrupt config behind a switch → 500 with a generic body (no clobbering)", async () => {
+    writeFileSync(path.join(root, "config.json"), "{ not json", "utf8");
+
+    const res = await postMode('{"flow_mode":"auto"}');
+
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "internal error" });
+    expect(readFileSync(path.join(root, "config.json"), "utf8")).toBe("{ not json");
+  });
+});
+
+describe("routing", () => {
+  it("unknown path → 404 JSON", async () => {
+    const res = await fetch(`${baseUrl}/nope`);
+
+    expect(res.status).toBe(404);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const body = (await res.json()) as { error: string };
+    expect(typeof body.error).toBe("string");
+  });
+
+  it("GET /mcp → 405 with Allow: POST", async () => {
+    const res = await fetch(`${baseUrl}/mcp`);
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST");
+  });
+
+  it("DELETE /mcp → 405 with Allow: POST", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, { method: "DELETE" });
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST");
+  });
+
+  it("POST /mcp is routed to the MCP branch (not 404/405)", async () => {
+    // Routing-level assertion only: the response is either a 500 JSON or an
+    // SDK-level protocol response. Either way
+    // POST must not fall through to 404/405.
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+
+    expect(res.status).not.toBe(404);
+    expect(res.status).not.toBe(405);
+  });
+});
+
+describe("error responses ", () => {
+  it("unexpected /state failure → 500 with generic body, no path leak to the client", async () => {
+    // ACL semantics differ by host. Inject the same EACCES at the filesystem
+    // boundary; HTTP and Store exception handling still execute unchanged.
+    fsFailure.denied = path.join(root, "tasks");
+    try {
+      const res = await fetch(`${baseUrl}/state`);
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("internal error");
+      expect(JSON.stringify(body)).not.toContain(tmp);
+    } finally { fsFailure.denied = undefined; }
+  });
+});
+
+describe("Host header guard", () => {
+  it("accepts loopback Host values with a port", async () => {
+    const host = new URL(baseUrl).host; // 127.0.0.1:<port>
+    const res = await requestRaw("GET", "/state", host);
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts the IPv6 loopback [::1], with and without a port", async () => {
+    expect((await requestRaw("GET", "/state", "[::1]")).status).toBe(200);
+    expect((await requestRaw("GET", "/state", "[::1]:3001")).status).toBe(200);
+  });
+
+  it("tolerates an absent Host header (HTTP/1.0-style raw socket)", async () => {
+    const res = await requestNoHost("/state");
+    expect(res.status).toBe(200);
+    expect(res.body).toContain('"flow_mode"');
+  });
+
+  it("rejects a non-loopback Host with 403", async () => {
+    // fetch forbids overriding Host, so use a raw http.request.
+    const res = await requestRaw("GET", "/state", "evil.example.com");
+    expect(res.status).toBe(403);
+    expect(res.body).toContain("forbidden");
+  });
+});
+
+describe("startServer lifecycle", () => {
+  it("resolves an actual-port url for port 0 and releases the port on close()", async () => {
+    expect(new URL(baseUrl).port).not.toBe("0");
+    expect(new URL(baseUrl).port).not.toBe("");
+
+    const port = Number(new URL(baseUrl).port);
+    await running.close();
+
+    // The port is actually free again: a plain TCP listener can take it.
+    const taker = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      taker.once("error", reject);
+      taker.listen(port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => taker.close(() => resolve()));
+  });
+
+  it("rejects with a clear error when the port is already in use (EADDRINUSE)", async () => {
+    // Pick a definitely-free explicit port: reserve with a dummy socket, then race.
+    const dummy = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      dummy.once("error", reject);
+      dummy.listen(0, "127.0.0.1", () => resolve());
+    });
+    const port = (dummy.address() as net.AddressInfo).port;
+    await new Promise<void>((resolve) => dummy.close(() => resolve()));
+
+    const first = await startServer({ root, port });
+    try {
+      await expect(startServer({ root, port })).rejects.toThrow(/already in use.*EADDRINUSE/);
+    } finally {
+      await first.close();
+    }
+  });
+});
+
+// cli arg parsing moved to test/integration/cli/cli.test.ts (nine-command skeleton).
+
+// --- helpers ---------------------------------------------------------------
+
+interface RawResponse {
+  status: number;
+  body: string;
+}
+
+/** fetch cannot override the Host header, so the Host-guard tests go raw. */
+function requestRaw(method: string, pathname: string, host: string): Promise<RawResponse> {
+  const target = new URL(baseUrl);
+  return new Promise<RawResponse>((resolve, reject) => {
+    const req = http.request(
+      {
+        host: target.hostname,
+        port: target.port,
+        method,
+        path: pathname,
+        headers: { host }, // deliberately lowercase; node sends it as Host
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.once("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * Truly Host-less request: node:http always injects a Host header, so the
+ * absent-Host edge case (HTTP/1.0-style clients) needs a raw TCP socket.
+ */
+function requestNoHost(pathname: string): Promise<RawResponse> {
+  const target = new URL(baseUrl);
+  return new Promise<RawResponse>((resolve, reject) => {
+    const sock = net.connect(Number(target.port), target.hostname);
+    let raw = "";
+    sock.on("connect", () => sock.write(`GET ${pathname} HTTP/1.0\r\n\r\n`));
+    sock.on("data", (chunk: Buffer) => {
+      raw += chunk.toString("utf8");
+    });
+    sock.on("end", () => {
+      const statusLine = raw.split("\r\n", 1)[0] ?? "";
+      resolve({ status: Number.parseInt((statusLine.split(" ", 3)[1] ?? "0"), 10), body: raw });
+    });
+    sock.once("error", reject);
+  });
+}
+
+// --- repair/recovery endpoints + concurrent /mode -----------------------------------
+
+describe("POST /repair-meta (meta-rebuild entry)", () => {
+  it("rebuilds a corrupt meta over HTTP: next /state moves the task out of degraded, decide-side append works", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    writeFileSync(path.join(dir, "meta.json"), "{ broken");
+
+    let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    const res = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", title: "Routing Task", description: "rebuilt over HTTP" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { task_id: string; version: number; status?: string };
+    expect(body).toMatchObject({ task_id: "routing-task", version: 1 }); // server-computed from disk max
+
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toBeUndefined();
+    expect(state.tasks.map((t) => t.task_id)).toContain("routing-task");
+  });
+
+  it("400 on a readable meta, 404 on an unknown task, 405 on GET", async () => {
+    const healthy = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", title: "rogue overwrite" }),
+    });
+    expect(healthy.status).toBe(400);
+    expect(((await healthy.json()) as { error: string }).error).toContain("readable");
+
+    const missing = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "ghost-task" }),
+    });
+    expect(missing.status).toBe(404);
+
+    const get = await fetch(`${baseUrl}/repair-meta`);
+    expect(get.status).toBe(405);
+  });
+
+  it("rejects a malformed body with 400", async () => {
+    const noBody = await fetch(`${baseUrl}/repair-meta`, { method: "POST", body: "{}" });
+    expect(noBody.status).toBe(400);
+    const badJson = await fetch(`${baseUrl}/repair-meta`, { method: "POST", body: "{nope" });
+    expect(badJson.status).toBe(400);
+  });
+
+  it("a present-but-invalid KNOWN field is a 400, never silently dropped — no rebuild, no disk change", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    writeFileSync(path.join(dir, "meta.json"), "{ broken");
+    let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string; flow: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    const badBodies: [label: string, unknown][] = [
+      ["title of wrong type", { task_id: "routing-task", title: 123 }],
+      ["empty-string title", { task_id: "routing-task", title: "" }],
+      ["flow outside the enum", { task_id: "routing-task", flow: "bogus" }],
+      ["description of wrong type", { task_id: "routing-task", description: false }],
+      ["cast not an object", { task_id: "routing-task", cast: "pi" }],
+      ["checkout not an object", { task_id: "routing-task", checkout: [] }],
+      ["created_at of wrong type", { task_id: "routing-task", created_at: 42 }],
+    ];
+    for (const [label, body] of badBodies) {
+      const res = await fetch(`${baseUrl}/repair-meta`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(res.status, label).toBe(400);
+      const payload = (await res.json()) as { error: string };
+      expect(payload.error.length, label).toBeGreaterThan(0);
+    }
+
+    // Nothing landed and nothing changed: meta still the same corrupt bytes, still degraded.
+    expect(readFileSync(path.join(dir, "meta.json"), "utf8")).toBe("{ broken");
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { degraded?: string[]; tasks: { task_id: string; flow: string }[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    // A valid explicit value still repairs — including the previously-silently-dropped flow.
+    const ok = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", title: "Routing Task", flow: "direct" }),
+    });
+    expect(ok.status).toBe(200);
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { degraded?: string[]; tasks: { task_id: string; flow: string }[] };
+    expect(state.degraded).toBeUndefined();
+    expect(state.tasks.find((t) => t.task_id === "routing-task")?.flow).toBe("direct");
+
+    // Unknown extension fields stay ignored (additive-only surface).
+    writeFileSync(path.join(dir, "meta.json"), "{ broken");
+    const withUnknown = await fetch(`${baseUrl}/repair-meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", zzz_future_field: 1, title: "Routing Task" }),
+    });
+    expect(withUnknown.status).toBe(200);
+  });
+});
+
+describe("POST /recover-record (record-recovery entry)", () => {
+  it("registers recovery over HTTP: task leaves degraded, folding uses the recovered copy", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+    const original = readFileSync(path.join(dir, recordFile));
+    const snapshotPath = path.join(tmp, "snapshot-copy.json");
+    writeFileSync(snapshotPath, original);
+    writeFileSync(path.join(dir, recordFile), "{ broken");
+
+    let state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+
+    const res = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", record_file: recordFile, from_path: snapshotPath, source: "http test snapshot" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { seq: number; recovered_file: string };
+    expect(body).toEqual({ task_id: "routing-task", record_file: recordFile, seq: 1, recovered_file: `${recordFile}.recovered` });
+
+    state = (await (await fetch(`${baseUrl}/state`)).json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toBeUndefined();
+    expect(state.tasks.map((t) => t.task_id)).toContain("routing-task");
+    // The corrupt original is still on disk, byte-for-byte.
+    expect(readFileSync(path.join(dir, recordFile), "utf8")).toBe("{ broken");
+  });
+
+  it("400 on validation (healthy record / bad shape / bad source) and 404 on unknown task", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+
+    const healthy = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", record_file: recordFile, from_path: "/etc/hostname" }),
+    });
+    expect(healthy.status).toBe(400);
+    expect(((await healthy.json()) as { error: string }).error).toContain("parses");
+
+    const badShape = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task", record_file: "meta.json", from_path: "/etc/hostname" }),
+    });
+    expect(badShape.status).toBe(400);
+
+    const missingFields = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "routing-task" }),
+    });
+    expect(missingFields.status).toBe(400);
+
+    const ghost = await fetch(`${baseUrl}/recover-record`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: "ghost", record_file: recordFile, from_path: "/etc/hostname" }),
+    });
+    expect(ghost.status).toBe(404);
+  });
+});
+
+describe("GET /state under structural damage", () => {
+  it("a syntactically-valid but structurally-invalid record never 500s: 200, degraded listing, absent from tasks[]", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const recordFile = readdirSync(dir).find((f) => f.startsWith("v") && f.endsWith(".json"))!;
+    // The exact derive-crash shape from the review: parses as JSON, has no payload.
+    writeFileSync(path.join(dir, recordFile), JSON.stringify({ content_type: "note" }));
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200); // never a TypeError 500 — the fold never sees the malformed artifact
+    const state = (await res.json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+    expect(state.tasks.map((t) => t.task_id)).not.toContain("routing-task");
+  });
+
+  it("a structurally-invalid meta (flow outside the enum) is degraded too — not a garbage tasks[] entry", async () => {
+    const dir = path.join(root, "tasks", "routing-task");
+    const meta = JSON.parse(readFileSync(path.join(dir, "meta.json"), "utf8")) as Record<string, unknown>;
+    meta.flow = "bogus";
+    writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta));
+
+    const res = await fetch(`${baseUrl}/state`);
+    expect(res.status).toBe(200);
+    const state = (await res.json()) as { tasks: { task_id: string }[]; degraded?: string[] };
+    expect(state.degraded).toEqual(["routing-task"]);
+    expect(state.tasks.map((t) => t.task_id)).not.toContain("routing-task");
+  });
+});
+
+describe("POST /mode concurrency", () => {
+  it("100 concurrent switches never corrupt config.json (unique temp + serialized write chain)", async () => {
+    const responses = await Promise.all(
+      Array.from({ length: 100 }, (_, i) =>
+        fetch(`${baseUrl}/mode`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ flow_mode: i % 2 === 0 ? "auto" : "manual" }),
+        }),
+      ),
+    );
+    expect(responses.every((r) => r.status === 200)).toBe(true);
+
+    const raw = readFileSync(path.join(root, "config.json"), "utf8");
+    const config = JSON.parse(raw) as { flow_mode: string }; // throws on the corruption shape
+    expect(config.flow_mode === "manual" || config.flow_mode === "auto").toBe(true);
+    expect(readdirSync(root).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+});
+
+it('exposes replayed review lint attention on /state and clears it after ack', async () => {
+  const { task_id } = await store.createTask({title: 'http lint', description: '## 验收场景\n1. first\n2. second', creator: 't', role: 'human', flow: 'direct'});
+  await store.append(task_id, {role: 'executor', content_type: 'code_changes', payload: {summary: 's', body: 'b'}});
+  await store.append(task_id, {role: 'reviewer', content_type: 'review', payload: {summary: 's', body: 'missing sections', verdict: 'pass'}});
+  const state = async () => ((await (await fetch(`${baseUrl}/state`)).json()) as {tasks: Array<{task_id: string}>}).tasks.find((t: {task_id: string}) => t.task_id === task_id);
+  expect(await state()).toMatchObject({status: 'pending_approval', needs_attention: true, waiting_for: 'human'});
+  await store.append(task_id, {role: 'human', content_type: 'note', payload: {summary: 'ack', body: 'ack', ack: true}});
+  expect(await state()).toMatchObject({status: 'pending_approval', needs_attention: false});
+});
+
+it('built CLI create returns spec and checkout hints through the real Hub with exit zero', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const { fileURLToPath } = await import('node:url');
+  const { stdout, stderr } = await promisify(execFile)(process.execPath, [
+    fileURLToPath(new URL('../../../dist/cli.js', import.meta.url)), 'create', '--url', baseUrl,
+    '--title', 'cli lint', '--description', '## 验收场景\n1. TODO', '--creator', 't', '--role', 'human',
+    '--flow', 'direct', '--checkout', `worktree:${path.join(tmp, 'missing-checkout')}`,
+  ], {cwd: tmp, env: {...process.env, TUT_HUB_ROOT: tmp}, timeout: 10000});
+  const result = JSON.parse(stdout);
+  expect(result).toMatchObject({version: 0, status: 'implementing'});
+  expect(stderr).toContain('第 1 条为空或占位');
+  expect(stderr.match(/does not exist yet/gu)).toHaveLength(1);
+  expect(result.warning).toContain('第 1 条为空或占位');
+  expect(result.warning).toContain('does not exist yet');
+  expect((await store.readTask(result.task_id)).versions).toEqual([]);
+});
+
+describe("state awareness HTTP projection", () => {
+  it("explicitly reports that both active and historical views are untruncated", async () => {
+    for (const suffix of ["", "?include=closed"]) {
+      const response = await fetch(`${baseUrl}/state${suffix}`);
+      expect(await response.json()).toMatchObject({ truncated: false });
+    }
+  });
+
+  const readState = async (suffix = "") => await (await fetch(`${baseUrl}/state${suffix}`)).json() as { tasks: import("../../../src/hub/store.js").TaskListEntry[] };
+  it("retires closed tasks by default, exposes explicit history and preserves every record", async () => {
+    const before = await store.readTask("routing-task");
+    await store.append("routing-task", { role: "human", content_type: "decision",
+      payload: { summary: "close", body: "retire", decision: "close" } });
+    const active = await readState();
+    expect(active.tasks).toEqual([]);
+    const history = await readState("?include=closed");
+    expect(history.tasks).toHaveLength(1);
+    expect(history.tasks[0]!).toMatchObject({ task_id: "routing-task", status: "closed",
+      needs_attention: false, waiting_for: "none", warnings: [], pending_since: null, round_count: 0 });
+    expect((await store.readTask("routing-task")).versions.slice(0, before.versions.length)).toEqual(before.versions);
+    const head = await fetch(`${baseUrl}/state?include=closed`, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect((await readState("?include=typo")).tasks).toEqual([]);
+  });
+
+  it("projects warning source versions and stable approval timing through warm/cold Store reads", async () => {
+    const warningState = await readState();
+    expect(warningState.tasks[0]!.warnings).toEqual([{ version: 1, code: "OUT_OF_TABLE" }]);
+    const mutable = (await store.snapshotTasks()).tasks.find(t => t.task_id === "routing-task")!;
+    mutable.warnings![0]!.version = 999;
+    mutable.warnings!.length = 0;
+    expect((await store.snapshotTasks()).tasks.find(t => t.task_id === "routing-task")!.warnings)
+      .toEqual([{ version: 1, code: "OUT_OF_TABLE" }]);
+    const { task_id } = await store.createTask({ title: "approval age", description: "test", creator: "test", role: "human", flow: "direct" });
+    await store.append(task_id, { role: "executor", content_type: "code_changes", payload: { summary: "done", body: "done" } });
+    await store.append(task_id, { role: "reviewer", content_type: "review", payload: { summary: "pass", body: "pass", verdict: "pass" } });
+    const readEntry = async () => (await readState()).tasks.find((t: { task_id: string }) => t.task_id === task_id);
+    const pending = await readEntry();
+    expect(pending).toMatchObject({ round_count: 1, pending_since: (await store.readTask(task_id)).versions[1]!.timestamp });
+    await store.append(task_id, { role: "human", content_type: "note", payload: { summary: "info", body: "info" } });
+    expect(await readEntry()).toMatchObject({ pending_since: pending!.pending_since, round_count: 1 });
+    const cold = await new Store(root).snapshotTasks();
+    expect(cold.tasks.find(t => t.task_id === task_id)).toMatchObject({ pending_since: pending!.pending_since, round_count: 1 });
+  });
+});
+
+it("/state ignores repository-operation descriptions and preserves targeted record repair", async () => {
+  const created = await store.createTask({ title: "diagnostic sheets", description: "## 验收场景\n1. works\n开 PR", creator: "human", role: "human", flow: "direct" });
+  const readState = async () => {
+    const body = await (await fetch(`${baseUrl}/state`)).json() as { tasks: Array<Record<string, unknown>> };
+    return body.tasks.find(task => task.task_id === created.task_id)!;
+  };
+  expect(await readState()).toMatchObject({ version: 0, status: "implementing", needs_attention: false, waiting_for: "agent:executor", warnings: [] });
+  await store.append(created.task_id, { role: "Reviewer", content_type: "note", payload: { summary: "s", body: "typo" } });
+  expect(await readState()).toMatchObject({ version: 1, warnings: expect.arrayContaining([
+    expect.objectContaining({ code: "NON_CANONICAL_ROLE", location: { field: "role" }, correction: { root_version: 1, round: 1, limit: 2, exhausted: false }, supportedFixes: expect.any(Array) }),
+  ]) });
+  await store.append(created.task_id, { role: "reviewer", content_type: "note", payload: { summary: "s", body: "correct role", ref_version: 1 } });
+  expect(await readState()).toMatchObject({ needs_attention: false, warnings: [], waiting_for: "agent:executor" });
+});
+
+const fsFailure = vi.hoisted(() => ({ denied: undefined as string | undefined }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readdir: (file: unknown, ...args: unknown[]) => {
+    if (String(file) === fsFailure.denied) return Promise.reject(Object.assign(new Error(`denied ${file}`), { code: "EACCES" }));
+    return Reflect.apply(actual.readdir, actual, [file, ...args]);
+  } };
+});
+
+describe('POST /prune', () => {
+  it('removes a closed task, exposes its audit identity and preserves the result after Hub restart', async () => {
+    const { task_id: id } = await store.createTask({ title: 'disposable', description: 'fixture', creator: 'test', role: 'human', flow: 'direct' });
+    await store.append(id, { role: 'human', content_type: 'decision', payload: { summary: 'close', body: 'fixture', decision: 'close' } });
+    const before = await (await fetch(`${baseUrl}/state?include=closed`)).json() as { tasks: unknown[] };
+    const archive = path.join(tmp, 'backup');
+    const res = await fetch(`${baseUrl}/prune`, { method: 'POST', body: JSON.stringify({ task_id: id, by: 'test', reason: 'fixture disposal', archive }) });
+    expect(res.status).toBe(200);
+    const result = await res.json() as { archive: string };
+    expect(result.archive).toBe(await realpath(path.join(archive, id)));
+    expect(readFileSync(path.join(result.archive, 'v001.decision.json'), 'utf8')).toContain('close');
+    expect(readdirSync(path.join(root, 'tasks'))).not.toContain(id);
+    const state = await (await fetch(`${baseUrl}/state?include=closed`)).json() as { tasks: Array<{ task_id: string }>; pruned: string[]; degraded?: string[] };
+    expect(state.tasks).toHaveLength(before.tasks.length - 1);
+    expect(state.pruned).toEqual([id]); expect(state.degraded).toBeUndefined();
+    expect(state.tasks.some(t => t.task_id === id)).toBe(false);
+    await running.close(); running = await startServer({ root, port: 0 }); baseUrl = running.url;
+    const restarted = await (await fetch(`${baseUrl}/state?include=closed`)).json() as typeof state;
+    expect(restarted.tasks).toEqual(state.tasks); expect(restarted.pruned).toEqual([id]);
+    expect(stderrWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-closed, missing and invalid input with explicit errors; POST only', async () => {
+    const request = (body: unknown) => fetch(`${baseUrl}/prune`, { method: 'POST', body: JSON.stringify(body) });
+    const active = await request({ task_id: 'routing-task', by: 'test', reason: 'fixture' });
+    expect(active.status).toBe(400); expect((await active.json() as { error: string }).error).toContain('finish the task first');
+    const missing = await request({ task_id: 'not-found', by: 'test', reason: 'fixture' });
+    expect(missing.status).toBe(404); expect((await missing.json() as { error: string }).error).toContain('task not found');
+    for (const body of [null, [], {}, { task_id: 'routing-task', by: 2, reason: 'x' }, { task_id: 'routing-task', by: 'x' }, { task_id: 'routing-task', by: 'x', reason: 'x', archive: 3 }]) {
+      expect((await request(body)).status).toBe(400);
+    }
+    const badJson = await fetch(`${baseUrl}/prune`, { method: 'POST', body: '{' }); expect(badJson.status).toBe(400);
+    const get = await fetch(`${baseUrl}/prune`); expect(get.status).toBe(405); expect(get.headers.get('allow')).toBe('POST');
+  });
+});

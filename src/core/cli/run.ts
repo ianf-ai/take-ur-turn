@@ -1,10 +1,10 @@
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { resolveRigRoot, resolveCliHubUrl } from '../hub/rig-discovery.js';
-import { HubSession, hubReadVia } from '../hub/hub-client.js';
+import { resolveRigRoot, resolveCliHubUrl } from '../../hub/rig-discovery.js';
+import { HubSession, hubReadVia } from '../../hub/hub-client.js';
 import { readLaunchCheckout } from '../common/config.js';
-import { requireDeclaration } from '../../standalone/launcher-headless/checkout-anchor.js';
+import { requireDeclaration } from '../launcher/checkout-anchor.js';
 import { RunStore } from '../run/store.js';
 import { startRun, listRuns, attachRun, stopRun } from '../run/control.js';
 import { repairRun } from '../run/repair.js';
@@ -91,7 +91,7 @@ export async function runProcessCommand(p: Extract<ParsedArgs, { command: 'run' 
     const line = `${p.run_id}: ${outcome.disposition}${'detail' in outcome ? ` — ${outcome.detail}` : ''}${'reason' in outcome ? ` — ${outcome.reason}` : ''}`;
     (outcome.disposition === 'refused' ? process.stderr : process.stdout).write(`${line}\n`);
     if (outcome.disposition === 'quarantined' || outcome.disposition === 'already-quarantined')
-      process.stdout.write(`  run log preserved at ${store.directory(p.run_id)}/log — evidence material, never deleted\n`);
+      process.stdout.write(`  run log preserved at ${store.logPath(p.run_id)} — evidence material, never deleted\n`);
     return outcome.disposition === 'refused' ? 1 : 0;
   }
   if (p.command === 'run') {

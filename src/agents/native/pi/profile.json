@@ -1,0 +1,326 @@
+{
+  "schema_version": 2,
+  "id": "pi",
+  "revision": "3558c357-legacy-1-commands-v2",
+  "evidence": {
+    "baseline_commit": "3558c357",
+    "native_versions": [],
+    "platforms": ["posix", "win32"],
+    "references": ["src/standalone/launcher-detached/plan.ts", "src/core/run/resume.ts", "scripts/usage-audit/lib/sessions.mjs"],
+    "note": "Compatibility contract migrated from the approved source baseline; native version ranges remain unverified."
+  },
+  "match": {"supported_executable_names": ["pi"], "platform_target_identity": {"win32": "pi"}},
+  "invoke": {
+    "run": {"tier": "declarative", "spec": "pi {args} {print} {mode} --session-id {session} -- {prompt}"},
+    "resume": {"tier": "declarative", "spec": "pi {args} {print} {mode} --session-id {session} -- {prompt}"},
+    "model": {
+      "tier": "declarative",
+      "spec": {
+        "names": ["--model"],
+        "scope": "options",
+        "syntax": "value",
+        "key": null,
+        "absent": "native-default",
+        "conflict": "preserve-native-order"
+      }
+    },
+    "effort": {
+      "tier": "declarative",
+      "spec": {
+        "names": ["--thinking"],
+        "scope": "options",
+        "syntax": "value",
+        "key": null,
+        "absent": "native-default",
+        "conflict": "preserve-native-order"
+      }
+    },
+    "cwd": {
+      "tier": "declarative",
+      "spec": {
+        "spawn": "checkoutRoot",
+        "env_sync": [],
+        "native_precedence": ["process.cwd", "native-default"],
+        "path": "host-resolve",
+        "prepare": {"tier": "declarative", "spec": {"kind": "none"}}
+      }
+    },
+    "route": "pi"
+  },
+  "session": {
+    "fresh_identity": "designated",
+    "capture": {"tier": "unsupported", "reason": "designated-id-is-not-observed"},
+    "id_validation": {
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "flags": "u",
+      "max_length": 36
+    },
+    "resume_identity": "designated",
+    "verify_resume": {"tier": "assisted", "hook": "pi-store-v1"},
+    "legacy_plain_argv": {"tier": "declarative", "spec": "pi"}
+  },
+  "usage": {
+    "capability": {
+      "tier": "declarative",
+      "spec": {
+        "kind": "jsonl",
+        "roots": [
+          {
+            "kind": "option-or-home",
+            "option": "piRoot",
+            "home_parts": [".pi", "agent", "sessions"],
+            "layout": "cwd-slash-encoded"
+          }
+        ],
+        "path_pattern": "**/*.jsonl",
+        "encoding": "utf8",
+        "header": {
+          "type": "session",
+          "cwd": ["cwd"],
+          "id": ["id"],
+          "version": ["version"],
+          "accepted_versions": [3],
+          "exclude": {"any": []}
+        },
+        "row": {
+          "timestamp": ["timestamp"],
+          "type": ["type"],
+          "event": ["payload", "type"],
+          "turn": ["payload", "turn_id"],
+          "role": ["message", "role"],
+          "stop": ["message", "stopReason"],
+          "id": ["id"],
+          "usage": ["message", "usage"]
+        },
+        "window": {
+          "start": [
+            {"path": ["type"], "op": "eq", "value": "message"},
+            {"path": ["message", "role"], "op": "eq", "value": "user"}
+          ],
+          "end": [
+            {"path": ["type"], "op": "eq", "value": "message"},
+            {"path": ["message", "role"], "op": "eq", "value": "assistant"},
+            {"path": ["message", "stopReason"], "op": "eq", "value": "stop"}
+          ],
+          "turn_match": false,
+          "launch_inclusive": true,
+          "delivery_end_inclusive": true,
+          "next_start_exclusive": true,
+          "partial_last_segment": "invalid",
+          "timestamp_order": "nondecreasing"
+        },
+        "counters": {
+          "input": [["input"], ["cacheRead"], ["cacheWrite"]],
+          "output": ["output"],
+          "total": ["totalTokens"],
+          "cost": ["cost", "total"]
+        },
+        "samples": [
+          {"path": ["type"], "op": "eq", "value": "message"},
+          {"path": ["message", "role"], "op": "eq", "value": "assistant"}
+        ]
+      }
+    },
+    "readable_formats": ["task-usage-v1"],
+    "source": {
+      "kind": "jsonl",
+      "roots": [
+        {
+          "kind": "option-or-home",
+          "option": "piRoot",
+          "home_parts": [".pi", "agent", "sessions"],
+          "layout": "cwd-slash-encoded"
+        }
+      ],
+      "path_pattern": "**/*.jsonl",
+      "encoding": "utf8",
+      "header": {
+        "type": "session",
+        "cwd": ["cwd"],
+        "id": ["id"],
+        "version": ["version"],
+        "accepted_versions": [3],
+        "exclude": {"any": []}
+      },
+      "row": {
+        "timestamp": ["timestamp"],
+        "type": ["type"],
+        "event": ["payload", "type"],
+        "turn": ["payload", "turn_id"],
+        "role": ["message", "role"],
+        "stop": ["message", "stopReason"],
+        "id": ["id"],
+        "usage": ["message", "usage"]
+      },
+      "window": {
+        "start": [{"path": ["type"], "op": "eq", "value": "message"}, {"path": ["message", "role"], "op": "eq", "value": "user"}],
+        "end": [
+          {"path": ["type"], "op": "eq", "value": "message"},
+          {"path": ["message", "role"], "op": "eq", "value": "assistant"},
+          {"path": ["message", "stopReason"], "op": "eq", "value": "stop"}
+        ],
+        "turn_match": false,
+        "launch_inclusive": true,
+        "delivery_end_inclusive": true,
+        "next_start_exclusive": true,
+        "partial_last_segment": "invalid",
+        "timestamp_order": "nondecreasing"
+      },
+      "counters": {
+        "input": [["input"], ["cacheRead"], ["cacheWrite"]],
+        "output": ["output"],
+        "total": ["totalTokens"],
+        "cost": ["cost", "total"]
+      },
+      "samples": [
+        {"path": ["type"], "op": "eq", "value": "message"},
+        {"path": ["message", "role"], "op": "eq", "value": "assistant"}
+      ]
+    },
+    "attribution": "legacy-cwd-window-v1",
+    "accounting": {
+      "mode": "sum-deduplicated",
+      "dedup": "message-id-or-line",
+      "baseline": "zero",
+      "terminal": "assistant-stop",
+      "integers": "nonnegative-safe",
+      "total": "input-plus-output",
+      "cost_missing": "null",
+      "cost_null": "invalid"
+    },
+    "cost": {"kind": "native-usd"}
+  },
+  "platform_overrides": {
+    "win32": {
+      "invoke": {
+        "cwd": {
+          "tier": "declarative",
+          "spec": {
+            "spawn": "checkoutRoot",
+            "env_sync": [],
+            "native_precedence": ["process.cwd", "native-default"],
+            "path": "windows-native",
+            "prepare": {"tier": "assisted", "hook": "pi-windows-location-v1"}
+          }
+        }
+      },
+      "usage": {
+        "capability": {
+          "tier": "declarative",
+          "spec": {
+            "kind": "jsonl",
+            "roots": [{"kind": "hook", "hook": "pi-windows-location-v1"}],
+            "path_pattern": "**/*.jsonl",
+            "encoding": "utf8",
+            "header": {
+              "type": "session",
+              "cwd": ["cwd"],
+              "id": ["id"],
+              "version": ["version"],
+              "accepted_versions": [3],
+              "exclude": {"any": []}
+            },
+            "row": {
+              "timestamp": ["timestamp"],
+              "type": ["type"],
+              "event": ["payload", "type"],
+              "turn": ["payload", "turn_id"],
+              "role": ["message", "role"],
+              "stop": ["message", "stopReason"],
+              "id": ["id"],
+              "usage": ["message", "usage"]
+            },
+            "window": {
+              "start": [
+                {"path": ["type"], "op": "eq", "value": "message"},
+                {"path": ["message", "role"], "op": "eq", "value": "user"}
+              ],
+              "end": [
+                {"path": ["type"], "op": "eq", "value": "message"},
+                {"path": ["message", "role"], "op": "eq", "value": "assistant"},
+                {"path": ["message", "stopReason"], "op": "eq", "value": "stop"}
+              ],
+              "turn_match": false,
+              "launch_inclusive": true,
+              "delivery_end_inclusive": true,
+              "next_start_exclusive": true,
+              "partial_last_segment": "invalid",
+              "timestamp_order": "nondecreasing"
+            },
+            "counters": {
+              "input": [["input"], ["cacheRead"], ["cacheWrite"]],
+              "output": ["output"],
+              "total": ["totalTokens"],
+              "cost": ["cost", "total"]
+            },
+            "samples": [
+              {"path": ["type"], "op": "eq", "value": "message"},
+              {"path": ["message", "role"], "op": "eq", "value": "assistant"}
+            ]
+          }
+        },
+        "source": {
+          "kind": "jsonl",
+          "roots": [{"kind": "hook", "hook": "pi-windows-location-v1"}],
+          "path_pattern": "**/*.jsonl",
+          "encoding": "utf8",
+          "header": {
+            "type": "session",
+            "cwd": ["cwd"],
+            "id": ["id"],
+            "version": ["version"],
+            "accepted_versions": [3],
+            "exclude": {"any": []}
+          },
+          "row": {
+            "timestamp": ["timestamp"],
+            "type": ["type"],
+            "event": ["payload", "type"],
+            "turn": ["payload", "turn_id"],
+            "role": ["message", "role"],
+            "stop": ["message", "stopReason"],
+            "id": ["id"],
+            "usage": ["message", "usage"]
+          },
+          "window": {
+            "start": [
+              {"path": ["type"], "op": "eq", "value": "message"},
+              {"path": ["message", "role"], "op": "eq", "value": "user"}
+            ],
+            "end": [
+              {"path": ["type"], "op": "eq", "value": "message"},
+              {"path": ["message", "role"], "op": "eq", "value": "assistant"},
+              {"path": ["message", "stopReason"], "op": "eq", "value": "stop"}
+            ],
+            "turn_match": false,
+            "launch_inclusive": true,
+            "delivery_end_inclusive": true,
+            "next_start_exclusive": true,
+            "partial_last_segment": "invalid",
+            "timestamp_order": "nondecreasing"
+          },
+          "counters": {
+            "input": [["input"], ["cacheRead"], ["cacheWrite"]],
+            "output": ["output"],
+            "total": ["totalTokens"],
+            "cost": ["cost", "total"]
+          },
+          "samples": [
+            {"path": ["type"], "op": "eq", "value": "message"},
+            {"path": ["message", "role"], "op": "eq", "value": "assistant"}
+          ]
+        },
+        "accounting": {
+          "mode": "sum-deduplicated",
+          "dedup": "message-id-or-line",
+          "baseline": "zero",
+          "terminal": "assistant-stop",
+          "integers": "nonnegative-safe",
+          "total": "input-plus-output",
+          "cost_missing": "null",
+          "cost_null": "null"
+        }
+      }
+    }
+  }
+}

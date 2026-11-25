@@ -1,9 +1,11 @@
+import {validInputDelivery} from './input-types.js';
 import { WINDOWS_PROTOCOL, validateWindowsMeta } from './windows-protocol.js';
-import type { RunMeta } from './store.js';
+import type { RunMeta } from './meta.js';
 import { CONTROL_PROTOCOL, STOP_SCOPE } from './protocol.js';
 const date = (s: unknown): boolean => typeof s === 'string' && Number.isFinite(Date.parse(s));
 /** Unknown protocol versions remain readable, but cannot acquire control. */
 export function validateControlMeta(m: RunMeta): void {
+  if(m.input_delivery!==undefined&&!validInputDelivery(m.input_delivery))throw Error('invalid input delivery');
   if (m.control_protocol !== undefined && typeof m.control_protocol !== 'string') throw new Error('invalid control protocol');
   if (m.control_protocol === WINDOWS_PROTOCOL) { validateWindowsMeta(m); return; }
   if (m.control_protocol !== CONTROL_PROTOCOL || m.stop_request === undefined) return;

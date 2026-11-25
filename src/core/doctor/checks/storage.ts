@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, readdir, lstat, stat } from "node:fs/promises";
 import path from "node:path";
-import { LEGACY_TASK_ID_PATTERN, recordFileVersion, StoreError, validateMetaArtifact, validateRecordArtifact } from "../../hub/store.js";
+import { LEGACY_TASK_ID_PATTERN, recordFileVersion, StoreError, validateMetaArtifact, validateRecordArtifact } from "../../../hub/store.js";
 import { validateId, validateMeta, QUARANTINE_BASE } from "../../run/store.js";
 import { worst, isErrnoException } from "../shared.js";
 import type { DoctorCheck, DoctorContext, DoctorStatus } from "../types.js";
@@ -488,10 +488,10 @@ async function checkStorage(ctx: DoctorContext, hub: HubOutcome): Promise<Doctor
     check.details.push(`${tmpCount} leftover temp file(s) under tasks/ — crash residue; the hub sweeps aged temps on its next append`);
   }
   // delivery.log — rotates at 5 MiB (one .1 generation kept).
-  for (const logName of ["delivery.log", "delivery.log.1"]) {
+  for (const logName of ["delivery.log", "delivery.log.1", "logs/delivery/delivery.log", "logs/delivery/delivery.log.1"]) {
     try {
       const info = await stat(path.join(ctx.root, logName));
-      if (logName === "delivery.log" && info.size > DELIVERY_LOG_MAX_BYTES) {
+      if (logName.endsWith("delivery.log") && info.size > DELIVERY_LOG_MAX_BYTES) {
         statuses.push("warn");
         check.details.push(
           `${logName}: ${info.size} bytes exceeds the ${DELIVERY_LOG_MAX_BYTES}-byte rotation cap — rotation is failing (check write/rename errors)`,

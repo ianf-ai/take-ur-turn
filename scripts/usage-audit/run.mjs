@@ -3,14 +3,14 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { run } from './lib/audit.mjs';
+import { usageAuditDefaults } from '../../dist/agents/public/usage.js';
+import { installServiceLog } from '../../dist/core/logging/service-log.js';
 import { requestTimeout } from './lib/hub.mjs';
 export function parse(argv, env = process.env, runtime = {}) {
   const platform = runtime.platform ?? process.platform, home = runtime.home ?? os.homedir();
   const paths = platform === 'win32' ? path.win32 : path.posix;
   const o = { root: runtime.cwd ?? process.cwd(), url: 'http://127.0.0.1:3001',
-    ...(platform === 'win32' ? { platform, home, piEnv: { PI_CODING_AGENT_SESSION_DIR: env.PI_CODING_AGENT_SESSION_DIR, PI_CODING_AGENT_DIR: env.PI_CODING_AGENT_DIR } }
-      : { piRoot: paths.join(home, '.pi/agent/sessions') }),
-    codexRoot: paths.join(home, '.codex/sessions'), intervalMs: 5000, timeoutMs: Infinity };
+    ...usageAuditDefaults(platform,home,env), intervalMs: 5000, timeoutMs: Infinity };
   let modes = 0;
   const seen = new Set();
   for (let i=0; i<argv.length; i++) {
@@ -42,13 +42,31 @@ export function parse(argv, env = process.env, runtime = {}) {
   return o;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // POSIX-only self-identification (mirrors src/core/common/process-title.ts:
+  // on Windows the title setter only rewrites the console title, which none
+  // of TUT's Windows-side identification surfaces read).
+  if (process.platform !== 'win32') process.title = 'tut-watcher';
   try {
     const options = parse(process.argv.slice(2));
+    if (options.watch && !options.help) installServiceLog(path.join(options.root, '.context-hub'), 'usage-audit.log', { mirror: !process.env.TUT_POWER_SESSION });
     if (options.help) console.log('usage-audit --watch | --since ISO8601 | --backfill | --recover\n  --root PROJECT_ROOT --url HUB_URL --task TASK_ID\n  --pi-root DIR --codex-root DIR --interval-ms 5000 --timeout-ms N\n  TUT_USAGE_AUDIT_TIMEOUT_MS: Hub/local I/O deadline, default 30000ms\n  --recover: report owner, reclaim dead lock only, backfill, suggest --watch; never kill\nBuild first: npm run build. See README.md for schema and diagnostics.');
     else {
       const abort = new AbortController();
       for (const signal of ['SIGINT','SIGTERM']) process.once(signal, () => abort.abort());
       await run({ ...options, signal: abort.signal });
     }
-  } catch (e) { console.error(`usage-audit: ${e.message}`); process.exitCode = 1; }
+  } catch (e) {
+    process.exitCode = 1;
+    const message = `usage-audit: ${e.message}\n`;
+    // Abandoned native reads (e.g. a FIFO open or exhausted libuv pool) can
+    // keep Node alive even during process.exit()'s native thread-pool teardown.
+    // At the terminal threshold no submitted mutation remains. Flush the
+    // reason, then self-terminate with the OS default action (POSIX status
+    // 128+SIGTERM; Windows TerminateProcess exits 1). No external watchdog.
+    if (e.code === 'WATCHER_TIMEOUT_LIMIT') process.stderr.write(message, () => {
+      process.removeAllListeners('SIGTERM');
+      process.kill(process.pid, 'SIGTERM');
+    });
+    else process.stderr.write(message);
+  }
 }

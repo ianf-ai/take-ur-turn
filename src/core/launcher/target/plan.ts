@@ -1,6 +1,8 @@
+import {selfUpdatePolicyFor} from '../../../agents/public/diagnostics.js';
+export {selfUpdatePolicyFor} from '../../../agents/public/diagnostics.js';
 /** Frozen route, self-update policy and platform execution plans. */
-import type { AgentCommand, AgentRoute, LaunchInvocation, PosixDirectPlan } from "../../common/types.js";
-import type { EffectiveAgentPlan, PlatformExecutionPlan, PlatformPlanOptions, ResolvedAgentTarget, ResolvePlatformExecutionPlanOptions, SelfUpdatePolicy } from "./types.js";
+import type { AgentCommand, AgentRoute, LaunchInvocation, PosixDirectPlan } from "../../../protocol/types.js";
+import type { EffectiveAgentPlan, PlatformExecutionPlan, PlatformPlanOptions, ResolvedAgentTarget, ResolvePlatformExecutionPlanOptions } from "./types.js";
 import { resolvePosixTargetPresence } from "./posix.js";
 import { resolveWindowsExecutableTarget } from "./windows.js";
 
@@ -8,26 +10,6 @@ import { resolveWindowsExecutableTarget } from "./windows.js";
 export function normalizeRouteCommand(route: AgentRoute): AgentCommand {
   if (typeof route === "string") return { agent: route, args: [] };
   return { agent: route.agent, args: [...route.args] };
-}
-
-/**
- * Freeze the agent self-update suppression policy once, keyed by the bare
- * route agent's logical name — never by a wrapped command or resolved path.
- */
-export function selfUpdatePolicyFor(
-  routeAgent: string,
-  routeArgs: readonly string[],
-  environment: NodeJS.ProcessEnv,
-): SelfUpdatePolicy {
-  const suppress = environment.TUT_SUPPRESS_AGENT_UPDATE !== "0";
-  if (!suppress) return { args: [...routeArgs], env: {} };
-  if (routeAgent === "codex") {
-    return { args: [...routeArgs, "-c", "check_for_update_on_startup=false"], env: {} };
-  }
-  if (routeAgent === "pi") {
-    return { args: [...routeArgs], env: { PI_SKIP_VERSION_CHECK: "1" } };
-  }
-  return { args: [...routeArgs], env: {} };
 }
 
 /** Pure POSIX plan: the bare route agent plus the frozen policy. */
@@ -79,7 +61,7 @@ export async function planForPlatform(
 /**
  * The door-facing resolution used by canonical planners (start-next and
  * Notifier auto) before the marker: prove the target first, then produce the
- * frozen plan.  Any target failure throws before marker or Herdr mutation.
+ * frozen plan. Any target failure throws before marker writes or launch side effects.
  */
 export async function resolvePlatformExecutionPlan(
   route: AgentCommand,

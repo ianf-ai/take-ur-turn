@@ -1,20 +1,37 @@
+import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import os from 'node:os';
+import { canonicalRoot } from '../../hub/rig-discovery.js';
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readConfigFile } from "./config.js";
 
-// --- usage watcher (shared with the herdr path — identical output) ---------------
+// --- shared usage watcher ------------------------------------------------------
 
-/** Where usage-watcher diagnostics land (the herdr path's convention). */
-const USAGE_LOG_REL = path.join(".context-hub", "usage-audit.log");
+/** Shared destination for usage-watcher diagnostics. */
+const USAGE_LOG_REL = path.join(".context-hub", "logs", "diagnostics", "usage-audit.log");
+
+/** Legacy power facts need the watcher's own root-bound lock receipt before
+ * controlling a live watcher. A Hub handshake proves the Hub, not the watcher.
+ * Both mutex layouts are read in place; an unknown receipt grants no authority. */
+export async function usageWatcherOwned(root: string, pid: number): Promise<boolean> {
+  const owner = canonicalRoot(root);
+  const legacy = path.join(os.tmpdir(), `tut-usage-audit-${createHash('sha256').update(owner).digest('hex')}.lock`);
+  for (const file of [path.join(owner, '.context-hub', 'runtime', 'usage-audit.lock'), legacy]) {
+    try {
+      const record = JSON.parse(await readFile(file, 'utf8')) as { pid?: unknown; root?: unknown };
+      if (record?.pid === pid && record.root === owner) return true;
+    } catch { /* Absent, unreadable and invalid receipts do not identify an owner. */ }
+  }
+  return false;
+}
 
 /**
  * Start the shipped usage watcher detached (opt-in via usage_audit = "on").
- * EXACTLY the herdr up step's semantics and output, extracted so both power
- * modes share one implementation: read usage_audit (invalid file/value →
- * warning + off), plan in dry-run, otherwise spawn detached with the log as
- * stdio. Returns the spawned pid, or null when nothing was started. The
+ * Power modes share this implementation and output: read usage_audit (invalid file/value →
+ * warning + off), plan in dry-run, otherwise spawn detached with the watcher owning its managed log. Returns the spawned pid, or null when nothing was started. The
  * watcher's own file lock makes reruns self-healing (a second instance
  * exits immediately) — measurement must never fail the rig.
  */
@@ -38,18 +55,15 @@ export async function provisionUsageWatcher(cwd: string, hubUrl: string, dryRun:
     process.stdout.write(`up: [dry-run] would start the usage watcher (detached; log at ${USAGE_LOG_REL})\n`);
     return null;
   }
-  const logPath = path.join(cwd, USAGE_LOG_REL);
-  const out = openSync(logPath, "a");
   const child = spawn(process.execPath, [usageScript, "--watch", "--root", cwd, "--url", hubUrl], {
     detached: true,
-    stdio: ["ignore", out, out],
+    stdio: ["ignore", "ignore", "ignore"],
     env: { ...process.env, ...extraEnv },
     windowsHide: true,
   });
   // Spawn failures arrive asynchronously (ENOENT/EMFILE/...) — without a
   // listener they escape and kill the caller.
   child.on("error", (err) => {
-    try { closeSync(out); } catch {}
     process.stderr.write(`tut: up: usage watcher failed to start (non-fatal): ${err.message}\n`);
   });
   child.unref();

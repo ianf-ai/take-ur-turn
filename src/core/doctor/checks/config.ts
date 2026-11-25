@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { autoSectionOf, configPath, readConfigFile } from "../../common/config.js";
-import { AgentCommandError, parseAgentRoute, validateAgentRoute } from "../../common/agent-command.js";
+import { AgentCommandError, parseAgentRoute, validateAgentRoute } from "../../../protocol/agent-command.js";
 import { DEFAULT_ROLES, KNOWN_ROLES, UNKNOWN_ROLE_AGENT, defaultUserConfigDir, resolveAgentRouteWithSource } from "../../common/workspace.js";
-import type { AgentRoute } from "../../common/types.js";
+import type { AgentRoute } from "../../../protocol/types.js";
 import { worst, isErrnoException } from "../shared.js";
 import type { DoctorCheck, DoctorContext, DoctorStatus } from "../types.js";
 
@@ -120,6 +120,10 @@ function displayRoute(route: AgentRoute): string {
 
 /** Roles any workspace level declares (drives checks 4/8's role set). */
 async function declaredWorkspaceRoles(ctx: DoctorContext): Promise<Set<string>> {
+  const config = await readConfigFile(ctx.root);
+  if (config.status === "ok" && Object.hasOwn(config.config, "roles")) {
+    return new Set(Object.keys(workspaceViewOf(config.config).roles));
+  }
   const roles = new Set<string>(KNOWN_ROLES);
   for (const file of [ctx.l1WorkspaceFile, path.join(defaultUserConfigDir(ctx.env), "workspace.json")]) {
     const read = await readJsonDiagnostic(file);
@@ -176,6 +180,17 @@ async function checkConfig(ctx: DoctorContext): Promise<DoctorCheck> {
     { label: "L1 project", file: l1File, read: await readJsonDiagnostic(l1File) },
     { label: "L2 user", file: l2File, read: await readJsonDiagnostic(l2File) },
   ];
+  const authoritative = cfg.status === "ok" && Object.hasOwn(cfg.config, "roles");
+  if (authoritative) {
+    declaredRoles.clear();
+    levels.splice(0, levels.length, { label: "rig config", file: cfgFile, read: { status: "ok", value: cfg.config } });
+    const roles = cfg.config.roles;
+    if (roles !== null && typeof roles === "object" && !Array.isArray(roles)) {
+      for (const role of KNOWN_ROLES) {
+        if (!Object.hasOwn(roles, role)) check.details.push(`roles.${role}: not configured — assign explicitly or supply a task cast`);
+      }
+    }
+  }
   for (const level of levels) {
     if (level.read.status === "missing") {
       check.details.push(`${level.label} ${level.file}: absent — chain falls through`);
@@ -193,14 +208,14 @@ async function checkConfig(ctx: DoctorContext): Promise<DoctorCheck> {
     if (view.rolesContainerError !== undefined) {
       statuses.push("fail");
       check.details.push(
-        `${level.label} ${level.file}: roles: ${view.rolesContainerError} — resolution silently falls through this level`,
+        `${level.label} ${level.file}: roles: ${view.rolesContainerError} — ${authoritative ? "launch resolution refused" : "resolution silently falls through this level"}`,
       );
       check.fix ??= `fix the JSON by hand: ${level.file} (tut assign never clobbers a file it cannot parse)`;
     }
     for (const problem of view.malformedRoles) {
       statuses.push("fail");
       check.details.push(
-        `${level.label} roles.${problem.role}: malformed (${problem.error}) — the chain silently treats it as absent`,
+        `${level.label} roles.${problem.role}: malformed (${problem.error}) — ${authoritative ? "launch resolution refused" : "the chain silently treats it as absent"}`,
       );
       check.fix ??= `fix the declaration by hand (${level.file}) or re-point the seat: tut assign ${problem.role} <command...>`;
     }
@@ -219,10 +234,15 @@ async function checkConfig(ctx: DoctorContext): Promise<DoctorCheck> {
 
   // Effective resolution per role (cast is task-level, not global — not shown here).
   for (const role of [...declaredRoles].sort()) {
-    const resolved = await resolveAgentRouteWithSource(role, undefined, {
+    let resolved;
+    try { resolved = await resolveAgentRouteWithSource(role, undefined, {
       projectRoot: ctx.projectRoot,
       userConfigDir: defaultUserConfigDir(ctx.env),
-    });
+    }); } catch (error) {
+      statuses.push("fail");
+      check.details.push(`effective ${role}: ${(error as Error).message}`);
+      continue;
+    }
     const known = role in DEFAULT_ROLES;
     check.details.push(
       `effective ${role} → ${displayRoute(resolved.route)} (${resolved.source}` +
@@ -234,8 +254,8 @@ async function checkConfig(ctx: DoctorContext): Promise<DoctorCheck> {
   check.status = worst(statuses);
   check.summary =
     check.status === "fail"
-      ? "config/workspace files corrupt — see details (resolution is silently degraded)"
-      : "config.json + workspace chain parsed; effective lineup above";
+      ? "config/workspace intent invalid — see details (launch resolution refused)"
+      : "config.json + compatibility workspace chain parsed; effective lineup above";
   return check;
 }
 

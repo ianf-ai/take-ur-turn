@@ -1,5 +1,7 @@
+import '../../../dist/app/agents.js';
+import { normalizeUsageAgent, usageReadable } from '../../../dist/agents/public/usage.js';
 import { instant } from './sessions.mjs';
-import { auditPath, sameCwd } from './paths.mjs';
+import { auditPath } from './paths.mjs';
 const deliveries = { architect: ['design'], executor: ['code_changes','revision'], reviewer: ['review'] };
 export function extract(task, root, options = {}) {
   const rounds = [], pending = new Map(), launched = new Set();
@@ -45,29 +47,19 @@ export function extract(task, root, options = {}) {
     // Windows routes may name a shim or a package entry. Only the matching
     // run's frozen target can establish their native identity; never resolve
     // today's PATH or guess that a file named cli.js is Pi.
-    if (round.windows_attempt) round.windows_attempt.delivery_agent = r.agent;
+    const deliveryAgent = normalizeUsageAgent(r.agent, root);
+    if (round.windows_attempt) round.windows_attempt.delivery_agent = deliveryAgent;
     else {
-      if (launch?.agent && r.agent && launch.agent !== r.agent) round.problem = 'agent_conflict';
+      round.agent = normalizeUsageAgent(round.agent, root);
+      if (launch?.agent && r.agent && round.agent !== deliveryAgent) round.problem = 'agent_conflict';
       if (!round.agent) round.problem ??= 'missing_route';
-      else if (!['pi','codex'].includes(round.agent)) round.problem ??= 'unsupported_agent';
+      else if (!usageReadable(round.agent,'task-usage-v1',root)) round.problem ??= 'unsupported_agent';
     }
     rounds.push(round);
   }
   return rounds;
 }
-export function attribute(rounds, sessions, options = {}) {
-  const matches = rounds.map(round => {
-    if (round.problem) return { round, reason: round.problem, candidates: [] };
-    const candidates = [], errors = [];
-    for (const s of sessions.filter(s => s.agent === round.agent && !s.excluded && sameCwd(s.header.cwd, round.cwd, options))) {
-      // Discovery authorizes candidates per round, before globally deduplicated
-      // parsing. A copy under another round's root cannot fill a missing file.
-      if ((options.platform ?? process.platform) === 'win32' && round.agent === 'pi' &&
-          options.piCandidates && !options.piCandidates.get(round)?.has(s.file)) continue;
-      try { candidates.push(...measureSafe(s, round, options)); } catch (e) { errors.push(e.message); }
-    }
-    return { round, candidates, reason: candidates.length > 1 ? 'ambiguous_sessions' : errors.length ? [...new Set(errors)].sort().join(',') : candidates.length ? undefined : 'missing_session_or_end' };
-  });
+export function attributeMatches(matches) {
   // Check every task, even when only one task is requested for output.
   // Two-tier conflict disclosure (tui zero-change redline): every round a
   // headless rescue delivery (it carries superseded_versions) joins the
@@ -85,4 +77,3 @@ export function attribute(rounds, sessions, options = {}) {
   }
   return matches;
 }
-import { measure as measureSafe } from './sessions.mjs';

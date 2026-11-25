@@ -1,10 +1,10 @@
-import { resolveRigRoot } from "../../core/hub/rig-discovery.js";
-import { rigLabel } from "../../core/hub/rig.js";
+import { resolveRigRoot } from "../../hub/rig-discovery.js";
+import { rigLabel } from "../../hub/rig-identity.js";
 import { HerdrClient } from "../launcher/legacy-herdr-client.js";
 
 /** A signal for the host, never an instruction or an approval. */
-export type { HostStatusReport } from '../../core/notifier/contracts.js';
-import type { HostStatusReport } from '../../core/notifier/contracts.js';
+export type { HostStatusReport } from '../../core/notifier/shared-contracts.js';
+import type { HostStatusReport } from '../../core/notifier/shared-contracts.js';
 
 const herdr = new HerdrClient();
 

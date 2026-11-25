@@ -1,0 +1,204 @@
+{
+  "schema_version": 2,
+  "id": "codex",
+  "revision": "3558c357-legacy-1-commands-v2",
+  "evidence": {
+    "baseline_commit": "3558c357",
+    "native_versions": [],
+    "platforms": ["posix", "win32"],
+    "references": ["src/standalone/launcher-detached/plan.ts", "src/core/run/resume.ts", "scripts/usage-audit/lib/sessions.mjs"],
+    "note": "Compatibility contract migrated from the approved source baseline; native version ranges remain unverified."
+  },
+  "match": {"supported_executable_names": ["codex"], "platform_target_identity": {"win32": "codex"}},
+  "invoke": {
+    "run": {"tier": "declarative", "spec": "codex {root} exec {nonroot} {json} {prompt}"},
+    "resume": {"tier": "declarative", "spec": "codex {root} exec {parent} resume {shared} {json} {session} {prompt}"},
+    "model": {
+      "tier": "declarative",
+      "spec": {
+        "names": ["-m", "--model"],
+        "scope": "root",
+        "syntax": "value",
+        "key": null,
+        "absent": "native-default",
+        "conflict": "preserve-native-order"
+      }
+    },
+    "effort": {
+      "tier": "declarative",
+      "spec": {
+        "names": ["-c", "--config"],
+        "scope": "root",
+        "syntax": "config-assignment",
+        "key": "model_reasoning_effort",
+        "absent": "native-default",
+        "conflict": "preserve-native-order"
+      }
+    },
+    "cwd": {
+      "tier": "declarative",
+      "spec": {
+        "spawn": "checkoutRoot",
+        "env_sync": [],
+        "native_precedence": ["process.cwd", "native-default"],
+        "path": "host-resolve",
+        "prepare": {"tier": "declarative", "spec": {"kind": "none"}}
+      }
+    },
+    "route": "codex"
+  },
+  "session": {
+    "fresh_identity": "native-observed",
+    "capture": {
+      "tier": "declarative",
+      "spec": {
+        "kind": "json-line",
+        "guards": [{"path": ["type"], "op": "eq", "value": "thread.started"}, {"path": ["thread_id"], "op": "string"}],
+        "path": ["thread_id"],
+        "rule": {"pattern": "^[a-zA-Z0-9-]{8,128}$", "flags": "u", "max_length": 128},
+        "max_line_chars": 1048576,
+        "first": "legacy-first-buffer"
+      }
+    },
+    "id_validation": {"pattern": "^[a-zA-Z0-9-]{8,128}$", "flags": "u", "max_length": 128},
+    "resume_identity": "observed",
+    "verify_resume": {"tier": "declarative", "spec": {"kind": "observed-identity", "store": "not-required"}},
+    "legacy_plain_argv": {"tier": "declarative", "spec": "codex"}
+  },
+  "usage": {
+    "capability": {
+      "tier": "declarative",
+      "spec": {
+        "kind": "jsonl",
+        "roots": [{"kind": "option-or-home", "option": "codexRoot", "home_parts": [".codex", "sessions"], "layout": "recursive"}],
+        "path_pattern": "**/*.jsonl",
+        "encoding": "utf8",
+        "header": {
+          "type": "session_meta",
+          "cwd": ["payload", "cwd"],
+          "id": null,
+          "version": ["payload", "cli_version"],
+          "accepted_versions": [],
+          "exclude": {
+            "any": [
+              {"path": ["payload", "parent_thread_id"], "op": "truthy"},
+              {"path": ["payload", "source"], "op": "eq", "value": "subagent"},
+              {"path": ["payload", "source"], "op": "object-has-key", "key": "subagent"}
+            ]
+          }
+        },
+        "row": {
+          "timestamp": ["timestamp"],
+          "type": ["type"],
+          "event": ["payload", "type"],
+          "turn": ["payload", "turn_id"],
+          "role": ["message", "role"],
+          "stop": ["message", "stopReason"],
+          "id": ["id"],
+          "usage": ["payload", "info", "total_token_usage"]
+        },
+        "window": {
+          "start": [
+            {"path": ["type"], "op": "eq", "value": "event_msg"},
+            {"path": ["payload", "type"], "op": "eq", "value": "task_started"}
+          ],
+          "end": [
+            {"path": ["type"], "op": "eq", "value": "event_msg"},
+            {"path": ["payload", "type"], "op": "eq", "value": "task_complete"}
+          ],
+          "turn_match": true,
+          "launch_inclusive": true,
+          "delivery_end_inclusive": true,
+          "next_start_exclusive": true,
+          "partial_last_segment": "invalid",
+          "timestamp_order": "nondecreasing"
+        },
+        "counters": {"input": [["input_tokens"]], "output": ["output_tokens"], "total": ["total_tokens"], "cost": null},
+        "samples": [
+          {"path": ["type"], "op": "eq", "value": "event_msg"},
+          {"path": ["payload", "type"], "op": "eq", "value": "token_count"}
+        ]
+      }
+    },
+    "readable_formats": ["task-usage-v1"],
+    "source": {
+      "kind": "jsonl",
+      "roots": [{"kind": "option-or-home", "option": "codexRoot", "home_parts": [".codex", "sessions"], "layout": "recursive"}],
+      "path_pattern": "**/*.jsonl",
+      "encoding": "utf8",
+      "header": {
+        "type": "session_meta",
+        "cwd": ["payload", "cwd"],
+        "id": null,
+        "version": ["payload", "cli_version"],
+        "accepted_versions": [],
+        "exclude": {
+          "any": [
+            {"path": ["payload", "parent_thread_id"], "op": "truthy"},
+            {"path": ["payload", "source"], "op": "eq", "value": "subagent"},
+            {"path": ["payload", "source"], "op": "object-has-key", "key": "subagent"}
+          ]
+        }
+      },
+      "row": {
+        "timestamp": ["timestamp"],
+        "type": ["type"],
+        "event": ["payload", "type"],
+        "turn": ["payload", "turn_id"],
+        "role": ["message", "role"],
+        "stop": ["message", "stopReason"],
+        "id": ["id"],
+        "usage": ["payload", "info", "total_token_usage"]
+      },
+      "window": {
+        "start": [
+          {"path": ["type"], "op": "eq", "value": "event_msg"},
+          {"path": ["payload", "type"], "op": "eq", "value": "task_started"}
+        ],
+        "end": [
+          {"path": ["type"], "op": "eq", "value": "event_msg"},
+          {"path": ["payload", "type"], "op": "eq", "value": "task_complete"}
+        ],
+        "turn_match": true,
+        "launch_inclusive": true,
+        "delivery_end_inclusive": true,
+        "next_start_exclusive": true,
+        "partial_last_segment": "invalid",
+        "timestamp_order": "nondecreasing"
+      },
+      "counters": {"input": [["input_tokens"]], "output": ["output_tokens"], "total": ["total_tokens"], "cost": null},
+      "samples": [
+        {"path": ["type"], "op": "eq", "value": "event_msg"},
+        {"path": ["payload", "type"], "op": "eq", "value": "token_count"}
+      ]
+    },
+    "attribution": "legacy-cwd-window-v1",
+    "accounting": {
+      "mode": "cumulative-difference",
+      "dedup": "ordered-snapshots",
+      "baseline": "last-before-start-or-first-zero",
+      "terminal": "snapshot-at-or-after-delivery",
+      "integers": "nonnegative-safe",
+      "total": "input-plus-output",
+      "cost_missing": "null",
+      "cost_null": "null"
+    },
+    "cost": {"kind": "unavailable", "reason": "no-native-usd-no-pricing-table"}
+  },
+  "platform_overrides": {
+    "win32": {
+      "invoke": {
+        "cwd": {
+          "tier": "declarative",
+          "spec": {
+            "spawn": "checkoutRoot",
+            "env_sync": [],
+            "native_precedence": ["process.cwd", "native-default"],
+            "path": "windows-native",
+            "prepare": {"tier": "declarative", "spec": {"kind": "none"}}
+          }
+        }
+      }
+    }
+  }
+}

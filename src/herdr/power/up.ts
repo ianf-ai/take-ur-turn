@@ -1,12 +1,12 @@
-import { discoverHub, resolveNotifierPort, resolveUpHub } from "../../core/hub/rig-discovery.js";
-import { acquireRigStartLock } from "../../core/hub/rig-lock.js";
-import { rigLabel, rigEnvironment, unscopedLabel } from "../../core/hub/rig.js";
+import { discoverHub, resolveNotifierPort, resolveUpHub } from "../../hub/rig-discovery.js";
+import { acquireRigStartLock } from "../../core/common/rig-lock.js";
+import { rigLabel, rigEnvironment, unscopedLabel } from "../../hub/rig-identity.js";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderPaneCommand, resolvePaneShellDialect, type PaneCommand, type ShellDialect } from "../launcher/shell-renderer.js";
 import { HerdrClient, type HerdrPane as HerdrClientPane } from "../launcher/legacy-herdr-client.js";
-import { defaultUserConfigDir } from "../../core/common/workspace.js";
+import { defaultUserConfigDir, DEFAULT_ROLES } from "../../core/common/workspace.js";
 import { provisionUsageWatcher } from "../../core/common/usage-watcher.js";
 import { DEFAULT_HUB_URL, DEFAULT_EVENT_PORT, DEFAULT_HUB_PORT } from "../../core/cli/shared.js";
 import type { ParsedArgs } from "../../core/cli/args.js";
@@ -242,17 +242,18 @@ export async function runHerdrUp(parsed: Extract<ParsedArgs, { command: "up" }>,
     // the project-level and user-level workspace configs missing → the
     // built-in defaults are in effect; print the migration pointer once.
     if (
+      !existsSync(path.join(cwd, ".context-hub", "config.json")) &&
       !existsSync(path.join(cwd, ".context-hub", "workspace.json")) &&
       !existsSync(path.join(defaultUserConfigDir(), "workspace.json"))
     ) {
       process.stdout.write(
-        "up: no workspace lineup config found — using built-in defaults (architect=codex, executor=pi, reviewer=codex)\n",
+        `up: no workspace lineup config found — using built-in defaults (architect=${DEFAULT_ROLES.architect}, executor=${DEFAULT_ROLES.executor}, reviewer=${DEFAULT_ROLES.reviewer})\n`,
       );
       process.stdout.write(
-        "up:   to customize: tut assign <role> <agent>   (the light path — e.g. tut assign executor pi; rewrites one seat)\n",
+        `up:   to customize: tut assign <role> <agent>   (the light path — e.g. tut assign executor ${DEFAULT_ROLES.executor}; rewrites one seat)\n`,
       );
       process.stdout.write(
-        `up:   full control: see README.md → Configuration → Workspace lineup (https://github.com/ianf-ai/take-ur-turn#configuration); save your config to ${path.join(cwd, ".context-hub", "workspace.json")} (project-level; or ${path.join(defaultUserConfigDir(), "workspace.json")} for all projects)\n`,
+        `up:   full control: see README.md → Configuration → Workspace lineup (https://github.com/ianf-ai/take-ur-turn#configuration); save your rig intent to ${path.join(cwd, ".context-hub", "config.json")} (roles and optional naming)\n`,
       );
     }
 

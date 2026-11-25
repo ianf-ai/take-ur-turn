@@ -1,8 +1,11 @@
+import {nativeComposerPolicy,pendingNativeInput} from '../../agents/public/native-compat.js';
 /** Controlled, one-shot recovery. A status flip is observation, not consumption proof. */
 import { createHerdrClient } from './legacy-herdr-client.js';
 import { parseDeliveryV2 } from './escalation.js';
 import { deliveryStatusWindow, parseDeliveryKnobs, promptTailEvidence, type DeliveryEvidenceV2 } from './delivery.js';
 import type { CallContext, DeliveryClientV2, PaneIdentity, StatusSample } from './herdr-client-v2.js';
+import type { RemediationEvidence } from './remediation-contracts.js';
+export type { RemediationEvidence } from './remediation-contracts.js';
 
 export const MAX_REMEDIATION_ATTEMPTS = 4096;
 export const MAX_CONCURRENT_REMEDIATIONS = 64;
@@ -26,18 +29,6 @@ export interface RemediationRequest {
   canAct(): boolean | Promise<boolean>;
   /** Append action evidence before issuing the control call. */
   recordAction?(evidence: RemediationEvidence): Promise<void>;
-}
-export interface RemediationEvidence {
-  strategy: string;
-  action: 'none' | 'machine-enter';
-  result: 'skipped' | 'attempting' | 'working-observed' | 'give-up';
-  enter_transport: 'not-attempted' | 'sent' | 'not-sent' | 'uncertain';
-  status_flip: boolean;
-  attribution: 'machine-remediation' | 'unavailable';
-  reason: string;
-  /** Accepted staging evidence; a viewport match alone never authorizes input. */
-  staged_basis?: 'text-transport-sent' | 'codex-input-tail';
-  reevaluated?: true;
 }
 export interface Remediator {
   remediate(request: RemediationRequest): Promise<RemediationEvidence>;
@@ -64,24 +55,7 @@ function targetOf(e: DeliveryEvidenceV2, agent: string): PaneIdentity | undefine
 }
 const nonworking = (s: string) => ['idle', 'blocked', 'done'].includes(s);
 
-/** Inspect only the last Codex composer, never a matching historical prompt. */
-export function pendingCodexInput(screen: string, tail: DeliveryEvidenceV2['prompt_tail']): boolean {
-  if (!tail || tail.length < 1 || tail.length > 80 || !/^[a-f0-9]{64}$/.test(tail.sha256)) return false;
-  const lines = screen.split(/\r?\n/);
-  let start = -1;
-  for (let i = 0; i < lines.length; i++) if (/^› /u.test(lines[i]!)) start = i;
-  if (start < 0) return false;
-  const rest = lines.slice(start + 1);
-  const end = rest.findIndex(line => line.trim() === '');
-  if (end < 0) return false;
-  const footer = rest.slice(end).filter(line => line.trim() !== '');
-  // Anything between the candidate input and footer could be a response to
-  // an already consumed historical prompt, so reject the whole snapshot.
-  if (!footer.length || !footer.every(line => /^ {2}\? for shortcuts\b/u.test(line) || /^ {2}GPT-\S+.* · \S/u.test(line))) return false;
-  const input = [lines[start]!.slice(2), ...rest.slice(0, end)].join('\n');
-  const actual = promptTailEvidence(input);
-  return actual.length === tail.length && actual.sha256 === tail.sha256;
-}
+export const pendingCodexInput=(screen:string,tail:DeliveryEvidenceV2['prompt_tail'])=>pendingNativeInput(screen,tail,promptTailEvidence);
 
 export function createEnterRepress(options: EnterRepressOptions = {}): Remediator {
   const knobs = parseDeliveryKnobs(options.env ?? process.env, message => {
@@ -109,7 +83,7 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
     const e = parseDeliveryV2(request.evidence);
     const unknownBaseline = e?.reason === 'baseline-unknown' && e.status_before === 'unknown';
     const reevaluate = e?.reason === 'attribution-unavailable' && e.status_flip && e.status_last === 'working' &&
-      nonworking(e.status_before) && request.agent === 'codex';
+      nonworking(e.status_before) && nativeComposerPolicy(request.agent).inputTail;
     if (!e || (!reevaluate && !unknownBaseline && (e.reason !== 'deadline' || !nonworking(e.status_before) || !nonworking(e.status_last))) ||
         (!reevaluate && e.status_flip) || (!unknownBaseline && e.status_error !== null) ||
         ['PANE_MISSING', 'PANE_DUPLICATE', 'IDENTITY_CHANGED'].includes(e.status_error ?? '') ||
@@ -185,7 +159,7 @@ export function createEnterRepress(options: EnterRepressOptions = {}): Remediato
       }
       if (!await request.canAct() || !await matchesPane(target.paneId, request.pane)) return { ...result, reason: 'pane-mismatch' };
       // The retry path requires both original sent transport and current input.
-      result.staged_basis = reevaluate ? 'codex-input-tail' : 'text-transport-sent';
+      result.staged_basis = reevaluate ? nativeComposerPolicy(request.agent).basis : 'text-transport-sent';
       if (reevaluate && !pendingCodexInput(await readPane(target.paneId), e.prompt_tail))
         return { ...result, reason: 'input-changed' };
       const before = await read();

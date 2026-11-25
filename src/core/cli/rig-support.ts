@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { probeHub, probeNotifier, notifierMatches } from "../hub/rig-discovery.js";
-import { hubRead, HubError, type HubReadResult } from "../hub/hub-client.js";
+import { probeHub, probeNotifier, notifierMatches } from "../../hub/rig-discovery.js";
+import { hubRead, HubError, type HubReadResult } from "../../hub/hub-client.js";
 import { DEFAULT_EVENT_PORT, DEFAULT_HUB_URL, cliFetchInit, sleepMs } from "./shared.js";
 
 /** Event-port probe target — the Notifier answers 405 on non-POST. Derived from the single-source default. */
@@ -25,10 +25,10 @@ export function hubWaitMs(): number {
 
 /**
  * How long tut up waits for a freshly provisioned notifier to answer the
- * event port — the notify twin of hubWaitMs. Spawn ok ≠ listening: a pane
- * run into a pane still occupied by a live foreground process swallows the
- * command while herdr still reports ok, so the notify success report is
- * gated on this probe. TUT_UP_NOTIFY_WAIT_MS (read per call) shortens the
+ * event port — the notify twin of hubWaitMs. A successful launch request
+ * does not prove that the service process is listening, so the notify
+ * success report is gated on this endpoint probe.
+ * TUT_UP_NOTIFY_WAIT_MS (read per call) shortens the
  * wait — test/ops knob, the same discipline as TUT_UP_HUB_WAIT_MS.
  */
 export function notifyWaitMs(): number {

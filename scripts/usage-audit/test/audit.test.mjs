@@ -5,20 +5,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { windowsPiEncodedCwd } from '../../../dist/core/run/windows-pi-session.js';
+import { windowsPiEncodedCwd } from '../../../dist/agents/public/native-compat.js';
 import { createServer } from 'node:http';
-import { Store } from '../../../dist/core/hub/store.js';
-import { startServer } from '../../../dist/core/hub/server.js';
+import { Store } from '../../../dist/hub/store.js';
+import { startServer } from '../../../dist/hub/server.js';
 import { readConfigFile, writeConfigKey, parseConfigValue } from '../../../dist/core/common/config.js';
-import { extract, attribute } from '../lib/rounds.mjs';
-import { measure, readSession } from '../lib/sessions.mjs';
+import { extract } from '../lib/rounds.mjs';
+import { attribute, measure, readSession } from './helpers.mjs';
 import { run, collect, enabled, lock, lockPath, merge, writeUsage, loadUsage, source, validateUsage } from '../lib/audit.mjs';
-import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
+import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
 import { parse } from '../run.mjs';
+import { installServiceLog } from '../../../dist/core/logging/service-log.js';
 // Real native fixture directory: legacy POSIX encoding is not a Windows filename.
 const fixtureCwdDirectory = root => process.platform === 'win32' ? windowsPiEncodedCwd(root) : `--${root.slice(1).replaceAll('/', '-')}--`;
 const T = n => new Date(Date.UTC(2026,0,1,0,0,0,n)).toISOString();
-async function temp(t) { const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'usage-test-'))); t.after(() => fs.rm(dir,{recursive:true,force:true})); return dir; }
+async function temp(t) { const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'usage-test-'))); t.after(() => fs.rm(dir,{recursive:true,force:true})); await fs.mkdir(path.join(dir,'.context-hub','runtime'),{recursive:true}); return dir; }
 const launch = (v, n, agent='pi', role='executor') => ({ version:v, timestamp:T(n), role:'human', content_type:'note', payload:{launch:{role, base_version:v-1,route:{agent,args:[]}}} });
 const delivery = (v,n,role='executor') => ({ version:v,timestamp:T(n),role,content_type:role==='executor'?'code_changes':role==='architect'?'design':'review',payload:{} });
 const task = (root,versions,id='one') => ({task_id:id, versions});
@@ -303,6 +304,58 @@ test('missing launch/route, identity conflict and repeated launches never fabric
   const l=launch(1,1);delete l.payload.launch.route;
   assert.equal(extract(task(root,[l,delivery(2,3)]),root)[0].problem,'missing_route');
 });
+test('audit agent labels canonicalize registered IDs on both sides, preserving unknown identities',()=>{
+  const root='/tmp/x';
+  for (const [marker,label,expected] of [['codex','Codex','codex'],['CoDeX','codex','codex'],['PI','Pi','pi']]) {
+    for (const legacy of [false,true]) {
+      const l=launch(1,5,marker);
+      if (legacy) l.payload.launch.route=marker+' --model fixture';
+      const [round]=extract(task(root,[l,{...delivery(2,30),agent:label}]),root);
+      assert.equal(round.problem,undefined);
+      assert.equal(round.agent,expected);
+    }
+  }
+  for (const [marker,label] of [['codex','pi'],['codex','Claude'],['Unknown','unknown'],['/opt/bin/Codex','/opt/bin/codex'],['binding:Worker','binding:worker']]) {
+    const [round]=extract(task(root,[launch(1,5,marker),{...delivery(2,30),agent:label}]),root);
+    assert.equal(round.problem,'agent_conflict');
+    assert.equal(round.agent,marker);
+  }
+  const [missing]=extract(task(root,[{...delivery(1,30),agent:'Codex'}]),root);
+  assert.equal(missing.agent,'codex');assert.equal(missing.problem,'missing_launch');
+});
+test('audit normalization uses workspace registry IDs and respects invalid overrides',async t=>{
+  const root=await temp(t),dir=path.join(root,'.context-hub','agents');await fs.mkdir(dir);
+  const {agentProfiles,profileArtifact}=await import('../../../dist/agents/public/transition.js');
+  const profile=JSON.parse(profileArtifact(agentProfiles.get('codex')));
+  profile.id='custom-meter';profile.match.supported_executable_names=['meter-cli'];profile.match.platform_target_identity=null;
+  const history=task(root,[launch(1,5,'custom-meter'),{...delivery(2,30),agent:'Custom-Meter'}]);
+  assert.equal(extract(history,root)[0].problem,'agent_conflict');
+  const file=path.join(dir,'custom-meter.json');await fs.writeFile(file,JSON.stringify(profile));
+  const [round]=extract(history,root);assert.equal(round.problem,undefined);assert.equal(round.agent,'custom-meter');
+  history.versions[1].agent='METER-CLI';
+  assert.equal(extract(history,root)[0].problem,'agent_conflict'); // executable aliases are not profile IDs
+  await fs.writeFile(file,JSON.stringify({id:'custom-meter'}));history.versions[1].agent='Custom-Meter';
+  assert.equal(extract(history,root)[0].problem,'agent_conflict');
+});
+test('case-insensitive agent label replay counts both Codex reviewer deliveries and clears prior agent conflicts',async t=>{
+  const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const {task_id:id}=await store.createTask({title:'agent label replay reviewer',description:'Protocol regression.',creator:'test',role:'human',flow:'direct'});
+  const history=task(root,[launch(8,5,'codex','reviewer'),{...delivery(9,30,'reviewer'),agent:'Codex'},
+    launch(14,50,'codex','reviewer'),{...delivery(15,70,'reviewer'),agent:'Codex'}],id);
+  const before=structuredClone(history),rounds=extract(history,root);
+  await writeUsage(root,id,merge(null,rounds.map(round=>({round,reason:'agent_conflict',candidates:[]}))));
+  const dir=path.join(root,'codex');await fs.mkdir(dir);
+  await session(dir,'codex',[codexHead(root),ev(10,'task_started',{turn_id:'first'}),count(40,150,20),ev(41,'task_complete',{turn_id:'first'}),
+    ev(60,'task_started',{turn_id:'second'}),count(80,180,25),ev(81,'task_complete',{turn_id:'second'})]);
+  const options={root,codexRoot:dir,piRoot:path.join(root,'no-pi')},deps={allowed:async()=>true,hub:{list:async()=>[{task_id:id}],read:async()=>history}};
+  const [report]=await collect(options,deps);
+  assert.deepEqual(report.total,{rounds:2,total_tokens:205,cost_usd:null,complete:true});
+  const ledger=await loadUsage(path.join(root,'.context-hub','tasks',id));
+  assert.deepEqual(ledger.rounds.map(r=>[r.delivery_version,r.agent,r.total_tokens]),[[9,'codex',170],[15,'codex',35]]);
+  assert.deepEqual(ledger.unresolved,[]);assert.equal(ledger.schema_version,1);
+  assert.equal((await collect({...options,watch:true},deps))[0].changed,false);
+  assert.deepEqual(history,before);
+});
 const hlaunch=(v,n,agent='pi',role='executor')=>({...launch(v,n,agent,role),payload:{launch:{role,base_version:v-1,launch_mode:'headless',route:{agent,args:[]}}}});
 test('headless supersession: delivering round stays measurable, replaced launches anchored unaccounted (tui unchanged)',async t=>{
   const root=await temp(t);
@@ -474,6 +527,7 @@ async function fixture(t) {
   const lockFile=lockPath(canonicalRoot(root));
   t.after(async () => {
     await fs.rm(lockFile,{force:true});
+    await fs.rm(lockFile+'.cursor.json',{force:true});
     await fs.rm(lockFile+'.reclaim',{recursive:true,force:true});
   });
   const store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
@@ -654,9 +708,30 @@ test('watch survives HTTP timeouts, retries at its interval and later completes 
     await run({root,url,watch:true,requestTimeoutMs:40,intervalMs:7,timeoutMs:3000,signal:ac.signal},
       {enabled:async()=>true,sleep:async ms=>{waits.push(ms);},report:()=>{passes++;ac.abort();}});
   } finally {process.stderr.write=original;}
-  assert.equal(passes,1);assert.equal(attempts,3);assert.deepEqual(waits,[7,7]);
+  assert.equal(passes,1);assert.equal(attempts,3);assert.equal(waits.length,2);assert.ok(waits.every(ms=>ms>=30&&ms<3000));
   assert.equal(lines.filter(l=>l.includes('pass failed')).length,1);
   assert.match(lines.join(''),/HUB_TIMEOUT/);
+  await assert.rejects(fs.stat(lockPath(root)),{code:'ENOENT'});
+});
+
+test('ten consecutive HTTP read timeouts reach the same terminal threshold with endpoint evidence',async t=>{
+  const root=await temp(t),lines=[];let attempts=0;
+  const url=await auditPeer(t,root,(phase,res)=>{
+    if(phase!=='state')return false;
+    attempts++;
+    const rescue=setTimeout(()=>res.destroy(),700);res.on('close',()=>clearTimeout(rescue));return true;
+  });
+  const original=process.stderr.write;process.stderr.write=b=>{lines.push(String(b));return true;};
+  try {
+    await assert.rejects(run({root,url,watch:true,requestTimeoutMs:40,intervalMs:1},
+      {enabled:async()=>true}),{code:'WATCHER_TIMEOUT_LIMIT'});
+  } finally {process.stderr.write=original;}
+  assert.equal(attempts,10);
+  const events=lines.filter(l=>l.startsWith('{')).map(JSON.parse);
+  const stalls=events.filter(e=>e.event==='IO_STALLED');
+  assert.equal(stalls.length,10);
+  assert.ok(stalls.every(e=>e.code==='HUB_TIMEOUT'&&e.target===`${url}/state`&&e.elapsed_ms>=39));
+  assert.equal(events.at(-1).event,'WATCHER_TIMEOUT_LIMIT');
   await assert.rejects(fs.stat(lockPath(root)),{code:'ENOENT'});
 });
 
@@ -665,7 +740,7 @@ test('watch heartbeat runs every 60s during a pending request and reports succes
   const original=process.stderr.write;process.stderr.write=b=>{lines.push(String(b));return true;};
   try {
     await run({root,watch:true,intervalMs:1,timeoutMs:Infinity,signal:ac.signal},{
-      enabled:async()=>true,report:()=>{},
+      logHeartbeat:line=>lines.push(line),enabled:async()=>true,report:()=>{},
       setInterval:(fn,ms)=>{assert.equal(ms,60000);tick=fn;return 42;},
       clearInterval:id=>{assert.equal(id,42);cleared++;},
       collect:async options=>{
@@ -678,7 +753,7 @@ test('watch heartbeat runs every 60s during a pending request and reports succes
       sleep:async()=>{tick();if(passes===3)ac.abort();},
     });
   } finally {process.stderr.write=original;}
-  const beats=lines.filter(l=>l.startsWith('{')).map(JSON.parse);
+  const beats=lines.filter(l=>l.startsWith('{')).map(JSON.parse).filter(b=>b.event==='heartbeat');
   assert.equal(beats.length,6);assert.equal(cleared,1);
   assert.deepEqual(beats.map(b=>b.in_request),[true,false,true,false,true,false]);
   assert.deepEqual(beats.map(b=>b.consecutive_failures),[0,1,1,2,2,0]);
@@ -687,12 +762,69 @@ test('watch heartbeat runs every 60s during a pending request and reports succes
   assert.ok(Number.isFinite(Date.parse(beats.at(-1).last_successful_pass)));
 });
 
+test('healthy heartbeats accumulate in the managed file for three simulated minutes without terminal output', async t => {
+  const root = await temp(t), ac = new AbortController(), terminal = [];
+  let tick, clock = Date.now(), sleeps = 0;
+  t.mock.method(Date, 'now', () => clock);
+  const original = process.stderr.write;
+  process.stderr.write = line => { terminal.push(String(line)); return true; };
+  const close = installServiceLog(path.join(root, '.context-hub'), 'usage-audit.log');
+  try {
+    await run({ root, watch: true, intervalMs: 60_000, signal: ac.signal }, {
+      enabled: async () => true, collect: async () => [], report: () => {},
+      setInterval: (fn, ms) => { assert.equal(ms, 60_000); tick = fn; },
+      sleep: async () => { clock += 60_000; tick(); if (++sleeps === 3) ac.abort(); },
+    });
+  } finally { await close(); process.stderr.write = original; }
+  assert.deepEqual(terminal, []);
+  const events = (await fs.readFile(path.join(root, '.context-hub/logs/diagnostics/usage-audit.log'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(events.length, 3);
+  assert.ok(events.every(e => e.event === 'heartbeat' && !e.stalled && !e.success_overdue && e.consecutive_failures === 0));
+  assert.equal(Date.parse(events.at(-1).timestamp) - Date.parse(events[0].timestamp), 120_000);
+});
+
+test('heartbeat alarms deduplicate health flags, combine simultaneous anomalies and rearm after recovery', async t => {
+  const root = await temp(t), ac = new AbortController(), terminal = [], beats = [];
+  const now = Date.now(); let clock = now, tick, passes = 0, progress;
+  t.mock.method(Date, 'now', () => clock);
+  const original = process.stderr.write;
+  process.stderr.write = line => { terminal.push(String(line)); return true; };
+  try {
+    await run({ root, watch: true, intervalMs: 1, signal: ac.signal }, {
+      enabled: async () => true, report: () => {}, logHeartbeat: line => beats.push(JSON.parse(line)),
+      setInterval: fn => { tick = fn; },
+      collect: async options => {
+        passes++; progress = options.onProgress;
+        if (passes === 5) {
+          progress('hub-read'); clock += 180_000; tick(); tick();
+          // Recovery starts a new success clock before the next failure.
+          clock = now;
+        }
+        if ([2, 3, 4, 6].includes(passes)) throw Error('same transient failure');
+        return [];
+      },
+      sleep: async () => {
+        if (passes === 4) { clock += 180_000; progress('scan'); }
+        tick(); tick();
+        if (passes === 6) ac.abort();
+      },
+    });
+  } finally { process.stderr.write = original; }
+  const alarms = terminal.filter(l => l.startsWith('{')).map(JSON.parse);
+  assert.deepEqual(alarms.map(e => e.event), ['PASS_FAILED', 'PASS_SUCCESS_OVERDUE', 'PASS_STALLED', 'PASS_FAILED']);
+  assert.equal(alarms[2].stalled, true); assert.equal(alarms[2].success_overdue, true);
+  assert.deepEqual(alarms.map(e => e.consecutive_failures), [1, 3, 3, 1]);
+  assert.ok(beats.length > alarms.length);
+  assert.ok(beats.every(e => e.event === 'heartbeat'));
+  assert.ok(!terminal.some(l => l.includes('"event":"heartbeat"')));
+});
+
 test('report failure does not claim a successful pass or reset failure telemetry; releases heartbeat and lock',async t=>{
   const root=await temp(t),lines=[];let tick,passes=0,cleared=0;
   const original=process.stderr.write;process.stderr.write=b=>{lines.push(String(b));return true;};
   try {
     await assert.rejects(run({root,watch:true,intervalMs:1,timeoutMs:Infinity},{
-      enabled:async()=>true,
+      logHeartbeat:line=>lines.push(line),enabled:async()=>true,
       setInterval:fn=>{tick=fn;return 42;},
       clearInterval:id=>{assert.equal(id,42);tick();cleared++;},
       collect:async()=>{if(++passes===1)throw Error('collect failed');return [];},
@@ -700,7 +832,7 @@ test('report failure does not claim a successful pass or reset failure telemetry
       report:()=>{throw Error('EPIPE');},
     }),/EPIPE/);
   } finally {process.stderr.write=original;}
-  const beat=JSON.parse(lines.find(l=>l.startsWith('{')));
+  const beat=JSON.parse(lines.find(l=>l.startsWith('{')&&JSON.parse(l).event==='heartbeat'));
   assert.equal(beat.last_successful_pass,null);
   assert.equal(beat.consecutive_failures,1);
   assert.equal(cleared,1);
@@ -788,7 +920,9 @@ test('default-off create→start-next→delivery uses normal product files and z
   await fs.writeFile(preload,`const fs=require('node:fs');const p=require('node:fs/promises');const append=fs.appendFileSync.bind(fs);const log=${JSON.stringify(log)};
 for(const api of [fs,p])for(const key of ['readFile','readFileSync','readdir','readdirSync','open','openSync','writeFile','writeFileSync','stat','statSync','lstat','lstatSync','access','accessSync','rename','renameSync','mkdir','mkdirSync'])if(typeof api[key]==='function'){const original=api[key];api[key]=function(...args){const s=String(args[0]);if(/\\.(pi|codex)[/\\\\].*sessions|usage\\.json|tut-usage-audit-|\\.usage-/.test(s)){append(log,s+'\\n');throw Error('unexpected measurement I/O');}return original.apply(this,args);};}require('node:module').syncBuiltinESMExports();`);
   const cli=path.resolve('dist/cli.js'),bin=path.resolve('test/bin');
-  const env={...process.env,NODE_OPTIONS:`--require=${preload}`,PATH:`${bin}${path.delimiter}${process.env.PATH}`,TUT_HUB_ROOT:root,TUT_PROJECT_ROOT:root,TUT_USER_CONFIG_DIR:path.join(root,'user-config'),TUT_HUB_URL:server.url,TUT_HERDR_EXECUTABLE:path.join(bin,'herdr'),TUT_HERDR_PANES:'[]',TUT_DRY_RUN:'1'};
+  // This dry-run has no Notifier; pin a dead fixture endpoint rather than
+  // inherit a live event address or depend on discovery from its random Hub port.
+  const env={...process.env,NODE_OPTIONS:`--require=${preload}`,PATH:`${bin}${path.delimiter}${process.env.PATH}`,TUT_HUB_ROOT:root,TUT_PROJECT_ROOT:root,TUT_USER_CONFIG_DIR:path.join(root,'user-config'),TUT_HUB_URL:server.url,TUT_EVENT_PORT_URL:'http://127.0.0.1:1/agent-event',TUT_HERDR_EXECUTABLE:path.join(bin,'herdr'),TUT_HERDR_PANES:'[]',TUT_DRY_RUN:'1'};
   async function command(args) {const child=spawn(process.execPath,[cli,...args],{cwd:root,env,stdio:['ignore','pipe','pipe']});let out='',err='';child.stdout.on('data',b=>out+=b);child.stderr.on('data',b=>err+=b);const [code]=await once(child,'exit');assert.equal(code,0,err);return out;}
   await command(['create','--title','Off normal flow','--description','Isolated test','--creator','test','--role','human','--flow','direct','--cast','executor=pi','--url',server.url]);
   const hub=await source(server.url,root),entries=await hub.list(),id=entries.find(e=>e.task_id!=='project').task_id;
@@ -797,4 +931,282 @@ for(const api of [fs,p])for(const key of ['readFile','readFileSync','readdir','r
   const result=await hub.read(id);assert.equal(result.versions.length,2);assert.equal(result.status,'reviewing');
   assert.deepEqual((await fs.readdir(path.join(root,'.context-hub/tasks',id))).sort(),['meta.json','v001.note.json','v002.code_changes.json']);
   await assert.rejects(fs.stat(log),{code:'ENOENT'});await assert.rejects(fs.stat(lockPath(root)),{code:'ENOENT'});
+});
+
+// Exercise the real read port and watcher with a mixed exact source. Only the
+// bundled catalog selection and the native run-log I/O failure are substituted.
+async function mixedRunLogFixture(t, failure) {
+  const { agentProfiles, profileArtifact } = await import('../../../dist/agents/public/transition.js');
+  const { RunStore } = await import('../../../dist/core/run/store.js');
+  const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+  const bad=await store.createTask({title:'Mixed exact source',description:'test',creator:'test',role:'human',flow:'direct'});
+  const other=await store.createTask({title:'Overlap source',description:'test',creator:'test',role:'human',flow:'direct'});
+  const value=JSON.parse(profileArtifact(agentProfiles.get('codex')));
+  value.usage.attribution='exact-session-window-v1';value.usage.source.header.id=['payload','id'];
+  value.usage.source.roots.push({kind:'run-log',via:'RunStore',run_id:'round.run_id'});value.usage.capability.spec=structuredClone(value.usage.source);
+  const peer=structuredClone(value);peer.id='pi';peer.match.supported_executable_names=['pi'];peer.match.platform_target_identity.win32='pi';peer.usage.attribution='legacy-cwd-window-v1';peer.usage.source.roots.pop();peer.usage.capability.spec=structuredClone(peer.usage.source);
+  await fs.mkdir(path.join(root,'.context-hub','agents'),{recursive:true});
+  for(const profile of [value,peer])await fs.writeFile(path.join(root,'.context-hub','agents',profile.id+'.json'),JSON.stringify(profile));
+  const attempt='0ec82a6a-a166-4b1e-afc1-17667c629d30',runStore=new RunStore(root),runId=runStore.create();
+  const route={agent:'codex',args:[]};
+  await runStore.initialize(runId,{run_id:runId,task_id:bad.task_id,pid:2147483000,pgid:2147483000,supervisor_pid:2147482999,argv:['codex'],cwd:root,started_at:T(0),ended_at:T(40),status:'exited',exit_code:0,agent_session_id:'native',headless:{schema:1,role:'executor',attempt_id:attempt,base_version:0,trigger_version:0,route,route_source:'task-cast',session_reason:'test'}});
+  const marker=launch(1,5,'codex');marker.payload.launch.attempt_id=attempt;
+  const histories=[task(root,[marker,delivery(2,20)],bad.task_id)];
+  const hub={list:async()=>histories.map(h=>({task_id:h.task_id})),read:async id=>histories.find(h=>h.task_id===id)};
+  const dir=path.join(root,'native');await fs.mkdir(dir);
+  await session(dir,'codex',[{...codexHead(root),payload:{...codexHead(root).payload,id:'native'}},ev(10,'task_started',{turn_id:'turn'}),count(20,7,3),ev(30,'task_complete',{turn_id:'turn'})]);
+  let reads=0;const originalLog=RunStore.prototype.openLog;
+  RunStore.prototype.openLog=function(){reads++;throw failure;};t.after(()=>{RunStore.prototype.openLog=originalLog;});
+  return {root,bad,other,histories,hub,runId,reads:()=>reads,options:{root,codexRoot:dir},deps:{hub,runs:async()=>[runStore.read(runId)]},ledger:id=>loadUsage(path.join(root,'.context-hub','tasks',id))};
+}
+for(const code of ['EACCES','EIO'])test(`a later run-log ${code} keeps the file claim for overlap checks and prevents sole-candidate accounting`,async t=>{
+  const failure=Object.assign(Error('native run-log unreadable'),{code}),f=await mixedRunLogFixture(t,failure);
+  const reports=await collect(f.options,f.deps);assert.equal(f.reads(),1);
+  const ledger=await f.ledger(f.bad.task_id);assert.equal(ledger.rounds.length,0);assert.equal(ledger.total.complete,false);
+  assert.equal(ledger.unresolved[0].reason,'unreadable_session_candidate');
+  assert.ok(reports.some(r=>r.diagnostic?.agent==='codex'&&r.diagnostic.reason===failure.message));
+  f.histories.push(task(f.root,[launch(1,5,'pi'),delivery(2,20)],f.other.task_id));
+  await collect(f.options,f.deps);assert.equal(f.reads(),2);
+  // The unreadable Codex log cannot erase its valid file claim and let this
+  // other profile account for the very same native window.
+  const peer=await f.ledger(f.other.task_id);assert.equal(peer.rounds.length,0);assert.equal(peer.unresolved[0].reason,'overlapping_rounds');
+});
+test('a later run-log timeout preserves the original error and never writes a partial ledger',async t=>{
+  const failure=Object.assign(Error('native run-log deadline'),{code:'LOCAL_IO_TIMEOUT',phase:'run-log-read',target:'native run-log',elapsed_ms:25,timeout_ms:25});
+  const f=await mixedRunLogFixture(t,failure);
+  await assert.rejects(collect(f.options,f.deps),e=>e===failure&&e.phase==='run-log-read'&&e.target==='native run-log'&&e.timeout_ms===25&&e.elapsed_ms===25);
+  assert.equal(f.reads(),1);assert.equal(await f.ledger(f.bad.task_id),null);
+});
+
+
+test('a later round discovers its new session without reparsing historical files outside its window',async t=>{
+  const f=await fixture(t),options={...f.options,watch:true};let reads=0;
+  const deps={hub:{list:f.hub.list,read:(id,since)=>f.store.readTask(id,since)},allowed:async()=>true,
+    readSession:async(...args)=>{reads++;return readSession(...args);}};
+  await collect(options,deps);assert.equal(reads,1);
+  await new Promise(resolve=>setTimeout(resolve,5));
+  await f.store.append(f.id,{role:'human',content_type:'note',payload:{summary:'launch',body:'test',launch:{role:'executor',base_version:2,route:{agent:'pi',args:[]}}}});
+  await f.store.append(f.id,{role:'executor',content_type:'revision',payload:{summary:'done',body:'test'}});
+  const task=await f.store.readTask(f.id),[L,D]=task.versions.slice(-2);
+  const start={...user(10),timestamp:L.timestamp},end={...pi(40,'stop','new'),timestamp:new Date(Date.parse(D.timestamp)+1).toISOString()};
+  await session(f.cwdDir,'pi',[piHead(f.root),start,end],'later.jsonl');
+  await collect(options,deps);assert.equal(reads,2);
+  const dir=path.join(f.root,'.context-hub/tasks',f.id),incremental=await loadUsage(dir);
+  assert.equal(incremental.rounds.length,2);
+  await collect({...f.options,cache:new Map()},deps);assert.deepEqual(await loadUsage(dir),incremental);
+});
+
+test('incremental task cursors use inclusive Hub deltas, compact bodies, and cold calibration after restart',async t=>{
+  const f=await fixture(t),options={...f.options,watch:true},reads=[],deps={allowed:async()=>true,hub:{
+    list:f.hub.list,read:async(id,since)=>{reads.push([id,since]);return f.store.readTask(id,since);}
+  }};
+  await collect(options,deps);await collect(options,deps);
+  assert.deepEqual(reads,[[f.id,undefined]]);
+  await f.store.append(f.id,{role:'human',content_type:'note',payload:{summary:'metadata',body:'x'.repeat(100000)}});
+  await collect(options,deps);assert.deepEqual(reads.at(-1),[f.id,3]);
+  const snapshot=options.incremental.tasks.get(f.id).task;
+  assert.equal(snapshot.versions.length,3);assert.equal(snapshot.versions.at(-1).payload.body,undefined);
+  const ledger=await loadUsage(path.join(f.root,'.context-hub/tasks',f.id));
+  await collect({...f.options,watch:true},deps);assert.deepEqual(reads.at(-1),[f.id,undefined]);
+  assert.deepEqual(await loadUsage(path.join(f.root,'.context-hub/tasks',f.id)),ledger);
+});
+
+test('incremental outcomes equal full scans through append, partial tails, corruption, replacement, ambiguity and removal',async t=>{
+  const f=await fixture(t),options={...f.options,watch:true},deps={hub:f.hub,allowed:async()=>true};
+  const ledger=()=>loadUsage(path.join(f.root,'.context-hub/tasks',f.id));
+  const check=async()=>{await collect(options,deps);const incremental=await ledger();
+    await collect({...f.options,cache:new Map()},deps);assert.deepEqual(await ledger(),incremental);};
+  await check();await fs.appendFile(f.s.file,'{');await check();
+  await fs.writeFile(f.s.file,f.rows.map(JSON.stringify).join('\n')+'\n');await check();
+  await fs.writeFile(f.s.file,'broken\n');await check();
+  const replacement=f.s.file+'.new';await fs.writeFile(replacement,f.rows.map(JSON.stringify).join('\n')+'\n');
+  await fs.rename(replacement,f.s.file);await check();
+  const copy=path.join(f.cwdDir,'copy.jsonl');await fs.copyFile(f.s.file,copy);await check();
+  await fs.unlink(copy);await check();await fs.unlink(f.s.file);await check();
+  await fs.writeFile(f.s.file,f.rows.map(JSON.stringify).join('\n')+'\n');await check();
+  assert.equal((await ledger()).total.complete,true);
+});
+
+test('new task collisions invalidate attribution of unchanged tasks and match a full scan',async t=>{
+  const f=await fixture(t),options={...f.options,watch:true},deps={hub:f.hub,allowed:async()=>true};
+  await collect(options,deps);
+  const {task_id:other}=await f.store.createTask({title:'Collision',description:'test',creator:'test',role:'human',flow:'direct'});
+  const history=await f.store.readTask(f.id),newHistory=history.versions.map(r=>({...r,task_id:other}));
+  deps.hub={list:f.hub.list,read:async(id,since)=>id===other?{task_id:other,versions:newHistory.filter(r=>since===undefined||r.version>=since)}:f.store.readTask(id,since)};
+  await collect(options,deps);
+  const ledgers=()=>Promise.all([f.id,other].map(id=>loadUsage(path.join(f.root,'.context-hub/tasks',id))));
+  const snapshots=await ledgers();await collect({...f.options,cache:new Map()},deps);
+  assert.deepEqual(await ledgers(),snapshots);assert.ok(snapshots.every(v=>v.unresolved[0].reason==='overlapping_rounds'));
+});
+
+test('watch persists compact cursors outside usage output and ignores them on cold startup',async t=>{
+  const f=await fixture(t),file=lockPath(canonicalRoot(f.root))+'.cursor.json';t.after(()=>fs.rm(file,{force:true}));
+  for(let restart=0;restart<2;restart++) {
+    const ac=new AbortController();let reads=0;
+    await run({...f.options,watch:true,signal:ac.signal},{enabled:async()=>true,
+      hub:{list:f.hub.list,read:async(...args)=>{reads++;return f.store.readTask(...args);}},report:()=>ac.abort()});
+    assert.equal(reads,1);const cursor=JSON.parse(await fs.readFile(file,'utf8'));
+    assert.deepEqual(cursor.tasks,[[f.id,2]]);assert.equal(cursor.sessions.length,1);
+    assert.equal(cursor.sessions[0].length,2);assert.equal(cursor.rounds,undefined);
+  }
+});
+
+test('slow watch passes back off by their duration and fast passes retain the configured floor',async t=>{
+  const f=await fixture(t),ac=new AbortController(),waits=[];let pass=0;
+  await run({...f.options,watch:true,intervalMs:10,timeoutMs:Infinity,signal:ac.signal},{
+    enabled:async()=>true,lock:async()=>async()=>{},collect:async()=>{
+      if(++pass===1)await new Promise(resolve=>setTimeout(resolve,45));if(pass===3)ac.abort();return [];
+    },sleep:async ms=>{waits.push(ms);},report:()=>{}
+  });
+  assert.equal(waits.length,2);assert.ok(waits[0]>=35);assert.equal(waits[1],10);
+});
+
+test('copied watcher coordination belongs to the new root and cannot steal the source owner', async t => {
+  const root = await temp(t), target = await temp(t);
+  const release = await lock(root);
+  const original = await fs.readFile(lockPath(root), 'utf8');
+  await fs.cp(path.join(root, '.context-hub'), path.join(target, '.context-hub'), { recursive: true });
+  try {
+    const releaseCopy = await lock(target);
+    assert.equal(JSON.parse(await fs.readFile(lockPath(target), 'utf8')).root, canonicalRoot(target));
+    assert.equal(await fs.readFile(lockPath(root), 'utf8'), original);
+    await releaseCopy();
+  } finally { await release(); }
+});
+test('a peer change during native I/O stays in the old pass and invalidates the next source cache',async t=>{
+ const root=await temp(t),dir=path.join(root,'native'),profiles=path.join(root,'.context-hub','agents');
+ await fs.mkdir(dir);await fs.mkdir(profiles,{recursive:true});
+ const file=path.join(dir,'session.jsonl');
+ await fs.writeFile(file,[piHead(root),ev(10,'task_started',{turn_id:'t'}),count(20,7,3),ev(30,'task_complete',{turn_id:'t'})].map(x=>JSON.stringify(x)).join('\n')+'\n');
+ const store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+ const created=await store.createTask({title:'peer cache',description:'test',creator:'test',role:'human',flow:'direct'});
+ const history=task(root,[launch(1,5,'codex'),delivery(2,20)],created.task_id);
+ const hub={list:async()=>[{task_id:created.task_id}],read:async()=>history};
+ const options={root,codexRoot:dir,piRoot:path.join(root,'no-pi-files'),watch:true};let reads=0;
+ const deps={hub,allowed:async()=>true,readSession:async(file,agent,opts)=>{
+  reads++;if(reads===1)await fs.writeFile(path.join(profiles,'pi.json'),JSON.stringify({id:'pi'}));
+  return readSession(file,agent,opts);
+ }};
+ const [first]=await collect(options,deps);assert.equal(first.total.total_tokens,10);
+ await collect(options,deps);assert.equal(reads,2);
+ await collect(options,deps);assert.equal(reads,2);
+});
+
+test('basic capability is unmetered without native I/O; a pass freezes its binding snapshot',async t=>{
+ const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+ const created=await store.createTask({title:'basic usage',description:'Protocol fixture.',creator:'test',role:'human',flow:'direct'});
+ const config=path.join(root,'.context-hub','config.json');
+ const binding={executable:'worker-x',args:[],prompt:{kind:'argv',index:0}};
+ await fs.writeFile(config,JSON.stringify({flow_mode:'manual',agent_bindings:{'worker-x':binding}}));
+ const history=task(root,[launch(1,5,'binding:worker-x'),delivery(2,20)],created.task_id);
+ let reads=0;
+ const hub={list:async()=>[{task_id:created.task_id}],read:async()=>{reads++;await fs.writeFile(config,JSON.stringify({flow_mode:'manual',agent_bindings:{'worker-x':{broken:true}}}));return history;}};
+ const deps={hub,files:async()=>{throw Error('basic must not discover native sources');}};
+ const {collectStats}=await import('../../../dist/core/stats.js');
+ for(const record of history.versions)await store.append(created.task_id,{role:record.role,content_type:record.content_type,payload:record.payload.summary?record.payload:{...record.payload,summary:'fixture',body:'fixture'}});
+ const missing=await collectStats(path.join(root,'.context-hub'));
+ assert.equal(missing.tasks[0].usage.status,'missing');
+ assert.deepEqual(missing.tasks[0].usage.unmetered,[{agent:'binding:worker-x',reason:'not-declared'}]);
+ const [first]=await collect({root},deps);
+ assert.equal(first.total.rounds,0);assert.equal(first.total.complete,false);
+ assert.deepEqual(first.unresolved[0],{delivery_version:2,launch_version:1,reason:'usage_unavailable',agent:'binding:worker-x',reason_code:'not-declared',capability:'unavailable'});
+ const [next]=await collect({root},deps);
+ assert.match(next.unresolved[0].reason,/agent binding\.agent/);
+ assert.equal(next.unresolved[0].capability,'invalid');assert.equal(reads,2);
+ await fs.writeFile(config,JSON.stringify({flow_mode:'manual',agent_bindings:{'worker-x':binding}}));
+ await collect({root},{...deps,hub:{...hub,read:async()=>history}});
+ const stats=await collectStats(path.join(root,'.context-hub'));
+ assert.deepEqual(stats.tasks[0].usage.by_agent,{});
+ assert.deepEqual(stats.tasks[0].usage.unmetered,[{agent:'binding:worker-x',reason:'not-declared'}]);
+ assert.equal(stats.tasks[0].usage.unsupported,undefined);
+});
+
+for(const routeAgent of ['/opt/fixture/codex','meter-cli'])test(`resolved route ${routeAgent} keeps full/watch attribution and other tasks alive`,async t=>{
+ const f=await fixture(t);
+ if(routeAgent==='meter-cli') {
+  const {agentProfiles,profileArtifact}=await import('../../../dist/agents/public/transition.js');
+  const profile=JSON.parse(profileArtifact(agentProfiles.get('codex')));
+  profile.id='custom-meter';profile.match.supported_executable_names=['meter-cli'];profile.match.platform_target_identity=null;
+  await fs.mkdir(path.join(f.root,'.context-hub','agents'),{recursive:true});
+  await fs.writeFile(path.join(f.root,'.context-hub','agents','custom-meter.json'),JSON.stringify(profile));
+ }
+ const {task_id:id}=await f.store.createTask({title:'Resolved meter route',description:'Protocol regression.',creator:'test',role:'human',flow:'direct'});
+ const route={agent:routeAgent,args:['--fixed','kept']};
+ await f.store.append(id,{role:'human',content_type:'note',payload:{summary:'launch',body:'fixture',launch:{role:'executor',base_version:0,route}}});
+ await f.store.append(id,{role:'executor',content_type:'code_changes',payload:{summary:'done',body:'fixture'}});
+ const history=await f.store.readTask(id),[L,D]=history.versions;
+ const options={...f.options,watch:true},deps={hub:f.hub,allowed:async()=>true};
+ const ledger=()=>loadUsage(path.join(f.root,'.context-hub/tasks',id));
+ await collect(options,deps);
+ assert.equal((await ledger()).unresolved[0].reason,'missing_session_or_end');
+ assert.equal((await loadUsage(path.join(f.root,'.context-hub/tasks',f.id))).total.total_tokens,37);
+ let expected=await ledger();await collect({...f.options,cache:new Map()},deps);assert.deepEqual(await ledger(),expected);
+ await fs.mkdir(f.options.codexRoot);
+ await fs.writeFile(path.join(f.options.codexRoot,'native.jsonl'),[
+  codexHead(f.root),
+  {...ev(10,'task_started',{turn_id:'resolved'}),timestamp:L.timestamp},
+  {...count(20,7,3),timestamp:new Date(Date.parse(D.timestamp)+10).toISOString()},
+  {...ev(30,'task_complete',{turn_id:'resolved'}),timestamp:new Date(Date.parse(D.timestamp)+100).toISOString()}
+ ].map(JSON.stringify).join('\n')+'\n');
+ await collect(options,deps);expected=await ledger();
+ assert.deepEqual(expected.total,{rounds:1,total_tokens:10,cost_usd:null,complete:true});
+ assert.equal(expected.rounds[0].agent,routeAgent);assert.deepEqual(expected.unresolved,[]);
+ await collect(options,deps);assert.deepEqual(await ledger(),expected);
+ await collect({...f.options,watch:true},deps);assert.deepEqual(await ledger(),expected);
+ await collect({...f.options,cache:new Map()},deps);assert.deepEqual(await ledger(),expected);
+ const {collectStats}=await import('../../../dist/core/stats.js');
+ const stats=await collectStats(path.join(f.root,'.context-hub'));
+ assert.equal(stats.tasks.find(t=>t.task_id===id).usage.by_agent[routeAgent].total_tokens,10);
+ assert.equal((await f.store.readTask(id)).versions[0].payload.launch.route.agent,routeAgent);
+ await fs.writeFile(path.join(f.options.codexRoot,'native.jsonl'),'broken\n');
+ await collect(options,deps);assert.equal((await ledger()).unresolved[0].reason,'unreadable_session_candidate');
+ assert.equal((await ledger()).total.total_tokens,10);
+ assert.equal((await loadUsage(path.join(f.root,'.context-hub/tasks',f.id))).total.total_tokens,37);
+});
+
+test('merge never treats an empty candidate list as a successful measurement',()=>{
+ const round={task_id:'one',round:1,agent:'meter-cli',role:'executor',launch_version:1,delivery_version:2,ts:T(20)};
+ const value=merge(null,[{round,candidates:[]}]);
+ assert.equal(value.rounds.length,0);assert.equal(value.unresolved[0].reason,'missing_session_or_end');
+});
+
+test('exact file sources have identical cold watch, full and stationary results with stable opaque callbacks',async t=>{
+ const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+ const {task_id:id}=await store.createTask({title:'Exact file usage',description:'Protocol regression.',creator:'test',role:'human',flow:'direct'});
+ const {agentProfiles,profileArtifact}=await import('../../../dist/agents/public/transition.js');
+ const profile=JSON.parse(profileArtifact(agentProfiles.get('codex')));
+ profile.usage.attribution='exact-session-window-v1';profile.usage.source.header.id=['payload','id'];profile.usage.capability.spec=structuredClone(profile.usage.source);
+ await fs.mkdir(path.join(root,'.context-hub','agents'),{recursive:true});
+ await fs.writeFile(path.join(root,'.context-hub','agents','codex.json'),JSON.stringify(profile));
+ const dir=path.join(root,'native');await fs.mkdir(dir);
+ const file=path.join(dir,'native.jsonl');
+ await fs.writeFile(file,[{...codexHead(root),payload:{...codexHead(root).payload,id:'native'}},ev(10,'task_started',{turn_id:'exact'}),count(20,7,3),ev(30,'task_complete',{turn_id:'exact'})].map(JSON.stringify).join('\n')+'\n');
+ const attempt='0ec82a6a-a166-4b1e-afc1-17667c629d30',marker=launch(1,5,'codex');marker.payload.launch.attempt_id=attempt;
+ const history=task(root,[marker,delivery(2,20)],id),route=marker.payload.launch.route;
+ const run={run_id:'exact-run',task_id:id,cwd:root,argv:['codex'],agent_session_id:'native',headless:{role:'executor',attempt_id:attempt,base_version:0,route}};
+ let reads=0;
+ const options={root,codexRoot:dir,watch:true},deps={allowed:async()=>true,hub:{list:async()=>[{task_id:id,version:2}],read:async()=>history},runs:async()=>[run],readSession:async(...args)=>{reads++;return readSession(...args);}};
+ const ledger=()=>loadUsage(path.join(root,'.context-hub/tasks',id));
+ await collect(options,deps);const expected=await ledger();
+ assert.deepEqual(expected.total,{rounds:1,total_tokens:10,cost_usd:null,complete:true});assert.deepEqual(expected.unresolved,[]);assert.equal(reads,1);
+ await collect(options,deps);assert.deepEqual(await ledger(),expected);assert.equal(reads,1);
+ await collect({root,codexRoot:dir},deps);assert.deepEqual(await ledger(),expected);assert.equal(reads,2);
+ await collect(options,deps);assert.deepEqual(await ledger(),expected);assert.equal(reads,2);
+ const {resolveContract,contractSource}=await import('../../../dist/agents/public/index.js');
+ const {bindUsage,bindUsageRun,readUsage}=await import('../../../dist/agents/public/usage.js');
+ const selected=resolveContract({agent:'codex'},contractSource(root),'posix');assert.equal(selected.status,'resolved');
+ // This direct adapter assertion selects a POSIX contract on every host;
+ // its cwd/home must be POSIX facts too, independent of the physical fixture.
+ const adapterRun={...run,cwd:'/contract-checkout'};
+ const facts={task_id:id,role:'executor',agent:'codex',route,cwd:adapterRun.cwd,launch_version:1,delivery_version:2,launch_ts:T(5),delivery_ts:T(20),attempt_id:attempt};
+ const bound=bindUsageRun(selected.handle,facts,[adapterRun]);
+ const extra=bindUsage(selected.handle,{...facts,run_id:run.run_id,native_session_id:'native'},{run_id:run.run_id,native_session_id:'native',identity_source:'observed',profile:{value:'private'},round:{},attribution:'wrong'});
+ assert.equal(extra.status,'bound');assert.equal(extra.ref.key,bound.ref.key);
+ assert.equal(bound.status,'bound');let calls=0;
+ await readUsage(bound.ref,{facts:{home:'/contract-home',auditCwd:adapterRun.cwd,platform:'posix',codexRoot:'/contract-native',piEnv:{}},list:async()=>['/contract-native/native.jsonl'],readRun:async()=>adapterRun,readSource:async(_file,callback)=>{
+  calls++;assert.equal(callback,bound.ref);assert.equal(callback.key,bound.ref.key);
+  const identity=JSON.parse(callback.key)[2];assert.deepEqual(Object.keys(identity).sort(),['identity_source','native_session_id','run_id']);
+  assert.equal(identity.profile,undefined);return {candidates:[],sourceEvidence:[],problems:[]};
+ }});
+ assert.equal(calls,1);
 });

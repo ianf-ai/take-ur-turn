@@ -8,13 +8,10 @@ import { readConfig, autoSectionOf } from '../../core/common/config.js';
  * a .sh file.
  */
 
-import { rigLabel, rigEnvironment } from "../../core/hub/rig.js";
-import { canonicalRoot, resolveRigRoot } from "../../core/hub/rig-discovery.js";
-import {
-  buildLaunchInvocation,
-  explicitRouteFromValues,
-  targetDigest,
-} from "../../core/launcher/invocation.js";
+import { rigLabel, rigEnvironment } from "../../hub/rig-identity.js";
+import { canonicalRoot, resolveRigRoot, resolveLegacyLaunchHubUrl } from "../../hub/rig-discovery.js";
+import { buildLaunchInvocation } from "../../protocol/launch-codec.js";
+import { explicitRouteFromValues, targetDigest } from "../../protocol/launch-policy.js";
 import {
   AgentTargetError,
   planForPlatform,
@@ -32,7 +29,7 @@ import {
   type DeliveryOutcome,
 } from "./delivery.js";
 import { DELIVERY_GIVEUP_EVENT, eventPortUrlOf, postAgentEvent, type GiveUpEvidence } from "./escalation.js";
-import { birthCwdOf } from "../../core/launcher/checkout.js";
+import { birthCwdOf } from "./command-context.js";
 import { worktreeGitEnvironment } from "../../core/launcher/worktree-git.js";
 import {
   renderPaneCommand,
@@ -41,7 +38,7 @@ import {
   type RenderedPaneCommand,
   type ShellDialect,
 } from "./shell-renderer.js";
-import { normalizeAgentRoute } from "../../core/common/agent-command.js";
+import { normalizeAgentRoute } from "../../protocol/agent-command.js";
 import {
   defaultUserConfigDir,
   readWorkspaceConfigSnapshot,
@@ -61,12 +58,12 @@ import type {
   LaunchNaming,
   LaunchRequest,
   LaunchRouteSource,
-} from "../../core/common/types.js";
+} from "../../protocol/types.js";
 import type { LaunchEntry } from "../../core/launcher/entry-parse.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HerdrPane } from "./legacy-herdr-client.js";
-import type { LaunchAnchor } from "../../core/common/types.js";
+import type { LaunchAnchor } from "../../protocol/types.js";
 
 interface HerdrResult {
   code: number | null;
@@ -186,7 +183,7 @@ type TaskMetadataOutcome =
 export async function taskLaunchMetadata(taskId: string, hubUrl: string, rigRoot: string = resolveRigRoot()): Promise<TaskMetadataOutcome> {
   let response: Response;
   try {
-    response = await fetch(new URL("/state", hubUrl));
+    response = await fetch(new URL("/state", hubUrl), { signal: AbortSignal.timeout(10_000), headers: { Connection: "close" } });
   } catch (error) {
     return { kind: "hub-unreadable", detail: `fetch failed: ${(error as Error).message}` };
   }
@@ -243,7 +240,7 @@ async function buildLegacyInvocation(request: LaunchRequest, invocation?: Launch
   // Resolve the Herdr snapshot once.  Route/naming and birth consume this
   // same context; no later phase is allowed to rediscover the anchor.
   const environment = { ...process.env };
-  const hubUrl = environment.TUT_HUB_URL ?? DEFAULT_HUB_URL;
+  const hubUrl = await resolveLegacyLaunchHubUrl(environment.TUT_HUB_URL ?? DEFAULT_HUB_URL);
   const outcome = await taskLaunchMetadata(request.task_id, hubUrl);
   if (outcome.kind === "task-missing") {
     // A well-formed 200 that does not know the task is a caller error, not
@@ -287,7 +284,7 @@ async function buildLegacyInvocation(request: LaunchRequest, invocation?: Launch
   const workspaceSnapshot = await readWorkspaceConfigSnapshot({
     projectRoot: routingRoot,
     userConfigDir: defaultUserConfigDir(environment),
-    ...(context.checkout.kind === "worktree" && !context.hubRoot.startsWith("<")
+    ...(!context.hubRoot.startsWith("<")
       ? { fallbackProjectRoot: context.hubRoot }
       : {}),
   });

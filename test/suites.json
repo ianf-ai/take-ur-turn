@@ -1,0 +1,483 @@
+{
+  "schema": 1,
+  "baselineCount": 112,
+  "suites": [
+    {
+      "path": "test/lanes/herdr/agent-command.test.ts",
+      "previousPath": "test/agent-command.test.ts"
+    },
+    {
+      "path": "test/integration/agents/agent-probe.test.ts",
+      "previousPath": "test/agent-probe.test.ts"
+    },
+    {
+      "path": "test/integration/agents/agent-profile-contracts.test.ts",
+      "previousPath": "test/agent-profile-contracts.test.ts"
+    },
+    {
+      "path": "test/core/agents/agent-profiles.test.ts",
+      "previousPath": "test/agent-profiles.test.ts"
+    },
+    {
+      "path": "test/integration/release/assert-release.test.ts",
+      "previousPath": "test/assert-release.test.ts"
+    },
+    {
+      "path": "test/integration/board/board-http.test.ts",
+      "previousPath": "test/board-http.test.ts"
+    },
+    {
+      "path": "test/core/board/board.test.ts",
+      "previousPath": "test/board.test.ts"
+    },
+    {
+      "path": "test/core/channels/channels.test.ts",
+      "previousPath": "test/channels.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/checkout-legacy-launch.test.ts",
+      "previousPath": "test/checkout-legacy-launch.test.ts"
+    },
+    {
+      "path": "test/lanes/shared/checkout-routing.test.ts",
+      "previousPath": "test/checkout-routing.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/cli-assign-launch.test.ts",
+      "previousPath": "test/cli-assign-launch.test.ts"
+    },
+    {
+      "path": "test/core/cli/cli-config.test.ts",
+      "previousPath": "test/cli-config.test.ts"
+    },
+    {
+      "path": "test/integration/cli/cli-doctor.test.ts",
+      "previousPath": "test/cli-doctor.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/cli-launch-boundaries.test.ts",
+      "previousPath": "test/cli-launch-boundaries.test.ts"
+    },
+    {
+      "path": "test/core/cli/cli-repair.test.ts",
+      "previousPath": "test/cli-repair.test.ts"
+    },
+    {
+      "path": "test/core/cli/cli-skill-init.test.ts",
+      "previousPath": "test/cli-skill-init.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/cli-start-next.test.ts",
+      "previousPath": "test/cli-start-next.test.ts"
+    },
+    {
+      "path": "test/integration/cli/cli-up.test.ts",
+      "previousPath": "test/cli-up.test.ts"
+    },
+    {
+      "path": "test/core/cli/cli-watch.test.ts",
+      "previousPath": "test/cli-watch.test.ts"
+    },
+    {
+      "path": "test/integration/cli/cli.test.ts",
+      "previousPath": "test/cli.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/close-audit.test.ts",
+      "previousPath": "test/close-audit.test.ts",
+      "budgetClass": "native-process"
+    },
+    {
+      "path": "test/measure/config/config-publish.test.ts",
+      "previousPath": "test/config-publish.test.ts"
+    },
+    {
+      "path": "test/core/config/config.test.ts",
+      "previousPath": "test/config.test.ts"
+    },
+    {
+      "path": "test/core/doctor/doctor.test.ts",
+      "previousPath": "test/doctor.test.ts"
+    },
+    {
+      "path": "test/integration/hub/e2e.mcp.test.ts",
+      "previousPath": "test/e2e.mcp.test.ts"
+    },
+    {
+      "path": "test/integration/stack/event-chain.test.ts",
+      "previousPath": "test/event-chain.test.ts"
+    },
+    {
+      "path": "test/core/hub/exit-conditions-field.test.ts",
+      "previousPath": "test/exit-conditions-field.test.ts"
+    },
+    {
+      "path": "test/lanes/shared/fixture-executable.test.ts",
+      "previousPath": "test/fixture-executable.test.ts"
+    },
+    {
+      "path": "test/core/agents/headless-codex-argv.test.ts",
+      "previousPath": "test/headless-codex-argv.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/headless-observation.test.ts",
+      "previousPath": "test/headless-observation.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/headless-opencode.test.ts",
+      "previousPath": "test/headless-opencode.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/headless-windows-routing.test.ts",
+      "previousPath": "test/headless-windows-routing.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/headless-windows-target.test.ts",
+      "previousPath": "test/headless-windows-target.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/host-entries.test.ts",
+      "previousPath": "test/host-entries.test.ts"
+    },
+    {
+      "path": "test/core/channels/host-status-relay.test.ts",
+      "previousPath": "test/host-status-relay.test.ts"
+    },
+    {
+      "path": "test/integration/hub/http-client-teardown.test.ts",
+      "previousPath": "test/http-client-teardown.test.ts"
+    },
+    {
+      "path": "test/integration/hub/http.test.ts",
+      "previousPath": "test/http.test.ts"
+    },
+    {
+      "path": "test/integration/hub/hub-client.test.ts",
+      "previousPath": "test/hub-client.test.ts"
+    },
+    {
+      "path": "test/integration/hub/hubs-http.test.ts",
+      "previousPath": "test/hubs-http.test.ts"
+    },
+    {
+      "path": "test/integration/stack/integration.full-stack.test.ts",
+      "previousPath": "test/integration.full-stack.test.ts"
+    },
+    {
+      "path": "test/integration/board/kibitz-http.test.ts",
+      "previousPath": "test/kibitz-http.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launch-ack-dedup.test.ts",
+      "previousPath": "test/launch-ack-dedup.test.ts"
+    },
+    {
+      "path": "test/core/notifier/launch-catchup.test.ts",
+      "previousPath": "test/launch-catchup.test.ts"
+    },
+    {
+      "path": "test/integration/stack/launch-worktree-git.test.ts",
+      "previousPath": "test/launch-worktree-git.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launch.test.ts",
+      "previousPath": "test/launch.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-checkout.test.ts",
+      "previousPath": "test/launcher-checkout.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-default-budget.test.ts",
+      "previousPath": "test/launcher-default-budget.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-delivery.test.ts",
+      "previousPath": "test/launcher-delivery.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/launcher-detached-checkout.test.ts",
+      "previousPath": "test/launcher-detached-checkout.test.ts",
+      "historicalPaths": [
+        "test/launcher-headless-checkout.test.ts"
+      ]
+    },
+    {
+      "path": "test/lanes/detached/launcher-detached.test.ts",
+      "previousPath": "test/launcher-detached.test.ts",
+      "budgetClass": "native-process",
+      "historicalPaths": [
+        "test/launcher-headless.test.ts"
+      ]
+    },
+    {
+      "path": "test/lanes/herdr/launcher-entry.test.ts",
+      "previousPath": "test/launcher-entry.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-escalation.test.ts",
+      "previousPath": "test/launcher-escalation.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-fresh.test.ts",
+      "previousPath": "test/launcher-fresh.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-herdr-context.test.ts",
+      "previousPath": "test/launcher-herdr-context.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-herdr-v2.test.ts",
+      "previousPath": "test/launcher-herdr-v2.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-lifecycle.test.ts",
+      "previousPath": "test/launcher-lifecycle.test.ts"
+    },
+    {
+      "path": "test/integration/stack/launcher-platform-e2e.test.ts",
+      "previousPath": "test/launcher-platform-e2e.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-protocol.test.ts",
+      "previousPath": "test/launcher-protocol.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/launcher-shell-renderer.test.ts",
+      "previousPath": "test/launcher-shell-renderer.test.ts"
+    },
+    {
+      "path": "test/lanes/shared/launcher-target-resolver.test.ts",
+      "previousPath": "test/launcher-target-resolver.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/legacy-launch-handshake.test.ts",
+      "previousPath": "test/legacy-launch-handshake.test.ts"
+    },
+    {
+      "path": "test/core/hub/lint-repair-protocol.test.ts",
+      "previousPath": "test/lint-repair-protocol.test.ts"
+    },
+    {
+      "path": "test/integration/board/live-view.test.ts",
+      "previousPath": "test/live-view.test.ts"
+    },
+    {
+      "path": "test/integration/hub/mcp-bridge.test.ts",
+      "previousPath": "test/mcp-bridge.test.ts"
+    },
+    {
+      "path": "test/integration/hub/mcp.test.ts",
+      "previousPath": "test/mcp.test.ts"
+    },
+    {
+      "path": "test/core/notifier/notifier-assembly.test.ts",
+      "previousPath": "test/notifier-assembly.test.ts"
+    },
+    {
+      "path": "test/core/notifier/notifier-routing.test.ts",
+      "previousPath": "test/notifier-routing.test.ts"
+    },
+    {
+      "path": "test/core/notifier/notifier.test.ts",
+      "previousPath": "test/notifier.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/opencode-continuity.test.ts",
+      "previousPath": "test/opencode-continuity.test.ts"
+    },
+    {
+      "path": "test/lanes/herdr/pane-runner.test.ts",
+      "previousPath": "test/pane-runner.test.ts"
+    },
+    {
+      "path": "test/power/standalone/power-listener.test.ts",
+      "previousPath": "test/power-listener.test.ts"
+    },
+    {
+      "path": "test/power/standalone/power-standalone.test.ts",
+      "previousPath": "test/power-standalone.test.ts",
+      "budgetClass": "native-process"
+    },
+    {
+      "path": "test/power/windows/power-windows.test.ts",
+      "previousPath": "test/power-windows.test.ts"
+    },
+    {
+      "path": "test/integration/cli/preflight-cli.test.ts",
+      "previousPath": "test/preflight-cli.test.ts"
+    },
+    {
+      "path": "test/core/doctor/preflight.test.ts",
+      "previousPath": "test/preflight.test.ts"
+    },
+    {
+      "path": "test/core/hub/record-lint.test.ts",
+      "previousPath": "test/record-lint.test.ts"
+    },
+    {
+      "path": "test/core/notifier/remediator.test.ts",
+      "previousPath": "test/remediator.test.ts"
+    },
+    {
+      "path": "test/core/rig/rig-discovery.test.ts",
+      "previousPath": "test/rig-discovery.test.ts"
+    },
+    {
+      "path": "test/core/rig/rig-isolation.test.ts",
+      "previousPath": "test/rig-isolation.test.ts"
+    },
+    {
+      "path": "test/core/rig/rig-lock.test.ts",
+      "previousPath": "test/rig-lock.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/run-control.test.ts",
+      "previousPath": "test/run-control.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/run-cooperative.test.ts",
+      "previousPath": "test/run-cooperative.test.ts",
+      "budgetClass": "native-process"
+    },
+    {
+      "path": "test/lanes/detached/run-file.test.ts",
+      "previousPath": "test/run-file.test.ts"
+    },
+    {
+      "path": "test/integration/run/run-hub.test.ts",
+      "previousPath": "test/run-hub.test.ts"
+    },
+    {
+      "path": "test/measure/run/run-lock-sharing.test.ts",
+      "previousPath": "test/run-lock-sharing.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/run-lock.test.ts",
+      "previousPath": "test/run-lock.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/run-repair.test.ts",
+      "previousPath": "test/run-repair.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/run-resume.test.ts",
+      "previousPath": "test/run-resume.test.ts",
+      "budgetClass": "native-process"
+    },
+    {
+      "path": "test/core/run/run-store.test.ts",
+      "previousPath": "test/run-store.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/run.test.ts",
+      "previousPath": "test/run.test.ts",
+      "budgetClass": "native-process"
+    },
+    {
+      "path": "test/integration/hub/seam.test.ts",
+      "previousPath": "test/seam.test.ts"
+    },
+    {
+      "path": "test/lanes/detached/start-next-headless.test.ts",
+      "previousPath": "test/start-next-headless.test.ts"
+    },
+    {
+      "path": "test/core/hub/state-awareness.test.ts",
+      "previousPath": "test/state-awareness.test.ts"
+    },
+    {
+      "path": "test/core/hub/state-machine.test.ts",
+      "previousPath": "test/state-machine.test.ts"
+    },
+    {
+      "path": "test/integration/usage/stats.test.ts",
+      "previousPath": "test/stats.test.ts"
+    },
+    {
+      "path": "test/core/hub/store-build-version.test.ts",
+      "previousPath": "test/store-build-version.test.ts"
+    },
+    {
+      "path": "test/core/hub/store-cache.test.ts",
+      "previousPath": "test/store-cache.test.ts"
+    },
+    {
+      "path": "test/core/hub/store.test.ts",
+      "previousPath": "test/store.test.ts"
+    },
+    {
+      "path": "test/core/hub/task-spec.test.ts",
+      "previousPath": "test/task-spec.test.ts"
+    },
+    {
+      "path": "test/lanes/shared/temporary-directory-cleanup.test.ts",
+      "previousPath": "test/temporary-directory-cleanup.test.ts"
+    },
+    {
+      "path": "test/integration/usage/usage-profile-roots.test.ts",
+      "previousPath": "test/usage-profile-roots.test.ts"
+    },
+    {
+      "path": "test/measure/windows/windows-broker-cache.test.ts",
+      "previousPath": "test/windows-broker-cache.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/windows-control.test.ts",
+      "previousPath": "test/windows-control.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/windows-native.test.ts",
+      "previousPath": "test/windows-native.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/windows-run-file.test.mjs",
+      "previousPath": "test/windows-run-file.test.mjs"
+    },
+    {
+      "path": "test/lanes/windows/windows-run-file.test.ts",
+      "previousPath": "test/windows-run-file.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/windows-run-meta-batch.test.ts",
+      "previousPath": "test/windows-run-meta-batch.test.ts"
+    },
+    {
+      "path": "test/lanes/windows/windows-supervisor.test.ts",
+      "previousPath": "test/windows-supervisor.test.ts"
+    },
+    {
+      "path": "test/core/config/workspace-agent-profiles.test.ts",
+      "previousPath": "test/workspace-agent-profiles.test.ts"
+    },
+    {
+      "path": "test/core/config/workspace.test.ts",
+      "previousPath": "test/workspace.test.ts"
+    },
+    {
+      "path": "test/lanes/shared/worktree-consistency.test.ts",
+      "previousPath": "test/worktree-consistency.test.ts"
+    },
+    {
+      "path": "test/integration/cli/worktree-task-cli.test.ts",
+      "previousPath": "test/worktree-task-cli.test.ts"
+    }
+  ],
+  "additionalSuites": [
+    {
+      "path": "test/integration/stack/event-chain-default-url.test.ts",
+      "extractedFrom": "test/integration/stack/event-chain.test.ts",
+      "reason": "Clean-environment default URL delivery through a real notifier, fatal default/explicit port conflicts, and explicit endpoint overrides. Requires exclusive loopback port 3002; never skips on occupation."
+    },
+    {
+      "path": "test/measure/observation/headless-observation.test.ts",
+      "extractedFrom": "test/lanes/detached/headless-observation.test.ts",
+      "reason": "Four 24h polling measurements, with their original assertions and timeouts."
+    },
+    {
+      "path": "test/core/hub/task-prune.test.ts",
+      "extractedFrom": "test/core/hub/store.test.ts",
+      "reason": "Closed-task disposal and failure/concurrency coverage separated from the Store suite."
+    }
+  ]
+}

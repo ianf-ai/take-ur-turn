@@ -11,7 +11,7 @@ import { performance } from "node:perf_hooks";
 import { validDeliveryAck, parseStatusSample } from "./herdr-client-v2.js";
 import type { CallContext, CallTrace, DeliveryClientV2, PaneIdentity, SendResult, StatusSample, TransportFault } from "./herdr-client-v2.js";
 export * from "./herdr-client-v2.js";
-import { paneEnvArgs } from "../../core/hub/rig.js";
+import { paneEnvArgs } from "./command-context.js";
 import type { ChildProcess } from "node:child_process";
 import { spawnDirect, type DirectSpawn, type DirectSpawnOptions } from "./process.js";
 

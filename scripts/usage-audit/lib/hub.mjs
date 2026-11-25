@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
+import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
 
 export function requestTimeout(env = process.env) {
   const ms = Number(env.TUT_USAGE_AUDIT_TIMEOUT_MS ?? 30_000);
@@ -18,12 +18,15 @@ export function requestTimeout(env = process.env) {
 async function boundedRead(endpoint, options, action) {
   const controller = new AbortController();
   const timeoutMs = options.requestTimeoutMs ?? requestTimeout();
+  const started = performance.now();
   let timer;
   options.onRequest?.(true);
   try {
     const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => {
-        const error = new Error(`HUB_TIMEOUT:${endpoint}: read exceeded ${timeoutMs}ms`);
+        const error = Object.assign(new Error(`HUB_TIMEOUT:${endpoint}: read exceeded ${timeoutMs}ms`), {
+          code: 'HUB_TIMEOUT', target: String(endpoint), elapsed_ms: Math.round(performance.now() - started), timeout_ms: timeoutMs,
+        });
         reject(error);
         controller.abort(error);
       }, timeoutMs);
@@ -75,6 +78,6 @@ export async function source(url, root, options = {}) {
       || canonicalRoot(body.hub_root) !== root) throw new Error(`hub_root_mismatch:${url}`);
   return {
     list: async () => (await readTool(url, 'context.list', {}, options)).tasks,
-    read: id => readTool(url, 'context.read', { task_id: id }, options),
+    read: (id, since_version) => readTool(url, 'context.read', { task_id: id, ...(since_version === undefined ? {} : { since_version }) }, options),
   };
 }

@@ -1,16 +1,17 @@
 import { fileURLToPath } from "node:url";
-import { rigLabel } from "../../core/hub/rig.js";
+import { rigLabel } from "../../hub/rig-identity.js";
 import { launchBlocked, latestRecordVersion, markLaunched, readLaunchLog } from "../../core/launcher/launch.js";
-import { bindLaunchBaseVersion, buildLaunchInvocation } from "../../core/launcher/invocation.js";
+import { bindLaunchBaseVersion } from "../../protocol/launch-policy.js";
+import { buildLaunchInvocation } from "../../protocol/launch-codec.js";
 import { ensureNotifierEventUrl } from "../../core/launcher/event-endpoint.js";
 import { AgentTargetError, UnsupportedWindowsShimError, resolvePlatformExecutionPlan } from "../../core/launcher/target-resolver.js";
 import { cliEntryPath, runInternalLaunchInvocation } from "./process.js";
 import { requireBirthAnchor, resolveExecutionContext } from "./anchor.js";
 import { defaultUserConfigDir, readWorkspaceConfigSnapshot, resolveAgentRouteWithSource, resolveTabLabelTemplateFromSnapshot } from "../../core/common/workspace.js";
 import { failWith } from "../../core/cli/shared.js";
-import type { Cast, CheckoutRoute, LaunchRequest } from "../../core/common/types.js";
+import type { Cast, CheckoutRoute, Flow, LaunchRequest } from "../../protocol/types.js";
 
-export async function runStartNextTui(parsed: { url: string; force: boolean }, entry: { version?: number; cast?: Cast; checkout?: CheckoutRoute }, request: LaunchRequest): Promise<number> {
+export async function runStartNextTui(parsed: { url: string; force: boolean }, entry: { version?: number; cast?: Cast; checkout?: CheckoutRoute; flow?: Flow }, request: LaunchRequest): Promise<number> {
   const { task_id: taskId, role } = request;
   let records;
   try {
@@ -25,7 +26,7 @@ export async function runStartNextTui(parsed: { url: string; force: boolean }, e
     process.stderr.write(`tut: cannot launch ${role} for ${taskId}: ${(e as Error).message}\n`);
     return 1;
   }
-  const blocked = launchBlocked(records, role);
+  const blocked = launchBlocked(records, role, undefined, entry.flow);
   if (blocked.blocked && !parsed.force) {
     process.stderr.write(
       `tut: ALREADY_LAUNCHED: ${role} launched at v${blocked.noteVersion ?? "?"}, no new publish since; inspect this round and outstanding control calls before considering --force\n`,
@@ -57,7 +58,7 @@ export async function runStartNextTui(parsed: { url: string; force: boolean }, e
     const workspaceSnapshot = await readWorkspaceConfigSnapshot({
       projectRoot,
       userConfigDir: defaultUserConfigDir(launchEnvironment),
-      ...(executionContext.checkout.kind === "worktree" && !executionContext.hubRoot.startsWith("<")
+      ...(!executionContext.hubRoot.startsWith("<")
         ? { fallbackProjectRoot: executionContext.hubRoot }
         : {}),
     });

@@ -3,6 +3,22 @@ import { DEFAULT_HUB_URL, DEFAULT_EVENT_PORT } from "./shared.js";
 export const USAGE = `tut — Take Ur Turn Context Hub
 
 Usage:
+  tut agent add <id> --from <file|->
+      Import a minimal JSON invocation declaration (stdin: --from -), with
+      static field diagnostics; saves config without TTY, samples or probe.
+      Then: tut assign executor binding:<id>; tut start-next <task-id>.
+      binding: is reserved for explicit config.agent_bindings references;
+      missing or invalid bindings fail without executable/profile fallback.
+      Legacy: --prompt stdin|argv:<index> -- <executable> [args...].
+  tut agent setup <id> [--from <file|->]
+      Optional declaration import/enhancement helper. No arguments prints
+      bundled authoring guidance; --from imports a binding or native profile.
+      Session/resume/usage declarations are optional. Saving runs no model.
+  tut agent probe <id>
+      Run fresh/session/resume/usage native CLI smoke checks using the owning
+      workspace profiles (.context-hub/agents/*.json). Executes the configured
+      CLI/model in an isolated temporary rig; preserves evidence and reports
+      unsupported usage explicitly. Exit 0 = declared contracts checked.
   tut run [--task <id>] [--fix-preflight] -- <command...>
       Start a detached POSIX process group in the calling cwd; prints run-id.
       Offline log/meta: <hub-root>/.context-hub/runs/<run-id>/ (TUT_HUB_ROOT or nearest Hub root).
@@ -32,7 +48,8 @@ Usage:
   tut resume <run-id> [instruction] [--fix-preflight]
       Continue a COMPLETED run's exact native session in a NEW run (new
       run-id/log/PID/PGID/attempt; the old evidence stays untouched).
-      codex resumes via the observed agent_session_id; pi resumes only a
+      codex/opencode resume via the observed agent_session_id; opencode uses
+      --session and requires explicit --auto. pi resumes only a
       session identity that is stored AND verified in this project's session
       store (a missing pi session is refused — pi would silently create one).
       The instruction is one string (default: a continuation prompt, or the
@@ -99,10 +116,10 @@ Usage:
       Human-confirmed launch of the next agent. Without task_id: pick the single
       task waiting on an agent (none → list human-waiting tasks; ambiguous →
       list candidates and ask to specify). Duplicate launches are blocked;
-      --force permits a manual retry after inspecting the pane and outstanding calls. --fresh (orthogonal to
-      --force): force-close the task's same-role pane and birth a brand-new
-      one — the explicit outside-perspective choice;
-      the Notifier never passes it.
+      --force permits a manual retry after inspecting the agent session/logs
+      and outstanding calls. --fresh (orthogonal to --force) requests a new
+      same-role session for an outside perspective; the Notifier never passes it.
+      In tui mode, --fresh closes the task's same-role pane and creates a new one.
   tut launch [--fresh] <task_id> <role> [<agent> [<arg>...]]
   tut launch --cleanup <task_id>
       Internal launch entry used by start-next, Notifier, and the POSIX shim.
@@ -130,7 +147,7 @@ Usage:
       --cast executor=pi --cast 'reviewer=codex --model gpt-5.6'); routing
       only, immutable like flow. The legacy comma form remains supported;
       command values are shell-neutral argv words.
-      checkout optionally freezes where this task's panes are born: use
+      checkout optionally freezes this task's execution directory: use
       --checkout current (default) or --checkout worktree:<path> (equivalent
       to --checkout worktree --checkout-path <path>). The path must name a
       worktree prepared by the caller; TUT does not run git worktree create.
@@ -146,26 +163,42 @@ Usage:
   tut publish <task_id> --role <r> --content-type <t> --summary <s>
              (--body <text> | --payload-file <md>)
              [--verdict <pass|blocked_external|fail_code|fail_design>] [--commits <a,b>]
-             [--ref-version <n>] [--expected-version <n>] [--agent <a>] [--model <m>] [--url <u>]
+             [--exit-conditions-file <json>] [--ref-version <n>] [--expected-version <n>] [--agent <a>] [--model <m>] [--url <u>]
       Append a context record. --summary required; body via --body or --payload-file.
+      --exit-conditions-file parses its JSON file into the optional
+      payload.exit_conditions per-item exit-condition verdict array (canonical
+      items: id, verdict, evidence). Unreadable file or JSON syntax error
+      fails before any request; a legal-JSON wrong shape is submitted verbatim
+      and diagnosed by the record lint.
   tut read <task_id> [--since-version <n>] [--json] [--url <u>]
       Read a task's records + derived status. --since-version returns records
       with version >= n (n itself included). --json for machine output.
   tut list [--status <s>] [--json] [--url <u>]
       List tasks (optionally filtered by derived status).
   tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
-      Record a human decision. decide close also reaps the task's panes
-      (best-effort; the decision itself never depends on the terminal).
+      Record a human decision. decide close also cleans up task execution resources
+      (best-effort; the decision itself never depends on resource cleanup).
+      The Herdr launcher reaps the task's round panes.
+  tut prune <task_id> --by <name> --reason <text> [--archive <dir>] [--url <u>]
+      Human-authorized disposal of one closed task through the running Hub.
+      Appends and syncs .context-hub/tasks/.pruned.jsonl before removing the
+      task directory. Non-closed/missing tasks fail. --by names the human
+      authorizing disposal; naming them does not itself grant permission.
+      Default: no copy. --archive copies the complete directory to
+      <dir>/<task_id> first; dir must be outside Hub storage and the copy
+      must not already exist. Relative paths resolve from the caller's cwd.
+      Run archives remain, including orphan references; pruned IDs stay reserved.
+      Manifest entries record intent: a failed removal can leave the task
+      present. Inspect after errors before retrying; no batch pruning.
   tut assign <role> <command...>
-      Change which agent command occupies a role seat, writing the PROJECT-level
-      .context-hub/workspace.json (cwd). Missing file → initialized from the
-      currently effective lineup (all three roles) first; a corrupt file is
-      never clobbered. User-level ~/.config/tut/workspace.json is maintained
-      by hand (a low-frequency machine-wide declaration).
+      Change which agent command occupies a role seat, writing the owning rig's
+      .context-hub/config.json (TUT_HUB_ROOT or nearest rig). First assign captures the effective legacy
+      lineup; config.roles is then authoritative (no per-role fallback).
+      Unknown keys survive; corrupt config or conflicting legacy keys refuse.
+      workspace.json stays readable when config.roles is absent, and is never written.
   tut up [--url <u>] [--event-port <p>] [--root <dir>] [--adopt] [--dry-run]
-      Provision the workspace power switch (idempotent): hub + notify panes
-      only — role/agent panes are no longer pre-provisioned: launchers
-      raise agent panes on demand at hand-off time. --url targets a
+      Provision workspace services (idempotent): hub + notifier. Agent execution
+      resources are provisioned on demand at hand-off time. --url targets a
       non-default local hub (loopback + explicit port; it must not equal the
       event port — up refuses the collision up front). --event-port moves the
       notifier's event listener off ${DEFAULT_EVENT_PORT}: up probes, provisions,
@@ -174,10 +207,10 @@ Usage:
       back to the default). --root names the rig root explicitly (the directory
       owning .context-hub; default: cwd's rig root — same locator as tut down).
       The config key power.mode selects the power implementation: "herdr"
-      (default — the pane-provisioned rig above, unchanged behavior) or
+      (default — provisions hub + notify panes; agent panes are created on demand) or
       "standalone" — up itself raises detached process groups (hub + notifier,
       plus the opt-in usage watcher), records their pid/pgid/port facts in
-      .context-hub/power.json, and tut down stops them. Illegal power.mode
+      .context-hub/runtime/power.json, and tut down stops them. Illegal power.mode
       values (or an unreadable config) fail visibly before any provisioning.
       Standalone up and doctor report unregistered live services as power drift.
       --adopt explicitly registers verified same-root listeners for tut down;
@@ -190,7 +223,7 @@ Usage:
       --adopt --dry-run verifies and previews adoption without writing state.
   tut down [--root <dir>]
       Stop this rig's standalone services (power.mode=standalone): read
-      .context-hub/power.json and stop in reverse start order (notifier →
+      .context-hub/runtime/power.json and stop in reverse start order (notifier →
       usage watcher → hub) — on POSIX, SIGTERM to each recorded process group, grace
       window, liveness re-check, SIGKILL escalation, final port re-check.
       Signals are identity-gated (a live pid is not ownership: recycled or
@@ -258,7 +291,7 @@ Usage:
   tut repair-meta <task_id> [--title <t>] [--description <d>] [--creator <c>] [--created-at <iso>]
                   [--flow <full|direct|solo>] [--cast <role=command>]... [--checkout <current|worktree:path>] [--url <u>]
                   [--from-snapshot <file>]
-      meta-rebuild storage repair (system-design 4.3): rebuild a corrupt/missing
+      meta-rebuild storage repair: rebuild a corrupt/missing
       meta.json through the RUNNING hub (POST /repair-meta, its single-writer
       queue — same discipline as tut mode; a second process writing meta
       directly would race concurrent appends). version is computed
@@ -276,7 +309,7 @@ Usage:
       file, not a live /state fetch after corruption. Check its provenance
       and age before repair; snapshots do not supply description or checkout.
   tut recover-record <task_id> <record_file> --from <path> [--source <text>] [--url <u>]
-      record-recovery registration (system-design 4.3): register the
+      record-recovery registration: register the
       recovered ORIGINAL bytes of a corrupt record file. Fetch them from an
       external snapshot yourself (backup / shared repo / team git — the hub
       never fetches backups); --from points at that copy, --source is the

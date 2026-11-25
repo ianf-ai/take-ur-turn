@@ -1,43 +1,22 @@
-/**
- * tut resume planning and execution: continue a COMPLETED
- * run's exact native session in a NEW run — new run-id, log, PID/PGID and
- * attempt; the old log/identity/stop evidence stay untouched.
- *
- * Admission contract (see admission.ts): a resume only spawns when no
- * incomplete run or pending intent holds the same session identity (and, for
- * managed runs, the same task in any role). The verify→reserve→spawn section
- * runs under the rig-wide admission lock; the persisted resume-start intent
- * keeps an uncertain handshake attributable. Nothing here implicitly stops
- * or kills the source run.
- *
- * Session identity:
- *  - codex: the run-observed agent_session_id (thread.started evidence
- *    captured by the supervisor). No blind --last, no fresh fallback.
- *  - pi: headless.designated_session_id, or a --session-id carried by a
- *    TUT-built plain argv — VERIFIED against the project's session store
- *    (exact id + matching cwd) before spawn, because pi's --session-id
- *    silently CREATES a missing session (a fake resume).
- *  - other agents / shell wrappers / unrecoverable argv shapes: explicit
- *    unsupported refusals with reasons.
- */
+/** Explicit continuation of a completed run. Authorization, completion and
+ * verify→reserve→spawn admission remain here; native identity policy is agents'. */
+import {realpathSync} from 'node:fs';
+import {resolveResumeContract,contractSource,selectSession,verifySession,prepareInvocation,encodeContract,
+ SessionContractError as ResumeError,type ContractHandle,type ExactSessionRef,type SessionPlan,type SessionReadServices} from '../../agents/public/index.js';
+import {sessionReadServices} from './session-services.js';
+export {SessionContractError as ResumeError,parsePlainCodexArgv,parsePlainPiArgv,parsePlainOpencodeArgv,
+ piSessionDirFor,readPiSessionHead,verifyPiSession,type PiSessionHead,type PlainCodexParse,type PlainPiParse,type PlainOpencodeParse} from '../../agents/public/index.js';
 import { randomUUID } from 'node:crypto';
-import { openSync, readSync, closeSync, readdirSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { userInfo } from 'node:os';
 import { RunStore, complete, validateHeadlessOwnership, type HeadlessOwnership, type ResumeSource, type RunMeta } from './store.js';
 import { startRun, StartRunError } from './control.js';
-import { requireHeadlessPlatform } from '../../standalone/launcher-headless/run-platform.js';
-import type { WindowsOwnership } from '../../standalone/launcher-headless/windows-plan.js';
+import { requireHeadlessPlatform } from './platform.js';
+import type { WindowsOwnership } from './windows-launch.js';
 import { sessionOccupants, taskOccupants, withAdmissionLock, type SessionIdentity } from './admission.js';
-import { codexArgv } from '../../standalone/launcher-headless/codex-argv.js';
-import { nativeArgv } from '../../standalone/launcher-headless/plan.js';
-import type { ContextRecord } from '../common/types.js';
+import type { ContextRecord } from '../../protocol/types.js';
 import { worktreeGitEnvironment } from '../launcher/worktree-git.js';
-
-export class ResumeError extends Error {
-  constructor(message: string, readonly reason: string) { super(message); this.name = 'ResumeError'; }
-}
 
 export interface SessionHandle {
   agent: string;
@@ -46,6 +25,10 @@ export interface SessionHandle {
 }
 
 export interface ResumePlan {
+  profile?: ContractHandle;
+  sessionRef?: ExactSessionRef;
+  sessionReads?: SessionReadServices;
+  sessionPlan?: import('../../agents/public/index.js').ReadyInvocation['sessionPlan'];
   from: RunMeta;
   from_run_id: string;
   cwd: string;
@@ -75,157 +58,9 @@ export interface PlanResumeOptions {
 }
 
 const CONTINUATION_PROMPT = '继续这个 run 的工作：先核对并简要说明已有结果（本会话此前已完成的部分），然后继续原范围内尚未完成的工作；不要重新开始已经完成的部分。';
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 function requestedBy(): string {
   return `${userInfo().username}:pid=${process.pid}`;
-}
-
-// --- pi session store verification -------------------------------------------
-
-/** pi encodes a cwd as `--<cwd with [\\/:] as '-'>--` under the session base
- *  (pi resolves the cwd first — realpath when it exists, resolve otherwise). */
-export function piSessionDirFor(cwd: string, base: string): string {
-  let resolved: string;
-  try { resolved = realpathSync(path.resolve(cwd)); } catch { resolved = path.resolve(cwd); }
-  const safe = `--${resolved.replace(/^[/\\]/u, '').replace(/[/\\:]/gu, '-')}--`;
-  return path.join(base, safe);
-}
-
-export interface PiSessionHead { id: string; cwd?: string }
-
-/** Read the FIRST line of one session file: the session header carries id and
- *  cwd. Only the head is read (bounded); no session bodies, no other projects. */
-export function readPiSessionHead(file: string): PiSessionHead | undefined {
-  try {
-    const fd = openSync(file, 'r');
-    try {
-      const buffer = Buffer.alloc(8192);
-      const n = readSync(fd, buffer, 0, buffer.length, 0);
-      const newline = buffer.subarray(0, n).indexOf(10);
-      const line = (newline === -1 ? buffer.subarray(0, n) : buffer.subarray(0, newline)).toString('utf8');
-      const parsed: unknown = JSON.parse(line);
-      if (typeof parsed === 'object' && parsed !== null && (parsed as { type?: unknown }).type === 'session') {
-        const id = (parsed as { id?: unknown }).id;
-        const cwd = (parsed as { cwd?: unknown }).cwd;
-        if (typeof id === 'string') return { id, ...(typeof cwd === 'string' ? { cwd } : {}) };
-      }
-      return undefined;
-    } finally { closeSync(fd); }
-  } catch { return undefined; }
-}
-
-/** Verify an exact pi session exists for THIS project cwd. A missing or
- *  cross-project id is a refusal — never a fresh-session fallback. */
-export function verifyPiSession(base: string, cwd: string, sessionId: string): { ok: true; file: string } | { ok: false; reason: string } {
-  const dir = piSessionDirFor(cwd, base);
-  let entries: string[];
-  try {
-    entries = readdirSync(dir).filter(name => name.endsWith('.jsonl'));
-  } catch {
-    return { ok: false, reason: `no pi session store for this project (${dir}) — cannot confirm session ${sessionId}` };
-  }
-  for (const name of entries) {
-    const file = path.join(dir, name);
-    const head = readPiSessionHead(file);
-    if (head?.id === sessionId) {
-      if (head.cwd !== undefined && path.resolve(head.cwd) !== path.resolve(cwd)) {
-        return { ok: false, reason: `session ${sessionId} belongs to another project (cwd ${head.cwd})` };
-      }
-      return { ok: true, file };
-    }
-  }
-  return { ok: false, reason: `pi session ${sessionId} not found in ${dir} (pi --session-id would CREATE a new session — refusing)` };
-}
-
-// --- plain argv reconstruction -------------------------------------------------
-
-export interface PlainCodexParse { agent: string; optionTokens: string[] }
-
-/** Conservatively parse a plain `codex [exec] [opts] [session] prompt` argv.
- *  Exactly the shapes TUT itself builds parse; anything ambiguous refuses. */
-export function parsePlainCodexArgv(argv: readonly string[]): PlainCodexParse {
-  const agent = argv[0]!;
-  const valueOptions = new Set(['-m', '--model', '-c', '--config', '-s', '--sandbox', '-a', '--ask-for-approval', '-p', '--profile',
-    '--enable', '--disable', '--add-dir', '--local-provider', '--thread-source', '--cyber-access-program', '--output-schema', '-o', '--output-last-message', '--color']);
-  const flagOptions = new Set(['--strict-config', '--oss', '--search', '--no-daemon', '--approve-for-me', '--skip-git-repo-check',
-    '--ephemeral', '--ignore-user-config', '--ignore-rules', '--json', '--dangerously-bypass-hook-trust']);
-  const optionTokens: string[] = [];
-  const positionals: string[] = [];
-  let sawExec = false;
-  for (let i = 1; i < argv.length; i++) {
-    const token = argv[i]!;
-    if (token === 'exec' && !sawExec) { sawExec = true; continue; }
-    if (token === 'resume') continue; // session selector segment is replaced wholesale
-    const option = token.split('=', 1)[0]!;
-    const attached = token.includes('=');
-    if (valueOptions.has(option) || flagOptions.has(option)) {
-      optionTokens.push(token);
-      if (valueOptions.has(option) && !attached) {
-        const value = argv[++i];
-        if (value === undefined) throw new ResumeError(`unsupported plain codex argv: missing value for ${option}`, 'codex-argv-unrecoverable');
-        optionTokens.push(value);
-      }
-      continue;
-    }
-    if (token.startsWith('-') || (token.startsWith('--') && token.length > 2)) {
-      throw new ResumeError(`unsupported plain codex argv option: ${token} (unknown option — refusing to guess its scope)`, 'codex-argv-unrecoverable');
-    }
-    positionals.push(token);
-  }
-  // codex exec takes at most one prompt (fresh) or session+prompt (resume);
-  // `resume` tokens were skipped above, so any extra positional is ambiguous.
-  const expected = argv.includes('resume') ? 2 : 1;
-  if (positionals.length > expected) {
-    throw new ResumeError(`unsupported plain codex argv: ${positionals.length} positional arguments — cannot tell prompt from session selectors`, 'codex-argv-unrecoverable');
-  }
-  return { agent, optionTokens };
-}
-
-export interface PlainPiParse { agent: string; head: string[]; session_id: string }
-
-/** Conservatively parse a plain pi argv built by TUT (`--session-id <uuid> --
- *  prompt`). Selector/ephemeral/unknown shapes refuse explicitly. */
-export function parsePlainPiArgv(argv: readonly string[]): PlainPiParse {
-  const agent = argv[0]!;
-  const selector = /^(--(?:continue|resume|session|session-id|fork|no-session|session-dir)|-[cr])(?:=|$)/u;
-  const valueOptions = new Set(['--provider', '--model', '--api-key', '--system-prompt', '--append-system-prompt', '--name', '-n',
-    '--models', '--tools', '-t', '--exclude-tools', '-xt', '--thinking', '--extension', '-e', '--skill', '--prompt-template',
-    '--theme', '--use-theme', '--tui-mode', '--mode']);
-  const flagOptions = new Set(['--print', '-p']);
-  let sessionIndex = -1;
-  for (let i = 1; i < argv.length; i++) {
-    const token = argv[i]!;
-    if (token === '--') break; // everything after belongs to the prompt
-    if (token === '--session-id') {
-      if (sessionIndex !== -1) throw new ResumeError('unsupported plain pi argv: duplicate --session-id', 'pi-argv-unrecoverable');
-      sessionIndex = i;
-      const value = argv[++i];
-      if (value === undefined || !UUID_RE.test(value)) throw new ResumeError('unsupported plain pi argv: --session-id without an exact uuid', 'pi-argv-unrecoverable');
-      continue;
-    }
-    if (selector.test(token)) {
-      throw new ResumeError(`unsupported plain pi argv selector: ${token} (only TUT-built --session-id forms are resumable)`, 'pi-argv-unrecoverable');
-    }
-    if (valueOptions.has(token)) {
-      const value = argv[++i];
-      if (value === undefined) throw new ResumeError(`unsupported plain pi argv: missing value for ${token}`, 'pi-argv-unrecoverable');
-      continue;
-    }
-    if (flagOptions.has(token)) continue;
-    if (token.startsWith('-')) {
-      throw new ResumeError(`unsupported plain pi argv option: ${token}`, 'pi-argv-unrecoverable');
-    }
-    throw new ResumeError(`unsupported plain pi argv positional: ${token} (only the trailing prompt after -- is positional)`, 'pi-argv-unrecoverable');
-  }
-  if (sessionIndex === -1) throw new ResumeError('plain pi run carries no exact --session-id identity; not resumable', 'pi-identity-unavailable');
-  // The head must be exactly argv[0..sessionIndex): everything between the
-  // session id and `--` would be a prompt fragment we cannot replace safely.
-  const afterSession = argv.slice(sessionIndex + 2);
-  if (!(afterSession[0] === '--')) {
-    throw new ResumeError('unsupported plain pi argv: tokens between --session-id and the prompt separator', 'pi-argv-unrecoverable');
-  }
-  return { agent, head: argv.slice(0, sessionIndex), session_id: argv[sessionIndex + 1]! };
 }
 
 // --- planning -------------------------------------------------------------------
@@ -245,75 +80,43 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
       : 'source-run-incomplete';
     throw new ResumeError(`source run ${fromRunId} has no completion evidence (status=${from.status}${from.ended_at ? '' : ', no ended_at'}${from.stop_request ? `, stop ${from.stop_request.phase}` : ''}); resume accepts only completed runs — never implicitly stops the source`, reason);
   }
-  const windowsPlan = platform === 'win32' ? await import('../../standalone/launcher-headless/windows-plan.js') : undefined;
+  const windowsPlan = platform === 'win32' ? await import('./windows-launch.js') : undefined;
   const windows = windowsPlan && from.headless ? windowsPlan.readWindowsLaunch(from.headless) : undefined;
-  const windowsPi = windows?.target.agent === 'pi' ? await import('./windows-pi-session.js') : undefined;
   if (platform === 'win32' && !windows) throw new ResumeError('Windows resume requires a managed run with frozen logical/physical identity', 'windows-launch-unavailable');
-  const agent = windows?.target.agent ?? path.basename(from.argv[0] ?? '');
-  const managed = from.headless !== undefined;
-  let session: SessionHandle;
-
-  if (agent === 'codex') {
-    if (!from.agent_session_id) {
-      throw new ResumeError(`source run ${fromRunId} (codex) recorded no observed agent_session_id; exact session identity unavailable`, 'codex-session-unavailable');
-    }
-    session = { agent: 'codex', session_id: from.agent_session_id, source: 'observed' };
-  } else if (agent === 'pi') {
-    let id: string | undefined;
-    let source: SessionHandle['source'];
-    if (from.headless?.designated_session_id) { id = from.headless.designated_session_id; source = 'designated'; }
-    else {
-      try {
-        const parsed = parsePlainPiArgv(from.argv);
-        id = parsed.session_id;
-        source = 'argv';
-      } catch (e) {
-        if (e instanceof ResumeError && e.reason === 'pi-identity-unavailable') {
-          throw new ResumeError(`source run ${fromRunId} (pi) carries no exact session identity; not resumable`, 'pi-identity-unavailable');
-        }
-        throw e;
-      }
-    }
-    if (windows?.pi_session) {
-      if (windows.pi_session.launch_cwd !== path.win32.resolve(from.cwd)) throw new ResumeError('frozen Windows pi cwd differs from run cwd', 'pi-session-not-found');
-      try { windows.pi_session = windowsPi!.verifyWindowsPiSession(windows.pi_session, id); }
-      catch (e) { throw new ResumeError((e as Error).message, 'pi-session-not-found'); }
-    } else {
-      const base = opts.piSessionsBase ?? process.env.PI_CODING_AGENT_SESSION_DIR ?? path.join(os.homedir(), '.pi', 'agent', 'sessions');
-      const verified = verifyPiSession(base, from.cwd, id);
-      if (!verified.ok) throw new ResumeError(verified.reason, 'pi-session-not-found');
-    }
-    session = { agent: 'pi', session_id: id, source: source! };
-  } else {
-    throw new ResumeError(`source run ${fromRunId} agent '${agent || '(none)'}' is not resumable: only codex/pi native sessions are supported; shell wrappers and unknown agents refuse explicitly`, 'unsupported-agent');
+  const resolved=resolveResumeContract(from,()=>contractSource(store.hubRoot),platform==='win32'?'win32':'posix');
+  if(resolved.status!=='resolved')throw new ResumeError(resolved.reason,resolved.code);
+  const profile=resolved.handle,managed=from.headless!==undefined;
+  const selected=selectSession(profile,from);
+  if(selected.status!=='selected'&&selected.status!=='verified') {
+    if(selected.status==='unavailable')throw new ResumeError('RESUME_UNAVAILABLE: native resume not configured','RESUME_UNAVAILABLE');
+    throw new ResumeError(selected.reason??'exact session identity unavailable',selected.code??'session-unavailable');
   }
+  const reads=sessionReadServices({nativeSessionBase:opts.piSessionsBase,env:opts.env});
+  const verified=await verifySession(profile,selected.session,reads);
+  if(verified.status!=='verified')throw new ResumeError('reason' in verified?verified.reason:'exact session identity unavailable','code' in verified?verified.code??'SESSION_INVALID':'RESUME_UNAVAILABLE');
+  const sessionRef=verified.session;
+  const session:SessionHandle={agent:profile.identity,session_id:sessionRef.session_id,source:sessionRef.identity_source};
 
   const prompt = opts.instruction !== undefined ? opts.instruction
     : managed ? `轮到你了（role: ${from.headless!.role}）：请用 Context Hub 读取任务 ${from.task_id} 的完整上下文（context.read），按你的 role skill 开始本轮工作，完成后发布相应记录（context.publish）。`
     : CONTINUATION_PROMPT;
 
-  let argv: string[];
-  if (managed) {
-    const route = from.headless!.route;
-    const logical = nativeArgv(windows ? { agent, args: agent === 'pi' ? windowsPi!.windowsPiRouteArgs(route.args).args : route.args } : route, prompt, session.session_id);
-    argv = windows ? windowsPlan!.physicalWindowsArgv(windows.target, logical, windows.pi_session) : logical;
-    if (windows) windows.logical_argv = logical;
-  } else if (agent === 'codex') {
-    const parsed = parsePlainCodexArgv(from.argv);
-    argv = codexArgv(parsed.agent, parsed.optionTokens, prompt, session.session_id);
-  } else {
-    const parsed = parsePlainPiArgv(from.argv);
-    argv = [...parsed.head, '--session-id', session.session_id, '--', prompt];
-  }
-
-  const env = managed
+  const result=await prepareInvocation(profile,{mode:'resume',route:sessionRef.route,checkoutRoot:from.cwd,prompt,entry:'manual',
+    environmentFacts:{home:os.homedir(),env:opts.env??process.env,...(windows?{windows_target:windows.target}:{})},sessionRef,
+    ...(managed?{origin:'managed' as const}:{origin:'plain-legacy' as const,plain:{source_run_id:from.run_id,argv:from.argv}})});
+  if(result.status!=='ready')throw new ResumeError(result.reason,result.status==='invalid'?result.code:'RESUME_UNAVAILABLE');
+  const invocation=result.invocation;
+  const argv=[invocation.executable,...invocation.argv];
+  if(windows){windows.logical_argv=invocation.logicalArgv;if(invocation.sessionPlan.store)windows.pi_session={...invocation.sessionPlan.store,session_id:session.session_id};}
+  const env: NodeJS.ProcessEnv = managed
     ? { ...(opts.env ?? process.env), TUT_HUB_ROOT: store.hubRoot, ...(opts.hubUrl !== undefined ? { TUT_HUB_URL: opts.hubUrl } : {}), ...(opts.eventUrl !== undefined ? { TUT_EVENT_PORT_URL: opts.eventUrl } : {}), ...worktreeGitEnvironment({ hubRoot: store.hubRoot, checkoutRoot: from.cwd }) }
-    : (opts.env ?? process.env);
+    : { ...(opts.env ?? process.env) };
+  Object.assign(env,invocation.envPatch);
 
   const resume: ResumeSource = {
     schema: 1,
     from_run_id: fromRunId,
-    agent,
+    agent:session.agent,
     session_id: session.session_id,
     identity: session.source,
     requested_at: (opts.now ?? (() => new Date()))().toISOString(),
@@ -325,6 +128,8 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
   if (managed) {
     const source = from.headless!;
     headless = {
+      contract:encodeContract(profile),
+      session_identity:{agent:profile.identity,session_id:session.session_id},
       schema: 1,
       role: source.role,
       attempt_id: randomUUID(),
@@ -332,12 +137,14 @@ export async function planResume(store: RunStore, fromRunId: string, opts: PlanR
       route_source: source.route_source,
       session_reason: `resume: manual continuation of run ${fromRunId}`,
       resume_from_run_id: fromRunId,
-      ...(agent === 'pi' ? { designated_session_id: session.session_id } : {}),
+      ...(invocation.sessionPlan.designated_id ? { designated_session_id: invocation.sessionPlan.designated_id } : {}),
       ...(windows ? { windows } : {}),
     };
   }
 
   return {
+    profile,sessionRef,sessionReads:reads,
+    sessionPlan:invocation.sessionPlan,
     from,
     from_run_id: fromRunId,
     cwd: from.cwd,
@@ -429,7 +236,7 @@ async function publishManualMarker(
   },
   expectedVersion?: number,
 ): Promise<{ version: number }> {
-  const { hubPublish } = await import('../hub/hub-client.js');
+  const { hubPublish } = await import('../../hub/hub-client.js');
   const result = await hubPublish(hubUrl, {
     task_id: marker.task_id,
     role: 'human',
@@ -473,7 +280,7 @@ export async function executeManagedResume(
   if (!plan.managed || plan.headless === undefined || plan.task_id === undefined) throw new Error('executeManagedResume requires a managed plan');
   const fetchState = deps.fetchState ?? fetchStateDefault;
   const readLog = deps.readLog ?? (async (taskId: string) => {
-    const { hubRead } = await import('../hub/hub-client.js');
+    const { hubRead } = await import('../../hub/hub-client.js');
     return await hubRead(input.hubUrl, taskId);
   });
   const publishMarker = deps.publishMarker ?? publishManualMarker;
@@ -481,6 +288,7 @@ export async function executeManagedResume(
   const identity: SessionIdentity = { agent: plan.session.agent, session_id: plan.session.session_id };
 
   return await withAdmissionLock(store, async () => {
+    await reverifyResume(store,plan);
     // Bounded verify loop: the gate must be established from a
     // VERSION-CONSISTENT pair of (state snapshot, log read). A log that is
     // newer than the /state fold (a record landed between the two reads)
@@ -524,8 +332,8 @@ export async function executeManagedResume(
       if (taskBusy.length > 0) {
         throw new ResumeError(`task ${plan.task_id} still has incomplete runs: ${taskBusy.map(o => `${o.run_id} (${o.detail})`).join(', ')}`, 'task-busy');
       }
+      await reverifyResume(store,plan);
       try {
-        if (plan.headless!.windows) (await import('../../standalone/launcher-headless/windows-plan.js')).verifyWindowsContinuation(plan.headless as WindowsOwnership, plan.cwd);
         await publishMarker(input.hubUrl, {
           task_id: plan.task_id!,
           role: plan.headless!.role,
@@ -549,7 +357,7 @@ export async function executeManagedResume(
       const ownership: HeadlessOwnership = { ...plan.headless!, base_version: base, trigger_version: base } as HeadlessOwnership;
       validateHeadlessOwnership(ownership);
       try {
-        const run_id = await start(store, plan.argv, plan.cwd, plan.task_id, { env: plan.env, headless: ownership, resume: plan.resume });
+        const run_id = await start(store, plan.argv, plan.cwd, plan.task_id, { ...(plan.profile?{profile:encodeContract(plan.profile)}:{}),env: plan.env, headless: ownership, resume: plan.resume });
         return { run_id };
       } catch (e) {
         if (e instanceof StartRunError) {
@@ -577,12 +385,14 @@ export async function executeResume(store: RunStore, plan: ResumePlan, options: 
   if (plan.managed) throw new Error('managed plans use executeManagedResume');
   const identity: SessionIdentity = { agent: plan.session.agent, session_id: plan.session.session_id };
   return await withAdmissionLock(store, async () => {
+    await reverifyResume(store,plan);
     const sessionBusy = sessionOccupants(store, identity);
     if (sessionBusy.length > 0) {
       throw new ResumeError(`session ${plan.session.agent}/${plan.session.session_id} is held by: ${sessionBusy.map(o => `${o.run_id} (${o.detail})`).join(', ')}`, 'session-busy');
     }
     try {
       const run_id = await (options.start ?? startRun)(store, plan.argv, plan.cwd, plan.task_id, {
+        ...(plan.profile?{profile:encodeContract(plan.profile)}:{}),
         env: plan.env,
         resume: plan.resume,
       });
@@ -594,4 +404,17 @@ export async function executeResume(store: RunStore, plan: ResumePlan, options: 
       throw e;
     }
   });
+}
+
+/** Re-read completion and native evidence after waiting for the admission lock. */
+async function reverifyResume(store:RunStore,plan:ResumePlan):Promise<void> {
+ const source=store.read(plan.from_run_id);
+ if(!complete(source))throw new ResumeError('source completion changed before spawn','source-run-incomplete');
+ if(source.task_id!==plan.from.task_id||source.task_id!==plan.task_id||source.cwd!==plan.from.cwd||JSON.stringify(source.argv)!==JSON.stringify(plan.from.argv)||JSON.stringify(source.headless)!==JSON.stringify(plan.from.headless)||source.contract!==plan.from.contract)throw new ResumeError('source launch identity changed before spawn','SESSION_SOURCE_INVALID');
+ if(plan.profile&&plan.sessionRef) {
+  const selected=selectSession(plan.profile,source);
+  if(selected.status!=='selected'||selected.session.session_id!==plan.sessionRef.session_id||selected.session.identity_source!==plan.sessionRef.identity_source)throw new ResumeError('source session identity changed before spawn','SESSION_SOURCE_INVALID');
+  const result=await verifySession(plan.profile,plan.sessionRef,plan.sessionReads??sessionReadServices());
+  if(result.status!=='verified')throw new ResumeError('reason' in result?result.reason:'session verification failed','code' in result?result.code??'SESSION_INVALID':'RESUME_UNAVAILABLE');
+ }
 }

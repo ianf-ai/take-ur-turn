@@ -1,14 +1,17 @@
-import { Store, type ReadTaskResult, type TaskListEntry } from "./hub/store.js";
-import { foldOntoCursor, initialCursor } from "./hub/state-machine.js";
-import { validateAgentRoute } from "./common/agent-command.js";
+import { Store, type ReadTaskResult, type TaskListEntry } from "../hub/store.js";
+import { foldOntoCursor, initialCursor } from "../hub/state-machine.js";
+import { validateAgentRoute } from "../protocol/agent-command.js";
 import path from "node:path";
-import type { ContextRecord } from "./common/types.js";
+import {contractSource,withContractBindings} from "../agents/public/index.js";
+import {usageAvailability} from "../agents/public/usage.js";
+import {readConfigFile} from "./common/config.js";
+import type { ContextRecord } from "../protocol/types.js";
 
 const VERDICTS = ["pass", "blocked_external", "fail_code", "fail_design"] as const;
 type Verdict = typeof VERDICTS[number];
 type Counts = Record<string, number>;
 interface Tokens { rounds: number; input_tokens: number; output_tokens: number; total_tokens: number; cost_usd: number | null }
-interface Usage { status: "missing" | "invalid" | "complete" | "incomplete"; by_agent: Record<string, Tokens>; unresolved: number; error?: string }
+interface Usage { status: "missing" | "invalid" | "complete" | "incomplete"; by_agent: Record<string, Tokens>; unresolved: number; error?: string; unsupported?: {agent:string;reason:string}[]; unmetered?: {agent:string;reason:string}[] }
 const counts = (): Counts => Object.create(null) as Counts;
 const increment = (obj: Counts, key: string, amount = 1): void => { obj[key] = (obj[key] ?? 0) + amount; };
 const rate = (passed: number, total: number): number | null => total ? passed / total : null;
@@ -121,7 +124,7 @@ function usageMetrics(raw: unknown, task: ReadTaskResult, deliveries: Set<number
     if (launch < 1 || delivery <= launch || launches.has(launch) || measured.has(delivery) ||
       (!deliveries.has(delivery) && (!record || !isUsageDelivery(record))) ||
       !launchRecord || launchRecord.payload.launch === undefined || r.role !== record?.role ||
-      (r.agent !== "codex" && r.agent !== "pi")) throw new Error("invalid usage attribution");
+      typeof r.agent !== 'string' || !r.agent) throw new Error("invalid usage attribution");
     const marker = object(launchRecord.payload.launch);
     const route = marker.route === undefined ? record?.agent : validateAgentRoute(marker.route);
     const agent = typeof route === "string" ? route : route?.agent;
@@ -142,12 +145,20 @@ function usageMetrics(raw: unknown, task: ReadTaskResult, deliveries: Set<number
   const declared = object(usage.total);
   if (declared.rounds !== usage.rounds.length || declared.total_tokens !== total || declared.cost_usd !== totalCost ||
     declared.complete !== (usage.unresolved.length === 0)) throw new Error("invalid usage totals");
+  const unsupported=usage.unresolved.flatMap(u=>{
+    const item=object(u);return item.capability==='unsupported'&&typeof item.agent==='string'&&typeof item.reason_code==='string'?[{agent:item.agent,reason:item.reason_code}]:[];
+  });
+  const unmetered=usage.unresolved.flatMap(u=>{
+    const item=object(u);return item.capability==='unavailable'&&typeof item.agent==='string'&&typeof item.reason_code==='string'?[{agent:item.agent,reason:item.reason_code}]:[];
+  });
   const complete = usage.unresolved.length === 0 && [...deliveries].every(v => measured.has(v));
-  return { status: complete ? "complete" : "incomplete", by_agent, unresolved: usage.unresolved.length };
+  return { status: complete ? "complete" : "incomplete", by_agent, unresolved: usage.unresolved.length, ...(unsupported.length?{unsupported}:{}), ...(unmetered.length?{unmetered}:{}) };
 }
 
 /** Store's read-only constructor skips startup sweeping; all IO remains behind Store. */
 export async function collectStats(root: string, selected: readonly string[] = []) {
+  const config=await readConfigFile(root);
+  const contracts=withContractBindings(contractSource(path.dirname(path.resolve(root))),config.status==='ok'?config.config.agent_bindings:undefined);
   const store = new Store(root, { readOnly: true });
   const snapshot = await store.snapshotTasks();
   const entries = snapshot.tasks.filter(t => t.scope !== "project" && (!selected.length || selected.includes(t.task_id)));
@@ -162,6 +173,19 @@ export async function collectStats(root: string, selected: readonly string[] = [
     let usage: Usage;
     try { usage = usageMetrics(await store.readUsage(entry.task_id), task, usageDeliveries); }
     catch (error) { usage = { status: "invalid", by_agent: {}, unresolved: 0, error: (error as Error).message }; }
+    if(usage.status==='missing') {
+      const unmetered=new Map<string,string>();
+      for(const record of task.versions) {
+        const marker=record.payload.launch as {route?:unknown}|undefined;
+        if(!marker?.route)continue;
+        try {
+          const route=validateAgentRoute(marker.route),agent=typeof route==='string'?route:route.agent;
+          const availability=usageAvailability(agent,contracts);
+          if(availability.status==='unavailable'&&availability.capability==='unavailable')unmetered.set(agent,availability.reason);
+        }catch { /* malformed launch evidence cannot claim a capability */ }
+      }
+      if(unmetered.size)usage.unmetered=[...unmetered].map(([agent,reason])=>({agent,reason}));
+    }
     tasks.push({ ...metrics, usage });
   }
   const reviews = { pass: 0, blocked_external: 0, fail_code: 0, fail_design: 0 };

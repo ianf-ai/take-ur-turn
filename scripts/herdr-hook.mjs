@@ -20,7 +20,7 @@
  *      written atomically (temp file + rename);
  *   5. resolves pane_id → pane label via `herdr pane get` on raw argv — if the
  *      label cannot be obtained it does NOT guess and forwards the raw pane_id;
- *   6. spawns the sibling canonical entry on-agent-event.mjs with
+ *   6. spawns the canonical entry agent-event/on-agent-event.mjs with
  *      process.execPath, shell:false (package-relative absolute path).
  * Every degradation is stderr + exit 0: a lost event is acceptable because
  * polling is the primary channel.
@@ -41,8 +41,8 @@ const KNOWN_STATUSES = new Set(["idle", "working", "blocked", "done"]);
 const PANE_GET_TIMEOUT_MS = 5000;
 const EVENT_CHILD_TIMEOUT_MS = 10000;
 
-/** Package-relative sibling of the canonical event entry (works in repo and pack). */
-const ON_AGENT_EVENT = join(dirname(fileURLToPath(import.meta.url)), "on-agent-event.mjs");
+/** Package-relative path to the canonical event entry (works in repo and pack). */
+const ON_AGENT_EVENT = join(dirname(fileURLToPath(import.meta.url)), "agent-event", "on-agent-event.mjs");
 
 const diag = (message) => process.stderr.write(`herdr-hook: ${message}\n`);
 
