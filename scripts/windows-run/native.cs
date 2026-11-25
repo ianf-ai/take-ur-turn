@@ -5,6 +5,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
 
 public static class TutRunNative {
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
@@ -77,15 +79,18 @@ public static class TutRunNative {
     [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
     static IntPtr File(string name,bool write) {
         Security sec=new Security(); sec.length=Marshal.SizeOf(sec); sec.inherit=1;
-        // Append-only output; share read/write, not deletion. NUL is the only input.
+        // Append-only output; share read/write, not deletion. NUL supplies input for legacy/argv runs.
         IntPtr h=CreateFileW(name,write?4u:0x80000000u,3,ref sec,3,0x80,IntPtr.Zero);
         if(h==new IntPtr(-1)) Fail("CreateFileW"); return h;
     }
     public static Child Suspended(string exe,string[] args,string cwd,string log,string environment) {
+        return Suspended(exe,args,cwd,log,environment,null);
+    }
+    public static Child Suspended(string exe,string[] args,string cwd,string log,string environment,InputWriter writer) {
         IntPtr input=IntPtr.Zero,output=IntPtr.Zero,list=IntPtr.Zero,handles=IntPtr.Zero,env=IntPtr.Zero;
         bool initialized=false;
         try {
-            input=File("NUL",false); output=File(log,true);
+            input=writer==null?File("NUL",false):writer.ChildInput; output=File(log,true);
             IntPtr size=IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref size);
             list=Marshal.AllocHGlobal(size);
             if(!InitializeProcThreadAttributeList(list,1,0,ref size)) Fail("InitializeProcThreadAttributeList"); initialized=true;
@@ -102,9 +107,79 @@ public static class TutRunNative {
             if(list!=IntPtr.Zero) Marshal.FreeHGlobal(list);
             if(handles!=IntPtr.Zero) Marshal.FreeHGlobal(handles);
             if(env!=IntPtr.Zero) Marshal.FreeHGlobal(env);
-            if(input!=IntPtr.Zero) CloseHandle(input);
+            if(input!=IntPtr.Zero) { if(writer==null) CloseHandle(input); else writer.CloseChildInput(); }
             if(output!=IntPtr.Zero) CloseHandle(output);
         }
+    }
+    // A private overlapped pipe gives the writer a deadline independent of broker requests.
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr h,uint mask,uint flags);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool WriteFile(IntPtr h,IntPtr buffer,uint count,IntPtr written,IntPtr overlapped);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool CancelIoEx(IntPtr h,IntPtr overlapped);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetOverlappedResult(IntPtr h,IntPtr overlapped,out uint bytes,bool wait);
+    [StructLayout(LayoutKind.Sequential)] struct Overlap { public IntPtr internalLow,internalHigh;public uint offset,offsetHigh;public IntPtr signal; }
+    public sealed class InputWriter : IDisposable {
+        public IntPtr ChildInput {get;private set;}
+        System.IO.Pipes.NamedPipeServerStream pipe;
+        readonly byte[] bytes;
+        readonly object gate=new object();
+        readonly ManualResetEvent cancel=new ManualResetEvent(false);
+        string status="pending",error=null;
+        bool started;
+        Stopwatch deliveryClock;
+        public InputWriter(string text) {
+            bytes=new UTF8Encoding(false,true).GetBytes(text);
+            if(bytes.Length>65536)throw new Exception("input exceeds 64 KiB");
+            string name="tut-input-"+Guid.NewGuid().ToString("N");
+            pipe=Pipe(name);
+            Security sec=new Security();sec.length=Marshal.SizeOf(sec);sec.inherit=1;
+            try {
+                ChildInput=CreateFileW(@"\\.\pipe\"+name,0x80000000u,0,ref sec,3,0x80,IntPtr.Zero);
+                if(ChildInput==new IntPtr(-1)){ChildInput=IntPtr.Zero;Fail("input CreateFileW");}
+                pipe.WaitForConnection();
+            } catch {Dispose();throw;}
+        }
+        public void CloseChildInput(){if(ChildInput!=IntPtr.Zero){CloseHandle(ChildInput);ChildInput=IntPtr.Zero;}}
+        public string Status {get{lock(gate)return status;}}
+        public string Error {get{lock(gate)return error;}}
+        public int Bytes {get{return bytes.Length;}}
+        public void Start() {
+            lock(gate){if(started)throw new Exception("input already started");started=true;deliveryClock=Stopwatch.StartNew();}
+            var thread=new Thread(Write);thread.IsBackground=true;thread.Start();
+        }
+        public void Cancel(string reason) {lock(gate){if(status!="pending")return;status="failed";error=reason;cancel.Set();}}
+        void Write() {
+            IntPtr data=IntPtr.Zero,overlap=IntPtr.Zero;
+            using(var done=new ManualResetEvent(false)) {
+                try {
+                    data=Marshal.AllocHGlobal(Math.Max(1,bytes.Length));Marshal.Copy(bytes,0,data,bytes.Length);
+                    Overlap o=new Overlap();o.signal=done.SafeWaitHandle.DangerousGetHandle();
+                    overlap=Marshal.AllocHGlobal(Marshal.SizeOf(o));Marshal.StructureToPtr(o,overlap,false);
+                    IntPtr handle=pipe.SafePipeHandle.DangerousGetHandle();
+                    if(cancel.WaitOne(0))throw new Exception("input cancelled");
+                    bool sent=WriteFile(handle,data,(uint)bytes.Length,IntPtr.Zero,overlap);
+                    if(!sent&&Marshal.GetLastWin32Error()!=997)Fail("input WriteFile");
+                    if(!sent) {
+                        int result=WaitHandle.WaitAny(new WaitHandle[]{done,cancel},Math.Max(0,30000-(int)deliveryClock.ElapsedMilliseconds));
+                        if(result!=0) {
+                            CancelIoEx(handle,overlap);
+                            uint ignored;GetOverlappedResult(handle,overlap,out ignored,true);
+                            throw new Exception(result==WaitHandle.WaitTimeout?"input write timeout":"input cancelled");
+                        }
+                    }
+                    uint written;if(!GetOverlappedResult(handle,overlap,out written,true))Fail("input completion");
+                    if(written!=bytes.Length)throw new Exception("partial input delivery");
+                    // Closing the sole parent endpoint sends EOF before publishing complete.
+                    pipe.Dispose();pipe=null;
+                    lock(gate){if(status=="pending")status="complete";}
+                } catch(Exception e){lock(gate){if(status=="pending"){status="failed";error=e.Message;}}}
+                finally {
+                    if(pipe!=null){pipe.Dispose();pipe=null;}
+                    if(overlap!=IntPtr.Zero)Marshal.FreeHGlobal(overlap);
+                    if(data!=IntPtr.Zero)Marshal.FreeHGlobal(data);
+                }
+            }
+        }
+        public void Dispose(){CloseChildInput();Cancel("input cancelled by broker shutdown");if(!started&&pipe!=null){pipe.Dispose();pipe=null;}}
     }
     public static void Assign(IntPtr job,IntPtr process) { if(!AssignProcessToJobObject(job,process)) Fail("AssignProcessToJobObject"); }
     public static void Resume(IntPtr thread) { if(ResumeThread(thread)==0xffffffff) Fail("ResumeThread"); }

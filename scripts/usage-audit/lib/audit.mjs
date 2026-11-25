@@ -1,27 +1,38 @@
+// runtime/usage-audit.lock[.cursor.json]: watcher owns mutex and disposable
+// scan cursor; audit/recovery read them. Locks retire by owner identity only,
+// cursor generations invalidate by their existing root/source fingerprints.
+// Unknown runtime siblings are protected; no directory sweep is authorized.
+import '../../../dist/app/agents.js';
+import { contractSource, withContractBindings } from '../../../dist/agents/public/index.js';
+import { readUsage, usageResultReason, bindUsageRun, usageNeedsRun, usageContracts, usageAvailability, usageReadable, withAgentProfileSnapshot, parseUsageSource, usageSourceFromLegacy, bindLegacyUsageRounds } from '../../../dist/agents/public/usage.js';
+
+import { UsageRepository } from '../../../dist/hub/usage-repository.js';
+import { writeServiceLog } from '../../../dist/core/logging/service-log.js';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readConfigFile } from '../../../dist/core/common/config.js';
-import { canonicalRoot } from '../../../dist/core/hub/rig-discovery.js';
+import { canonicalRoot } from '../../../dist/hub/rig-discovery.js';
 import { source, requestTimeout } from './hub.mjs';
 import { localIO, localFs } from './io.mjs';
 export { source } from './hub.mjs';
-import { extract, attribute } from './rounds.mjs';
-import { files, readSession, vector, instant } from './sessions.mjs';
-import { bindWindowsPi, piDirectory } from './paths.mjs';
+import { extract, attributeMatches } from './rounds.mjs';
+import { files, vector, instant } from './sessions.mjs';
+import { IncrementalScan } from './incremental.mjs';
 
 export async function enabled(root, options = {}) {
-  const result = await localIO('config', options, () => readConfigFile(path.join(root, '.context-hub')));
+  const storage = path.join(root, '.context-hub');
+  const result = await localIO('config', options, signal => readConfigFile(storage, { signal }), false, path.join(storage, 'config.json'));
   if (result.status === 'invalid') throw new Error('invalid_config');
   const v = result.status === 'ok' && result.config.usage_audit !== undefined ? result.config.usage_audit : 'off';
   if (v !== 'on' && v !== 'off') throw new Error('invalid_usage_audit');
   return v === 'on';
 }
 export function lockPath(root) {
-  return path.join(os.tmpdir(), `tut-usage-audit-${createHash('sha256').update(canonicalRoot(root)).digest('hex')}.lock`);
+  return path.join(canonicalRoot(root), '.context-hub', 'runtime', 'usage-audit.lock');
 }
+const foreignOwner = (owner, root) => typeof owner?.root === 'string' && path.isAbsolute(owner.root) && owner.root !== canonicalRoot(root);
 const LOCKED = (file) => new Error(`audit_locked:${file}; inspect owner and remove only after confirming no writer is alive`);
 
 // pid liveness with errno discipline: ESRCH = gone (self-heal eligible),
@@ -51,7 +62,7 @@ async function claimLock(file, root) {
 // Serialize stale retirement across healers (the .reclaim mkdir mutex is the
 // same pattern as rig-lock.ts): two
 // healers must not both see a dead owner and unlink each other's replacement.
-async function healStale(file, root) {
+async function healStale(file, root, options) {
   const reclaim = `${file}.reclaim`;
   await fs.mkdir(reclaim).catch((e) => {
     if (e.code !== 'EEXIST') throw e; // EACCES/ENOENT etc are real failures, not a competing healer
@@ -62,78 +73,83 @@ async function healStale(file, root) {
   });
   try {
     let owner;
-    try { owner = JSON.parse(await fs.readFile(file, 'utf8')); }
-    catch { throw LOCKED(file); } // became empty/corrupt meanwhile: alive, refuse
-    if (pidAlive(owner.pid) !== false) throw LOCKED(file);
+    try { owner = JSON.parse(await localFs(options).readFile(file, 'utf8')); }
+    catch (e) { if (e.code === 'LOCAL_IO_TIMEOUT') throw e; throw LOCKED(file); } // became empty/corrupt meanwhile: alive, refuse
+    if (!foreignOwner(owner, root) && pidAlive(owner.pid) !== false) throw LOCKED(file);
     await fs.unlink(file).catch(() => {}); // already retired by the healer that holds our memory of it; fine
     return await claimLock(file, root);
   } finally { await fs.rmdir(reclaim).catch(() => {}); }
 }
 
-export async function lock(root) {
+export async function lock(root, options = {}) {
   const file = lockPath(root);
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   let claimed = await claimLock(file, root);
   if (!claimed) {
     // Lock exists. Self-heal only a provably stale one: SIGKILL/crash leaves
     // the lock with no signal handler to clean it. Empty/corrupt/unparseable
     // and EPERM owners count as ALIVE — refuse rather than steal.
     let owner;
-    try { owner = JSON.parse(await fs.readFile(file, 'utf8')); }
-    catch { throw LOCKED(file); }
-    if (pidAlive(owner.pid) !== false) throw LOCKED(file);
-    claimed = await healStale(file, root);
+    try { owner = JSON.parse(await localFs(options).readFile(file, 'utf8')); }
+    catch (e) { if (e.code === 'LOCAL_IO_TIMEOUT') throw e; throw LOCKED(file); }
+    if (!foreignOwner(owner, root) && pidAlive(owner.pid) !== false) throw LOCKED(file);
+    claimed = await healStale(file, root, options);
     if (!claimed) throw LOCKED(file); // another healer won the fair retry
   }
   return async () => {
     try {
-      const current = JSON.parse(await fs.readFile(file, 'utf8'));
+      const current = JSON.parse(await localFs(options).readFile(file, 'utf8'));
       if (current.pid === process.pid) await fs.unlink(file);
-    } catch { /* already gone or unreadable: nothing of ours to remove */ }
+    } catch (e) {
+      // Do not let a saturated native read pool hide a terminal timeout exit.
+      // An unreadable lock stays in place for the existing stale-owner recovery.
+      if (e.code === 'LOCAL_IO_TIMEOUT') process.stderr.write(`usage-audit: lock release read timed out; retained ${file}\n`);
+    }
   };
 }
 
-async function recoveryLock(root, log) {
+async function recoveryLock(root, log, options) {
   const file = lockPath(root);
   let owner, status;
   try {
-    owner = JSON.parse(await fs.readFile(file, 'utf8'));
-    const alive = pidAlive(owner?.pid);
+    owner = JSON.parse(await localFs(options).readFile(file, 'utf8'));
+    const alive = foreignOwner(owner, root) ? false : pidAlive(owner?.pid);
     status = alive === false ? 'dead' : alive === true ? 'alive' : 'unknown';
-  } catch (e) { status = e.code === 'ENOENT' ? 'absent' : 'unknown'; }
+  } catch (e) { if (e.code === 'LOCAL_IO_TIMEOUT') throw e; status = e.code === 'ENOENT' ? 'absent' : 'unknown'; }
   log(JSON.stringify({ event: 'recovery_lock', lock: file, pid: owner?.pid ?? null, status }) + '\n');
   if (status === 'alive' || status === 'unknown') {
     throw new Error(`audit_locked:${file}; writer pid=${owner?.pid ?? 'unknown'} is ${status}; inspect the owner and stop it manually if appropriate, then rerun --recover; no process was killed and no lock was removed`);
   }
   // Inspection is advisory: lock() rechecks liveness under the existing
   // reclaim mutex, claims atomically, and retains ownership through backfill.
-  return lock(root);
+  return lock(root, options);
 }
 
-export async function taskDir(root, id, options = {}) {
-  const fs = localFs(options);
-  if (!/^[a-z0-9][a-z0-9._-]*$/.test(id) || id === 'project') throw new Error('unsafe_task_id');
-  let current = root;
-  for (const component of ['.context-hub','tasks',id]) {
-    current = path.join(current, component);
-    const stat = await fs.lstat(current);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('unsafe_task_directory');
-  }
-  return current;
+function usageRepository(root,options={},rename=fs.rename) {
+ const io=localFs(options);
+ return new UsageRepository(root,{
+  lstat:file=>io.lstat(file),read:file=>io.readFile(file,'utf8'),
+  write:(file,bytes)=>io.writeFile(file,bytes,{flag:'wx',mode:0o600}),unlink:file=>io.unlink(file),
+  rename:(from,to)=>localIO('rename',options,()=>rename(from,to),true,to),
+  allow:check=>localIO('config',options,check,false,path.join(root,'.context-hub','config.json')),
+  validate:value=>validateUsage(value,{...options,root})
+ });
 }
+export async function taskDir(root,id,options={}) {return usageRepository(root,options).taskDirectory(id);}
 function total(rounds, unresolved) {
   let count = 0, cost = 0;
   for (const r of rounds) { count += r.total_tokens; cost = cost === null || r.cost_usd === null ? null : cost + r.cost_usd; }
   if (!Number.isSafeInteger(count) || (cost !== null && !Number.isFinite(cost))) throw new Error('aggregate_overflow');
   return { rounds: rounds.length, total_tokens: count, cost_usd: cost, complete: unresolved.length === 0 };
 }
-export function validateUsage(v) {
+export function validateUsage(v,options={}) {
   if (v?.schema_version !== 1 || !Array.isArray(v.rounds) || !Array.isArray(v.unresolved)) throw new Error('invalid_usage_schema');
   const seen = new Set();
   for (const r of v.rounds) {
     vector(r);
     if (!Number.isSafeInteger(r.launch_version) || r.launch_version < 1 || seen.has(r.launch_version)
       || !Number.isSafeInteger(r.delivery_version) || r.delivery_version <= r.launch_version
-      || !Number.isSafeInteger(r.round) || r.round < 1 || !['pi','codex'].includes(r.agent)
+      || !Number.isSafeInteger(r.round) || r.round < 1 || typeof r.agent !== 'string' || !r.agent
       || !['architect','executor','reviewer'].includes(r.role)
       || typeof r.session_file !== 'string' || !path.isAbsolute(r.session_file)
       || !Number.isSafeInteger(r.start_line) || r.start_line < 1 || !Number.isSafeInteger(r.end_line) || r.end_line <= r.start_line
@@ -146,26 +162,21 @@ export function validateUsage(v) {
   if (!v.total || Object.keys(expected).some(k => v.total[k] !== expected[k])) throw new Error('invalid_usage_total');
   return v;
 }
-export async function loadUsage(dir, options = {}) {
-  const fs = localFs(options);
-  const file = path.join(dir, 'usage.json');
-  try {
-    const st = await fs.lstat(file);
-    if (!st.isFile() || st.isSymbolicLink()) throw new Error('unsafe_usage_file');
-    return validateUsage(JSON.parse(await fs.readFile(file, 'utf8')));
-  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
-}
-export function merge(previous, matches, since) {
+export async function loadUsage(dir,options={}) {return usageRepository(options.root??path.resolve(dir,'../../..'),options).readDirectory(dir);}
+export function merge(previous, matches, since, options={}) {
   const rounds = new Map((previous?.rounds ?? []).map(r => [r.launch_version, r]));
   const unresolved = [];
   for (const m of matches) {
-    const r = m.round, selected = since === undefined || instant(r.ts) >= since;
-    if (selected && !m.reason) {
+    const r = m.round;
+    if (!m.availability && m.reason === 'unsupported_agent') m.availability = usageAvailability(r.agent, contractSource(options.root));
+    const selected = since === undefined || instant(r.ts) >= since;
+    const reason=m.reason??(m.candidates.length===1?undefined:m.candidates.length?'ambiguous_sessions':'missing_session_or_end');
+    if (selected && !reason) {
       const { cwd, task_id, launch_ts, problem, superseded_versions, windows_attempt, route_args, pi_session, ...identity } = r;
       rounds.set(r.launch_version, { ...identity, ...m.candidates[0] });
     } else if (selected || !rounds.has(r.launch_version)) {
       unresolved.push({ delivery_version: r.delivery_version, ...(r.launch_version ? { launch_version: r.launch_version } : {}),
-        reason: selected ? m.reason : 'not_selected', ...(rounds.has(r.launch_version) ? { preserved: true } : {}) });
+        reason: selected ? reason : 'not_selected', ...(selected&&m.availability?{agent:r.agent,reason_code:m.availability.reason,capability:m.availability.capability??'invalid'}:{}), ...(rounds.has(r.launch_version) ? { preserved: true } : {}) });
     }
     // Headless supersession (mode-split in extract): the delivering round
     // accounts for itself above; each launch it replaced stays unaccounted
@@ -182,39 +193,49 @@ export function merge(previous, matches, since) {
   const sorted = [...rounds.values()].sort((a,b) => a.launch_version-b.launch_version);
   return { schema_version: 1, rounds: sorted, unresolved, total: total(sorted, unresolved) };
 }
-export async function writeUsage(root, id, value, mayCommit = async () => true, rename = fs.rename, options = {}) {
-  const fs = localFs(options);
-  const dir = await taskDir(root, id, options), file = path.join(dir, 'usage.json');
-  await loadUsage(dir, options); // Refuse corrupt or symlink replacements, including races since merge.
-  const bytes = JSON.stringify(validateUsage(value), null, 2) + '\n';
-  try { if (await fs.readFile(file, 'utf8') === bytes) return false; } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  if (!await localIO('config', options, mayCommit)) return false;
-  const tmp = path.join(dir, `.usage-${process.pid}-${randomUUID()}.tmp`);
-  try {
-    await fs.writeFile(tmp, bytes, { flag: 'wx', mode: 0o600 });
-    if (!await localIO('config', options, mayCommit)) return false;
-    await taskDir(root, id, options);
-    await localIO('rename', options, () => rename(tmp, file), true);
-    return true;
-  } finally { await fs.unlink(tmp).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
+export async function writeUsage(root,id,value,mayCommit=async()=>true,rename=fs.rename,options={}) {
+ return usageRepository(root,options,rename).commit(id,value,mayCommit);
 }
 export async function collect(options, deps = {}) {
-  const fs = localFs(options);
-  const allowed = () => localIO('config', options, deps.allowed ?? (() => options.watch ? enabled(options.root, options) : Promise.resolve(true)));
+  const allowed = () => localIO('config', options, deps.allowed ?? (() => options.watch ? enabled(options.root, options) : Promise.resolve(true)), false, path.join(options.root, '.context-hub', 'config.json'));
   if (!await allowed()) return [];
+  return withAgentProfileSnapshot(options.root, () => collectSnapshot(options, { ...deps, allowed }));
+}
+async function collectSnapshot(options, deps) {
+  const fs = localFs(options), allowed = deps.allowed;
+  const config = await localIO('config', options, signal => readConfigFile(path.join(options.root,'.context-hub'), {signal}), false, path.join(options.root,'.context-hub','config.json'));
+  if(config.status==='invalid')throw Error('invalid_config');
+  const snapshot = withContractBindings(contractSource(options.root),config.status === 'ok' ? config.config.agent_bindings : undefined);
   const hub = deps.hub ?? await source(options.url, options.root, options);
   // Hub reads already own their deadline and network cancellation. A second
   // local-I/O timer would win the race and misclassify the original failure.
   options.onProgress?.('hub-list');
+  const scan = options.watch ? (options.incremental ??= new IncrementalScan()) : undefined;
+  scan?.begin();
   const entries = await hub.list(), tasks = [];
+  scan?.pruneTasks(entries);
   for (const e of entries.filter(e => e.task_id !== 'project')) {
     if (!await allowed()) return [];
     options.onProgress?.('hub-read');
-    tasks.push(await hub.read(e.task_id));
+    tasks.push(scan ? await scan.task(hub, e) : await hub.read(e.task_id));
   }
   const rounds = tasks.flatMap(t => extract(t, options.root, options));
   const targets = tasks.filter(t => !options.task || t.task_id === options.task);
   if (!targets.length) return [];
+  const availabilityByRound=new Map(),selectedByRound=new Map();
+  for(const round of rounds) {
+    if(round.problem&&round.problem!=='unsupported_agent')continue;
+    const availability=usageAvailability(round.agent,snapshot);
+    // A legacy Windows executable needs the frozen run's native target.
+    if(round.windows_attempt&&availability.status==='invalid'&&availability.code==='CONTRACT_UNAVAILABLE')continue;
+    if(availability.status!=='available') {
+      availabilityByRound.set(round,availability);
+      round.problem=availability.status==='unavailable'?(availability.capability==='unsupported'?'unsupported_agent':'usage_unavailable'):availability.reason;
+    } else {
+      selectedByRound.set(round,availability.handle);
+      if(round.problem==='unsupported_agent')delete round.problem;
+    }
+  }
   if (rounds.some(r => r.windows_attempt && !r.problem)) {
     try {
       const runs = await localIO('run-read', options, async () => {
@@ -222,71 +243,117 @@ export async function collect(options, deps = {}) {
         const { RunStore } = await import('../../../dist/core/run/store.js');
         const store = new RunStore(options.root);
         return store.list().map(id => store.read(id));
-      });
-      bindWindowsPi(rounds, runs);
+      }, false, path.join(options.root, '.context-hub', 'runs'));
+      bindLegacyUsageRounds(rounds, runs, options);
     } catch (e) {
       if (e.code === 'LOCAL_IO_TIMEOUT') throw e;
       for (const r of rounds.filter(r => r.windows_attempt && !r.problem)) r.problem = 'unreadable_windows_runs';
     }
   }
-  const sessions = [], diagnostics = [], piCandidates = new Map();
-  const discover = deps.files ? root => localIO('session-discover', options, () => deps.files(root)) : root => files(root, options);
-  const read = deps.readSession ? (file, agent) => localIO('session-read', options, () => deps.readSession(file, agent)) : (file, agent) => readSession(file, agent, options);
-  // Watch passes rescan the same trees; a file whose mtime and size are
-  // unchanged since the previous pass reuses its parse instead of re-reading
-  // multi-MB histories (cached rows are metadata only — bodies were already
-  // discarded at parse time). Keys are agent-prefixed: the same path can in
-  // principle be discovered for both agents.
-  const cache = options.cache ??= new Map();
-  const listed = new Set();
-  for (const agent of ['pi','codex']) {
-    if (!await allowed()) return [];
-    const relevant = rounds.filter(r => r.agent === agent && !r.problem);
-    if (!relevant.length) continue;
-    const roots = new Map();
-    if (agent === 'pi') for (const r of relevant) {
-      try {
-        const directory = await piDirectory(r, options);
-        if (!roots.has(directory)) roots.set(directory, []);
-        roots.get(directory).push(r);
-        piCandidates.set(r, new Set());
-      }
-      catch (e) { if (e.code === 'LOCAL_IO_TIMEOUT') throw e; r.problem = 'invalid_pi_session_directory'; }
-    } else roots.set(options.codexRoot, []);
-    const discovered = new Set();
-    for (const [root, sourceRounds] of roots) {
-      let discoveredFiles;
-      try { discoveredFiles = await discover(root); }
-      catch (e) {
-        if ((options.platform ?? process.platform) !== 'win32' || e.code === 'LOCAL_IO_TIMEOUT') throw e;
-        diagnostics.push({ agent, file: root, reason: e.code ?? 'unreadable_session_directory' });
-        continue;
-      }
-      for (const file of discoveredFiles) {
-        if (!await allowed()) return [];
-        for (const r of sourceRounds) piCandidates.get(r).add(file);
-        if ((options.platform ?? process.platform) === 'win32' && discovered.has(file)) continue;
-        discovered.add(file);
+  const diagnostics=[],cache=options.watch?new Map():(options.cache??=new Map()),listed=new Set();
+  const discovery=new Map(),parses=new Map(),sourceErrors=new Map();
+  let sourceTimeout;
+  const remember=async(source,action)=>{try{return await action();}catch(e){sourceErrors.set(source,e);if(e.code==='LOCAL_IO_TIMEOUT')sourceTimeout=e;throw e;}};
+  const profiles=usageContracts(snapshot,(options.platform??process.platform)==='win32'?'win32':'posix');
+  const profilesById=new Map(profiles.map(profile=>[profile.id,profile]));
+  const matches=rounds.map(round=>{
+    // Legacy Windows binding has already projected the frozen target's id.
+    const contract=profilesById.get(selectedByRound.get(round)?.id??round.agent);
+    return {round,contract,candidates:[],...(round.problem?{reason:round.problem}:!contract?{reason:'usage_contract_unavailable'}:{}),
+      ...(availabilityByRound.has(round)?{availability:availabilityByRound.get(round)}:{})};
+  });
+  let runFacts;
+  const loadRunFacts=async()=>{
+    if(!runFacts)runFacts=await localIO('run-read',options,async()=>{
+      const {RunStore}=await import('../../../dist/core/run/store.js'),store=new RunStore(options.root);
+      return new Map((deps.runs?await deps.runs():store.list().map(id=>store.read(id))).map(m=>[m.run_id,m]));
+    },false,path.join(options.root,'.context-hub','runs'));
+    return runFacts;
+  };
+  const services={
+    facts:{home:options.home??os.homedir(),auditCwd:process.cwd(),profileRoot:options.root,platform:(options.platform??process.platform)==='win32'?'win32':'posix',
+      ...(options.piRoot!==undefined?{piRoot:options.piRoot}:{}),codexRoot:options.codexRoot,piEnv:{...(options.piEnv??process.env)}},
+    signal:options.signal,
+    list(root,pattern) {
+      const key=root+'\0'+pattern;
+      if(!discovery.has(key))discovery.set(key,remember(root,()=>deps.files?localIO('session-discover',options,()=>deps.files(root),false,root):files(root,options,pattern)));
+      return discovery.get(key);
+    },
+    async readLines(file) {const text=await fs.readFile(file,'utf8'),lines=text.split('\n'),partial=lines.at(-1).length>0;lines.pop();return {lines,partial};},
+    async readSettings(file) {try{return await fs.readFile(file,'utf8');}catch(e){if(e.code==='ENOENT')return undefined;sourceErrors.set('usage-root',e);if(e.code==='LOCAL_IO_TIMEOUT')sourceTimeout=e;throw e;}},
+    readHead(file,maxBytes) {return localIO('read-head',options,async()=>{
+      const {open}=await import('node:fs/promises'),handle=await open(file,'r');
+      try{const buffer=Buffer.alloc(maxBytes),{bytesRead}=await handle.read(buffer,0,maxBytes,0);return buffer.subarray(0,bytesRead).toString('utf8');}finally{await handle.close();}
+    },false,file);},
+    async readRun(id) {return remember(id,async()=>{
+      const value=(await loadRunFacts()).get(id);if(!value)throw Error('missing_usage_run');return value;
+    });},
+    async readRunLog(id) {return remember(id,()=>localIO('run-log-read',options,async()=>{
+      const {RunStore}=await import('../../../dist/core/run/store.js');const store=new RunStore(options.root),fd=store.openLog(id);
+      try {const {readFile}=await import('node:fs');const text=await new Promise((resolve,reject)=>readFile(fd,'utf8',(e,s)=>e?reject(e):resolve(s)));const lines=text.split('\n'),partial=lines.at(-1).length>0;lines.pop();return {absolute_path:store.logPath(id),lines,partial};}
+      finally {(await import('node:fs')).closeSync(fd);}
+    },false,id));},
+    async loadSource(file,profile) {
+      const key=profile.id+'\0'+file;
+      if(!parses.has(key))parses.set(key,(async()=>{
+        if(!await allowed())throw Error('usage-disabled-or-aborted');
         listed.add(file);
         try {
-          const st = await fs.stat(file), key = `${agent}\u0000${file}`, hit = cache.get(key);
-          if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) { sessions.push(hit.session); continue; }
-          const session = await read(file, agent);
-          cache.set(key, { mtimeMs: st.mtimeMs, size: st.size, session });
-          sessions.push(session);
-        } catch (e) {
-          cache.delete(`${agent}\u0000${file}`);
-          if (e.code === 'LOCAL_IO_TIMEOUT') throw e;
-          diagnostics.push({ agent, file, reason: e.message });
-        }
-      }
+          const st=await fs.stat(file),hit=cache.get(key);
+          if(hit&&hit.mtimeMs===st.mtimeMs&&hit.size===st.size&&hit.session.key===profile.sourceKey)return hit.session;
+          const session=deps.readSession?usageSourceFromLegacy(await localIO('session-read',options,()=>deps.readSession(file,profile.id,options),false,file),profile):parseUsageSource(await fs.readFile(file,'utf8'),file,profile);
+          cache.set(key,{mtimeMs:st.mtimeMs,size:st.size,session});return session;
+        }catch(e){cache.delete(key);sourceErrors.set(file,e);if(e.code==='LOCAL_IO_TIMEOUT')sourceTimeout=e;throw e;}
+      })());
+      return parses.get(key);
     }
+  };
+  const markerFor=r=>tasks.find(t=>t.task_id===r.task_id)?.versions.find(v=>v.version===r.launch_version)?.payload?.launch;
+  const routeFor=r=>{
+    const marker=markerFor(r);
+    if(typeof marker?.route==='object')return {agent:marker.route.agent,args:marker.route.args??[]};
+    if(typeof marker?.route==='string'){const [agent,...args]=marker.route.split(/\s+/);return {agent,args};}
+    return {agent:r.agent,args:r.route_args??[]};
+  };
+  for(const profile of profiles) {
+    if(!await allowed())return [];
+    const prepared=[];
+    for(const match of matches.filter(m=>m.contract===profile&&!m.reason)) {
+      const r=match.round,round={task_id:r.task_id,role:r.role,agent:profile.id,route:routeFor(r),cwd:r.cwd,launch_version:r.launch_version,delivery_version:r.delivery_version,launch_ts:r.launch_ts,delivery_ts:r.ts,...(r.pi_session?{pi_session:r.pi_session}:{})};
+      round.attempt_id=r.windows_attempt?.attempt_id??markerFor(r)?.attempt_id;
+      const binding=bindUsageRun(profile,round,usageNeedsRun(profile)?[...(await loadRunFacts()).values()]:[]);
+      if(binding.status!=='bound'){match.reason=binding.reason;continue;}
+      const ref=binding.ref;
+      prepared.push({match,ref});
+    }
+    const refs=prepared.map(p=>p.ref);
+    const profileServices=scan?{...services,readSource:(file,ref)=>remember(file,()=>scan.read(file,ref,refs,options,async file=>{
+      try {
+        if(!await allowed())throw Error('usage-disabled-or-aborted');
+        return deps.readSession?usageSourceFromLegacy(await localIO('session-read',options,()=>deps.readSession(file,profile.id,options),false,file),profile):parseUsageSource(await fs.readFile(file,'utf8'),file,profile);
+      }catch(e){sourceErrors.set(file,e);if(e.code==='LOCAL_IO_TIMEOUT')sourceTimeout=e;throw e;}
+    }))}:services;
+    const profilePass=scan?await scan.profile(profile,profileServices,options,refs):undefined;
+    for(const {match,ref} of prepared) {
+      const result=profilePass?await profilePass.read(ref,readUsage):await readUsage(ref,profileServices);
+      match.problems=result.problems;
+      match.candidates=result.status==='measured'?result.candidates:[];
+      for(const problem of result.problems) {
+        if(problem.cause_code==='LOCAL_IO_TIMEOUT')throw sourceTimeout??sourceErrors.get(problem.source)??Object.assign(Error(problem.reason),{code:'LOCAL_IO_TIMEOUT'});
+        if(problem.code==='SOURCE_DIRECTORY_UNREADABLE'&&services.facts.platform!=='win32')throw sourceErrors.get(problem.source)??Object.assign(Error(problem.reason),{code:problem.cause_code});
+        if(['SOURCE_UNREADABLE','SOURCE_DIRECTORY_UNREADABLE','USAGE_READ_ERROR'].includes(problem.code))!diagnostics.some(d=>d.agent===profile.id&&d.file===problem.source)&&diagnostics.push({agent:profile.id,file:problem.source,reason:problem.code==='SOURCE_DIRECTORY_UNREADABLE'?(problem.cause_code??'unreadable_session_directory'):problem.reason});
+      }
+      const errors=result.problems.filter(p=>p.code==='SOURCE_WINDOW_INVALID').map(p=>p.reason);
+      match.reason=match.candidates.length>1?'ambiguous_sessions':errors.length?[...new Set(errors)].sort().join(','):match.candidates.length?undefined:usageResultReason(result);
+    }
+    if(profilePass)await profilePass.finish(refs);
   }
-  for (const key of [...cache.keys()]) if (!listed.has(key.slice(key.indexOf('\u0000') + 1))) cache.delete(key); // files that disappeared
-  const matches = attribute(rounds, sessions, { ...options, piCandidates }), reports = [];
+  for(const key of [...cache.keys()])if(!listed.has(key.slice(key.indexOf('\0')+1)))cache.delete(key);
+  attributeMatches(matches);
+  const reports=[];
   // An unreadable candidate cannot be silently discarded to make another
   // candidate appear unique. Its cwd may itself be unreadable.
-  for (const m of matches) if (diagnostics.some(d => d.agent === m.round.agent)) m.reason = 'unreadable_session_candidate';
+  for (const m of matches) if (diagnostics.some(d => d.agent === m.contract?.id)) m.reason = 'unreadable_session_candidate';
   for (const task of targets) {
     const own = matches.filter(m => m.round.task_id === task.task_id);
     if (!await allowed()) return reports;
@@ -298,25 +365,33 @@ export async function collect(options, deps = {}) {
     if (!own.some(m => options.since === undefined || instant(m.round.ts) >= options.since)) continue;
     const dir = await taskDir(options.root, task.task_id, options);
     const previous = await loadUsage(dir, options);
-    const value = merge(previous, own, options.since);
+    const value = merge(previous, own, options.since, options);
     const changed = await writeUsage(options.root, task.task_id, value, allowed, undefined, options);
     reports.push({ task_id: task.task_id, changed, total: value.total, unresolved: value.unresolved });
   }
+  scan?.finish(profiles.map(p=>p.sourceKey));
   return [...reports, ...diagnostics.map(d => ({ diagnostic: d }))];
 }
+export const TIMEOUT_PASS_LIMIT = 10;
+const isTimeout = e => e.code === 'LOCAL_IO_TIMEOUT' || e.code === 'HUB_TIMEOUT';
+
 export async function run(options, deps = {}) {
   options = { intervalMs: 5000, timeoutMs: Infinity, ...options, root: canonicalRoot(options.root),
     requestTimeoutMs: options.requestTimeoutMs ?? requestTimeout() };
   const started = Date.now(), log = text => process.stderr.write(text);
   let failStreak = 0, lastFail = '', consecutiveFailures = 0, lastSuccessfulPass = null;
   let inRequest = false, heartbeat, release, passId = 0, phase = 'config', progressAt = started;
-  let stallReported = false, reportFailed = false;
-  let countedFailure = false;
+  let lastHealthState = '', reportFailed = false, sleepUntil = 0;
+  let countedFailure = false, consecutiveTimeouts = 0;
   const progress = next => { phase = next; progressAt = Date.now(); };
   const failed = e => {
     if (countedFailure) return;
     countedFailure = true;
     consecutiveFailures++;
+    consecutiveTimeouts = isTimeout(e) ? consecutiveTimeouts + 1 : 0;
+    if (isTimeout(e)) log(JSON.stringify({ event: 'IO_STALLED', timestamp: new Date().toISOString(), pid: process.pid,
+      pass_id: passId, phase: e.phase ?? phase, code: e.code, target: e.target,
+      elapsed_ms: e.elapsed_ms, timeout_ms: e.timeout_ms, consecutive_timeouts: consecutiveTimeouts }) + '\n');
     failStreak = e.message === lastFail ? failStreak + 1 : 0;
     lastFail = e.message;
     if (failStreak % 20 === 0) {
@@ -333,47 +408,62 @@ export async function run(options, deps = {}) {
   const allowed = async () => {
     if (options.signal?.aborted) return false;
     if (!options.watch) return true;
-    try { return await localIO('config', options, () => on(options.root, options)); }
+    try { return await localIO('config', options, () => on(options.root, options), false, path.join(options.root, '.context-hub', 'config.json')); }
     catch (e) { if (e.code !== 'LOCAL_IO_TIMEOUT') e.fatalConfig = true; throw e; }
   };
   // A disabled watcher still does no lock, session, Hub or heartbeat work.
   // Transient startup config timeouts enter the same observable retry loop.
-  let initiallyAllowed = false;
+  let initiallyAllowed = false, initialFailure;
   try { initiallyAllowed = await allowed(); if (!initiallyAllowed) return; }
-  catch (e) { if (!options.watch || e.fatalConfig) throw e; failed(e); }
+  catch (e) { if (!options.watch || e.fatalConfig) throw e; initialFailure = e; }
+  const acquire = async () => {
+    progress('lock');
+    try { return options.recover ? await recoveryLock(options.root, log, options) : await (deps.lock ?? lock)(options.root, options); }
+    catch (e) { if (!isTimeout(e)) e.fatalLock = true; throw e; }
+  };
   const lastReport = new Map();
   try {
     if (options.watch) heartbeat = (deps.setInterval ?? setInterval)(() => {
       const now = Date.now();
       const stalledMs = options.stallTimeoutMs ?? Math.max(120_000, 2 * options.requestTimeoutMs + options.intervalMs);
       const successAge = now - (lastSuccessfulPass === null ? started : Date.parse(lastSuccessfulPass));
-      const stalled = successAge >= stalledMs || now - progressAt >= stalledMs;
+      const plannedSleep = phase === 'sleep' && now <= sleepUntil;
+      const stalled = !plannedSleep && now - progressAt >= stalledMs;
+      // A long calibration with advancing work is not a frozen pass. Failed
+      // passes are separately observable even when they keep making progress.
+      const successOverdue = consecutiveFailures > 0 && successAge >= stalledMs;
       const status = { timestamp: new Date(now).toISOString(), pid: process.pid, pass_id: passId, phase,
         last_progress_at: new Date(progressAt).toISOString(), last_successful_pass: lastSuccessfulPass,
-        consecutive_failures: consecutiveFailures, in_request: inRequest };
-      log(JSON.stringify({ event: 'heartbeat', ...status, stalled }) + '\n');
-      if (stalled && !stallReported) {
-        log(JSON.stringify({ event: 'PASS_STALLED', ...status, threshold_ms: stalledMs }) + '\n');
+        consecutive_failures: consecutiveFailures, in_request: inRequest,
+        planned_sleep: plannedSleep, sleep_until: sleepUntil ? new Date(sleepUntil).toISOString() : null,
+        success_overdue: successOverdue };
+      (deps.logHeartbeat ?? writeServiceLog)(JSON.stringify({ event: 'heartbeat', ...status, stalled }) + '\n');
+      // Compare health flags, not counters/timestamps: continuing failures
+      // must not turn a minute-by-minute file record into terminal noise.
+      const failing = consecutiveFailures > 0;
+      const healthState = JSON.stringify([stalled, failing, successOverdue]);
+      if ((stalled || failing || successOverdue) && healthState !== lastHealthState) {
+        const event = stalled ? 'PASS_STALLED' : successOverdue ? 'PASS_SUCCESS_OVERDUE' : 'PASS_FAILED';
+        log(JSON.stringify({ event, ...status, stalled, threshold_ms: stalledMs }) + '\n');
       }
-      stallReported = stalled;
+      lastHealthState = healthState;
     }, 60_000);
-    if (initiallyAllowed) {
-      progress('lock');
-      release = options.recover ? await recoveryLock(options.root, log) : await (deps.lock ?? lock)(options.root);
-    }
     do {
       if (options.signal?.aborted) break;
       passId++;
+      const passStarted = performance.now();
       countedFailure = false;
       try {
+        // The startup probe is the first pass's config read, not an extra
+        // unnumbered failure (otherwise the terminal count would be off by one).
+        if (initialFailure) { const error = initialFailure; initialFailure = undefined; throw error; }
+        if (passId === 1 && initiallyAllowed) release = await acquire();
         // Both boundary config reads belong to the pass failure accounting.
         if (!await allowed()) break;
-        if (!release) {
-          progress('lock');
-          release = await (deps.lock ?? lock)(options.root);
-        }
+        if (!release) release = await acquire();
         progress('collect');
         const reports = await (deps.collect ?? collect)(options, { ...deps, allowed });
+        if(options.watch && options.incremental) await options.incremental.persist(`${lockPath(options.root)}.cursor.json`, options);
         const visible = options.watch ? reports.filter(v => {
           if (!(v.changed || v.diagnostic || v.reason || v.unresolved?.length)) return false;
           const key = v.diagnostic ? `d:${v.diagnostic.agent}:${v.diagnostic.file}` : String(v.task_id);
@@ -385,20 +475,31 @@ export async function run(options, deps = {}) {
         progress('report');
         try { (deps.report ?? (r => { for (const v of r) process.stdout.write(JSON.stringify(v) + '\n'); }))(visible); }
         catch (e) { reportFailed = true; throw e; }
+        const stopping = !options.watch || options.signal?.aborted || Date.now() - started >= options.timeoutMs || !await allowed();
         lastSuccessfulPass = new Date().toISOString();
         consecutiveFailures = 0;
-        if (!options.watch || options.signal?.aborted || Date.now() - started >= options.timeoutMs || !await allowed()) break;
+        consecutiveTimeouts = 0;
+        if (stopping) break;
       } catch (e) {
         // Output failures remain fatal and never claim a successful pass.
         if (!options.watch || reportFailed) throw e;
         failed(e);
-        if (e.fatalConfig) throw e;
+        if(options.incremental)for(const state of options.incremental.profiles.values()){state.signature=undefined;state.results.clear();}
+        if (e.fatalConfig || e.fatalLock) throw e;
+        if (consecutiveTimeouts >= TIMEOUT_PASS_LIMIT) {
+          const error = Object.assign(new Error(`WATCHER_TIMEOUT_LIMIT: ${consecutiveTimeouts} consecutive passes timed out; last=${e.message}`), { code: 'WATCHER_TIMEOUT_LIMIT' });
+          log(JSON.stringify({ event: error.code, timestamp: new Date().toISOString(), pid: process.pid, pass_id: passId,
+            phase, consecutive_timeouts: consecutiveTimeouts, limit: TIMEOUT_PASS_LIMIT, code: e.code, target: e.target, reason: error.message }) + '\n');
+          throw error;
+        }
         if (options.signal?.aborted || Date.now() - started >= options.timeoutMs) break;
       }
+      const wait = Math.max(0, Math.min(Math.max(options.intervalMs, performance.now() - passStarted), options.timeoutMs - (Date.now() - started)));
+      sleepUntil = Date.now() + wait;
       progress('sleep');
-      const wait = Math.max(0, Math.min(options.intervalMs, options.timeoutMs - (Date.now() - started)));
       try { await (deps.sleep ?? sleep)(wait, undefined, { signal: options.signal }); }
       catch (e) { if (e.name !== 'AbortError') throw e; }
+      finally { sleepUntil = 0; }
     } while (!options.signal?.aborted && Date.now() - started < options.timeoutMs);
   } finally {
     // Keep progress observation alive through cleanup, which may itself wait

@@ -1,6 +1,6 @@
 /** Shared target contracts and the single error-class identities. */
 import type { Stats } from "node:fs";
-import type { LaunchInvocation, PosixDirectPlan } from "../../common/types.js";
+import type { LaunchInvocation, PosixDirectPlan } from "../../../protocol/types.js";
 
 /** A route target could not be resolved to an executable this launcher may run. */
 export class AgentTargetError extends Error {

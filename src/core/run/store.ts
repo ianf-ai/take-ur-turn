@@ -1,47 +1,20 @@
+/** Storage ownership: runs/<id> holds permanent identity, startup/stop and repair
+ * evidence (RunStore/supervisor write; ps/resume/board/usage read), never TTL.
+ * logs/runs/<id>/log holds raw output (supervisor writes; attach/board/usage
+ * read); retain until an explicit retention transaction, respecting pins and
+ * incomplete/measurement/latest-role protections. runtime/{runs,admission}
+ * contains mutexes; only identity-checked owner recovery may retire them.
+ * Unrecognized siblings remain protected; none of these ports sweep directories. */
 /** Local run protocol only. Task/project records remain behind the Hub API. */
-import { constants as C, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { constants as C, closeSync, fsyncSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { validateControlMeta } from './validation.js';
-import type { StopRequest } from './protocol.js';
-import type { WindowsState } from './windows-protocol.js';
-import { readWindowsRunMeta, statWindowsRunFile } from '../hub/windows-run-file.js';
+import type { HeadlessOwnership, HeadlessStartIntent, ResumeSource, ResumeStartIntent, RunMeta } from './meta.js';
+import { readWindowsRunMeta, readWindowsRunMetas, statWindowsRunFile, createWindowsRunFileSession } from '../../hub/windows-run-file.js';
 
-export interface HeadlessOwnership {
-  schema: 1; role: string; attempt_id: string; base_version: number; trigger_version: number;
-  route: { agent: string; args: string[] }; route_source: string;
-  resume_from_run_id?: string; designated_session_id?: string; session_reason: string;
-}
-
-export interface HeadlessStartIntent { task_id: string; headless: HeadlessOwnership; cwd: string; startup: "pending" | "failed" }
-
-/** Provenance of a resumed run: which run it continues, which native session
- *  identity was used, and who asked. Additive; never process authority. */
-export interface ResumeSource {
-  schema: 1; from_run_id: string; agent: string; session_id: string;
-  identity: 'observed' | 'designated' | 'argv';
-  requested_at: string; requested_by: string; task_id?: string;
-}
-
-/** Persisted before the resumed process is spawned: an uncertain handshake
- *  stays attributable to its session identity. */
-export interface ResumeStartIntent { schema: 1; from_run_id: string; agent: string; session_id: string; cwd: string; startup: 'pending' | 'failed' }
-
-export interface RunMeta {
-  [key: string]: unknown;
-  run_id: string; task_id?: string; pid: number; pgid: number; argv: string[];
-  started_at: string; status: 'running' | 'stopped' | 'exited';
-  supervisor_pid: number; cwd: string;
-  /** Anchored checkout landing point validated from the 工作区 declaration (additive). */
-  checkout?: string;
-  headless?: HeadlessOwnership; root_exited_at?: string;
-  agent_session_id?: string; exit_code?: number; exit_signal?: string; ended_at?: string;
-  stopped_by?: string; stopped_at?: string;
-  identity_probe?: string; identity_ack?: string;
-  control_protocol?: string; stop_request?: StopRequest;
-  windows?: WindowsState;
-  resume?: ResumeSource;
-}
+export type { HeadlessOwnership, HeadlessStartIntent, ResumeSource, ResumeStartIntent, RunMeta } from './meta.js';
 /** A run is complete only with terminal evidence: ended_at present, and any
  *  stop request must have SUCCEEDED. "Stopped" alone, a failed stop, or a
  *  lost supervisor without ended_at are all incomplete. */
@@ -56,6 +29,7 @@ export function validateResumeSource(r: ResumeSource): void {
 }
 /** Keep the additive association narrow; never accept process authority here. */
 export function validateHeadlessOwnership(h: HeadlessOwnership): void {
+  if(h?.session_identity!==undefined&&(!h.session_identity||typeof h.session_identity.agent!=='string'||!h.session_identity.agent||typeof h.session_identity.session_id!=='string'||!h.session_identity.session_id))throw new Error('invalid headless session identity');
   if (!h || h.schema !== 1 || !['architect','executor','reviewer'].includes(h.role) || typeof h.attempt_id !== 'string' || !/^[a-f0-9-]{36}$/.test(h.attempt_id) ||
       !Number.isSafeInteger(h.base_version) || h.base_version < 0 || !Number.isSafeInteger(h.trigger_version) || h.trigger_version < 0 || h.trigger_version > h.base_version ||
       !h.route || typeof h.route.agent !== 'string' || !h.route.agent || !Array.isArray(h.route.args) || !h.route.args.every(s => typeof s === 'string') ||
@@ -125,7 +99,42 @@ function noLinkDirectory(file: string): void {
   if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`unsafe run directory: ${file}`);
 }
 
+export type RunMetaResult =
+  | { id: string; kind: 'meta'; meta: RunMeta }
+  | { id: string; kind: 'error'; error: unknown; origin: 'local' | 'file' | 'protocol' | 'transport' };
+
+export type CompletionOutcome = 'delivered' | 'ignored-closed' | 'missing-delivery-notification-reserved';
+export interface CompletionCheck {
+  schema: 1;
+  run_id: string; task_id: string; attempt_id: string; role: string; base_version: number;
+  ended_at: string; processed_at: string; outcome: CompletionOutcome;
+  evidence_version?: number;
+  delivery_version?: number;
+}
+export type CompletionResult = Pick<CompletionCheck, 'outcome' | 'evidence_version' | 'delivery_version'>;
+
+function completionIdentity(meta: RunMeta) {
+  validateMeta(meta, meta.run_id);
+  if (!complete(meta) || !meta.task_id || !meta.headless || meta.stop_request || meta.exit_code !== 0 || meta.exit_signal ||
+      (meta.input_delivery && meta.input_delivery.status !== 'complete')) throw new Error('run is not a successful managed completion');
+  return { run_id: meta.run_id, task_id: meta.task_id, attempt_id: meta.headless.attempt_id,
+    role: meta.headless.role, base_version: meta.headless.base_version, ended_at: meta.ended_at! };
+}
+function validateCompletion(value: unknown, meta: RunMeta): CompletionCheck {
+  const result = value as CompletionCheck | null;
+  const identity = completionIdentity(meta);
+  if (!result || result.schema !== 1 || Object.entries(identity).some(([key, v]) => result[key as keyof CompletionCheck] !== v) ||
+      !['delivered', 'ignored-closed', 'missing-delivery-notification-reserved'].includes(result.outcome) ||
+      typeof result.processed_at !== 'string' || !Number.isFinite(Date.parse(result.processed_at)) ||
+      (result.evidence_version !== undefined && (!Number.isSafeInteger(result.evidence_version) || result.evidence_version < 0)) ||
+      (result.delivery_version !== undefined && (!Number.isSafeInteger(result.delivery_version) || result.delivery_version <= identity.base_version)) ||
+      (result.outcome === 'delivered' && (result.delivery_version === undefined || result.evidence_version === undefined || result.delivery_version > result.evidence_version)) ||
+      (result.outcome !== 'delivered' && result.delivery_version !== undefined)) throw new Error('invalid completion check or mismatched run identity');
+  return result;
+}
+
 export class RunStore {
+  private readonly metadataReads = new AsyncLocalStorage<{ session: ReturnType<typeof createWindowsRunFileSession>; tail: Promise<void> }>();
   readonly root: string;
   constructor(readonly hubRoot: string) { this.root = path.join(hubRoot, '.context-hub', 'runs'); }
   private checkRoot(): void {
@@ -142,13 +151,26 @@ export class RunStore {
     }
     for (;;) {
       const id = `${new Date().toISOString().replace(/[-:.]/g, '')}-${randomBytes(4).toString('hex')}`;
-      try { mkdirSync(path.join(this.root, id), { mode: 0o700 }); return id; }
+      try {
+        mkdirSync(path.join(this.root, id), { mode: 0o700 });
+        this.ensureDirectories(path.join(this.hubRoot, '.context-hub', 'logs', 'runs', id));
+        this.ensureDirectories(path.join(this.hubRoot, '.context-hub', 'runtime', 'runs', id));
+        return id;
+      }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
     }
   }
   list(): string[] {
     try { this.checkRoot(); return readdirSync(this.root).sort(); }
     catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []; throw e; }
+  }
+  /** Isolation is settled only while meta.json is absent. Old evidence must
+   *  never hide a newly damaged or unsafe meta; unknown remains reportable. */
+  isQuarantined(id: string): boolean {
+    try {
+      const state = this.readRepairMetaState(id, this.directory(id));
+      return state.kind === 'absent' && state.isolatedMarker !== undefined;
+    } catch { return false; }
   }
   private open(id: string, name: string, flags: number): number {
     const fd = openSync(path.join(this.directory(id), name), flags | C.O_NOFOLLOW, 0o600);
@@ -157,13 +179,36 @@ export class RunStore {
       return fd;
     } catch (e) { closeSync(fd); throw e; }
   }
+  private ensureDirectories(target: string): void {
+    const base = path.join(this.hubRoot, '.context-hub');
+    noLinkDirectory(base);
+    let dir = base;
+    for (const part of path.relative(base, target).split(path.sep)) {
+      dir = path.join(dir, part);
+      try { mkdirSync(dir, { mode: 0o700 }); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
+      noLinkDirectory(dir);
+    }
+  }
+  /** New allocations own logs/runs/<id>; absent allocation means legacy layout.
+   * Unsafe new paths never fall back to the old log. No file is moved. */
+  logPath(id: string): string {
+    const legacy = this.directory(id);
+    let dir = path.join(this.hubRoot, '.context-hub');
+    try {
+      for (const part of ['logs', 'runs', id]) { dir = path.join(dir, part); noLinkDirectory(dir); }
+      return path.join(dir, 'log');
+    } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+    return path.join(legacy, 'log');
+  }
   openLog(id: string, append = false): number {
-    return this.open(id, 'log', append ? C.O_WRONLY | C.O_APPEND | C.O_CREAT : C.O_RDONLY);
+    const fd = openSync(this.logPath(id), (append ? C.O_WRONLY | C.O_APPEND | C.O_CREAT : C.O_RDONLY) | C.O_NOFOLLOW | C.O_NONBLOCK, 0o600);
+    try { if (!fstatSync(fd).isFile()) throw new Error('not a regular run file: log'); return fd; }
+    catch (e) { closeSync(fd); throw e; }
   }
   /** Observe output activity without reading or retaining log content. */
   logInfo(id: string): { mtimeMs: number } {
     if (process.platform === 'win32') {
-      try { return { mtimeMs: statWindowsRunFile(path.join(this.directory(id), 'log')).mtimeMs }; }
+      try { return { mtimeMs: statWindowsRunFile(this.logPath(id)).mtimeMs }; }
       catch (e) {
         if ((e as NodeJS.ErrnoException).code === 'EUNSAFEPATH') {
           throw Object.assign(new Error('unsafe or not a regular run file: log', { cause: e }), { code: 'EUNSAFEPATH' });
@@ -172,7 +217,7 @@ export class RunStore {
       }
     }
     // A FIFO without a writer must reach fstat instead of blocking the poll.
-    const fd = this.open(id, 'log', C.O_RDONLY | C.O_NONBLOCK);
+    const fd = this.openLog(id);
     try { return { mtimeMs: fstatSync(fd).mtimeMs }; }
     finally { closeSync(fd); }
   }
@@ -191,11 +236,14 @@ export class RunStore {
     await this.writeIntentFile(id, 'headless-start.json', intent);
   }
   readResumeIntent(id: string): ResumeStartIntent {
-    const value = JSON.parse(readFileSync(this.open(id, 'resume-start.json', C.O_RDONLY), 'utf8')) as ResumeStartIntent;
-    if (!value || value.schema !== 1 || !/^(\d{8}T\d{9}Z-[a-f0-9]{8})$/.test(value.from_run_id) || typeof value.agent !== 'string' ||
-        typeof value.session_id !== 'string' || !value.session_id || typeof value.cwd !== 'string' || !path.isAbsolute(value.cwd) ||
-        !['pending','failed'].includes(value.startup)) throw new Error('invalid resume startup intent');
-    return value;
+    const fd = this.open(id, 'resume-start.json', C.O_RDONLY);
+    try {
+      const value = JSON.parse(readFileSync(fd, 'utf8')) as ResumeStartIntent;
+      if (!value || value.schema !== 1 || !/^(\d{8}T\d{9}Z-[a-f0-9]{8})$/.test(value.from_run_id) || typeof value.agent !== 'string' ||
+          typeof value.session_id !== 'string' || !value.session_id || typeof value.cwd !== 'string' || !path.isAbsolute(value.cwd) ||
+          !['pending','failed'].includes(value.startup)) throw new Error('invalid resume startup intent');
+      return value;
+    } finally { closeSync(fd); }
   }
   async writeResumeIntent(id: string, intent: ResumeStartIntent): Promise<void> {
     if (intent.schema !== 1 || !/^(\d{8}T\d{9}Z-[a-f0-9]{8})$/.test(intent.from_run_id) || typeof intent.agent !== 'string' ||
@@ -218,14 +266,109 @@ export class RunStore {
     const fd = this.open(id, 'meta.json', C.O_RDONLY);
     try { return validateMeta(JSON.parse(readFileSync(fd, 'utf8')), id); } finally { closeSync(fd); }
   }
+  /** Only an absent sidecar is unprocessed. Unsafe/corrupt evidence is never overwritten. */
+  readCompletionCheck(meta: RunMeta): CompletionCheck | undefined {
+    completionIdentity(meta);
+    this.directory(meta.run_id);
+    let raw: string;
+    try { raw = this.readRepairFile(meta.run_id, 'completion-check.json').raw; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw e; }
+    return validateCompletion(JSON.parse(raw), meta);
+  }
+  /** Reserve once across processes, before any notification. No Hub or Channel I/O under the lock. */
+  async claimCompletionCheck(meta: RunMeta, result: CompletionResult): Promise<boolean> {
+    const identity = completionIdentity(meta);
+    const unlock = await this.lock(meta.run_id, 'meta');
+    try {
+      const current = await this.readMetadata(meta.run_id);
+      if (JSON.stringify(completionIdentity(current)) !== JSON.stringify(identity)) throw new Error('completion identity changed before reservation');
+      if (this.readCompletionCheck(current)) return false;
+      const value = validateCompletion({ ...result, ...identity, schema: 1, processed_at: new Date().toISOString() }, current);
+      const dir = this.directory(meta.run_id);
+      const file = path.join(dir, `completion-check.${randomBytes(12).toString('hex')}.tmp`);
+      const fd = openSync(file, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
+      try { writeFileSync(fd, JSON.stringify(value) + '\n'); fsyncSync(fd); } finally { closeSync(fd); }
+      try {
+        // Atomic create-only publication also refuses an unexpected existing link/file.
+        linkSync(file, path.join(dir, 'completion-check.json'));
+        if (process.platform !== 'win32') {
+          const directoryFd = openSync(dir, C.O_RDONLY | C.O_NOFOLLOW);
+          try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+        }
+      } finally { unlinkSync(file); }
+      return true;
+    } finally { unlock(); }
+  }
+  /** Reuse the existing safe helper within a live protocol operation. Each
+   * read still opens a fresh pinned chain and closes it before any write;
+   * neither metadata nor handles are cached across reads. */
+  async withMetadataReads<T>(action: () => Promise<T>): Promise<T> {
+    if (process.platform !== 'win32' || this.metadataReads.getStore()) return action();
+    const context = { session: createWindowsRunFileSession(), tail: Promise.resolve() };
+    try { return await this.metadataReads.run(context, action); }
+    finally { await context.tail; await context.session.close(); }
+  }
+  async readAsync(id: string): Promise<RunMeta> {
+    if (!this.metadataReads.getStore()) return this.read(id);
+    // Coordinate fresh native opens with atomic replacement. A delete-pending
+    // target is a sharing refusal, not permission to retry an unsafe path.
+    const unlock = await this.lock(id, 'meta');
+    try { return await this.readMetadata(id); }
+    finally { unlock(); }
+  }
+  private async readMetadata(id: string): Promise<RunMeta> {
+    const context = this.metadataReads.getStore();
+    if (!context) return this.read(id);
+    const file = path.join(this.directory(id), 'meta.json');
+    const read = context.tail.then(async () => {
+      const handle = await context.session.open(file);
+      try {
+        const size = (await handle.stat()).size;
+        if (size > 1024 * 1024) throw Object.assign(new Error('Windows safe read: EFBIG'), { code: 'EFBIG' });
+        const buffer = Buffer.alloc(size);
+        const { bytesRead } = await handle.read(buffer, 0, size, 0);
+        if (bytesRead !== size || (await handle.stat()).size < size) throw new Error('LOG_CHANGED');
+        return validateMeta(JSON.parse(buffer.toString('utf8')), id);
+      } finally { await handle.close(); }
+    });
+    // The helper is sequential even if an operation has concurrent readers.
+    context.tail = read.then(() => {}, () => {});
+    return read;
+  }
+  /** Ordered scan results; single-file transactions retain read() and its locks. */
+  readManyMetas(ids: readonly string[]): RunMetaResult[] {
+    if (process.platform !== 'win32') return ids.map(id => {
+      try { return { id, kind: 'meta', meta: this.read(id) }; }
+      catch (error) { return { id, kind: 'error', error, origin: 'file' }; }
+    });
+    const results: RunMetaResult[] = new Array(ids.length);
+    const files: { i: number; file: string }[] = [];
+    ids.forEach((id, i) => {
+      try { files.push({ i, file: path.join(this.directory(id), 'meta.json') }); }
+      catch (error) { results[i] = { id, kind: 'error', error, origin: 'local' }; }
+    });
+    for (const result of readWindowsRunMetas(files,
+      (data, i) => validateMeta(JSON.parse(data.toString('utf8')), ids[i]!), i => this.read(ids[i]!))) {
+      const { i, ...value } = result;
+      results[i] = { id: ids[i]!, ...value };
+    }
+    return results;
+  }
+  lockPath(id: string, name: 'meta' | 'stop'): string {
+    this.directory(id);
+    return path.join(this.hubRoot, '.context-hub', 'runtime', 'runs', id, `${name}.lock`);
+  }
   /** Exclusive file locks, with serialized, identity-checked dead-owner recovery. */
   async lock(id: string, name: 'meta' | 'stop', waitMs = process.platform === 'win32' && name === 'meta' ? 20000 : 2000): Promise<() => void> {
     // A Windows metadata transaction includes the bounded native read (15s)
     // and atomic publication retry (1s). The former POSIX 2s default could
     // make the original supervisor abandon a healthy concurrent writer.
     // Explicit caller deadlines, stop/admission locks and POSIX stay intact.
-    const file = path.join(this.directory(id), `${name}.lock`);
-    return this.lockFile(file, waitMs, `${name} lock in-progress or unverifiable for ${id}`);
+    this.directory(id);
+    const dir = path.join(this.hubRoot, '.context-hub', 'runtime', 'runs', id);
+    this.ensureDirectories(dir);
+    const file = this.lockPath(id, name);
+    return this.lockCompatible(path.join(this.directory(id), `${name}.lock`), file, waitMs, `${name} lock in-progress or unverifiable for ${id}`);
   }
   /** Rig-wide startup admission lock: serializes the verify→reserve→spawn
    *  critical section of resume and headless auto launches across processes. */
@@ -234,10 +377,24 @@ export class RunStore {
       try { mkdirSync(dir, { mode: 0o700 }); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
       noLinkDirectory(dir);
     }
-    return this.lockFile(path.join(this.root, 'admission.lock'), waitMs, `admission lock in-progress or unverifiable under ${this.root}`);
+    const runtime = path.join(this.hubRoot, '.context-hub', 'runtime');
+    this.ensureDirectories(runtime);
+    return this.lockCompatible(path.join(this.root, 'admission.lock'), path.join(runtime, 'admission.lock'), waitMs, `admission lock in-progress or unverifiable under ${this.root}`);
+  }
+  /** Old processes can reacquire their original mutex at any time. Until their
+   * lifetime is explicitly retired, absence of that file is not a cutover proof.
+   * Hold a compatibility mutex before the runtime mutex for the entire transaction;
+   * keep one wait budget and release in reverse order. Never move an old lock. */
+  private async lockCompatible(legacy: string, runtime: string, waitMs: number, busyMessage: string): Promise<() => void> {
+    const deadline = performance.now() + waitMs;
+    const releaseLegacy = await this.lockFile(legacy, waitMs, busyMessage);
+    try {
+      const releaseRuntime = await this.lockFile(runtime, Math.max(0, deadline - performance.now()), busyMessage);
+      return () => { try { releaseRuntime(); } finally { releaseLegacy(); } };
+    } catch (error) { releaseLegacy(); throw error; }
   }
   private async lockFile(file: string, waitMs: number, busyMessage: string): Promise<() => void> {
-    const owner = JSON.stringify({ pid: process.pid, token: randomBytes(16).toString('hex') });
+    const owner = JSON.stringify({ pid: process.pid, root: realpathSync(this.hubRoot), token: randomBytes(16).toString('hex') });
     const deadline = performance.now() + waitMs;
     let unverifiable = false;
     const retryable = (e: unknown): boolean => process.platform === 'win32' &&
@@ -262,7 +419,7 @@ export class RunStore {
         const st = lstatSync(file);
         if (!st.isFile() || st.isSymbolicLink()) throw new Error(`unsafe lock: ${file}`);
         const raw = readFileSync(file, 'utf8');
-        let previous: { pid?: unknown; token?: unknown } | undefined;
+        let previous: { pid?: unknown; token?: unknown; root?: unknown } | undefined;
         try {
           const parsed: unknown = JSON.parse(raw);
           if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) previous = parsed;
@@ -270,7 +427,7 @@ export class RunStore {
         unverifiable = !previous || !validPid(previous.pid) || typeof previous.token !== 'string';
         // An empty/partial owner is contention until the SAME deadline expires,
         // never evidence of a dead owner. In particular, do not reclaim it.
-        if (previous && validPid(previous.pid) && typeof previous.token === 'string' && probe(previous.pid) === false) {
+        if (previous && validPid(previous.pid) && typeof previous.token === 'string' && (probe(previous.pid) === false || (typeof previous.root === 'string' && path.isAbsolute(previous.root) && previous.root !== realpathSync(this.hubRoot)))) {
           const reclaim = `${file}.reclaim`;
           let held = false;
           try {
@@ -323,7 +480,7 @@ export class RunStore {
   async initialize(id: string, meta: RunMeta): Promise<void> {
     const unlock = await this.lock(id, 'meta');
     try {
-      try { this.read(id); throw new Error(`meta already exists: ${id}`); }
+      try { await this.readMetadata(id); throw new Error(`meta already exists: ${id}`); }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
       const publication = this.write(id, meta);
       if (publication) await publication;
@@ -332,7 +489,7 @@ export class RunStore {
   async updateMeta(id: string, fn: (current: RunMeta) => RunMeta): Promise<RunMeta> {
     const unlock = await this.lock(id, 'meta');
     try {
-      const next = fn(this.read(id));
+      const next = fn(await this.readMetadata(id));
       const publication = this.write(id, next);
       if (publication) await publication;
       return next;

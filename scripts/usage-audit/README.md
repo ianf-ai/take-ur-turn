@@ -51,19 +51,38 @@ I/O deadline; invalid values fail visibly. This is separate from the
 logging and interval retry path; one-shot modes exit nonzero and release the lock.
 
 The same deadline covers local config reads, session discovery/stat/read, task
-directory checks, and usage snapshot reads/writes/rename/cleanup. A pending
+directory checks, usage snapshot reads/writes/rename/cleanup, Windows Pi settings
+reads, and lock-owner reads (acquisition, stale recovery and release). A pending
 local read rejects with `LOCAL_IO_TIMEOUT`, counts as a failed pass (including
 config checks at both pass boundaries), and retries on the next interval.
 Read APIs that accept an abort signal receive one; an uninterruptible native
 read can still finish later, but its result cannot resume the failed pass or
 commit a snapshot. Ordinary malformed configuration remains fatal.
 
+Each timed-out watch pass immediately emits an `IO_STALLED` JSON event on stderr
+with `code` (`LOCAL_IO_TIMEOUT` or `HUB_TIMEOUT`), `target` (path or endpoint),
+`elapsed_ms`, `timeout_ms`, `pass_id`, `phase` and `consecutive_timeouts`.
+After **10 consecutive passes ending in a timeout**, watch logs
+`WATCHER_TIMEOUT_LIMIT` with the reason and stops abnormally. A fully successful
+pass (including its final config check), or a pass failing for another reason,
+breaks that timeout streak. Before the limit, reads retry in the same process
+at the normal interval; late results never resume an abandoned pass. This does
+not alter task records, launch order, power registration or pid bookkeeping.
+
+The CLI flushes its terminal reason then sends itself SIGTERM with the OS
+default action (POSIX shell status 143; Windows exit 1). This is necessary
+because Node's normal exit can itself wait forever for a stuck native read.
+If even the lock-owner cleanup read times out, the lock is retained and named
+in the log; after the process dies, existing dead-owner recovery can reclaim it.
+Doctor and power liveness checks can therefore observe a dead watcher. No
+watchdog or automatic restart is introduced.
+
 A submitted mutation cannot safely be abandoned. At its deadline the watcher
 counts the failed pass and immediately warns on stderr, keeps the writer lock,
 and waits for that operation to settle before cleanup/retry. It never starts a
 second pass or releases the lock while a late write/rename can still execute.
-If the filesystem remains stuck, the warning and heartbeat remain visible;
-when it recovers, cleanup and collection resume. This is an in-process guard,
+If the filesystem remains stuck, the warning remains visible and heartbeats
+continue in the diagnostic log; when it recovers, cleanup and collection resume. This is an in-process guard,
 not a forced native-I/O cancellation or a cross-process watchdog.
 
 `usage_audit` is a top-level `"off" | "on"` config key, absent means off.
@@ -90,8 +109,9 @@ deduplicated: a task or diagnostic re-emits only when its content changes
 (first sight, a changed snapshot, or a different unresolved set), so a
 permanently-unresolved task cannot flood the log either.
 
-While enabled, watch emits a JSON heartbeat to **stderr every 60 seconds**,
-independently of pass completion and retry sleeps:
+While enabled, watch writes a JSON heartbeat **only to
+`.context-hub/logs/diagnostics/usage-audit.log` every 60 seconds**, independently
+of pass completion and retry sleeps. Healthy heartbeats never reach the terminal:
 
 ```json
 {"event":"heartbeat","timestamp":"2026-10-16T00:01:00.000Z","pid":1234,"pass_id":3,"phase":"hub-read","last_progress_at":"2026-10-16T00:00:59.000Z","last_successful_pass":null,"consecutive_failures":2,"in_request":true,"stalled":false}
@@ -106,22 +126,30 @@ no heartbeat. `pid`, `pass_id`, `phase` and `last_progress_at` identify the
 process, attempted pass and latest operation boundary. A phase ending in
 `:draining` means a timed-out mutation still owns the writer lock.
 
-If no pass has succeeded, the success-age clock starts at watcher startup.
-If the last success or operation progress is older than
-`max(120000, 2 × I/O deadline + poll interval)` milliseconds, the next heartbeat
-sets `stalled: true` and emits a separate `PASS_STALLED` stderr alarm once per
-stall episode. Successful progress clears it and arms a future alarm. This
-also detects repeated failures whose changing pass IDs would otherwise look
-healthy. With default settings the threshold is two minutes, checked every
-60 seconds; local I/O timeouts report sooner, at 30 seconds.
+`PASS_STALLED` means operation progress has stopped for
+`max(120000, 2 × I/O deadline + poll interval)` milliseconds. A slow calibration
+that continues advancing does not set `stalled`. Repeated failed passes with
+no recent success set `success_overdue`, even while their operation progress
+continues. Heartbeat health is the combination of `stalled`,
+`consecutive_failures > 0`, and `success_overdue`. An unhealthy combination
+emits one terminal alarm when it changes: `PASS_STALLED` takes priority, then
+`PASS_SUCCESS_OVERDUE`, then `PASS_FAILED`. Increasing failure counts, new
+passes and timestamps do not repeat the alarm. Healthy recovery silently rearms
+it, so a later recurrence warns again. All alarms also enter the diagnostic log.
+
+The heartbeat reports `planned_sleep` and `sleep_until`. A scheduled adaptive
+backoff suppresses `PASS_STALLED` until its deadline; an overdue sleep can
+still stall. With defaults, the threshold is two minutes and heartbeats run
+every 60 seconds. Individual I/O deadlines and the ten consecutive timeout
+termination rule apply independently and remain unchanged.
 Missing heartbeats indicate that the watcher is no longer responding. A
 pending HTTP read still emits heartbeats: detect lack of progress using the
 success time, failure count and request flag as well as missing heartbeats.
 
 ## Recovery and diagnosis
 
-If usage stops advancing, inspect `.context-hub/usage-audit.log` (for watchers
-started by `tut up`) or the manual watcher's stderr for heartbeats and
+If usage stops advancing, inspect `.context-hub/logs/diagnostics/usage-audit.log` (for watchers
+started by `tut up` or manually) for heartbeats and
 `HUB_TIMEOUT`, `LOCAL_IO_TIMEOUT`, `PASS_STALLED` and pass failures. Verify that the Hub is running at the specified
 URL and belongs to the project root, then run:
 
@@ -318,6 +346,22 @@ If a previous recovery was interrupted (crash between the recovery steps), a
 `<lock>.reclaim` directory remains and the harness refuses while naming it in
 the error; remove that directory by hand only after confirming no watcher is
 alive.
+
+Watch performs a full calibration at every startup, then uses the Hub's task
+version/updated timestamp and native file mtime/ctime/size/identity to reuse
+unchanged task records and measured windows. It discovers session directories
+and checks file metadata each pass so additions, replacements, removals and
+read failures stay visible. Changed logs are read through `context.read` with
+`since_version`; native JSONL rows and publication bodies are not retained.
+Windows settings and exact-run identity are revalidated each pass.
+A disposable `<lock>.cursor.json` beside the writer lock in `.context-hub/runtime/` persists
+only task versions and session fingerprints. It never changes `usage.json`
+schema v1 and is not trusted across restarts; no migration is needed.
+After a pass takes longer than the configured interval, the next sleep grows
+to that pass's duration (default interval/floor: 5000ms). Explicit
+`--interval-ms` overrides remain available. Deadlines, heartbeat, consecutive
+timeout limit and mutation-draining lock ownership apply to incremental work
+and cursor writes as well.
 
 Reports are JSON lines on stdout. Operational failures exit 1. Successfully
 recorded unresolved measurements exit 0 with `complete:false` and diagnostics;

@@ -1,5 +1,5 @@
-import type { StateResponse } from './contracts.js';
-import type { ContextRecord } from '../common/types.js';
+import type { StateResponse } from './shared-contracts.js';
+import type { ContextRecord } from '../../protocol/types.js';
 
 // --- defaults --------------------------------------------------------------------
 

@@ -1,5 +1,5 @@
 import { createChannels, type Channel, type Notification } from '../common/channels.js';
-import type { NotifierDeps, StateTask, StateResponse } from './contracts.js';
+import type { SharedNotifierDeps, StateTask, StateResponse } from './shared-contracts.js';
 
 /** Keep approval alerts useful in desktop surfaces with a bounded title body. */
 const PENDING_APPROVAL_TITLE_LIMIT = 72;
@@ -25,6 +25,9 @@ export class NotifierNotifications {
   /** Vanished ids whose disappearance edge has already been alerted
    *  (cleared when the directory comes back). */
   private vanishedAlerted = new Set<string>();
+  private observedPrunes = new Map<string, string>();
+  /** New intents seen while a task is still present can precede its removal. */
+  private pendingPrunes = new Map<string, string>();
 
   private channels: Channel[] = createChannels(undefined);
 
@@ -36,7 +39,7 @@ export class NotifierNotifications {
 
   private stallNotified = new Set<string>();
 
-  constructor(private readonly stallMs: number, private readonly deps: Pick<NotifierDeps, 'now' | 'log' | 'channelsFor'>) { }
+  constructor(private readonly stallMs: number, private readonly deps: Pick<SharedNotifierDeps, 'now' | 'log' | 'channelsFor'>) { }
   private log(line: string): void { this.deps.log(line); }
   hasPendingApprovalNotification(taskId: string): boolean { return this.pendingApprovalNotifications.has(taskId); }
   completeApprovals(taskIds: ReadonlySet<string>): void {
@@ -59,12 +62,13 @@ export class NotifierNotifications {
   close(): void {
     this.pendingApprovalTasks.clear(); this.pendingApprovalNotifications.clear();
     this.degradedAlerted.clear(); this.vanishedAlerted.clear();
+    this.observedPrunes.clear(); this.pendingPrunes.clear();
     this.lastUpdatedAt.clear(); this.lastProgressAt.clear(); this.stallNotified.clear();
   }
 
   /**
-   * Degraded / disappearance edges on the task-SET level (system-design
-   * 4.3 + 6.1). Storage corruption never silently vanishes a task again:
+   * Degraded / disappearance edges on the task-SET level.
+   * Storage corruption must remain visible:
    * entering `degraded` alerts exactly once per stay (re-corruption after a
    * repair alerts again — the recovery edge cleared the bookkeeping), the
    * recovery edge (back in tasks[]) is a log line only (no re-alert), and a
@@ -117,9 +121,20 @@ export class NotifierNotifications {
       ...(prevTasks?.keys() ?? []),
       ...(prevDegraded ?? []),
     ]);
+    // Legacy hubs expose only IDs: a newly observed ID can explain its first
+    // disappearance, but an old ID must never become a permanent exemption.
+    const events = state.prune_events ?? (state.pruned ?? []).map(task_id => ({ task_id, event_id: `legacy:${task_id}` }));
+    const prunes = new Map(events.map(event => [event.task_id, event.event_id]));
+    const inProgress = new Set(events.filter(event => 'in_progress' in event && event.in_progress).map(event => event.task_id));
     // Anything present again clears its vanish bookkeeping FIRST — a restored
     // directory re-arms the alert for a future disappearance.
     for (const taskId of knownNow) {
+      const event = prunes.get(taskId);
+      // Presence consumes historical/failed intents. Only a live request may
+      // explain the NEXT disappearance, including one spanning startup. The
+      // Hub couples completed removal events to an absent task view.
+      this.pendingPrunes.delete(taskId);
+      if (event !== undefined && inProgress.has(taskId)) this.pendingPrunes.set(taskId, event);
       if (this.vanishedAlerted.delete(taskId)) {
         this.log(`[${taskId}] reappeared in /state (directory restored)`);
         if (state.tasks.some((t) => t.task_id === taskId)) recoveredIntoTasks.add(taskId);
@@ -127,6 +142,10 @@ export class NotifierNotifications {
     }
     for (const taskId of knownBefore) {
       if (knownNow.has(taskId)) continue;
+      const event = prunes.get(taskId);
+      const audited = event !== undefined && (event !== this.observedPrunes.get(taskId) || event === this.pendingPrunes.get(taskId));
+      this.pendingPrunes.delete(taskId);
+      if (audited) continue; // this disappearance's intent, never permanent immunity
       if (this.vanishedAlerted.has(taskId)) continue;
       this.vanishedAlerted.add(taskId);
       await this.sendAll({
@@ -139,6 +158,7 @@ export class NotifierNotifications {
         task_id: taskId,
       });
     }
+    this.observedPrunes = prunes;
     return recoveredIntoTasks;
   }
 
@@ -176,7 +196,7 @@ export class NotifierNotifications {
   }
 
   async sendAll(msg: Notification): Promise<void> {
-    // stdout IS the run log for the dedicated pane — every
+    // stdout is the Notifier service log — every
     // notification send is visible here, not only on the desktop banner.
     this.log(`${msg.task_id ? `[${msg.task_id}] ` : ""}${msg.title}`);
     for (const ch of this.channels) {
@@ -188,7 +208,7 @@ export class NotifierNotifications {
     }
   }
 
-  // --- stall watchdog (§3 超时兜底; no-signal-source degradation) -----------------
+  // --- stall watchdog (timeout fallback when signal sources are unavailable) -----------------
 
   markProgress(taskId: string, now: number): void {
     this.lastProgressAt.set(taskId, now);

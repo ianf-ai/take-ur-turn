@@ -1,7 +1,7 @@
-import { HubSession, hubReadVia } from '../hub/hub-client.js';
+import { HubSession, hubReadVia } from '../../hub/hub-client.js';
 import { readLaunchLog } from '../launcher/launch.js';
-import type { ContextRecord } from '../common/types.js';
-import type { NotifierDeps, StateTask, StateResponse } from './contracts.js';
+import type { ContextRecord } from '../../protocol/types.js';
+import type { SharedNotifierDeps, StateTask, StateResponse } from './shared-contracts.js';
 
 /** One entry of the per-task log cache (see NotifierLogCache for the protocol). */
 interface LogCacheEntry {
@@ -94,9 +94,9 @@ export class NotifierLogCache {
   private logCache = new Map<string, LogCacheEntry>();
   private closed = false;
   private readonly stateUrl: string;
-  private readonly deps: Pick<NotifierDeps, 'readLog' | 'readLogSince'>;
+  private readonly deps: Pick<SharedNotifierDeps, 'readLog' | 'readLogSince'>;
 
-  constructor(url: string, deps: Partial<NotifierDeps>) {
+  constructor(url: string, deps: Partial<SharedNotifierDeps>) {
     this.stateUrl = url.replace(/\/+$/, '') + '/state';
     const readLogSince = deps.readLogSince ?? (deps.readLog === undefined
       ? (taskId: string, sinceVersion: number) => hubReadVia(this.ensureHubSession(), taskId, sinceVersion > 0 ? sinceVersion : undefined).then(res => ({ versions: res.versions }))
@@ -129,7 +129,7 @@ export class NotifierLogCache {
    *   - quiet round (cache covers entry.version AND the entry's fold-visible
    *     signature matches the one the cache last synced under): the merged
    *     records are served from memory — ZERO Hub log requests/responses, the
-   *     §4 "≤ bytes added since the previous round" gate reads 0 on a silent
+   *     "≤ bytes added since the previous round" budget reads 0 on a silent
    *     poll. An entry without a version (older hub) can never
    *     be proven covered, so it always pulls.
    *   - otherwise: one context.read at since_version = cached.version + 1 —

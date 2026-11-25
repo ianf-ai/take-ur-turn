@@ -1,0 +1,729 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+
+/**
+ * Handler-level tests for the 5 MCP tools. The REAL Store runs on
+ * a temp dir (no vi.mock of store — real derive integration); tools are driven
+ * through the SDK's InMemoryTransport client pair so the zod input schemas are
+ * exercised end-to-end, exactly as a real MCP client would see them.
+ */
+
+import { createMcpServer } from "../../../src/hub/mcp-server.js";
+import { Store } from "../../../src/hub/store.js";
+
+let tmp: string;
+let store: Store;
+let client: Client;
+
+beforeEach(async () => {
+  tmp = mkdtempSync(path.join(os.tmpdir(), "tut-mcp-"));
+  store = new Store(path.join(tmp, ".context-hub"));
+  client = await connect();
+});
+
+afterEach(async () => {
+  await client.close();
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+async function connect(): Promise<Client> {
+  const server = createMcpServer(store);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  const c = new Client({ name: "tut-test-client", version: "0.0.0" });
+  await c.connect(clientTransport);
+  return c;
+}
+
+interface ToolOutcome {
+  isError: boolean;
+  text: string;
+  json: Record<string, unknown> | undefined;
+}
+
+async function call(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const res = await client.callTool({ name, arguments: args });
+  const blocks = (res.content ?? []) as Array<{ type: string; text?: string }>;
+  const text = blocks.find((b) => b.type === "text")?.text ?? "";
+  let json: Record<string, unknown> | undefined;
+  try {
+    json = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    json = undefined; // error texts ("CODE: message") are not JSON
+  }
+  return { isError: res.isError === true, text, json };
+}
+
+async function createTask(title = "mcp test task"): Promise<string> {
+  const out = await call("context.create", {
+    title,
+    description: "task created by test",
+    creator: "tester",
+    role: "architect",
+  });
+  expect(out.isError).toBe(false);
+  return out.json?.task_id as string;
+}
+
+describe("context.create", () => {
+  it("returns task_id, status designing, version 0", async () => {
+    const out = await call("context.create", {
+      title: "Add login",
+      description: "login flow",
+      creator: "tester",
+      role: "architect",
+    });
+    expect(out.isError).toBe(false);
+    expect(typeof out.json?.task_id).toBe("string");
+    expect(out.json?.status).toBe("designing");
+    expect(out.json?.version).toBe(0);
+  });
+
+  it("round-trips a parameterized cast through create, read, and list", async () => {
+    const cast = { executor: { agent: "codex", args: ["--model", "gpt-5.6", "--sandbox", "workspace-write", "--search"] } };
+    const created = await call("context.create", {
+      title: "Parameterized route",
+      description: "preserve ordered launch argv",
+      creator: "tester",
+      role: "architect",
+      cast,
+    });
+    expect(created.isError).toBe(false);
+    const taskId = created.json?.task_id as string;
+
+    const read = await call("context.read", { task_id: taskId });
+    expect(read.isError).toBe(false);
+    expect(read.json?.cast).toEqual(cast);
+
+    const listed = await call("context.list", {});
+    const entry = (listed.json?.tasks as Array<Record<string, unknown>>).find((task) => task.task_id === taskId);
+    expect(entry?.cast).toEqual(cast);
+  });
+
+  it("round-trips an explicit worktree checkout route through create, read, and list", async () => {
+    const checkout = { kind: "worktree", path: "/worktrees/mcp-task", ref: "mcp-task" };
+    const created = await call("context.create", {
+      title: "Worktree route",
+      description: "preserve task checkout",
+      creator: "tester",
+      role: "architect",
+      flow: "direct",
+      checkout,
+    });
+    expect(created.isError).toBe(false);
+    const taskId = created.json?.task_id as string;
+    expect((await call("context.read", { task_id: taskId })).json?.checkout).toEqual(checkout);
+    const listed = await call("context.list", {});
+    const entry = (listed.json?.tasks as Array<Record<string, unknown>>).find((task) => task.task_id === taskId);
+    expect(entry?.checkout).toEqual(checkout);
+  });
+
+  it("rejects a worktree checkout without a path — ref alone is not accepted", async () => {
+    for (const checkout of [{ kind: "worktree" }, { kind: "worktree", ref: "mcp-task" }]) {
+      const out = await call("context.create", {
+        title: "Invalid worktree route",
+        description: "must fail validation",
+        creator: "tester",
+        role: "architect",
+        checkout,
+      });
+      expect(out.isError).toBe(true);
+      expect(out.text).toContain("worktree checkout requires a path; ref alone is not accepted");
+    }
+  });
+
+  it("warns without blocking when a worktree path does not exist yet", async () => {
+    const created = await call("context.create", {
+      title: "Typo route",
+      description: "warn but create",
+      creator: "tester",
+      role: "architect",
+      flow: "direct",
+      checkout: { kind: "worktree", path: path.join(tmp, "no-such-worktree") },
+    });
+    expect(created.isError).toBe(false);
+    expect(created.json?.task_id).toBeTruthy();
+    expect(String(created.json?.warning)).toContain("does not exist yet");
+    expect(String(created.json?.warning)).toContain("缺少验收场景");
+
+    const existing = mkdtempSync(path.join(tmp, "real-worktree-"));
+    try {
+      const quiet = await call("context.create", {
+        title: "Real route",
+        description: "## 验收场景\n1. Existing checkout is preserved",
+        creator: "tester",
+        role: "architect",
+        flow: "direct",
+        checkout: { kind: "worktree", path: existing },
+      });
+      expect(quiet.isError).toBe(false);
+      expect(quiet.json).not.toHaveProperty("warning");
+    } finally {
+      rmSync(existing, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a missing required field as an input-validation tool error", async () => {
+    const out = await call("context.create", {
+      title: "x",
+      description: "y",
+      creator: "z", // role missing → zod rejects before the handler runs
+    });
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("-32602");
+    expect(out.text).toContain("role");
+  });
+});
+
+describe("context.create flow", () => {
+  it("flow direct: create returns status implementing; read exposes the description", async () => {
+    const out = await call("context.create", {
+      title: "Direct MCP Task",
+      description: "fix the launcher dry-run flag",
+      creator: "tester",
+      role: "architect",
+      flow: "direct",
+    });
+    expect(out.isError).toBe(false);
+    expect(out.json?.status).toBe("implementing"); // create output status derives per flow
+    expect(out.json?.version).toBe(0);
+    const taskId = out.json?.task_id as string;
+
+    const read = await call("context.read", { task_id: taskId });
+    expect(read.isError).toBe(false);
+    expect(read.json?.description).toBe("fix the launcher dry-run flag"); // requirement visible without a design record
+    expect(read.json?.status).toBe("implementing");
+  });
+
+  it("flow solo: code_changes goes straight to pending_approval; absent flow defaults to designing", async () => {
+    const solo = await call("context.create", {
+      title: "Solo MCP Task",
+      description: "d",
+      creator: "tester",
+      role: "architect",
+      flow: "solo",
+    });
+    const soloId = solo.json?.task_id as string;
+    expect(solo.isError).toBe(false);
+    expect(solo.json?.status).toBe("implementing");
+    const pub = await call("context.publish", { task_id: soloId, role: "executor", content_type: "code_changes", payload: { summary: "c", body: "c" } });
+    expect(pub.isError).toBe(false);
+    expect(pub.json?.status).toBe("pending_approval"); // review phase skipped
+
+    const plain = await call("context.create", { title: "Plain MCP Task", description: "d", creator: "tester", role: "architect" });
+    expect(plain.isError).toBe(false);
+    expect(plain.json?.status).toBe("designing");
+  });
+
+  it("flow solo: design is a reference record retained in the log without a transition or warning", async () => {
+    const created = await call("context.create", { title: "Solo reference", description: "d", creator: "tester", role: "human", flow: "solo" });
+    const task_id = created.json?.task_id as string;
+    const published = await call("context.publish", { task_id, role: "architect", content_type: "design", payload: { summary: "reference", body: "optional guidance" } });
+    expect(published.isError).toBe(false);
+    expect(published.json).toMatchObject({ version: 1, status: "implementing", needs_attention: false });
+    const read = await call("context.read", { task_id });
+    expect(read.json?.status).toBe("implementing");
+    expect(read.json?.versions).toMatchObject([{ content_type: "design", payload: { body: "optional guidance" } }]);
+  });
+
+  it("rejects an out-of-enum flow as an input-validation tool error", async () => {
+    const out = await call("context.create", { title: "x", description: "y", creator: "z", role: "r", flow: "turbo" });
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("-32602");
+    expect(out.text).toContain("flow");
+  });
+});
+
+describe("context.publish + context.read", () => {
+  it("publish design moves status to implementing and read round-trips the record", async () => {
+    const taskId = await createTask();
+    const pub = await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "the design", body: "long design body" },
+      agent: "codex",
+    });
+    expect(pub.isError).toBe(false);
+    expect(pub.json?.status).toBe("implementing");
+    expect(pub.json?.needs_attention).toBe(false);
+    expect(pub.json?.version).toBe(1);
+    expect(pub.json?.warnings).toBeUndefined(); // omitted when empty
+
+    const read = await call("context.read", { task_id: taskId });
+    expect(read.isError).toBe(false);
+    expect(read.json?.title).toBe("mcp test task");
+    expect(read.json?.status).toBe("implementing");
+    const versions = read.json?.versions as Array<Record<string, unknown>>;
+    expect(versions).toHaveLength(1);
+    expect(versions[0]?.content_type).toBe("design");
+    expect(versions[0]?.agent).toBe("codex");
+    expect((versions[0]?.payload as Record<string, unknown>)?.summary).toBe("the design");
+  });
+
+  it("lands commits in the stored record payload", async () => {
+    const taskId = await createTask();
+    await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+    });
+    const pub = await call("context.publish", {
+      task_id: taskId,
+      role: "executor",
+      content_type: "code_changes",
+      payload: { summary: "impl", body: "did it", commits: ["abc123", "def456"], ref_version: 1 },
+    });
+    expect(pub.isError).toBe(false);
+
+    const stored = await store.readTask(taskId);
+    const last = stored.versions[stored.versions.length - 1]!;
+    expect(last.payload.commits).toEqual(["abc123", "def456"]);
+    expect(last.payload.ref_version).toBe(1);
+  });
+
+  it("omits the agent field on the record when not provided", async () => {
+    const taskId = await createTask();
+    await call("context.publish", {
+      task_id: taskId,
+      role: "executor",
+      content_type: "note",
+      payload: { summary: "n", body: "n" },
+    });
+    const stored = await store.readTask(taskId);
+    expect(stored.versions[0] && "agent" in stored.versions[0]).toBe(false);
+  });
+
+  it("accepts an unknown content_type string (schema not restricted)", async () => {
+    const taskId = await createTask();
+    const pub = await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "brainstorm-idea",
+      payload: { summary: "s", body: "b" },
+    });
+    expect(pub.isError).toBe(false);
+    expect(pub.json?.status).toBe("designing"); // unknown type: no transition
+    expect(pub.json?.needs_attention).toBe(true); // OUT_OF_TABLE warning
+  });
+
+  it("review with an invalid verdict succeeds with needs_attention true (write-free)", async () => {
+    const taskId = await createTask();
+    await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+    });
+    await call("context.publish", {
+      task_id: taskId,
+      role: "executor",
+      content_type: "code_changes",
+      payload: { summary: "c", body: "c" },
+    });
+    const review = await call("context.publish", {
+      task_id: taskId,
+      role: "reviewer",
+      content_type: "review",
+      payload: { summary: "review", body: "verdict is nonsense", verdict: "banana" },
+    });
+    expect(review.isError).toBe(false);
+    expect(review.json?.needs_attention).toBe(true);
+    expect(review.json?.status).toBe("reviewing"); // no transition on invalid verdict
+    const warnings = review.json?.warnings as Array<Record<string, unknown>>;
+    expect(warnings?.some((w) => w.code === "INVALID_VERDICT")).toBe(true);
+  });
+
+  it("errors on nonexistent task with TASK_NOT_FOUND", async () => {
+    const out = await call("context.publish", {
+      task_id: "no-such-task",
+      role: "architect",
+      content_type: "note",
+      payload: { summary: "s", body: "b" },
+    });
+    expect(out.isError).toBe(true);
+    expect(out.text.startsWith("TASK_NOT_FOUND:")).toBe(true);
+  });
+
+  it("errors on missing summary with VALIDATION_ERROR (store-validated)", async () => {
+    const taskId = await createTask();
+    const out = await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "note",
+      payload: { body: "b" }, // summary missing
+    });
+    expect(out.isError).toBe(true);
+    expect(out.text.startsWith("VALIDATION_ERROR:")).toBe(true);
+  });
+
+  it("errors on expected_version mismatch with VERSION_CONFLICT", async () => {
+    const taskId = await createTask();
+    const out = await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+      expected_version: 7, // actual current version is 0
+    });
+    expect(out.isError).toBe(true);
+    expect(out.text.startsWith("VERSION_CONFLICT:")).toBe(true);
+  });
+
+  it("succeeds when expected_version matches the current version", async () => {
+    const taskId = await createTask();
+    const out = await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+      expected_version: 0,
+    });
+    expect(out.isError).toBe(false);
+    expect(out.json?.version).toBe(1);
+  });
+
+  it("read filters by since_version", async () => {
+    const taskId = await createTask();
+    await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+    });
+    await call("context.publish", {
+      task_id: taskId,
+      role: "executor",
+      content_type: "code_changes",
+      payload: { summary: "c", body: "c" },
+    });
+    const read = await call("context.read", { task_id: taskId, since_version: 2 });
+    expect(read.isError).toBe(false);
+    expect(read.json?.versions).toHaveLength(1);
+    expect((read.json?.versions as Array<Record<string, unknown>>)[0]?.version).toBe(2);
+  });
+
+  it("read of a nonexistent task errors with TASK_NOT_FOUND", async () => {
+    const out = await call("context.read", { task_id: "ghost" });
+    expect(out.isError).toBe(true);
+    expect(out.text.startsWith("TASK_NOT_FOUND:")).toBe(true);
+  });
+});
+
+describe("context.list", () => {
+  it("wraps entries in { tasks: [...] } with derived fields passed through", async () => {
+    const taskId = await createTask("list me");
+    await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+    });
+    const out = await call("context.list", {});
+    expect(out.isError).toBe(false);
+    const tasks = out.json?.tasks as Array<Record<string, unknown>>;
+    expect(Array.isArray(tasks)).toBe(true);
+    const mine = tasks.find((t) => t.task_id === taskId);
+    expect(mine?.title).toBe("list me");
+    expect(mine?.status).toBe("implementing");
+    expect(typeof mine?.updated_at).toBe("string");
+    expect(mine?.waiting_for).toBe("agent:executor");
+    expect(mine?.needs_attention).toBe(false);
+  });
+
+  it("filters by status", async () => {
+    await createTask("stays designing");
+    const other = await createTask("moves on");
+    await call("context.publish", {
+      task_id: other,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+    });
+    const out = await call("context.list", { status: "implementing" });
+    const tasks = out.json?.tasks as Array<Record<string, unknown>>;
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]?.task_id).toBe(other);
+  });
+});
+
+describe("project scope", () => {
+  it("publish without create succeeds and returns only { task_id, version }", async () => {
+    const pub = await call("context.publish", {
+      task_id: "project",
+      role: "architect",
+      content_type: "note",
+      payload: { summary: "global note", body: "shared context" },
+    });
+    expect(pub.isError).toBe(false);
+    expect(pub.json?.task_id).toBe("project");
+    expect(pub.json?.version).toBe(1);
+    expect(pub.json).not.toHaveProperty("status");
+    expect(pub.json).not.toHaveProperty("needs_attention");
+  });
+
+  it("list shows the project scope with scope: project and no status", async () => {
+    await call("context.publish", {
+      task_id: "project",
+      role: "architect",
+      content_type: "note",
+      payload: { summary: "s", body: "b" },
+    });
+    await createTask(); // a normal task alongside
+    const out = await call("context.list", {});
+    const tasks = out.json?.tasks as Array<Record<string, unknown>>;
+    const project = tasks.find((t) => t.task_id === "project");
+    expect(project?.scope).toBe("project");
+    expect(project).not.toHaveProperty("status");
+    expect(tasks.find((t) => t.task_id !== "project")).toBeTruthy();
+  });
+
+  it("read of project scope has no status key", async () => {
+    await call("context.publish", {
+      task_id: "project",
+      role: "architect",
+      content_type: "note",
+      payload: { summary: "s", body: "b" },
+    });
+    const read = await call("context.read", { task_id: "project" });
+    expect(read.isError).toBe(false);
+    expect(read.json?.title).toBe("project");
+    expect(read.json).not.toHaveProperty("status");
+  });
+
+  it("decide on project scope returns { task_id, version }", async () => {
+    const out = await call("context.decide", { task_id: "project", decision: "close", by: "alice" });
+    expect(out.isError).toBe(false);
+    expect(out.json?.task_id).toBe("project");
+    expect(typeof out.json?.version).toBe("number");
+    expect(out.json).not.toHaveProperty("status");
+  });
+});
+
+describe("context.decide", () => {
+  async function taskAtPendingApproval(): Promise<string> {
+    const taskId = await createTask("approval flow");
+    await call("context.publish", {
+      task_id: taskId,
+      role: "architect",
+      content_type: "design",
+      payload: { summary: "d", body: "d" },
+    });
+    await call("context.publish", {
+      task_id: taskId,
+      role: "executor",
+      content_type: "code_changes",
+      payload: { summary: "c", body: "c" },
+    });
+    await call("context.publish", {
+      task_id: taskId,
+      role: "reviewer",
+      content_type: "review",
+      payload: { summary: "r", body: "r", verdict: "pass" },
+    });
+    const read = await call("context.read", { task_id: taskId });
+    expect(read.json?.status).toBe("pending_approval");
+    return taskId;
+  }
+
+  it("approve after review pass moves status to approved and lands the record", async () => {
+    const taskId = await taskAtPendingApproval();
+    const out = await call("context.decide", {
+      task_id: taskId,
+      decision: "approve",
+      by: "alice",
+      reason: "ship it\nlooks good overall",
+    });
+    expect(out.isError).toBe(false);
+    expect(out.json?.task_id).toBe(taskId);
+    expect(out.json?.status).toBe("approved");
+
+    const stored = await store.readTask(taskId);
+    const decision = stored.versions[stored.versions.length - 1]!;
+    expect(decision.role).toBe("human");
+    expect(decision.agent).toBe("alice"); // by lands in the agent field
+    expect(decision.content_type).toBe("decision");
+    expect(decision.payload.decision).toBe("approve");
+    expect(decision.payload.summary).toBe("ship it"); // first line of reason
+    expect(decision.payload.body).toBe("ship it\nlooks good overall");
+  });
+
+  it("reject at pending_approval moves status to revising and lands the record", async () => {
+    const taskId = await taskAtPendingApproval();
+    const out = await call("context.decide", { task_id: taskId, decision: "reject", by: "alice" });
+    expect(out.isError).toBe(false);
+    expect(out.json?.task_id).toBe(taskId);
+    expect(out.json?.status).toBe("revising");
+
+    const stored = await store.readTask(taskId);
+    const decision = stored.versions[stored.versions.length - 1]!;
+    expect(decision.role).toBe("human");
+    expect(decision.agent).toBe("alice"); // by lands in the agent field
+    expect(decision.payload.decision).toBe("reject");
+  });
+
+  it("close works from any state and synthesizes body when no reason given", async () => {
+    const taskId = await createTask("close me"); // designing, nothing published
+    const out = await call("context.decide", { task_id: taskId, decision: "close", by: "alice" });
+    expect(out.isError).toBe(false);
+    expect(out.json?.status).toBe("closed");
+
+    const stored = await store.readTask(taskId);
+    const decision = stored.versions[stored.versions.length - 1]!;
+    expect(decision.payload.decision).toBe("close");
+    expect(decision.payload.summary).toBe("decision: close");
+    expect(decision.payload.body).toBe("alice decided close");
+  });
+
+  it("decide on a nonexistent task errors with TASK_NOT_FOUND", async () => {
+    const out = await call("context.decide", { task_id: "ghost", decision: "approve", by: "alice" });
+    expect(out.isError).toBe(true);
+    expect(out.text.startsWith("TASK_NOT_FOUND:")).toBe(true);
+  });
+});
+
+describe('spec lint through MCP', () => {
+  it.each(['legacy', '## 验收场景\nplain', '## 验收场景\n1. ', '## 验收场景\n1. TBD'])('creates incomplete spec %s with a warning and no records', async (description) => {
+    const result = await call('context.create', {title: 'lint create', description, creator: 't', role: 'human', flow: 'direct'});
+    expect(result.isError).toBe(false);
+    expect(result.json).toMatchObject({version: 0, status: 'implementing', warning: expect.stringContaining('验收场景')});
+    expect((await call('context.read', {task_id: result.json?.task_id})).json?.versions).toEqual([]);
+  });
+  it('lands incomplete review and returns diagnostic counts', async () => {
+    const created = await call('context.create', {title: 'lint review', description: '## 验收场景\n1. first\n2. second', creator: 't', role: 'human', flow: 'direct'});
+    const task_id = created.json?.task_id;
+    expect(created.json).not.toHaveProperty('warning');
+    await call('context.publish', {task_id, role: 'executor', content_type: 'code_changes', payload: {summary: 's', body: 'b'}});
+    const published = await call('context.publish', {task_id, role: 'Reviewer', content_type: 'review', payload: {summary: 's', verdict: 'pass', body: '## 退出条件逐条核验\n1. 满足 — checked'}});
+    expect(published.isError).toBe(false);
+    expect(published.json).toMatchObject({version: 2, status: 'pending_approval', needs_attention: true, warnings: expect.arrayContaining([expect.objectContaining({code: 'REVIEW_EXIT_CONDITIONS_INCOMPLETE', message: '退出条件已判定 1 / 应判定 2'})])});
+    expect((await call('context.read', {task_id})).json?.versions).toHaveLength(2);
+  });
+});
+
+it("accepts repository-operation descriptions while preserving record repair sheets", async () => {
+  const created = await call("context.create", { title: "advisory", description: "## 验收场景\n1. works\n请 push 分支并开 PR，merge 后 release 发版", creator: "human", role: "human", flow: "direct" });
+  expect(created.isError).toBe(false);
+  expect(created.json).toMatchObject({ version: 0, status: "implementing" });
+  expect(created.json!.needs_attention).not.toBe(true);
+  expect(created.json!.warnings ?? []).toEqual([]);
+  const task_id = created.json!.task_id;
+  const publish = (content_type: string, role: string, payload: Record<string, unknown>) => call("context.publish", { task_id, content_type, role, payload: { summary: "s", body: "b", ...payload } });
+  expect((await publish("code_changes", "executor", {})).json).toMatchObject({ version: 1, status: "reviewing", needs_attention: false });
+  const review = await publish("review", "reviewer", { verdict: "pass" });
+  expect(review.isError).toBe(false);
+  expect(review.json).toMatchObject({ version: 2, status: "pending_approval", warnings: expect.arrayContaining([
+    expect.objectContaining({ code: "REVIEW_EXIT_CONDITIONS_INCOMPLETE", location: { field: "payload.body", section: "退出条件逐条核验" }, supportedFixes: expect.any(Array) }),
+  ]) });
+  const fixed = await publish("note", "reviewer", { ref_version: 2, body: "## 退出条件逐条核验\n1. 满足 — checked\n## 超出规格的改动\n无" });
+  expect(fixed.json).toMatchObject({ version: 3, status: "pending_approval", needs_attention: false });
+  expect(fixed.json!.warnings ?? []).toEqual([]);
+  const read = await call("context.read", { task_id });
+  expect(read.json!.versions).toHaveLength(3);
+});
+
+describe("payload.exit_conditions public contract", () => {
+  it("tools/list exposes the optional union with the raw JSON branches on context.publish", async () => {
+    const tools = await client.listTools();
+    const publish = tools.tools.find(t => t.name === "context.publish");
+    expect(publish).toBeDefined();
+    const schema = publish!.inputSchema as {
+      properties?: { payload?: { properties?: Record<string, { anyOf?: Array<{ type?: string; items?: { type?: string; properties?: unknown } ; anyOf?: Array<{ type?: string }> }>; optional?: boolean }> } };
+    };
+    const field = schema.properties?.payload?.properties?.exit_conditions;
+    expect(field).toBeDefined();
+    // The union must keep BOTH branch families visible: the raw-JSON union
+    // (string/number/boolean/null/array/object) and the canonical item array.
+    // A union(array, unknown) shorthand alone would LOSE the loose branches in
+    // this SDK's discovery output — pin the real published shape. The raw
+    // union comes FIRST so values parse losslessly; the canonical array branch
+    // after it never wins a parse (any array already matched) and serves as
+    // discovery documentation only.
+    const branches = field!.anyOf!;
+    expect(branches[1]).toMatchObject({ type: "array", items: { type: "object" } });
+    expect(branches[1]!.items!.properties).toMatchObject({
+      id: { type: "integer", minimum: 1 },
+      verdict: { type: "string", enum: ["满足", "不满足", "外部阻塞", "已批准延后"] },
+      evidence: { type: "string" },
+    });
+    const rawTypes = (branches[0] as { anyOf?: Array<{ type?: string }> }).anyOf!.map(b => b.type);
+    expect(rawTypes).toEqual(["string", "number", "boolean", "null", "array", "object"]);
+  });
+
+  it.each([
+    ["canonical array with extension keys", [{ id: 1, verdict: "满足", evidence: "e1", extra: { deep: [1, null, "x"] } }, { id: 2, verdict: "已批准延后", evidence: "e2" }]],
+    ["empty array", []],
+    ["explicit null", null],
+    ["scalar number", 42],
+    ["scalar string", "raw"],
+    ["boolean", false],
+    ["non-array object", { a: { b: [1, 2] } }],
+    ["array with wrong-typed items", [{ id: "1", verdict: "满足", evidence: "e" }, "str", 3, null]],
+  ] as [string, unknown][])("round-trips %s losslessly through the real tool call", async (_name, value) => {
+    const taskId = await createTask("exit conditions shapes");
+    const pub = await call("context.publish", {
+      task_id: taskId, role: "reviewer", content_type: "review",
+      payload: { summary: "s", body: "## 超出规格的改动\n无", verdict: "fail_code", exit_conditions: value },
+    });
+    expect(pub.isError).toBe(false);
+    const read = await call("context.read", { task_id: taskId });
+    const stored = (read.json!.versions as Array<{ payload: Record<string, unknown> }>)[0]!.payload.exit_conditions;
+    expect(structuredClone(stored)).toEqual(value);
+  });
+
+  it("omits the key entirely when the field is not provided", async () => {
+    const taskId = await createTask();
+    await call("context.publish", { task_id: taskId, role: "reviewer", content_type: "note", payload: { summary: "s", body: "b" } });
+    const read = await call("context.read", { task_id: taskId });
+    const payload = (read.json!.versions as Array<{ payload: Record<string, unknown> }>)[0]!.payload;
+    expect(Object.hasOwn(payload, "exit_conditions")).toBe(false);
+  });
+
+  it("preserves special own keys (legal JSON \"__proto__\" data properties) through every shape", async () => {
+    // JSON.parse-built values so "__proto__" is a real own data property, as
+    // a real client's JSON wire bytes deliver it. Zod object parses rebuild
+    // their output and would drop it via the prototype setter — these cases
+    // pin the lossless raw-first union against that regression.
+    const canonical = JSON.parse('[{"id":1,"verdict":"满足","evidence":"e","__proto__":{"audit":"keep"}}]');
+    const rawObject = JSON.parse('{"note":"x","__proto__":{"audit":"keep"}}');
+    const errorArray = JSON.parse('[{"id":"1","verdict":"满足","evidence":"e","__proto__":{"audit":"keep"}}]');
+    const hasOwn = (o: unknown, k = "__proto__") => Object.prototype.hasOwnProperty.call(o, k);
+    for (const [name, value] of [["canonical array", canonical], ["raw non-array object", rawObject], ["error-shaped array", errorArray]] as [string, unknown][]) {
+      const taskId = await createTask(`proto keep ${name}`);
+      const pub = await call("context.publish", {
+        task_id: taskId, role: "reviewer", content_type: "review",
+        payload: { summary: "s", body: "## 超出规格的改动\n无", verdict: "fail_code", exit_conditions: value },
+      });
+      expect(pub.isError, name).toBe(false);
+      const read = await call("context.read", { task_id: taskId });
+      const stored = (read.json!.versions as Array<{ payload: Record<string, unknown> }>)[0]!.payload.exit_conditions;
+      expect(Array.isArray(stored) ? hasOwn(stored[0]) : hasOwn(stored), name).toBe(true);
+      expect(structuredClone(stored), name).toEqual(value);
+    }
+  });
+
+  it("field-source diagnostics surface with the field location and clear via a field note", async () => {
+    const created = await call("context.create", { title: "field lint", description: "## 验收场景\n1. first\n2. second", creator: "t", role: "human", flow: "direct" });
+    const task_id = created.json!.task_id;
+    await call("context.publish", { task_id, role: "executor", content_type: "code_changes", payload: { summary: "s", body: "b" } });
+    const full = [{ id: 1, verdict: "满足", evidence: "checked" }, { id: 2, verdict: "满足", evidence: "checked" }];
+    const partial = await call("context.publish", {
+      task_id, role: "reviewer", content_type: "review",
+      payload: { summary: "s", verdict: "fail_code", body: "## 超出规格的改动\n无", exit_conditions: [full[0]] },
+    });
+    expect(partial.json).toMatchObject({ needs_attention: true, warnings: expect.arrayContaining([
+      expect.objectContaining({ code: "REVIEW_EXIT_CONDITIONS_INCOMPLETE", message: "退出条件已判定 1 / 应判定 2", location: { field: "payload.exit_conditions" } }),
+    ]) });
+    const fixed = await call("context.publish", {
+      task_id, role: "reviewer", content_type: "note",
+      payload: { summary: "repair", body: "repair note", ref_version: 2, exit_conditions: full },
+    });
+    expect(fixed.json).toMatchObject({ needs_attention: false });
+    expect(fixed.json!.warnings ?? []).toEqual([]);
+  });
+});

@@ -1,9 +1,15 @@
+/** logs/delivery/delivery.log: delivery observer writes, operators/doctor read.
+ * ManagedLog owns 5 MiB + one generation, seven-day old-segment retirement;
+ * unknown siblings and legacy root logs remain untouched. */
+import {nativeComposerPolicy} from '../../agents/public/native-compat.js';
 /** Single attempt delivery. Status observation cannot establish input consumption. */
 import { createHash, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
-import { appendFile, mkdir, rename, stat } from "node:fs/promises";
+import { managedLogFdGuard } from "../../core/logging/output-guard.js";
+import { ManagedLog, logFs, boundedLogLine } from "../../core/logging/managed-log.js";
 import path from "node:path";
 import type { AgentStatus, CallContext, DeliveryClientV2, GiveUpReason, PaneIdentity, ReadFault, SendResult, StatusSample, TransportFault } from "./herdr-client-v2.js";
+import type { RemediationEvidence } from './remediation-contracts.js';
 
 export interface DeliveryDiagnostics {
   /** Emit one `tut-delivery t=<epoch-ms> <fields>` line to both sinks. */
@@ -13,13 +19,13 @@ export interface DeliveryDiagnostics {
 }
 
 /** Injectable filesystem seam for the durable sink; defaults to node:fs. */
-export interface DiagnosticsFs {
+export interface DiagnosticsFs extends Partial<Pick<import("../../core/logging/managed-log.js").LogFs, "lock" | "modified" | "remove">> {
   isDirectory(target: string): boolean;
   mkdir(dir: string): Promise<void>;
   append(file: string, text: string): Promise<void>;
   /** Current byte size of the log file; -1 when absent (rotation setup). */
   size(file: string): Promise<number>;
-  /** Rotation move (log → log.1); a failure disables rotation, never the log. */
+  /** Rotation move (log → log.1); a failure disables persistence, never delivery. */
   rename(from: string, to: string): Promise<void>;
 }
 
@@ -28,23 +34,8 @@ export interface DiagnosticsFs {
 export const DELIVERY_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 const nodeFs: DiagnosticsFs = {
-  isDirectory: (target) => {
-    try {
-      return statSync(target).isDirectory();
-    } catch {
-      return false;
-    }
-  },
-  mkdir: (dir) => mkdir(dir, { recursive: true }).then(() => undefined),
-  append: (file, text) => appendFile(file, text, "utf8").then(() => undefined),
-  size: async (file) => {
-    try {
-      return (await stat(file)).size;
-    } catch {
-      return -1;
-    }
-  },
-  rename: (from, to) => rename(from, to).then(() => undefined),
+  ...logFs,
+  isDirectory: target => { try { return statSync(target).isDirectory(); } catch { return false; } },
 };
 
 export interface DeliveryDiagnosticsOptions {
@@ -89,7 +80,14 @@ const silentDiagnostics: DeliveryDiagnostics = {
 export function createDeliveryDiagnostics(options: DeliveryDiagnosticsOptions = {}): DeliveryDiagnostics {
   const environment = options.env ?? process.env;
   if (!diagEnabled(environment)) return silentDiagnostics;
-  const stderr = options.stderr ?? ((text: string) => { process.stderr.write(text); });
+  const rawStderr = options.stderr ?? ((text: string) => { process.stderr.write(text); });
+  const targets = [environment.TUT_PROJECT_ROOT, options.persistRootFallback]
+    .filter((root): root is string => root !== undefined && root.length > 0)
+    .flatMap(root => [path.join(root, '.context-hub', 'logs', 'delivery', 'delivery.log'), path.join(root, '.context-hub', 'delivery.log')]
+      .map(file => ({ file, generations: 1 })));
+  const blocked = managedLogFdGuard(2, () => targets);
+  blocked();
+  const stderr = (text: string): void => { if (!blocked()) rawStderr(text); };
   const clock = options.clock ?? Date.now;
   const fs = options.fs ?? nodeFs;
   const task = options.task_id ?? "?";
@@ -98,67 +96,59 @@ export function createDeliveryDiagnostics(options: DeliveryDiagnosticsOptions = 
   let persistFile: string | undefined;
   let setupTried = false;
   let writes: Promise<void> = Promise.resolve();
-  let logBytes = 0;
-  let rotationUsable = true;
+  let sink: ManagedLog | undefined;
+  let queuedBytes = 0;
+  let queuedCount = 0;
+  let overflow = false;
 
-  const resolvePersistFile = async (): Promise<string | undefined> => {
+  const resolvePersistFile = (): string | undefined => {
     const configured = environment.TUT_PROJECT_ROOT;
     const root = configured !== undefined && configured.length > 0 && fs.isDirectory(configured)
       ? configured
       : options.persistRootFallback;
     if (root === undefined || root.length === 0) return undefined;
-    const dir = path.join(root, ".context-hub");
-    try {
-      await fs.mkdir(dir);
-    } catch {
-      return undefined;
-    }
-    return path.join(dir, "delivery.log");
+    return path.join(root, ".context-hub", "logs", "delivery", "delivery.log");
   };
 
-  const persist = (now: number, fields: string): Promise<void> =>
+  const persist = (line: string): Promise<void> =>
     (async () => {
       if (!setupTried) {
         setupTried = true;
-        persistFile = await resolvePersistFile();
+        persistFile = resolvePersistFile();
         if (persistFile !== undefined) {
-          try {
-            const existing = await fs.size(persistFile);
-            logBytes = Math.max(0, existing);
-          } catch {
-            rotationUsable = false;
-          }
+          sink = new ManagedLog(persistFile, {
+            generations: 1,
+            diagnostic: stderr,
+            fs: { ...logFs, ...fs,
+              // Legacy injectable in-memory seam. Production always uses logFs.
+              lock: fs.lock ?? (async (_file, work) => { await work(); }),
+              modified: fs.modified ?? (async () => -1),
+              remove: fs.remove ?? (async () => undefined),
+            },
+          });
         }
       }
-      if (persistFile === undefined) return;
-      const line = `tut-delivery t=${now} task=${task} role=${role} ${fields}\n`;
-      // The size cap counts BYTES (fs.size reports bytes): non-ASCII diag
-      // fields (pane tails carry user text) make a line's byte length exceed
-      // its character length, so the ledger tracks UTF-8 bytes throughout.
-      const lineBytes = Buffer.byteLength(line, "utf8");
-      try {
-        if (rotationUsable && logBytes > 0 && logBytes + lineBytes > DELIVERY_LOG_MAX_BYTES) {
-          try {
-            await fs.rename(persistFile, `${persistFile}.1`);
-            logBytes = 0;
-          } catch {
-            // Rotation is best-effort: keep appending to the same file.
-            rotationUsable = false;
-          }
-        }
-        await fs.append(persistFile, line);
-        logBytes += lineBytes;
-      } catch {
-        // First failing append disables persistence for the run.
-        persistFile = undefined;
-      }
+      sink?.write(line);
+      await sink?.flush();
     })();
 
   return {
     emit(fields) {
       const now = clock();
-      try { stderr(`tut-delivery t=${now} ${fields}\n`); } catch { /* diagnostics only */ }
-      writes = writes.then(() => persist(now, fields));
+      try { stderr(boundedLogLine(`tut-delivery t=${now} ${fields}\n`)); } catch { /* diagnostics only */ }
+      if (overflow) return;
+      const line = boundedLogLine(`tut-delivery t=${now} task=${task} role=${role} ${fields}\n`);
+      const bytes = Buffer.byteLength(line);
+      if (queuedCount >= 1024 || queuedBytes + bytes > 2 * DELIVERY_LOG_MAX_BYTES) {
+        overflow = true;
+        try { stderr('tut: delivery log degraded; backlog budget exceeded; subsequent persistence disabled\n'); } catch {}
+        return;
+      }
+      queuedBytes += bytes; queuedCount++;
+      writes = writes.then(() => persist(line)).catch(error => {
+        if (!setupTried) setupTried = true;
+        try { stderr(`tut: delivery log degraded; persistence disabled: ${(error as Error).message}\n`); } catch {}
+      }).finally(() => { queuedBytes -= bytes; queuedCount--; });
       // The chain tail is guarded here AND at flush: no diagnostics fault
       // may ever reject into the delivery caller (exit-0 invariant).
       void writes.catch(() => undefined);
@@ -190,7 +180,7 @@ export const BASELINE_READINESS_MS = 90_000;
 export interface DeliveryEvidenceV2 {
   /** Present after baseline readiness waiting (unknown or born-working). */
   baseline_wait?: { budget_ms: number; elapsed_ms: number };
-  remediation?: import('../../core/remediator.js').RemediationEvidence;
+  remediation?: RemediationEvidence;
   target?: PaneIdentity;
   prompt_tail?: { sha256: string; length: number };
   schema: 2;
@@ -424,12 +414,12 @@ export function createDelivery(options: DeliveryOptions): Delivery {
     if (stopped()) return finish(signal.aborted ? 'cancelled' : 'deadline');
     // Codex can interpret Enter in a rapid plain-text burst as a newline.
     // Allow its composer to settle; this is pacing, never submission evidence.
-    if ((input.agent ?? target.agentSession?.agent) === 'codex') {
+    if (nativeComposerPolicy(input.agent ?? target.agentSession?.agent).settleMs > 0) {
       // A working baseline starts its flip budget here, before settling, so
       // Enter cannot acquire a fresh budget after the pause.
       t0 ??= now();
       const settleDeadline = Math.min(t0 + knobs.flipMs, totalDeadline);
-      const pauseMs = Math.min(250, Math.max(0, settleDeadline - now()));
+      const pauseMs = Math.min(nativeComposerPolicy(input.agent ?? target.agentSession?.agent).settleMs, Math.max(0, settleDeadline - now()));
       emit(`input-settle pane=${target.paneId} budget_ms=${pauseMs}`);
       if (options.sleep) await options.sleep(pauseMs);
       else await new Promise<void>(resolve => {

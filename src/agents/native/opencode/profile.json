@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "id": "opencode",
+  "revision": "3558c357-legacy-1-commands-v2",
+  "evidence": {
+    "baseline_commit": "3558c357",
+    "native_versions": [],
+    "platforms": ["posix"],
+    "references": ["src/standalone/launcher-detached/plan.ts", "src/core/run/resume.ts", "scripts/usage-audit/lib/sessions.mjs"],
+    "note": "Compatibility contract migrated from the approved source baseline; native version ranges remain unverified."
+  },
+  "match": {"supported_executable_names": ["opencode"], "platform_target_identity": null},
+  "invoke": {
+    "run": {"tier": "declarative", "spec": "opencode run {args} {json} -- {prompt}"},
+    "resume": {"tier": "declarative", "spec": "opencode run {args} {json} --session {session} -- {prompt}"},
+    "model": {
+      "tier": "declarative",
+      "spec": {
+        "names": ["--model", "-m"],
+        "scope": "options",
+        "syntax": "value",
+        "key": null,
+        "absent": "native-default",
+        "conflict": "preserve-native-order"
+      }
+    },
+    "effort": {"tier": "unsupported", "reason": "thinking-flag-is-not-effort-level"},
+    "cwd": {
+      "tier": "declarative",
+      "spec": {
+        "spawn": "checkoutRoot",
+        "env_sync": ["PWD"],
+        "native_precedence": ["PWD", "process.cwd"],
+        "path": "host-resolve",
+        "prepare": {"tier": "declarative", "spec": {"kind": "none"}}
+      }
+    },
+    "route": "opencode"
+  },
+  "session": {
+    "fresh_identity": "native-observed",
+    "capture": {
+      "tier": "declarative",
+      "spec": {
+        "kind": "json-line",
+        "guards": [
+          {
+            "path": ["type"],
+            "op": "one-of",
+            "values": ["step_start", "text", "reasoning", "tool_use", "step_finish", "error"]
+          },
+          {"path": ["timestamp"], "op": "finite-number"},
+          {"path": ["sessionID"], "op": "string"}
+        ],
+        "path": ["sessionID"],
+        "rule": {"pattern": "^ses_[a-zA-Z0-9]{1,124}$", "flags": "u", "max_length": 128},
+        "max_line_chars": 1048576,
+        "first": "legacy-first-buffer"
+      }
+    },
+    "id_validation": {"pattern": "^ses_[a-zA-Z0-9]{1,124}$", "flags": "u", "max_length": 128},
+    "resume_identity": "observed",
+    "verify_resume": {"tier": "declarative", "spec": {"kind": "observed-identity", "store": "not-required"}},
+    "legacy_plain_argv": {"tier": "declarative", "spec": "opencode"}
+  },
+  "usage": {
+    "capability": {"tier": "unsupported", "reason": "usage-source-unverified"},
+    "readable_formats": [],
+    "source": null,
+    "attribution": "exact-session-window-v1",
+    "accounting": null,
+    "cost": {"kind": "unavailable", "reason": "usage-source-unverified"}
+  },
+  "platform_overrides": {}
+}

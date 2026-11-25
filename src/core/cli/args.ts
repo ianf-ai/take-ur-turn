@@ -1,11 +1,15 @@
 import path from "node:path";
-import { AgentCommandError, parseAgentInvocation, parseAgentRoute } from "../common/agent-command.js";
-import type { AgentRoute, Cast, CheckoutRoute, Flow } from "../common/types.js";
+import { parseAgentBinding } from "../common/config-intent.js";
+import { AgentCommandError, parseAgentInvocation, parseAgentRoute } from "../../protocol/agent-command.js";
+import type { AgentRoute, Cast, CheckoutRoute, Flow } from "../../protocol/types.js";
 import { DEFAULT_HUB_URL, DEFAULT_EVENT_PORT } from "./shared.js";
 
 // --- parsed shapes (frozen — handlers consume these) -------------------------
 
 export type ParsedArgs =
+  | { command: "agent"; action: "probe" | "setup"; id: string; from?: string }
+  | { command: "agent"; action: "add"; id: string; from: string }
+  | { command: "agent"; action: "add"; id: string; binding: import("../common/config-intent.js").AgentBinding }
   | { command: "run"; argv: string[]; task_id?: string; fixPreflight: boolean }
   | { command: "ps"; json: boolean }
   | { command: "attach" | "stop" | "repair-run"; run_id: string }
@@ -46,6 +50,7 @@ export type ParsedArgs =
       summary: string;
       body?: string;
       payloadFile?: string;
+      exitConditionsFile?: string;
       verdict?: string;
       commits?: string[];
       refVersion?: number;
@@ -73,6 +78,7 @@ export type ParsedArgs =
       url: string;
     }
   | { command: "recover-record"; task_id: string; recordFile: string; from: string; source?: string; url: string }
+  | { command: "prune"; task_id: string; by: string; reason: string; archive?: string; url: string }
   | { command: "decide"; task_id: string; decision: "approve" | "reject" | "close"; by: string; reason?: string; url?: string }
   | { command: "ack"; task_id: string; note?: string; url?: string }
   | { command: "assign"; role: "architect" | "executor" | "reviewer"; agent: AgentRoute }
@@ -516,7 +522,7 @@ function parseCreate(args: readonly string[]): ParsedArgs {
 function parsePublish(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, {
     values: new Set([
-      "role", "content-type", "summary", "body", "payload-file", "verdict",
+      "role", "content-type", "summary", "body", "payload-file", "exit-conditions-file", "verdict",
       "commits", "ref-version", "expected-version", "agent", "model", "url",
     ]),
   });
@@ -533,6 +539,7 @@ function parsePublish(args: readonly string[]): ParsedArgs {
   if ("error" in summary) return { command: "usage", error: summary.error };
   const body = strFlag(t, "body");
   const payloadFile = strFlag(t, "payload-file");
+  const exitConditionsFile = strFlag(t, "exit-conditions-file");
   if (body === undefined && payloadFile === undefined) {
     return { command: "usage", error: "either --body or --payload-file is required" };
   }
@@ -559,6 +566,7 @@ function parsePublish(args: readonly string[]): ParsedArgs {
     summary: summary.value,
     ...(body !== undefined ? { body } : {}),
     ...(payloadFile !== undefined ? { payloadFile } : {}),
+    ...(exitConditionsFile !== undefined ? { exitConditionsFile } : {}),
     ...(verdict !== undefined ? { verdict } : {}),
     ...(commits !== undefined ? { commits } : {}),
     ...(refVersion !== undefined ? { refVersion } : {}),
@@ -716,6 +724,27 @@ function parseRecoverRecord(args: readonly string[]): ParsedArgs {
   };
 }
 
+function parsePrune(args: readonly string[]): ParsedArgs {
+  const t = tokenize(args, { values: new Set(["by", "reason", "archive", "url"]) });
+  if ("error" in t) return { command: "usage", error: t.error };
+  const extra = extraPositionalError(t, 1);
+  if (extra !== undefined) return { command: "usage", error: extra };
+  const taskId = t.positionals[0];
+  if (!taskId?.trim()) return { command: "usage", error: "prune requires a task_id" };
+  const by = requireStr(t, "by");
+  if ("error" in by) return { command: "usage", error: by.error };
+  const reason = requireStr(t, "reason");
+  if ("error" in reason) return { command: "usage", error: reason.error };
+  if (!by.value.trim() || !reason.value.trim()) return { command: "usage", error: "--by and --reason must be non-empty" };
+  const archive = strFlag(t, "archive");
+  if (archive !== undefined && !archive.trim()) return { command: "usage", error: "--archive must be a non-empty directory path" };
+  return {
+    command: "prune", task_id: taskId, by: by.value, reason: reason.value,
+    ...(archive !== undefined ? { archive: path.resolve(archive) } : {}),
+    url: strFlag(t, "url") ?? process.env.TUT_HUB_URL ?? DEFAULT_HUB_URL,
+  };
+}
+
 function parseDecide(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, { values: new Set(["decision", "by", "reason", "url"]) });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -800,8 +829,8 @@ function parseUp(args: readonly string[]): ParsedArgs {
   };
 }
 
-/** `tut down [--root <dir>]` — stop this rig's standalone services; the
- *  herdr-mode refusal text lives in the handler (power/down.ts). */
+/** `tut down [--root <dir>]` — parse the service stop request;
+ *  the power entry handles support checks and refusal diagnostics. */
 function parseDown(args: readonly string[]): ParsedArgs {
   const t = tokenize(args, { values: new Set(["root"]), bools: new Set() });
   if ("error" in t) return { command: "usage", error: t.error };
@@ -913,6 +942,28 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if (first === undefined) return { command: "usage" };
   const rest = args;
   switch (first) {
+    case "agent": {
+      if ((rest[0] === "add" || rest[0] === "setup") && /^[a-z][a-z0-9-]{0,63}$/u.test(rest[1] ?? "")) {
+        const from = rest[2] === "--from" && rest.length === 4 ? rest[3]
+          : rest[2]?.startsWith("--from=") && rest.length === 3 ? rest[2].slice(7) : undefined;
+        if (from) return rest[0] === "add" ? { command: "agent", action: "add", id: rest[1]!, from } : { command: "agent", action: "setup", id: rest[1]!, from };
+      }
+      if (rest.length === 2 && (rest[0] === "probe" || rest[0] === "setup") && /^[a-z][a-z0-9-]{0,63}$/u.test(rest[1] ?? "")) {
+        return { command: "agent", action: rest[0], id: rest[1]! };
+      }
+      const add = rest[0] === "add" && rest[2]?.startsWith("--prompt=")
+        ? [...rest.slice(0, 2), "--prompt", rest[2].slice("--prompt=".length), ...rest.slice(3)]
+        : rest;
+      // All words after -- are the actual fixed argv; no flag guessing or shell expansion.
+      if (add[0] === "add" && /^[a-z][a-z0-9-]{0,63}$/u.test(add[1] ?? "") && add[2] === "--prompt" && add[4] === "--" && add.length > 5) {
+        try {
+          const prompt = add[3] === "stdin" ? { kind: "stdin" } : /^argv:\d+$/u.test(add[3] ?? "") ? { kind: "argv", index: Number(add[3]!.slice(5)) } : {};
+          const binding = parseAgentBinding({ executable: add[5], args: add.slice(6), prompt });
+          return { command: "agent", action: "add", id: add[1]!, binding };
+        } catch (error) { return { command: "usage", error: (error as Error).message }; }
+      }
+      return { command: "usage", error: "expected: tut agent add <id> --from <file|-> | tut agent setup <id> [--from <file|->] | tut agent probe <id>" };
+    }
     case "run": case "ps": case "attach": case "stop": case "repair-run": return parseProcessCommand(first, rest);
     case "resume": return parseResume(rest);
     case "live-view": return parseLiveView(rest);
@@ -933,6 +984,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     case "doctor": return parseDoctor(rest);
     case "repair-meta": return parseRepairMeta(rest);
     case "recover-record": return parseRecoverRecord(rest);
+    case "prune": return parsePrune(rest);
     case "decide": return parseDecide(rest);
     case "ack": return parseAck(rest);
     case "assign": return parseAssign(rest);

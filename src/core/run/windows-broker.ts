@@ -1,3 +1,4 @@
+import {validInputDelivery as validInputObservation} from './input-types.js';
 /** Private, bounded UTF-8 transport. A timeout poisons the channel: no replay/reconnect. */
 import { spawn } from 'node:child_process';
 import { connect, type Socket } from 'node:net';
@@ -7,6 +8,12 @@ import path from 'node:path';
 import { delay } from './store.js';
 import { WINDOWS_PROTOCOL, type BrokerBinding, type WindowsAction, type WindowsReceipt, type WindowsObservation, type WindowsIdentity } from './windows-protocol.js';
 export const MAX_BROKER_FRAME = 1024 * 1024;
+/** Conservative complete frame preflight before marker/reservation. Actual transport checks again. */
+export function preflightTargetFrame(payload:{argv:string[];cwd:string;env:NodeJS.ProcessEnv;input?:import('./input-types.js').InvocationInput},root=payload.cwd):void {
+ const frame={protocol:WINDOWS_PROTOCOL,run_id:'0'.repeat(32),attempt_id:'0'.repeat(36),broker_pid:9999999999,broker_creation_time:'0'.repeat(20),nonce:'0'.repeat(64),seq:1,operation:'create-target',deadline_ms:5000,
+  payload:{...payload,log:root+'\\.context-hub\\runs\\'+'0'.repeat(32)+'\\log',job_id:'0'.repeat(32)}};
+ if(Buffer.byteLength(JSON.stringify(frame)+'\n','utf8')>MAX_BROKER_FRAME)throw Error('preflight-rejected: broker frame too large');
+}
 export class BrokerClient {
     private seq = 0;
     private pending: {
@@ -88,6 +95,9 @@ export class BrokerClient {
             (o.root_exited && (!Number.isSafeInteger(o.exit_code) || o.exit_code < 0 || o.exit_code > 0xffffffff))) {
             this.fail(new Error('identity-unverified: invalid native observation'));
             throw this.failure;
+        }
+        if(o.input_delivery&&!validInputObservation(o.input_delivery)) {
+            this.fail(new Error('identity-unverified: invalid input observation'));throw this.failure;
         }
         return o;
     }

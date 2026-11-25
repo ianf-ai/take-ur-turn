@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { validateAgentRoute } from "../common/agent-command.js";
-import type { Cast, Flow } from "../common/types.js";
+import { validateAgentRoute } from "../../protocol/agent-command.js";
+import type { Cast, Flow } from "../../protocol/types.js";
 
 /** A saved Notifier /state response, not a fresh Hub read after corruption. */
 export async function readRepairSnapshot(file: string, taskId: string): Promise<{ title: string; flow?: Flow; cast?: Cast }> {

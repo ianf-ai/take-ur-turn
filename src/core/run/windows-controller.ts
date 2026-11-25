@@ -20,7 +20,7 @@ export class WindowsStopController {
         ];
     } = {}) { }
     private now(): number { return this.options.now?.() ?? performance.now(); }
-    private read(): WindowsRunMeta { const m = windowsMeta(this.store.read(this.initial.run_id)); assertRunIdentity(m, this.initial); return m; }
+    private async read(): Promise<WindowsRunMeta> { const m = windowsMeta(await this.store.readAsync(this.initial.run_id)); assertRunIdentity(m, this.initial); return m; }
     private update(fn: (m: WindowsRunMeta) => WindowsRunMeta): Promise<WindowsRunMeta> {
         return this.store.updateMeta(this.initial.run_id, value => {
             const m = windowsMeta(value);
@@ -49,7 +49,7 @@ export class WindowsStopController {
         }));
     }
     async fail(error: Error): Promise<void> {
-        const m = this.read();
+        const m = await this.read();
         if (!m.stop_request || m.stop_request.result)
             return;
         this.requestId = m.stop_request.id;
@@ -57,7 +57,7 @@ export class WindowsStopController {
         await this.finish('incomplete', undefined, error.message);
     }
     private async advance(): Promise<void> {
-        const m = this.read();
+        const m = await this.read();
         const r = m.stop_request;
         if (!r || r.result)
             return;

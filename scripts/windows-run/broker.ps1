@@ -11,6 +11,7 @@ if ($Launch) {
   finally { [void][TutRunNative]::CloseHandle($child.thread); [void][TutRunNative]::CloseHandle($child.process) }
   exit 0
 }
+$inputWriter = $null
 $server = $null; $job = [IntPtr]::Zero; $target = $null
 $created = ([TutRunNative]::Created([System.Diagnostics.Process]::GetCurrentProcess().Handle)).ToString()
 $binding = @{protocol='windows-console-v1';run_id=$RunId;attempt_id=$Attempt;broker_pid=$PID;broker_creation_time=$created;nonce=$Nonce}
@@ -29,6 +30,12 @@ function Observe {
   $members = @([TutRunNative]::Members($job))
   $observation = @{root_exited=(-not $alive);job_empty=($members.Count -eq 0)}
   if (-not $alive) { $observation.exit_code = [TutRunNative]::ExitCode($target.process) }
+  if ($null -ne $inputWriter) {
+    if (-not $alive -and $inputWriter.Status -eq 'pending') { $inputWriter.Cancel('target exited before input delivery') }
+    $delivery = @{status=$inputWriter.Status;bytes=$inputWriter.Bytes}
+    if ($delivery.status -eq 'failed') { $delivery.error = $inputWriter.Error }
+    $observation.input_delivery = $delivery
+  }
   return $observation
 }
 try {
@@ -65,13 +72,19 @@ try {
         }
         $entries = @($environment.GetEnumerator() | ForEach-Object { $_.Key + '=' + $_.Value })
         $envBlock = [string]::Join([char]0,$entries) + [char]0 + [char]0
+        if ($null -ne $p.input -and $p.input.kind -ne 'none') {
+          if ($p.input.kind -ne 'stdin' -or $p.input.encoding -ne 'utf8' -or $p.input.text -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount($p.input.text) -gt 65536) { throw 'preflight-rejected: invalid input' }
+          $inputWriter = New-Object TutRunNative+InputWriter ([string]$p.input.text)
+        }
         $job = [TutRunNative]::Job()
         $arguments = @(); if ($p.argv.Count -gt 1) { $arguments = @($p.argv | Select-Object -Skip 1) }
-        $target = [TutRunNative]::Suspended($p.argv[0],[string[]]$arguments,$p.cwd,$p.log,$envBlock)
+        if ($null -eq $inputWriter) { $target = [TutRunNative]::Suspended($p.argv[0],[string[]]$arguments,$p.cwd,$p.log,$envBlock) }
+        else { $target = [TutRunNative]::Suspended($p.argv[0],[string[]]$arguments,$p.cwd,$p.log,$envBlock,$inputWriter) }
         $createdTarget = $true
         [TutRunNative]::Assign($job,$target.process)
         $rootCreated = ([TutRunNative]::Created($target.process)).ToString()
         [TutRunNative]::Resume($target.thread)
+        if ($null -ne $inputWriter) { $inputWriter.Start() }
         $value = @{pid=$target.pid;read_only_replay_window=$readOnlyReplayLimit;identity=@{attempt_id=$Attempt;broker_pid=$PID;broker_creation_time=$created;root_creation_time=$rootCreated;job_id=$p.job_id}}
       } elseif (-not $createdTarget) { throw 'preflight-rejected: no owned target' }
       elseif ($request.operation -eq 'challenge') { $value = @{challenge=$request.payload.challenge}; [void](Observe) }
@@ -84,6 +97,7 @@ try {
         $stopOperation = $request.payload.operation
         # Reserve the stage before any native call; failure is terminal, never retried.
         $stage++; $receipts = @()
+        if ($null -ne $inputWriter) { $inputWriter.Cancel('input cancelled by stop') }
         if ($request.operation -eq 'break') {
           if ([TutRunNative]::Alive($target.process)) {
             $owned = [TutRunNative]::Owned($job,$target.pid)
@@ -125,6 +139,7 @@ try {
 } finally {
   # Deliberately no KILL_ON_JOB_CLOSE, TerminateJobObject or process cleanup.
   # Loss of observer leaves targets alive and the supervisor retains occupancy.
+  if ($null -ne $inputWriter) { $inputWriter.Dispose() }
   if ($null -ne $target) { [void][TutRunNative]::CloseHandle($target.thread); [void][TutRunNative]::CloseHandle($target.process) }
   if ($job -ne [IntPtr]::Zero) { [void][TutRunNative]::CloseHandle($job) }
   if ($null -ne $server) { $server.Dispose() }

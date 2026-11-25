@@ -2,7 +2,7 @@
  * executes Git, repairs metadata, or grants permission to change branches. */
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
-import type { PreflightItem } from './index.js';
+import type { PreflightItem } from './types.js';
 
 export interface WorktreeExpectation {
   ref: string;

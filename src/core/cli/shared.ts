@@ -1,6 +1,6 @@
-import { formatAgentRoute } from "../common/agent-command.js";
-import { HubError } from "../hub/hub-client.js";
-import type { Cast } from "../common/types.js";
+import { formatAgentRoute } from "../../protocol/agent-command.js";
+import { HubError } from "../../hub/hub-client.js";
+import type { Cast } from "../../protocol/types.js";
 
 /** Human rendering of a cast: "executor=pi, reviewer=codex" (insertion order). */
 function formatCast(cast: Cast): string {
@@ -45,7 +45,7 @@ function cliFetchInit(extra: RequestInit = {}): RequestInit {
 // --- handlers -----------------------------------------------------------------
 // All twenty-one subcommands are wired (notify; mode/config/start-next/watch;
 // doctor is the report-only self-check over src/doctor.ts; repair-meta /
-// recover-record are the storage-repair clients of the 4.3 endpoints;
+// recover-record are the storage-repair clients of the repair endpoints;
 // ack reuses the context publish path as a fixed human ack note; status is a
 // human overview over the context list path). Task creation is the
 // initiating side's action (tut create); the first round is an ordinary

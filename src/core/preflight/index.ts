@@ -27,17 +27,8 @@ import { constants as FsConstants, accessSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { inspectWorktree, type WorktreeExpectation } from './worktree.js';
 
-export type PreflightCheckName = "node-manifest" | "node-modules" | "tut-dist" | "worktree-consistency";
-export type PreflightStatus = "ok" | "missing" | "error" | "not-applicable" | "warn";
-
-export interface PreflightItem {
-  check: PreflightCheckName;
-  status: PreflightStatus;
-  /** Absolute target path and the evidence behind the verdict. */
-  detail: string;
-  /** Guidance for a human; fix mode only automates npm install/build items. */
-  fix?: string;
-}
+import type { PreflightCheckName, PreflightItem } from "./types.js";
+export type { PreflightCheckName, PreflightStatus, PreflightItem } from "./types.js";
 
 export interface PreflightReport {
   /** The inspected checkout (absolute). */

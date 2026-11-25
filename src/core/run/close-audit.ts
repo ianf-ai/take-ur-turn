@@ -19,8 +19,8 @@
  * double-audit. Hub failures are best-effort: logged locally, never retried
  * blind, and never roll back the decision or the stop result.
  */
-import { hubPublish } from "../hub/hub-client.js";
-import type { ContextRecord } from "../common/types.js";
+import { hubPublish } from "../../hub/hub-client.js";
+import type { ContextRecord } from "../../protocol/types.js";
 import type { RunMeta } from "./store.js";
 
 export const CLOSE_STOP_OPERATION = "close-stop";

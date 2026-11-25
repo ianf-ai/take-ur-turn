@@ -14,10 +14,14 @@
  * Write side is atomic (temp + rename), same pattern as store.ts.
  */
 
+import {resolveBindingReference} from '../../agents/public/declarations.js';
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
-import { KNOWN_ROLES } from "./workspace.js";
+import { KNOWN_ROLES, objectOf, parseConfigRoles, parseAgentBinding, validateBindingId, type AgentBinding } from "./config-intent.js";
+import { normalizeAgentRoute } from "../../protocol/agent-command.js";
+import type { AgentRoute } from "../../protocol/types.js";
+import { lockConfig } from "./config-lock.js";
 
 export type LaunchMode = "detached" | "tui";
 
@@ -52,9 +56,9 @@ export async function readPowerMode(root: string): Promise<PowerMode> {
 /**
  * The power-switch reader (tut up / tut down): power-only validation.
  * Unrelated config damage (corrupt JSON, illegal flow_mode, …) reads as the
- * herdr default — EXACTLY the pre-power behavior of up on a broken config
- * (the usage step still warns separately), so the power switch never widens
- * old failure modes. Only a present-but-illegal power section throws.
+ * default power mode (the usage step still warns separately), preserving
+ * compatibility with missing or damaged configuration. Only a
+ * present-but-illegal power section throws.
  */
 export async function readPowerModeForSwitch(root: string): Promise<PowerMode> {
   let raw: string;
@@ -197,14 +201,15 @@ const configWriteChains = new Map<string, Promise<unknown>>();
 
 function chainedConfigWrite<T>(filePath: string, op: () => Promise<T>): Promise<T> {
   const prev = configWriteChains.get(filePath) ?? Promise.resolve();
-  const run = prev.then(op, op); // a failed predecessor must not wedge the chain
-  configWriteChains.set(
-    filePath,
-    run.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
+  const locked = async () => {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    const unlock = await lockConfig(`${filePath}.lock`);
+    try { return await op(); } finally { unlock(); }
+  };
+  const run = prev.then(locked, locked); // a failed predecessor must not wedge the chain
+  const tail = run.then(() => undefined, () => undefined);
+  configWriteChains.set(filePath, tail);
+  void tail.then(() => { if (configWriteChains.get(filePath) === tail) configWriteChains.delete(filePath); });
   return run;
 }
 
@@ -314,12 +319,13 @@ function parseConfigStrict(raw: string, filePath: string): Config {
 /** Distinguish the three read outcomes readConfig collapses to null (writeFlowMode needs the difference). */
 export type ReadOutcome = { status: "ok"; config: Config } | { status: "missing" } | { status: "invalid" };
 
-export async function readConfigFile(root: string): Promise<ReadOutcome> {
+export async function readConfigFile(root: string, options: { signal?: AbortSignal } = {}): Promise<ReadOutcome> {
   const filePath = configPath(root);
   let raw: string;
   try {
-    raw = await readFile(filePath, "utf8");
+    raw = await readFile(filePath, { encoding: "utf8", ...options });
   } catch (e) {
+    if (options.signal?.aborted) throw e;
     if (isErrnoException(e, "ENOENT")) return { status: "missing" };
     return { status: "invalid" };
   }
@@ -373,18 +379,73 @@ export function autoSectionOf(config: Config | null | undefined): AutoConfig | u
  * clobber keys it cannot read — POST /mode surfaces that as a 500.
  */
 export async function writeFlowMode(root: string, mode: FlowMode): Promise<Config> {
+  return writeConfigKey(root, { key: "flow_mode", value: mode });
+}
+
+/** The only config RMW port. Re-read under both mutexes, preserve unrelated
+ * keys, and validate only the updated intent (existing per-key contracts stay intact). */
+async function updateConfig(root: string, label: string, mutate: (config: Config) => void | Promise<void>): Promise<Config> {
   const filePath = configPath(root);
   return chainedConfigWrite(filePath, async () => {
     const outcome = await readConfigFile(root);
-    if (outcome.status === "invalid") {
-      throw new Error(`cannot switch flow_mode: ${filePath} is unreadable or corrupt`);
-    }
-    const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
-    config.flow_mode = mode;
-    await mkdir(root, { recursive: true });
+    if (outcome.status === "invalid") throw new Error(`cannot set ${label}: ${filePath} is unreadable or corrupt`);
+    const config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : outcome.config;
+    await mutate(config);
     await writeConfigAtomic(filePath, config);
     return config;
   });
+}
+
+/** First assign freezes the effective legacy lineup; subsequent assigns never
+ * fill intentionally absent config seats. The initializer runs under the lock. */
+export async function writeConfigRole(root: string, role: string, route: AgentRoute,
+  initialize: () => Promise<Record<string, unknown>>): Promise<Config> {
+  if (!(KNOWN_ROLES as readonly string[]).includes(role)) throw new Error(`unknown role: ${role}`);
+  const command = normalizeAgentRoute(route);
+  return updateConfig(root, `roles.${role}`, async config => {
+    if (!Object.hasOwn(config, "roles")) {
+      const seed = await initialize();
+      for (const [key, value] of Object.entries(seed)) {
+        // Legacy extensions must not silently become active behavior or trust.
+        if (["flow_mode", "auto", "launch", "launch_mode", "power", "usage_audit", "review_standards", "notify", "agent_bindings"].includes(key) && !Object.hasOwn(config, key)) {
+          throw new Error(`legacy workspace key '${key}' conflicts with config intent; import explicitly before assigning`);
+        }
+        if (Object.hasOwn(config, key) && JSON.stringify(config[key]) !== JSON.stringify(value)) {
+          throw new Error(`legacy workspace conflicts with config.${key}; import explicitly before assigning`);
+        }
+        Object.defineProperty(config, key, { value, writable: true, enumerable: true, configurable: true });
+      }
+    }
+    const roles = objectOf(config.roles, "config.roles");
+    const entry = Object.hasOwn(roles, role) ? objectOf(roles[role], `config.roles.${role}`) : {};
+    const { args: _args, ...rest } = entry;
+    config.roles = { ...roles, [role]: { ...rest, agent: command.agent, ...(typeof route === "string" ? {} : { args: command.args }) } };
+    parseConfigRoles(config.roles);
+    resolveBindingReference(command.agent, command.args, config.agent_bindings);
+  });
+}
+
+export async function writeAgentBinding(root: string, id: string, value: AgentBinding): Promise<Config> {
+  validateBindingId(id);
+  const binding = parseAgentBinding(value);
+  if ("id" in binding && binding.id !== id) throw new Error("id: declaration must match agent add id");
+  return updateConfig(root, `agent_bindings.${id}`, config => {
+    const bindings = config.agent_bindings === undefined ? {} : objectOf(config.agent_bindings, "config.agent_bindings");
+    const previous = Object.hasOwn(bindings, id) ? objectOf(bindings[id], `agent_bindings.${id}`) : {};
+    const { executable: _executable, args: _args, prompt: _prompt, schema_version: _version, id: _id, command: _command, input: _input, ...extensions } = previous;
+    const saved = { ...extensions, ...binding };
+    parseAgentBinding(saved); // Unknown persisted metadata is inert; owned invocation fields stay validated.
+    config.agent_bindings = { ...bindings, [id]: saved };
+  });
+}
+
+export async function readAgentBinding(root: string, id: string): Promise<AgentBinding | undefined> {
+  validateBindingId(id);
+  const outcome = await readConfigFile(root);
+  if (outcome.status === "invalid") throw new Error(`cannot read agent_bindings: ${configPath(root)} is unreadable or corrupt`);
+  if (outcome.status === "missing" || outcome.config.agent_bindings === undefined) return undefined;
+  const bindings = objectOf(outcome.config.agent_bindings, "config.agent_bindings");
+  return Object.hasOwn(bindings, id) ? parseAgentBinding(bindings[id]) : undefined;
 }
 
 // --- tut config get/set engine -------------------------------------------------
@@ -392,7 +453,7 @@ export async function writeFlowMode(root: string, mode: FlowMode): Promise<Confi
 // The CLI surface (tut config) edits the SAME file serve re-reads per request
 // (readConfig above), so a write is picked up by the next poll cycle with no
 // restart and no Hub round-trip — config get/set works with the Hub down too
-// (same discipline as tut assign editing workspace.json directly).
+// (the same port used by tut assign and tut agent add).
 
 /** Scalar-settable config keys exposed to `tut config set`. */
 export type ConfigKey = "launch_mode" | "launch.catchup" | "power.mode" | "review_standards" | "usage_audit" | "flow_mode" | "auto.launch_roles" | "auto.remediate";
@@ -500,13 +561,18 @@ export function parseReviewStandards(raw: unknown):
  */
 export async function writeConfigKey(root: string, assignment: ConfigKeyAssignment): Promise<Config> {
   const { key } = assignment;
-  const filePath = configPath(root);
-  return chainedConfigWrite(filePath, async () => {
-    const outcome = await readConfigFile(root);
-    if (outcome.status === "invalid") {
-      throw new Error(`cannot set ${key}: ${filePath} is unreadable or corrupt`);
-    }
-    const config: Config = outcome.status === "missing" ? { ...DEFAULT_CONFIG } : { ...outcome.config };
+  if (!(CONFIG_KEYS as readonly string[]).includes(key)) throw new Error(`unsupported config key: ${key}`);
+  // Runtime callers share the CLI validator; TypeScript types alone are not validation.
+  if (key === "auto.launch_roles" && (!Array.isArray(assignment.value) || !assignment.value.every(v => typeof v === "string" && (KNOWN_ROLES as readonly string[]).includes(v)))) {
+    throw new Error("invalid value for auto.launch_roles");
+  }
+  if (key !== "auto.launch_roles" && typeof assignment.value !== "string") throw new Error(`invalid value for ${key}`);
+  const raw = Array.isArray(assignment.value) ? assignment.value.join(",") : assignment.value;
+  if (typeof raw !== "string") throw new Error(`invalid value for ${key}`);
+  const parsed = parseConfigValue(key, raw);
+  if (!parsed.ok) throw new Error(parsed.error);
+  assignment = parsed.assignment;
+  return updateConfig(root, key, config => {
     if (assignment.key === "launch_mode") {
       config.launch_mode = assignment.value;
     } else if (assignment.key === "launch.catchup") {
@@ -531,9 +597,6 @@ export async function writeConfigKey(root: string, assignment: ConfigKeyAssignme
         throw new Error(`unsupported config key: ${key}`);
       }
     }
-    await mkdir(root, { recursive: true });
-    await writeConfigAtomic(filePath, config);
-    return config;
   });
 }
 

@@ -1,3 +1,6 @@
+import {stopAfterInputFailure} from './input-stop.js';
+import {consumeInvocation} from './prepared.js';
+import {validateInput} from './input.js';
 import path from 'node:path';
 import { closeSync, writeSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -9,14 +12,19 @@ import { WindowsStopController } from './windows-controller.js';
 import { assertRunIdentity } from './validation.js';
 export async function supervise(r: StartRequest): Promise<void> {
     const store = new RunStore(r.root);
+    return store.withMetadataReads(() => superviseWithMetadataReads(r, store));
+}
+async function superviseWithMetadataReads(r: StartRequest, store: RunStore): Promise<void> {
     let broker: BrokerClient | undefined;
     let initial: WindowsRunMeta | undefined;
     let controller: WindowsStopController | undefined;
     try {
+        r=consumeInvocation(r);
+        validateInput(r.input);
         broker = await launchBroker(r.id, r.headless?.attempt_id);
         const job_id = randomBytes(16).toString('hex');
-        const created: CreatedTarget = await broker.request('create-target', { argv: r.argv, cwd: r.cwd, env: r.env ?? process.env, log: path.join(store.directory(r.id), 'log'), job_id });
-        initial = { run_id: r.id, pid: created.pid, pgid: created.pid, supervisor_pid: process.pid, argv: r.argv, cwd: r.cwd, started_at: new Date().toISOString(), status: 'running', control_protocol: WINDOWS_PROTOCOL,
+        const created: CreatedTarget = await broker.request('create-target', { argv: r.argv, cwd: r.cwd, env: r.env ?? process.env, log: store.logPath(r.id), ...(r.input?{input:r.input}:{}), job_id });
+        initial = { ...(r.profile!==undefined?{contract:r.profile}:{}),run_id: r.id, pid: created.pid, pgid: created.pid, supervisor_pid: process.pid, argv: r.argv, cwd: r.cwd, started_at: new Date().toISOString(), status: 'running', control_protocol: WINDOWS_PROTOCOL,
             windows: { identity: created.identity }, ...(r.task_id ? { task_id: r.task_id } : {}), ...(r.headless ? { headless: r.headless } : {}), ...(r.resume ? { resume: r.resume } : {}), ...(r.checkout ? { checkout: r.checkout } : {}) };
         await store.initialize(r.id, initial);
         controller = new WindowsStopController(store, initial, broker);
@@ -34,14 +42,17 @@ export async function supervise(r: StartRequest): Promise<void> {
             await store.updateMeta(r.id, m => { assertRunIdentity(m, initial!); return { ...m, identity_ack: challenge }; });
         };
         for (;;) {
-            let current = windowsMeta(store.read(r.id));
+            let current = windowsMeta(await store.readAsync(r.id));
             assertRunIdentity(current, initial);
             await acknowledge(current);
             const observation = await broker.observe();
+            if(r.input?.kind==='stdin'&&!observation.input_delivery)throw Error('identity-unverified: missing input observation');
+            if(observation.root_exited&&observation.input_delivery?.status==='pending')observation.input_delivery={...observation.input_delivery,status:'failed',error:'target exited before input delivery'};
             current = windowsMeta(await store.updateMeta(r.id, value => {
                 const m = windowsMeta(value);
                 assertRunIdentity(m, initial!);
                 return { ...m,
+                    ...(observation.input_delivery?{input_delivery:observation.input_delivery}:{}),
                     windows: { ...m.windows, observation: { ...observation, observed_at: new Date().toISOString() } },
                     ...(observation.root_exited ? { root_exited_at: m.root_exited_at ?? new Date().toISOString(), exit_code: observation.exit_code! } : {}) };
             }));
@@ -49,8 +60,9 @@ export async function supervise(r: StartRequest): Promise<void> {
             // probe. Answer it before further synchronous safe reads defer it
             // to the next poll and consume the caller's identity deadline.
             await acknowledge(current);
+            if(current.input_delivery?.status==='failed')await stopAfterInputFailure(store,r.id,initial);
             await controller.step();
-            current = windowsMeta(store.read(r.id));
+            current = windowsMeta(await store.readAsync(r.id));
             if (current.stop_request?.result?.success === false)
                 return;
             if (observation.root_exited && observation.job_empty) {

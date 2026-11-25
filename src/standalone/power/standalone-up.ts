@@ -1,10 +1,16 @@
+/** runtime/power.json and power-members.jsonl are current service-generation
+ * facts: power/register write, up/down/doctor read. Unverified copied runtime
+ * snapshots are preserved as power.unverified.<uuid>.json for manual inspection,
+ * never automatic cleanup candidates. Keep while owners or stop
+ * transactions remain unresolved; only the existing verified stop protocol
+ * retires members. Unknown runtime files are protected. */
 /**
  * Standalone power implementation (config power.mode = "standalone").
  *
  * `tut up` in standalone mode raises the rig's services — hub, notifier,
  * and (opt-in) the usage watcher — as DETACHED processes, each its own
  * process group (spawn detached ⇒ group leader, pgid === pid). Process
- * facts land in `.context-hub/power.json` (pid/pgid/started_at/port), the
+ * facts land in `.context-hub/runtime/power.json` (pid/pgid/started_at/port), the
  * single source `tut down` stops the rig from. Herdr mode provisions
  * panes instead and never touches power.json.
  *
@@ -18,65 +24,30 @@
  */
 
 import { adoptService, describePowerDrift, inspectPowerDrift, sameHubEndpoint } from "./reconcile.js";
-import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { appendFile } from "node:fs/promises";
-import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { promisify } from "node:util";
-import { probeHub, probeNotifier, notifierMatches, resolveUpHub, resolveRigRoot } from "../../core/hub/rig-discovery.js";
-import { acquireRigStartLock } from "../../core/hub/rig-lock.js";
-import { rigEnvironment } from "../../core/hub/rig.js";
-import { provisionUsageWatcher } from "../../core/common/usage-watcher.js";
+import { canonicalRoot, probeHub, probeNotifier, notifierMatches, resolveUpHub, resolveRigRoot } from "../../hub/rig-discovery.js";
+import { acquireRigStartLock } from "../../core/common/rig-lock.js";
+import { rigEnvironment } from "../../hub/rig-identity.js";
+import { provisionUsageWatcher, usageWatcherOwned } from "../../core/common/usage-watcher.js";
 export { provisionUsageWatcher } from "../../core/common/usage-watcher.js";
 import { DEFAULT_HUB_PORT, DEFAULT_EVENT_PORT, sleepMs } from "../../core/cli/shared.js";
-import { stopWindowsService, windowsStartToken } from "./windows.js";
+import { stopWindowsService } from "./windows.js";
 import { listenerPid } from "./listener.js";
 
 // --- power.json: process facts ---------------------------------------------------
 
-/** What down needs to stop one service. pid null = alive but not ours to
- *  signal (e.g. a hub this up only verified and reused). start_token is the
- *  recorded process-start fingerprint — down's identity proof that a live
- *  pid is still the SAME process instance this file was written about. */
-export interface PowerFacts {
-  pid: number | null;
-  pgid: number | null;
-  started_at: string;
-  start_token?: string | null;
-  process_scope?: "windows-tree";
-}
-
-/** Service facts plus the power session of THAT service's tree: the id up
- *  exported to the process (TUT_POWER_SESSION) whose non-detached children
- *  register under it. The session binds to the SURVIVING service instance —
- *  a reused service keeps its recorded session (its live tree still carries
- *  it); a freshly spawned service gets a new one. Absent for reused services
- *  without preserved facts (attribution impossible — down refuses their
- *  leaderless leftovers). An adopted service gets a new registration session
- *  with session_inherited=false: it was never exported into that process. */
-export interface ServiceFacts extends PowerFacts {
-  power_session?: string | null | undefined;
-  /** Explicit adoption cannot inject TUT_POWER_SESSION into an existing tree. */
-  adopted?: true;
-  session_inherited?: false;
-  /** Windows per-service completion allows retry after a later service fails. */
-  stopped_at?: string;
-}
-
-/** The standalone rig's power state; down stops from this file. */
-export interface PowerState {
-  mode: "standalone";
-  started_at: string;
-  hub: { url: string; port: number } & ServiceFacts;
-  notifier: { event_port: number } & ServiceFacts;
-  watcher?: (ServiceFacts & { pid: number }) | null;
-  stopped_at?: string;
-}
+import type { PowerFacts, ServiceFacts, PowerState } from "./types.js";
+export type { PowerFacts, ServiceFacts, PowerState } from "./types.js";
+export { processAlive, groupAlive, processStartToken, pidMatchesStartToken, processPgid } from "./process.js";
+import { processAlive, groupAlive, processStartToken, processPgid } from "./process.js";
 
 export function powerStatePath(storageDir: string): string {
-  return path.join(storageDir, "power.json");
+  return path.join(storageDir, "runtime", "power.json");
 }
 
 const isIso = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
@@ -116,13 +87,20 @@ const sessionOf = (raw: Record<string, unknown>): Pick<ServiceFacts, "power_sess
  * down must never guess what to stop).
  */
 export async function readPowerState(storageDir: string): Promise<PowerState | undefined> {
-  const file = powerStatePath(storageDir);
+  let file = powerStatePath(storageDir);
   let raw: string;
   try {
     raw = await readFile(file, "utf8");
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw new Error(`cannot read power state ${file}: unreadable — fix it by hand`);
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      // Read legacy process facts in place; only new publications use runtime.
+      file = path.join(storageDir, 'power.json');
+      try { raw = await readFile(file, 'utf8'); }
+      catch (legacyError) {
+        if ((legacyError as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw new Error(`cannot read power state ${file}: unreadable — fix it by hand`);
+      }
+    } else throw new Error(`cannot read power state ${file}: unreadable — fix it by hand`);
   }
   let parsed: unknown;
   try {
@@ -134,6 +112,9 @@ export async function readPowerState(storageDir: string): Promise<PowerState | u
   if (state.mode !== "standalone" || !isIso(state.started_at) || typeof state.hub !== "object" || state.hub === null ||
     typeof state.notifier !== "object" || state.notifier === null) {
     throw new Error(`cannot read power state ${file}: unexpected shape — fix it by hand`);
+  }
+  if (state.owner_root !== undefined && (typeof state.owner_root !== 'string' || !path.isAbsolute(state.owner_root))) {
+    throw new PowerOwnershipError(`cannot read power state ${file}: invalid owner root — preserve it for inspection`);
   }
   const hub = state.hub as unknown as Record<string, unknown>;
   const notifier = state.notifier as unknown as Record<string, unknown>;
@@ -160,6 +141,7 @@ export async function readPowerState(storageDir: string): Promise<PowerState | u
   const notifierRaw = notifier as unknown as Record<string, unknown>;
   return {
     mode: "standalone",
+    ...(state.owner_root !== undefined ? { owner_root: state.owner_root } : {}),
     started_at: state.started_at,
     hub: { url: hub.url as string, port: hub.port as number, ...hubFacts.value, ...sessionOf(hubRaw) },
     notifier: { event_port: notifier.event_port as number, ...notifierFacts.value, ...sessionOf(notifierRaw) },
@@ -168,13 +150,49 @@ export async function readPowerState(storageDir: string): Promise<PowerState | u
   };
 }
 
+/** A token identifies a process instance, not which rig may control it.
+ * Old snapshots require a live service's root handshake before gaining control.
+ * If no identity can establish that relationship, preserve the snapshot and refuse. */
+class PowerOwnershipError extends Error {}
+
+export async function assertPowerOwnership(root: string, state: PowerState): Promise<void> {
+  const owner = canonicalRoot(root);
+  if (state.owner_root !== undefined) {
+    if (state.owner_root === owner) return;
+    throw new PowerOwnershipError(`foreign power state: owner_root=${state.owner_root}, expected ${owner}; copied process facts are not control authority; no signals sent`);
+  }
+  const serviceOwned = (await probeHub(state.hub.url))?.root === owner ||
+    notifierMatches(await probeNotifier(`http://127.0.0.1:${state.notifier.event_port}/agent-event`), owner, state.hub.url);
+  const watcher = state.watcher;
+  const watcherActive = watcher != null && (processAlive(watcher.pid) ||
+    (process.platform !== 'win32' && groupAlive(watcher.pgid ?? watcher.pid)));
+  if (serviceOwned && (!watcherActive || await usageWatcherOwned(owner, watcher!.pid))) return;
+  throw new PowerOwnershipError(`unverified legacy power state for ${owner}; cannot establish its owning rig; preserve the facts and run tut up to establish a local generation; no signals sent`);
+}
+
+/** Retain copied control bytes before publishing a replacement local generation.
+ * Legacy root snapshots are already preserved in place by the new writer. */
+async function preserveUnverifiedPowerState(storageDir: string): Promise<string> {
+  let raw: Buffer;
+  try { raw = await readFile(powerStatePath(storageDir)); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return path.join(storageDir, 'power.json');
+    throw error;
+  }
+  const file = path.join(storageDir, 'runtime', `power.unverified.${randomUUID()}.json`);
+  await writeFile(file, raw, { flag: 'wx', mode: 0o600 });
+  return file;
+}
+
 /** Atomic power.json write (temp + rename, the store.ts/config.ts pattern). */
 export async function writePowerState(storageDir: string, state: PowerState): Promise<void> {
-  mkdirSync(storageDir, { recursive: true });
+  const owner = canonicalRoot(path.dirname(storageDir));
+  if (state.owner_root !== undefined && state.owner_root !== owner) throw new Error('cannot publish foreign power facts as local ownership');
+  mkdirSync(path.join(storageDir, "runtime"), { recursive: true });
   const file = powerStatePath(storageDir);
   const temp = `${file}.${process.pid}.tmp`;
   try {
-    await writeFile(temp, JSON.stringify(state, null, 2) + "\n", "utf8");
+    await writeFile(temp, JSON.stringify({ ...state, owner_root: owner }, null, 2) + "\n", "utf8");
     await rename(temp, file);
   } catch (e) {
     await unlink(temp).catch(() => undefined);
@@ -209,74 +227,6 @@ function waitMs(name: "hub" | "notify"): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10_000;
 }
 
-/** Best-effort liveness probe; EPERM still means alive. */
-export function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
-/** Group liveness: ESRCH = the whole recorded group is gone (leader and
- *  every member); EPERM = exists but foreign (conservative: alive). */
-export function groupAlive(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
-// --- process identitya live pid is not ownership) --------------------------
-
-const execFileAsync = promisify(execFile);
-
-/** Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot) —
- *  stable for the life of the process, changes on pid reuse. */
-async function procfsStartToken(pid: number): Promise<string | null> {
-  try {
-    const stat = await readFile(`/proc/${pid}/stat`, "utf8");
-    // comm may contain spaces and parens — the fields resume after the last ')'.
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const starttime = fields[19]; // overall field 22
-    return starttime !== undefined && starttime.length > 0 ? `procfs:${starttime}` : null;
-  } catch {
-    return null;
-  }
-}
-
-/** macOS: `ps -p <pid> -lstart=` (absolute start timestamp, whitespace
- *  normalized) — the same stability properties on the BSD side. */
-async function psStartToken(pid: number): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], { timeout: 2_000 });
-    const normalized = stdout.trim().replace(/\s+/g, " ");
-    return normalized.length > 0 ? `ps:${normalized}` : null;
-  } catch {
-    return null;
-  }
-}
-
-/** The current start fingerprint of a live pid, or null when this platform
- *  cannot derive one — null NEVER means mismatch; callers treat it as
- *  identity-unverifiable (the conservative branch). */
-export async function processStartToken(pid: number): Promise<string | null> {
-  if (process.platform === "win32") return windowsStartToken(pid);
-  if (process.platform === "linux") return procfsStartToken(pid);
-  if (process.platform === "darwin") return psStartToken(pid);
-  return null;
-}
-
-/** True only when the live pid provably IS the recorded instance: a token
- *  was recorded, the platform can re-derive it, and both agree. */
-export async function pidMatchesStartToken(pid: number, recorded: string | null | undefined): Promise<boolean> {
-  if (recorded === null || recorded === undefined) return false;
-  return (await processStartToken(pid)) === recorded;
-}
-
 /** Fact-preservation gate: keep the recorded facts unless the pid is
  *  PROVABLY gone or provably a different instance. A dead pid (ESRCH) is
  *  definitive — respawn, never preserve; a LIVE pid whose recorded token
@@ -305,32 +255,9 @@ function copyServiceFacts(facts: ServiceFacts): ServiceFacts {
     ...sessionOf(facts as unknown as Record<string, unknown>) };
 }
 
-/** The process group id of a live pid (POSIX): /proc field 5 on Linux,
- *  `ps -o pgid=` on macOS — Node exposes neither getpgrp nor getpgid. */
-export async function processPgid(pid: number): Promise<number | null> {
-  if (process.platform === "win32") return null; // Windows has no POSIX pgid.
-  if (process.platform === "linux") {
-    try {
-      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      const pgrp = Number(fields[2]); // overall field 5
-      return Number.isSafeInteger(pgrp) && pgrp > 0 ? pgrp : null;
-    } catch {
-      return null;
-    }
-  }
-  try {
-    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "pgid="], { timeout: 2_000 });
-    const pgid = Number(stdout.trim());
-    return Number.isSafeInteger(pgid) && pgid > 0 ? pgid : null;
-  } catch {
-    return null;
-  }
-}
-
 // --- power session & member registry -------------------------------------------
 
-/** One line of .context-hub/power-members.jsonl: a member of the rig's own
+/** One line of .context-hub/runtime/power-members.jsonl: a member of the rig's own
  *  process tree that carries the TUT_POWER_SESSION marker — the services up
  *  spawned plus their NON-detached descendants (e.g. `tut launch` children
  *  of the notifier, which inherit its process group). The registry is what
@@ -348,18 +275,15 @@ export interface PowerMember {
 }
 
 export function powerMembersPath(storageDir: string): string {
-  return path.join(storageDir, "power-members.jsonl");
+  return path.join(storageDir, "runtime", "power-members.jsonl");
 }
 
 /** Read the registry; missing file → empty, corrupt lines are skipped (the
  *  registry is advisory — attribution, not audit). */
 export async function readPowerMembers(storageDir: string): Promise<PowerMember[]> {
-  let raw: string;
-  try {
-    raw = await readFile(powerMembersPath(storageDir), "utf8");
-  } catch {
-    return [];
-  }
+  const parts = await Promise.all([powerMembersPath(storageDir), path.join(storageDir, 'power-members.jsonl')]
+    .map(file => readFile(file, 'utf8').catch(() => '')));
+  const raw = parts.join('\n');
   const members: PowerMember[] = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -378,7 +302,7 @@ export async function readPowerMembers(storageDir: string): Promise<PowerMember[
 
 /** Append one member line (O_APPEND small writes; best-effort by contract). */
 export async function appendPowerMember(storageDir: string, member: PowerMember): Promise<void> {
-  mkdirSync(storageDir, { recursive: true });
+  mkdirSync(path.join(storageDir, "runtime"), { recursive: true });
   await appendFile(powerMembersPath(storageDir), JSON.stringify(member) + "\n", "utf8");
 }
 
@@ -418,19 +342,18 @@ interface DetachedService {
   stop: () => Promise<void>;
 }
 
-/** One detached service process group with an append-mode power log. */
+/** One detached service group; its entry process owns the managed power log. */
 async function spawnPowerService(self: string, args: readonly string[], root: string, env: Readonly<Record<string, string>>, logFile: string): Promise<DetachedService> {
   mkdirSync(path.dirname(logFile), { recursive: true });
-  const out = openSync(logFile, "a");
+  // The child owns and reopens its managed log; never inherit an append FD.
   const child = spawn(process.execPath, [self, ...args], {
     detached: true,
-    stdio: ["ignore", out, out],
+    stdio: ["ignore", "ignore", "ignore"],
     cwd: root,
     env: { ...process.env, ...env },
     windowsHide: true,
   }) as ChildProcess & { pid: number };
   child.on("error", (err) => {
-    try { closeSync(out); } catch {}
     process.stderr.write(`tut: up: standalone service failed to start: ${err.message}\n`);
   });
   child.unref();
@@ -540,9 +463,16 @@ export async function runStandaloneUp(root: string, options: StandaloneUpOptions
     // strict reader.
     let prior: PowerState | undefined;
     try {
-      prior = await readPowerState(storageDir);
+      const loaded = await readPowerState(storageDir);
+      if (loaded) await assertPowerOwnership(root, loaded);
+      prior = loaded;
     } catch (error) {
-      process.stderr.write(`tut: up: ${(error as Error).message}; provisioning fresh (previous facts are lost)\n`);
+      if (error instanceof PowerOwnershipError) {
+        const preserved = dryRun ? 'unchanged (dry-run)' : await preserveUnverifiedPowerState(storageDir);
+        process.stderr.write(`tut: up: ${error.message}; prior facts preserved at ${preserved}; establishing a local generation\n`);
+      } else {
+        process.stderr.write(`tut: up: ${(error as Error).message}; provisioning fresh (previous facts are lost)\n`);
+      }
     }
     const drift = await inspectPowerDrift(root, prior, hubUrl, fetch, options.eventPort !== undefined ? `http://127.0.0.1:${options.eventPort}/agent-event` : process.env.TUT_EVENT_PORT_URL);
     for (const entry of drift) process.stderr.write(`tut: up: ${describePowerDrift(entry)}\n`);
@@ -595,9 +525,9 @@ export async function runStandaloneUp(root: string, options: StandaloneUpOptions
     }
     if (dryRun) {
       process.stdout.write(`up: [dry-run] power.mode=standalone — would provision detached services for ${root}:\n`);
-      process.stdout.write(`up: [dry-run]   node ${self} serve --port ${hubPort} --root ${storageDir}   (detached; log ${path.join(".context-hub", "power-hub.log")})\n`);
-      process.stdout.write(`up: [dry-run]   node ${self} notify --url ${hubUrl} --event-port ${eventPort}   (detached; log ${path.join(".context-hub", "power-notify.log")})\n`);
-      process.stdout.write(`up: [dry-run]   power state would land in ${path.join(".context-hub", "power.json")}\n`);
+      process.stdout.write(`up: [dry-run]   node ${self} serve --port ${hubPort} --root ${storageDir}   (detached; log ${path.join(".context-hub", "logs", "diagnostics", "power-hub.log")})\n`);
+      process.stdout.write(`up: [dry-run]   node ${self} notify --url ${hubUrl} --event-port ${eventPort}   (detached; log ${path.join(".context-hub", "logs", "diagnostics", "power-notify.log")})\n`);
+      process.stdout.write(`up: [dry-run]   power state would land in ${path.join(".context-hub", "runtime", "power.json")}\n`);
       await provisionUsageWatcher(root, hubUrl, true);
       return 0;
     }
@@ -618,12 +548,12 @@ export async function runStandaloneUp(root: string, options: StandaloneUpOptions
         : { pid: null, pgid: null, started_at: new Date().toISOString(), start_token: null, power_session: null });
     } else {
       const hubSession = randomUUID();
-      const hubChild = await spawnPowerService(self, ["serve", "--port", String(hubPort), "--root", storageDir], root, serviceEnv(hubSession), path.join(storageDir, "power-hub.log"));
+      const hubChild = await spawnPowerService(self, ["serve", "--port", String(hubPort), "--root", storageDir], root, serviceEnv(hubSession), path.join(storageDir, "logs", "diagnostics", "power-hub.log"));
       spawnedServices.push(hubChild);
       const startedAt = Date.now();
       if (!(await pollUntil(() => hubHealthy(hubUrl, root), waitMs("hub"), 250))) {
         await reap();
-        process.stderr.write(`tut: up: standalone serve (pid ${hubChild.child.pid}) started but ${hubUrl}/state stayed unhealthy for ${waitMs("hub")}ms — check ${path.join(".context-hub", "power-hub.log")}\n`);
+        process.stderr.write(`tut: up: standalone serve (pid ${hubChild.child.pid}) started but ${hubUrl}/state stayed unhealthy for ${waitMs("hub")}ms — check ${path.join(".context-hub", "logs", "diagnostics", "power-hub.log")}\n`);
         return 1;
       }
       hubFacts = { pid: hubChild.child.pid, pgid: hubChild.child.pid, started_at: new Date().toISOString(), start_token: await processStartToken(hubChild.child.pid), power_session: hubSession };
@@ -646,12 +576,12 @@ export async function runStandaloneUp(root: string, options: StandaloneUpOptions
         : { pid: null, pgid: null, started_at: new Date().toISOString(), start_token: null, power_session: null });
     } else {
       const notifySession = randomUUID();
-      const notifyChild = await spawnPowerService(self, ["notify", "--url", hubUrl, "--event-port", String(eventPort)], root, serviceEnv(notifySession), path.join(storageDir, "power-notify.log"));
+      const notifyChild = await spawnPowerService(self, ["notify", "--url", hubUrl, "--event-port", String(eventPort)], root, serviceEnv(notifySession), path.join(storageDir, "logs", "diagnostics", "power-notify.log"));
       spawnedServices.push(notifyChild);
       const startedAt = Date.now();
       if (!(await pollUntil(() => notifierHealthy(eventUrl, root, hubUrl), waitMs("notify"), 250))) {
         await reap();
-        process.stderr.write(`tut: up: standalone notify (pid ${notifyChild.child.pid}) started but ${eventUrl} never answered for ${waitMs("notify")}ms — check ${path.join(".context-hub", "power-notify.log")}; the half-born rig was stopped\n`);
+        process.stderr.write(`tut: up: standalone notify (pid ${notifyChild.child.pid}) started but ${eventUrl} never answered for ${waitMs("notify")}ms — check ${path.join(".context-hub", "logs", "diagnostics", "power-notify.log")}; the half-born rig was stopped\n`);
         return 1;
       }
       notifyFacts = { pid: notifyChild.child.pid, pgid: notifyChild.child.pid, started_at: new Date().toISOString(), start_token: await processStartToken(notifyChild.child.pid), power_session: notifySession };
@@ -707,7 +637,7 @@ export async function runStandaloneUp(root: string, options: StandaloneUpOptions
     // update deletes a freshly registered live member); stale lines are
     // harmless because attribution only trusts live, token-matching pids,
     // and the whole file is dropped after a VERIFIED full stop (down).
-    process.stdout.write(`up: power state recorded (${path.join(".context-hub", "power.json")}; stop with tut down)\n`);
+    process.stdout.write(`up: power state recorded (${path.join(".context-hub", "runtime", "power.json")}; stop with tut down)\n`);
     return 0;
   } catch (error) {
     // : EVERY late failure (state write, log open, …) reaps this run's

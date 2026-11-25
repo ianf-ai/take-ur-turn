@@ -1,8 +1,8 @@
 /** Optional Hub side effects run in a bounded disposable process. Never on the
  * supervisor's lifecycle path; no offline queue and no retry of a write. */
 import path from 'node:path';
-import { HubSession } from '../hub/hub-client.js';
-import { canonicalRoot } from '../hub/rig-discovery.js';
+import { HubSession } from '../../hub/hub-client.js';
+import { canonicalRoot } from '../../hub/rig-discovery.js';
 import { DEFAULT_HUB_URL } from '../cli/shared.js';
 
 export type HubActionName = 'associate' | 'stop' | 'resume';

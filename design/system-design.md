@@ -2,13 +2,11 @@
 
 ## 1. 概述
 
-TUT（Take Ur Turn）让多个 coding agent 围绕同一任务协作。Context Hub 保存追加式过程记录，纯函数从记录序列派生任务状态，Notifier 观察状态并通知或启动下一角色，人负责关键审批。
+本文说明当前宿主无关的架构、状态派生、Hub 接口、协作规则与宿主契约；决策理由与验证经过保存在 Context Hub。
 
-本文是宿主无关的系统根文档；设计文档反映当前行为，决策理由与验证经过保存在 Context Hub。
-
-- [上下文内容与管理](context-design.md)。
-- [Herdr 宿主实现](herdr-host.md)。
-- [Standalone 宿主实现](standalone-host.md)。
+- [上下文内容与管理](context-design.md)回答上下文放什么、怎么管理。
+- [Herdr 宿主](herdr-host.md)回答终端 pane 如何供给、发车、接收信号与协作停止。
+- [Standalone 宿主](standalone-host.md)回答独立服务与 run 如何启动、观察、停止、续跑及计量。
 
 ## 2. 整体架构
 
@@ -101,13 +99,13 @@ closed 的吸收与重复 close 的幂等规则见第 3.1 节。
 | EXPECTED_REVISION | full 的 fail_design 修订未按 revision 交付 |
 | NON_CANONICAL_ROLE | role 大小写不符合小写约定 |
 
-覆盖、范围及 EXPECTED_REVISION 检查仅在 description 有验收场景基线时启用，NON_CANONICAL_ROLE 无此门。create 的规格缺失提示是自由文本 warning，不属于 WarningCode。诊断不拒收、不改变转换规则；publish、list、`/state` 暴露 warnings，read 提供原记录正文。
+覆盖、范围及 EXPECTED_REVISION 检查仅在 description 有有效验收条件基线时启用，NON_CANONICAL_ROLE 无此门。覆盖按第 4.1.1 节选择字段或兼容正文，范围仍核验「超出规格的改动」正文节。create 的规格缺失提示是自由文本 warning，不属于 WarningCode。诊断不拒收、不改变转换规则，publish、list、`/state` 暴露 warnings，read 提供原记录及字段。
 
-四类记录 lint 可附 `location:{field,section?}`、`supportedFixes:[{field,instruction,example?,record:{role,content_type,ref_version?}}]` 与 `correction:{root_version,round,limit:2,exhausted}`。修复只能追加记录，不能改删原记录。
+四类记录 lint 可附 `location:{field,section?}`、`supportedFixes:[{field,instruction,example?,record:{role,content_type,ref_version?}}]` 与 `correction:{root_version,round,limit:2,exhausted}`。修复只能追加记录，不能改删原记录。supportedFix.example 为字符串或数字，字段数组示例以 JSON 字符串承载，证据使用可被占位检查识别的「待填写」。
 
 同一任务按 lint code + 小写 role 计轮，初次为第 1 轮，再次失败为第 2 轮并提示人工处置。无关 note、launch 和其他角色记录不计轮；成功清对应 warning，复发重新计轮。ack / close 清除此前诊断与计数；其他异常不因局部修复消失。
 
-缺正文小节时，同角色用精确小写 role 的 note，ref_version 指向根诊断或最近失败修复，补齐对应小节；后续同角色 review 也可重新检查。NON_CANONICAL_ROLE 以同角色小写 note 加正确引用核销。
+退出条件判定缺漏或范围小节缺漏时，同角色用精确小写 role 的 note 修复，ref_version 指向根诊断或最近失败修复版本。覆盖字段来源定位 payload.exit_conditions，缺字段的兼容来源仍定位 payload.body 及原小节，覆盖修复单优先建议补 exit_conditions。缺字段的正文修复 note 继续受支持，note 只核销命中的诊断，不重放 verdict。后续同角色 review 也可重新检查，NON_CANONICAL_ROLE 以同角色小写 note 加正确引用核销。
 
 EXPECTED_REVISION 必须由引用原 fail_design review 的有效 revision 核销；若仍在 reviewing，先以 executor 非 ack note 收回。对在役 EXPECTED_REVISION 的错误引用继续亮灯并计轮。旧 fail_design 轮被后续有效 review 结束后，不再为其他轮次的 revision 计数。耗尽后消费方停止自行重试，人的有效修复仍可核销；热增量与冷重放结果一致。
 
@@ -143,7 +141,23 @@ CLI 支持 `--checkout current`、`worktree:<path>`、`worktree=<path>`、JSON �
 
 read / list 对任务总返回规范化 flow，cast / checkout 有才返回。project scope 无这些任务字段、无 status；list 以 `scope:"project"` 标识它。decide 追加 role=human 的 decision，decision 值为 approve / reject / close，by 记录操作者。
 
-payload 的字段定义与内容要求见 [上下文信封](context-design.md#23-payload-信封schema)。
+payload 的字段定义与内容要求见[上下文信封](context-design.md#23-payload-信封schema)。可选 exit_conditions 是记录诊断输入，选择与兼容规则见第 4.1.1 节，整体 verdict 仍按第 3.1 节独立派生状态。
+
+#### 4.1.1 退出条件判定
+
+context.publish 的 payload 可包含 exit_conditions。规范值为对象数组，每项包含 id、verdict、evidence，扩展键原样保留。id 是 description 经现有 exitConditions 解析和占位过滤所得有效条件序列中从 1 开始的顺序，逐项 verdict 精确使用「满足」「不满足」「外部阻塞」「已批准延后」，evidence 为非占位的核验结果及引用。
+
+字段可选，传输层兼容接收任意合法 JSON 值，不做转换、补默认值或删扩展键。字段形状错误仍保存，由记录诊断层安全核验，不据此拒写。summary、body 等既有基本合法性检查保持不变，写入继续经过 Store／HTTP 和 expected_version 乐观并发。
+
+每条 review 或命中修复目标的 note 独立选择来源。字段存在时只读字段，字段缺失时沿用现有正文核验，不按日期、包版本或任务版本分流。显式 null、标量、非数组对象及空数组不触发正文回退，部分有效数组不从正文或其他记录补齐。
+
+有效基线长度为 N 时，仅整数 id 位于 1 至 N、判定词合法且 evidence 为非占位字符串的对象项计入覆盖集合。非对象项安全跳过，重复条号不增加覆盖，错误类型、越界及占位证据不增加覆盖。集合不足 N 沿用 REVIEW_EXIT_CONDITIONS_INCOMPLETE 及已判定数量诊断，完整集合之外的无效项不抹掉有效覆盖。
+
+没有有效基线时，覆盖、范围及 EXPECTED_REVISION 沿用原启用范围。范围核查仍按唯一且非占位的「超出规格的改动」正文节核验。新字段不替代整体 payload.verdict，不聚合总体结论，不增加状态、决策动作或审批门。
+
+覆盖诊断可由正确引用的同角色小写 note 补 exit_conditions 核销，也继续接受缺字段的旧正文修复。note 不重放原 verdict，不清掉无关诊断，原修正轮数及人工处置边界保持不变。缺字段的旧记录不迁移、不改删，热增量与冷重放使用相同规则。
+
+MCP 输入公开规范数组与原始 JSON 的可选联合，保留误写材料与扩展键。CLI 新增 --exit-conditions-file，解析其 JSON 值后原样提交，文件不可读或 JSON 语法错误在请求前失败。现有 --payload-file 仍表示整份 Markdown body，其余已有字段与 flag 不改语义。
 
 ### 4.2 存储
 
@@ -170,11 +184,13 @@ payload 的字段定义与内容要求见 [上下文信封](context-design.md#23
 ```text
 { hub_root, flow_mode, truncated: false, notify?, auto?, degraded?: [task_id],
   tasks: [{ task_id,title,status,updated_at,needs_attention,waiting_for,
-            version,flow,cast?,checkout?,pending_since,round_count,
+            version,flow,cast?,checkout?,pending_since,round_count,current_round_started_at,
             warnings: [{version,code,message?}] }] }
 ```
 
 hub_root 为服务所属根。version 取 meta 与目录记录文件名最大版本；flow 总出现并规范化为 full，cast / checkout 有才出现。notify / auto 回显当前配置，缺省或损坏配置不使接口报错。pending_since 是本次进入 pending_approval 的起点，离开后清空。
+
+current_round_started_at 是看板筛选当前轮 run 的稳定时间锚点：取当前底态对应角色（designing→architect、implementing / revising→executor、reviewing→reviewer）的最近一次 launch note 时间；状态翻转时重置为翻转记录时间，初始轮尚未发车时取任务创建时间。中途进度 note、ack 或其他角色的 launch note 不推进锚点；同角色再次发车则更新。该字段由 Store 增量折叠投影，不单独落盘，也不额外读取记录。
 
 round_count 从 0 开始，对每条有效 code_changes / revision 累计一次，即实际使任务从 implementing / revising 进入 reviewing 或 pending_approval 的交付。design、review、note、launch marker 及表外交付不计。warnings.version 指向触发该警告的记录版本；被 ack / close 清除的历史警告不再出现在当前 warnings 中。warning 可附第 3.2 节定义的修复单字段。
 
@@ -226,7 +242,7 @@ MCP HTTP 请求限时 10 秒。退出码为 0（EOF / 正常关闭）、1（参�
 
 任务表为状态 dot、Task、第 3 列、第 4 列、Age。Task 取 title，Age 取 updated_at，不逐行读 versions。按投影桶决定列语义：working 三桶（designing / implementing / reviewing）第 3 列为 Activity，仅由 round_count / warnings / pending_since 合成，第 4 列为 Agent · Model；needs-human 第 3 列为 Status、第 4 列为 Tokens；done 第 4 列为 flow。
 
-Agent · Model 在 working 三桶中只显示当前回合的运行事实：从该任务满足 `run.started_at ≥ /state.updated_at`（任务最新记录时间）的最新 run 的 argv_summary 提取，无论该 run 仍在运行或已退出；当前回合尚无 run 时显示 `pending`，存在不可归属的元数据损坏 run 或时间证据不可用时显示 `unknown`。不用 cast 或 PID 探测猜运行事实，不承载等待或角色话术；支持 --model / -m 及附值形式，缺失或截断显示未知。Tokens 求 usage 各轮 total_tokens 之和，缺失、非法或 unresolved 显示未知或部分值，不补零。
+Agent · Model 在 working 三桶中只显示当前回合的运行事实：从该任务满足 `run.started_at ≥ /state.current_round_started_at`（当前轮稳定锚点）的最新 run 的 argv_summary 提取，无论该 run 仍在运行或已退出；当前回合尚无 run 时显示 `pending`，存在不可归属的元数据损坏 run 或时间证据不可用时显示 `unknown`。不用 cast 或 PID 探测猜运行事实，不承载等待或角色话术；支持 --model / -m 及附值形式，缺失或截断显示未知。Tokens 求 usage 各轮 total_tokens 之和，缺失、非法或 unresolved 显示未知或部分值，不补零。
 
 LIVE 为 designing / implementing / reviewing / revising，LATE 为 pending_approval / approved / closed，详情读取仍按底态选择。
 
@@ -294,7 +310,7 @@ Reviewer 优先使用与 Executor 不同的 agent；同 agent 多角色合法但
 |---|---|
 | --url | http://127.0.0.1:3001 |
 | --interval | 整数秒，缺省 5，下限 1 |
-| --event-port | 正整数，缺省 3002 |
+| --event-port | 正整数；省略时复用归属验证通过的 Notifier，未发现时默认 Hub 用 3002，非默认 Hub 用 Hub 端口 + 1 |
 | --stall-timeout | 整数分钟，缺省 30，非正按 0 |
 | --working-timeout | 整数秒，缺省 300，非正按 0；--launch-working-timeout / --launch-timeout 为互斥别名 |
 
@@ -322,25 +338,25 @@ auto 每轮对候选记等待角色、门、白名单、查重、最终动作与
 
 #### 成功退出但没有交付
 
-运行观察只对本 rig 中具有合法 task_id/headless 身份、因而 `knows(task)` 的 run 对账。`complete(meta)`、无 stop_request、exit_code=0 且无退出信号才入候选。根进程退出但原组未完成、主动停止、非零退出、启动未确认和无归属的手动 run 不产生此告警；既有 give-up 语义保留。
+运行观察只核对本 rig 中具有合法 task_id/headless 身份、满足 `knows(task)` 的 run。候选必须同时满足 `complete(meta)`、无 stop_request、exit_code=0 和无退出信号。根进程退出但原组未完成、主动停止、非零退出、启动未确认和无归属的手动 run 不产生此告警；give-up 按宿主的失败通知规则独立处理。
 
-交付是同 task、同 role 的 design / code_changes / revision / review，版本严格大于 run 的 base_version。下一次同角色合法 launch marker 的 base_version 为前一轮的包含上界，防止后轮交付掩盖前轮缺交付。note、decision、launch marker、其他角色及启动前记录不算交付。关联依据为角色和版本，不证明发布进程身份。
+交付限同 task、同 role 的 design / code_changes / revision / review，版本严格大于 run 的 base_version，并以下一次同角色合法 launch marker 的 base_version 为包含上界。该区间隔离各轮交付，后轮交付不能掩盖前轮缺交付。note、decision、launch marker、其他角色及启动前记录不算交付。角色与版本只能建立关联，不能证明发布进程身份。
 
-在线退出与 restore 使用同一个完成候选队列。restore 将已完成成功 run 加入待判集合，不放回 occupied；冷启动首次成功观察也会补判 Notifier 停机窗口中的退出，但不重放旧 note、不补播历史 give-up、不启动下一轮。Hub 读取失败保留候选，下次既有轮询重试；同任务多个候选复用一次读取。核对有交付或尝试告警后消费候选，静止轮不重复读历史。
+在线退出与 restore 共用完成候选队列。restore 将已完成成功 run 加入待判集合，不放回 occupied；冷启动首次成功观察补判 Notifier 停机窗口中的退出，不重放已有 note、不补发 give-up、不启动下一轮。Hub 读取失败保留候选，下一轮轮询重试；同任务多个候选复用一次读取。确认有交付或尝试告警后消费候选，无待判变化时不重复读任务日志。
 
-原因名为 `stopped-without-publish`，沿用 attempt 级有界通知去重，先登记 key 再 await 发送。发送失败只记日志，不重投。去重只在 Notifier 生命周期内有效：再次重启可再次提醒仍未交付的历史成功 run；可恢复补判不等于跨重启永久 exactly-once。
+告警原因名为 `stopped-without-publish`，按 attempt 有界去重，先登记 key 再 await 发送。发送失败只记日志，不重投。去重仅在 Notifier 生命周期内有效；重启后可再次提醒已成功结束但仍未交付的 run，不保证跨重启永久 exactly-once。
 
 #### 新增交付的运行时间线核对
 
-仅在本次有效 `launch_mode=detached` 且 task 归属明确时核对新增 worker 交付。manual flow 不等于 TUI，观察不受 auto 白名单约束，也不赋予启动权限。human note/decision/ack、普通 worker note、系统 launch note 均排除。
+仅在当前有效 `launch_mode=detached` 且 task 归属明确时核对新增 worker 交付。manual flow 不等于 TUI，观察不受 auto 白名单约束，也不赋予启动权限。human note/decision/ack、普通 worker note、系统 launch note 均排除。
 
 按记录之前最近的合法 launch marker 定位轮次；必须明确 headless，且 attempt、role、base_version 与本地可信 run 对应。TUI/legacy marker、无 marker、跨 rig 或身份不明不推定为 headless。
 
-仍 occupied 的任务（含 starting/uncertain/未完成 stop，以及在线 meta 读取失败后尚未确认的完成）暂缓核对，保留交付区间；仅在确实完成核对时推进已处理版本，等待期间不重复拉取 Hub 历史。只有新交付沿才刷新 run 元数据；清单读取失败或不完整按 unknown 诊断，不能当成空清单。
+occupied 任务（含 starting/uncertain/未完成 stop，以及在线 meta 读取失败后尚未确认的完成）暂缓核对并保留交付区间。完成核对才推进已处理版本，等待期间不重复拉取 Hub 日志。只有新交付沿才刷新 run 元数据；清单读取失败或不完整按 unknown 诊断，不能当成空清单。
 
-用交付 timestamp 与 run 的 started_at/ended_at 区间核对，边界相等视为覆盖。publish 与退出在同一轮询窗口被看到时，已完成 run 仍提供时间证据。仅能确认无归属 run 覆盖记录时间才产生 `ghost-delivery`。时间非法、时序矛盾按 unknown，不作肯定诊断。正文包括 task、role、版本、attempt/run、记录与观察时间、无覆盖依据及 `tut read` / `tut ps` / `tut attach` 指引。
+交付 timestamp 按 run 的 started_at/ended_at 闭区间核对，边界相等视为覆盖。publish 与退出在同一轮询窗口被观察到时，已完成 run 也提供时间证据。只有确认没有归属 run 覆盖记录时间，才产生 `ghost-delivery`。时间非法或时序矛盾按 unknown，不作肯定诊断。通知正文包括 task、role、版本、attempt/run、记录与观察时间、无覆盖依据及 `tut read` / `tut ps` / `tut attach` 指引。
 
-Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。Hub 读取偶然看到更高版本，不提前消费。读取失败保留下界，下轮无需新增版本即可重试。首见、冷启动、版本回退、任务消失/降级后恢复、切入 detached 均先建基线，不追报历史新增；切出 detached 清理边界。
+Notifier 在自动启动前核对 `(已处理版本, 当前快照 /state.version]`。Hub 读取看到高于快照的版本时不提前消费。读取失败保留下界，下一轮无需版本增长即可重试。首见、冷启动、版本回退、任务消失/降级后恢复、切入 detached 均先建基线，不追报基线之前的交付；切出 detached 清理边界。
 
 通知按 task_id + record.version 去重，同一静止版本不重报。此路径不写 Hub 记录、不执行 stop/resume/重投。
 
@@ -348,16 +364,16 @@ Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。H
 
 | 观察 | 续期证据 | 超时含义 |
 |---|---|---|
-| 既有 stall | `/state.updated_at` / version 的进展，以及既有匹配 launch working 规则 | Hub 长时间无进展 |
+| stall | `/state.updated_at` / version 的进展，以及匹配在役 launch watch 的 working 事件 | Hub 长时间无进展 |
 | log mtime 静默 | 归属明确且仍运行的 headless run 的 log mtime 变化 | 长时间未观察到输出，可能在思考或等待 |
 
-两者共用 `--stall-timeout`，默认 30 分钟，内部归一化为非负毫秒阈值。0 表示立即到期：静默首次有效采样建基线，下一次有效比较即可触发；不是禁用开关。写 note 不清除日志静默，输出日志不冒充 Hub 进展，两类通知可以分别出现。
+两个时钟共用 `--stall-timeout`，默认 30 分钟，内部归一化为非负毫秒阈值。0 表示立即到期：静默首次有效采样建基线，下一次有效比较即可触发，不表示禁用。写 note 不清除日志静默，输出日志不作为 Hub 进展，两类通知可以分别出现。
 
-每个合格 run 每轮至多一次 RunStore.logInfo；仅取安全只读的文件元信息，不读取正文或阻塞轮询。首次有效采样、mtime 变化、新 run、重启、读取故障恢复都建立新时钟。一个连续静默段只提醒一次；恢复输出后，必须再次走完阈值才能提醒。
+每个合格 run 每轮至多调用一次 RunStore.logInfo，只取安全只读的文件元信息，不读取正文或阻塞轮询。首次有效采样、mtime 变化、新 run、重启、读取故障恢复均重设时钟。每个连续静默段只提醒一次，恢复输出后须再次达到阈值才能提醒。
 
 不可读、缺失或非法文件只记诊断，不把不可观测时间累计为静默。starting/uncertain、root_exited、complete、主动 stop、已关闭或不在当前可见任务集的 run 不武装静默告警。
 
-内部原因 `suspected-blocked/silent` 不是线上事件。它只提示可能性，不断言 blocked/失败，不修改 status/needs_attention，不自动补救。
+`suspected-blocked/silent` 是内部诊断原因，只提示可能性，不断言 blocked/失败，不修改 status/needs_attention，不自动补救，也不作为线上事件发送。
 
 ## 7. 宿主契约
 
@@ -371,7 +387,7 @@ Notifier 在自动启动前核对 `(已处理版本, 本次 /state.version]`。H
 | launch_mode | tui / detached：start-next 与 Notifier 发车后端 | tui |
 | flow_mode | manual / auto：谁按启动键 | manual |
 
-`launch_mode` 读写接受 `tui` / `detached` 及兼容别名 `headless`，旧值在配置输入边界归一为 `detached`；get 返回规范值但不回写，set 两种拼写均只写 `detached`。别名无预定删除日期，不产生周期告警。产品配置名不改变记录协议：新旧 marker 的 `launch_mode:'headless'`、`target_kind:'headless-posix'` 和 run 的 `headless` 归属键保持不变，不迁移存量记录、run 或 usage 文件。
+`launch_mode` 读写接受 `tui` / `detached` 及兼容别名 `headless`，别名在配置输入边界归一为 `detached`；get 返回规范值但不回写，set 两种拼写均只写 `detached`。别名无预定删除日期，不产生周期告警。记录协议独立于产品配置名：marker 的 `launch_mode:'headless'`、`target_kind:'headless-posix'` 和 run 的 `headless` 归属键固定使用这些名称，不迁移存量记录、run 或 usage 文件。
 
 三者互不替代：切电源不切发车，切发车不产生轮次，auto 不越过审批。power / launch 的配置 set 保键原子写，非法 set 不落盘；launch_mode 缺文件 / 缺键用缺省，损坏或非法值拒绝本次启动。up / down 的 power 读取只验证出现的 power 节；缺失、不可读或坏 JSON 按 herdr 缺省，显式非法 power 节失败；config get power.mode 使用严格读取并报告坏文件。
 
@@ -405,6 +421,8 @@ Notifier 在 loopback 监听 `POST /agent-event`，核心 JSON 字段为字符�
 
 生产者以非空 TUT_EVENT_PORT_URL 指完整接收 URL，缺省 http://127.0.0.1:3002/agent-event；它不改变监听端口，部署须与 --event-port 一致。可选证据由对应宿主定义，内部推断原因不是新线上事件。
 
+手动启动入口先按 Hub 根与地址有界发现本 rig 的 Notifier，并将实际事件 URL 注入 worker；非默认 Hub 发现失败时明确拒绝，不回退 3002。默认本地 Hub 允许带警告的兼容降级。位置参数入口 `tut launch <task_id> <role> [agent ...]` 同样遵循 launch_mode：detached 使用共享 detached 规划与执行，tui 使用 Herdr 路径。默认 Hub 不属于当前根时继续有界发现；显式 TUT_HUB_URL 的归属冲突拒绝启动。
+
 新线上词须同时具备兼容 schema、Notifier 消费与去重 / 降级语义、canonical on-agent-event.mjs 的 EVENTS 同步、旧消费者 ignored 与主轮询兜底。未知词不能承载唯一必需语义。
 
 ## 8. 工程约定
@@ -413,8 +431,10 @@ TypeScript、Node.js ≥ 20；运行时依赖为 MCP SDK 与显式声明以保�
 
 ```text
 src/cli.ts           CLI 构建入口（dist/cli.js）
-src/core/            Hub、MCP、Notifier、共享契约、CLI、诊断与 run 基础库
-src/herdr/           pane 启动器与终端视图适配
+src/hub/             Hub 存储、派生状态、MCP/HTTP API、建单检查与看板
+src/protocol/        共享纯契约、任务规格与启动协议叶
+src/core/            Notifier、CLI（含 live-view 渲染）、诊断与 run 基础库
+src/herdr/           pane 启动器、终端信号与通知适配
 src/standalone/      detached 电源与 detached 启动器
 skills/              共用及各角色操作文本
 scripts/             事件接线、打包检查与用量 harness
@@ -422,6 +442,38 @@ test/                Vitest 验证
 design/              本文及三篇叶子文档
 ```
 
+代码区与合法依赖方向（箭头指向被依赖方；区级视图，文件归属以目录为准）：
+
+```mermaid
+graph TD
+    protocol["protocol/<br>冻结契约叶<br>launch · types · task-spec"]
+    hub["hub/<br>Hub 服务层<br>存储 · 派生 · HTTP/MCP API · 看板"]
+    core["core/<br>中性基建与客户端编排<br>Notifier · run · CLI · 诊断"]
+    herdr["herdr/<br>TUI lane<br>pane 生命周期 · 终端发车"]
+    standalone["standalone/<br>detached lane<br>电源 · run/stop/resume"]
+    app["app/<br>组合根"]
+
+    hub --> protocol
+    core --> hub
+    core --> protocol
+    herdr --> core
+    herdr --> hub
+    herdr --> protocol
+    standalone --> core
+    standalone --> hub
+    standalone --> protocol
+    app --> herdr
+    app --> standalone
+    app --> core
+    app --> hub
+```
+
+图中未画出的方向一律非法：herdr 与 standalone 互不引用，core 到两个 lane 的直接导入为零并由方向门拒绝，Hub 对外依赖仅限自身、protocol 与方向门登记的存量豁免。
+
 物理代码分区与本文的协议辖区不同；宿主文档按用户行为归属组织。CLI 完整语法以 src/core/cli/usage.ts 为准。watch 退出码 0=轮次边界（含 pending_approval）、1=操作错、2=approved / closed、3=needs_attention；终态与待处置立即返回。ack 追加 human ack note，status 只读总览，config 管配置，skill 输出角色文本，init 初始化接线。
 
-发布检查在 npm pack 前验证 dist/cli.js、pane runner、role skills 等运行时材料，拒绝残缺包和退役构建残留。修改后运行 build、typecheck、test；派生表、异常重放、并发写、人工门、故障恢复、宿主身份 / 停止与观察边界按真实契约验证。文档引用与公开集泄露检查须通过。
+core 到 herdr/standalone 的直接导入（含类型、转发与动态 import）为零，方向门禁止新增；跨宿主装配归 app。
+
+Hub 是独立代码区：其他业务区可消费 Hub，Hub 新增依赖只允许指向自身或 protocol。方向门按登记豁免存量边并报告数量，豁免范围不得扩大。
+
+发布检查在 prepack 中清空 dist 后重新构建，记录源码、脚本、skills、锁文件与 Node/TypeScript 工具链的内容指纹及产物指纹，再验证 dist/cli.js、pane runner、role skills 等运行时材料。候选 tar 与 npm pack 最终 tar 均需核对构建身份、链接 watcher 全部导入并实际输出 --help；残缺包、旧产物和退役构建残留不得发布。修改后运行 build、typecheck、test；派生表、异常重放、并发写、人工门、故障恢复、宿主身份 / 停止与观察边界按真实契约验证。文档引用与公开集泄露检查须通过。

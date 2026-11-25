@@ -11,6 +11,8 @@ export async function runStats(parsed: Extract<ParsedArgs, { command: "stats" }>
       for (const task of report.tasks) {
         process.stdout.write(`${task.task_id} (${task.title}): ${task.status}; review pass ${percent(task.review_pass_rate)}; revisions ${task.revision_rounds}; waiting ${task.waiting_for}; usage ${task.usage.status}\n`);
         process.stdout.write(`  per-role ${JSON.stringify(task.per_role)}; tokens by agent ${JSON.stringify(task.usage.by_agent)}\n`);
+        if (task.usage.unsupported?.length) process.stdout.write(`  usage: 不支持 · ${task.usage.unsupported.map(u=>u.agent+': '+u.reason).join('; ')}${Object.keys(task.usage.by_agent).length?' · partial':''}\n`);
+        if (task.usage.unmetered?.length) process.stdout.write(`  usage: 未计量 · ${task.usage.unmetered.map(u=>u.agent+': '+u.reason).join('; ')}\n`);
         if (task.usage.error) process.stdout.write(`  usage error: ${task.usage.error}\n`);
       }
       const b = report.batch;

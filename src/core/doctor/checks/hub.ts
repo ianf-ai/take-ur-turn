@@ -1,9 +1,9 @@
 import path from "node:path";
-import { canonicalRoot } from "../../hub/rig-discovery.js";
+import { canonicalRoot } from "../../../hub/rig-discovery.js";
 import { DOCTOR_HUB_TIMEOUT_MS } from "../constants.js";
 import { worst } from "../shared.js";
 import type { DoctorCheck, DoctorContext } from "../types.js";
-import type { CheckoutRoute } from '../../common/types.js';
+import type { CheckoutRoute } from '../../../protocol/types.js';
 
 // --- check 1: hub --------------------------------------------------------------
 

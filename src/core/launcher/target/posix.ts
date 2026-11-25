@@ -14,7 +14,7 @@ const POSIX_WHICH_MISSING_HINT =
 /**
  * Prove the bare route agent exists on PATH.  The which output path is used
  * only for this validation — it never replaces the bare executable in an
- * invocation or PaneCommand.
+ * invocation or structured execution plan.
  */
 export async function resolvePosixTargetPresence(
   routeAgent: string,

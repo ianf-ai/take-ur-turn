@@ -71,41 +71,53 @@
 
 ## 发布 review
 
-前置条件：已完成本轮检查。verdict 按本文件「结论判据」选定；信封见 `skills/common.md`「记录信封」。
+前置条件：已完成本轮检查。verdict 按本文件「结论判据」选定，信封见 `skills/common.md`「记录信封」。
 
 1. 按「关闭条件」核对评审结果。
-2. 按以下模板逐节填写 body（小节标题保真）。
-3. 重读任务状态。
-4. 若已不在 reviewing，结束本轮（被 Executor 收回时等 revision 后再接手，不发 review）。
-5. 若仍在 reviewing，按 `skills/common.md`「记录信封」发布 review。
-6. 若有补充说明，发布 note。
+2. 按 context.publish 输入定义逐条填写 exit_conditions。
+3. 在各项 evidence 中记录核验证据。
+4. 在已批准延后项的 evidence 中引用人的拍板记录。
+5. 在外部阻塞项的 evidence 中说明未完成的验证与阻塞条件。
+6. 在重审项的 evidence 中引用已核销证据。
+7. 按以下模板逐节填写 body。
+8. 若没有有效条件基线，在总体评价中披露缺失。
+9. 重读任务状态。
+10. 若已不在 reviewing，结束本轮。
+11. 若仍在 reviewing，按 `skills/common.md`「记录信封」发布 review。
+12. 若有补充说明，发布 note。
 
 ```markdown
 ## 总体评价
 
-## 退出条件逐条核验
-1. 满足：<description 第 1 条条件原文或可追溯摘要>；证据：<测试、检查或记录引用>
-2. 不满足：<第 2 条条件>；证据：<缺口与检查结果>
-（逐条填写「满足」「不满足」「外部阻塞」「已批准延后」之一及证据。
- 延后项引用 human 拍板；外部验证未决使用 blocked_external；重审引用已核销证据。
- 无有效条件时披露基线缺失。）
-
 ## 超出规格的改动
 无
-（有改动时，逐项填写授权、必要性与对应验收；越界按「范围核查」处理。）
+（有改动时，逐项填写授权、必要性与对应验收，越界按「范围核查」处理。）
 
 ## 问题列表
-（按严重度排列问题；每条含 file:line、修法与关闭条件。）
+（按严重度排列，每条含 `file:line`、修法与关闭条件。）
 
 ## 建议与延后候选
 （填写延后建议及理由。）
 ```
 
-调用示例：
+被 Executor 收回时，等待 revision 后再接手。
+
+调用示例（示例证据需替换为真实材料）：
 
 ```
-context.publish {"task_id": "<id>", "role": "reviewer", "content_type": "review", "payload": {"summary": "一句话摘要", "body": "<模板正文>", "verdict": "fail_code", "ref_version": 3}, "expected_version": 3}
-tut publish <id> --role reviewer --content-type review --summary "…" --payload-file review.md --verdict fail_code --ref-version 3 --expected-version 3
+context.publish {"task_id": "<id>", "role": "reviewer", "content_type": "review", "payload": {"summary": "一句话摘要", "body": "<按正文模板填写>", "verdict": "fail_code", "ref_version": 3, "exit_conditions": [{"id": 1, "verdict": "满足", "evidence": "<真实核验证据>"}, {"id": 2, "verdict": "不满足", "evidence": "<缺口与检查结果>"}]}, "expected_version": 3}
+tut publish <id> --role reviewer --content-type review --summary "…" \
+  --payload-file review.md --exit-conditions-file exit-conditions.json \
+  --verdict fail_code --ref-version 3 --expected-version 3
+```
+
+exit-conditions.json 示例（与 --exit-conditions-file 配套，逐项 id、verdict、evidence）：
+
+```json
+[
+  {"id": 1, "verdict": "满足", "evidence": "<真实核验证据>"},
+  {"id": 2, "verdict": "不满足", "evidence": "<缺口与检查结果>"}
+]
 ```
 
 ### 设计交付物的审查判据

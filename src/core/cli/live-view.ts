@@ -1,8 +1,8 @@
 /** tut live-view --layout <json-file> — . The read-only seat grid. */
 import { readFileSync } from 'node:fs';
-import { resolveRigRoot } from '../hub/rig-discovery.js';
+import { resolveRigRoot } from '../../hub/rig-discovery.js';
 import { RunStore } from '../run/store.js';
-import { LiveView } from '../../herdr/live-view/view.js';
+import { LiveView } from './live-view/view.js';
 import type { ParsedArgs } from './args.js';
 
 export async function runLiveViewCommand(p: Extract<ParsedArgs, { command: 'live-view' }>): Promise<number> {

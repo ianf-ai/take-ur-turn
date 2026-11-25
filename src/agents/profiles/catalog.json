@@ -1,0 +1,5 @@
+{
+  "codex": "../native/codex/profile.json",
+  "pi": "../native/pi/profile.json",
+  "opencode": "../native/opencode/profile.json"
+}

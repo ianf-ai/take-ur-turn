@@ -1,6 +1,6 @@
 /** Best-effort delivery escalation. Exit zero does not confirm consumption. */
 import type { DeliveryEvidenceV2 } from "./delivery.js";
-import { DEFAULT_NOTIFIER_EVENT_URL } from "../../core/hub/rig-discovery.js";
+import { DEFAULT_NOTIFIER_EVENT_URL } from "../../hub/rig-discovery.js";
 
 /** Historical input-box diagnostics; never authorize manual submission. */
 export type GiveUpBoxEvidence = "held" | "cleared" | "unknown";

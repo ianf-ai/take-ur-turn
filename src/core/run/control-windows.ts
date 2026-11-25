@@ -1,3 +1,6 @@
+import {decodeContract} from '../../agents/public/index.js';
+import {validateInput} from './input.js';
+import {preflightTargetFrame} from './windows-broker.js';
 import path from 'node:path';
 import { fork } from 'node:child_process';
 import { closeSync, fstatSync, readSync, statSync } from 'node:fs';
@@ -8,9 +11,11 @@ import { fileURLToPath } from 'node:url';
 import type { Writable } from 'node:stream';
 import { RunStore, delay, probe, complete, validateHeadlessOwnership } from './store.js';
 import { StartRunError, type StartOptions, type StopOptions, type StopResult } from './control-contract.js';
-import { listRuns as posixList } from './control-posix.js';
+import type { listRuns as posixList } from './control-posix.js';
+import { quarantinedMarker } from './repair.js';
+import { CONTROL_PROTOCOL } from './protocol.js';
 import { assertRunIdentity } from './validation.js';
-import { openRunFile, type RunFile } from '../hub/run-file.js';
+import { openRunFile, type RunFile } from '../../hub/run-file.js';
 import { WINDOWS_PROTOCOL, WINDOWS_SCOPE, windowsMeta } from './windows-protocol.js';
 /** Resolve native executables once before reserving a run; shell/npm shims belong to the target planner. */
 function nativeExecutable(command: string, cwd: string, env: NodeJS.ProcessEnv): string {
@@ -24,6 +29,7 @@ function nativeExecutable(command: string, cwd: string, env: NodeJS.ProcessEnv):
     throw new Error('preflight-rejected: native executable not found; resolve npm shim before startRun');
 }
 export async function startRun(store: RunStore, argv: string[], cwd: string, task_id?: string, options: StartOptions = {}): Promise<string> {
+    validateInput(options.input);
     if (!argv[0] || argv.some(s => s.includes('\0')) || /\.(cmd|bat)$/i.test(argv[0]))
         throw new Error('preflight-rejected: native executable required (resolve npm shim before startRun)');
     argv = [nativeExecutable(argv[0]!, cwd, options.env ?? process.env), ...argv.slice(1)];
@@ -32,12 +38,16 @@ export async function startRun(store: RunStore, argv: string[], cwd: string, tas
         if (!task_id)
             throw new Error('headless ownership requires task_id');
     }
+    preflightTargetFrame({argv,cwd,env:options.env??process.env,...(options.input?{input:options.input}:{})},store.hubRoot);
+    const contract=options.profile??options.headless?.contract;
+    if(contract)decodeContract(contract);
+    options={...options,...(contract?{profile:contract,...(options.headless?{headless:{...options.headless,contract}}:{})}:{})};
     const id = store.create();
     closeSync(store.openLog(id, true));
     if (options.headless)
         await store.writeStartIntent(id, { task_id: task_id!, headless: options.headless, cwd, startup: 'pending' });
     if (options.resume)
-        await store.writeResumeIntent(id, { schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent, session_id: options.resume.session_id, cwd, startup: 'pending' });
+        await store.writeResumeIntent(id, { ...(contract?{contract}:{}),schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent, session_id: options.resume.session_id, cwd, startup: 'pending' });
     const supervisor = fork(fileURLToPath(new URL('./supervisor-windows.js', import.meta.url)), ['--supervise-windows'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: [] });
     try {
         await new Promise<void>((resolve, reject) => {
@@ -58,7 +68,7 @@ export async function startRun(store: RunStore, argv: string[], cwd: string, tas
             if (options.headless)
                 await store.writeStartIntent(id, { task_id: task_id!, headless: options.headless, cwd, startup: 'failed' });
             if (options.resume)
-                await store.writeResumeIntent(id, { schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent, session_id: options.resume.session_id, cwd, startup: 'failed' });
+                await store.writeResumeIntent(id, { ...(contract?{contract}:{}),schema: 1, from_run_id: options.resume.from_run_id, agent: options.resume.agent, session_id: options.resume.session_id, cwd, startup: 'failed' });
         }
         throw e;
     }
@@ -69,7 +79,24 @@ export async function startRun(store: RunStore, argv: string[], cwd: string, tas
     }
 }
 export function listRuns(store: RunStore): ReturnType<typeof posixList> {
-    const result = posixList(store);
+    const result: ReturnType<typeof posixList> = { runs: [], errors: [], quarantined: [] };
+    for (const item of store.readManyMetas(store.list())) {
+        const id = item.id;
+        if (item.kind === 'error') {
+            if ((item.error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+                const marker = quarantinedMarker(store, id);
+                if (marker !== undefined) {
+                    result.quarantined.push({ run_id: id, note: `quarantined: invalid meta isolated as ${marker}; run log preserved` });
+                    continue;
+                }
+            }
+            result.errors.push({ run_id: id, error: `incomplete/unreadable: ${(item.error as Error).message}` });
+            continue;
+        }
+        const m = item.meta, group_alive = probe(-m.pgid);
+        result.runs.push({ ...m, pid_alive: probe(m.pid), group_alive, supervisor_alive: probe(m.supervisor_pid),
+            stale: !m.ended_at && (m.control_protocol === CONTROL_PROTOCOL ? probe(m.supervisor_pid) === false : m.status === 'running' && group_alive === false) });
+    }
     for (const row of result.runs)
         if (row.control_protocol === WINDOWS_PROTOCOL) {
             const m = windowsMeta(row);
@@ -82,7 +109,10 @@ export function listRuns(store: RunStore): ReturnType<typeof posixList> {
     return result;
 }
 export async function stopRun(store: RunStore, id: string, options: StopOptions = {}): Promise<StopResult> {
-    let meta = windowsMeta(store.read(id));
+    return store.withMetadataReads(() => stopWithMetadataReads(store, id, options));
+}
+async function stopWithMetadataReads(store: RunStore, id: string, options: StopOptions): Promise<StopResult> {
+    let meta = windowsMeta(await store.readAsync(id));
     const initial = meta;
     const now = options.now ?? (() => performance.now());
     const sleep = options.sleep ?? delay;
@@ -97,7 +127,7 @@ export async function stopRun(store: RunStore, id: string, options: StopOptions 
             return result(true, 'already-ended');
         return undefined;
     };
-    const read = (): void => { meta = windowsMeta(store.read(id)); assertRunIdentity(meta, initial); };
+    const read = async (): Promise<void> => { meta = windowsMeta(await store.readAsync(id)); assertRunIdentity(meta, initial); };
     let done = terminal();
     if (done)
         return done;
@@ -105,7 +135,7 @@ export async function stopRun(store: RunStore, id: string, options: StopOptions 
         // Wait through the first caller's bounded challenge, then join its request.
         const unlock = await store.lock(id, 'stop', (options.identityMs ?? 7000) + 2000);
         try {
-            read();
+            await read();
             done = terminal();
             if (done)
                 return done;
@@ -118,7 +148,7 @@ export async function stopRun(store: RunStore, id: string, options: StopOptions 
                 await store.updateMeta(id, m => { assertRunIdentity(m, initial); return { ...m, identity_probe: nonce }; });
                 const deadline = now() + (options.identityMs ?? 7000);
                 for (;;) {
-                    read();
+                    await read();
                     done = terminal();
                     if (done)
                         return done;
@@ -151,7 +181,7 @@ export async function stopRun(store: RunStore, id: string, options: StopOptions 
     // after the ladder; explicit caller deadlines still take precedence.
     const deadline = now() + (options.waitMs ?? 60000);
     for (;;) {
-        read();
+        await read();
         done = terminal();
         if (done)
             return done;
@@ -167,7 +197,7 @@ export async function stopRun(store: RunStore, id: string, options: StopOptions 
 export async function attachRun(store: RunStore, id: string, output: Writable = process.stdout, signal?: AbortSignal): Promise<number> {
     // Windows keeps native read-only handles inside its helper for the whole
     // view, including backpressure waits; no ordinary open on the hot path.
-    const log: RunFile = await openRunFile(store.directory(id) + '/log');
+    const log: RunFile = await openRunFile(store.logPath(id));
     const buffer = Buffer.alloc(65536);
     try {
         let cursor = (await log.stat()).size;

@@ -1,0 +1,168 @@
+// Endpoint ownership/discovery is exercised with real HTTP in rig-discovery.test.ts.
+vi.mock("../../../src/hub/rig-discovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/hub/rig-discovery.js")>()),
+  resolveCliHubUrl: async (url: string) => url,
+  resolveLegacyLaunchHubUrl: async (url: string) => url,
+}));
+
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const processMocks = vi.hoisted(() => ({
+  runInternalLaunch: vi.fn(),
+  runInternalLaunchInvocation: vi.fn(),
+  runLaunchEntry: vi.fn(),
+}));
+const hubMocks = vi.hoisted(() => ({
+  hubDecide: vi.fn(),
+  hubPublish: vi.fn(),
+  hubRead: vi.fn(),
+}));
+
+vi.mock("../../../src/herdr/launcher/process.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/herdr/launcher/process.js")>()),
+  runInternalLaunch: processMocks.runInternalLaunch,
+  runInternalLaunchInvocation: processMocks.runInternalLaunchInvocation,
+}));
+
+vi.mock("../../../src/herdr/launcher/entry.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/herdr/launcher/entry.js")>()),
+  runLaunchEntry: processMocks.runLaunchEntry,
+}));
+
+vi.mock("../../../src/hub/hub-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/hub/hub-client.js")>()),
+  hubDecide: hubMocks.hubDecide,
+  hubPublish: hubMocks.hubPublish,
+  hubRead: hubMocks.hubRead,
+}));
+
+// Launch-mode routing pin: this file exercises the tui side of the start-next
+// switch (frozen launcher-child environment); the manual door's shipped
+// default is the pane chain (missing key), pinned here via the config read.
+// The headless side lives in test/lanes/detached/start-next-headless.test.ts.
+vi.mock("../../../src/core/common/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/core/common/config.js")>()),
+  readLaunchMode: vi.fn(async () => "tui" as const),
+  readPowerModeForSwitch: vi.fn(async () => { throw new Error("malformed power.mode"); }),
+}));
+
+import { main } from "../../../src/cli.js";
+import { readLaunchMode, readPowerModeForSwitch } from "../../../src/core/common/config.js";
+import { DEFAULT_CHILD_TIMEOUT_MS } from "../../../src/herdr/launcher/process.js";
+
+function captureIo(): { out: () => string; err: () => string; restore: () => void } {
+  let stdout = "";
+  let stderr = "";
+  const out = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    stdout += String(chunk);
+    return true;
+  });
+  const err = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+    stderr += String(chunk);
+    return true;
+  });
+  return { out: () => stdout, err: () => stderr, restore: () => { out.mockRestore(); err.mockRestore(); } };
+}
+
+describe("CLI launcher process boundaries", () => {
+  let io: ReturnType<typeof captureIo>;
+  let temporary: string;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    io = captureIo();
+    temporary = mkdtempSync(path.join(os.tmpdir(), "tut-cli-launch-boundary-"));
+    processMocks.runInternalLaunch.mockReset();
+    processMocks.runLaunchEntry.mockReset();
+    vi.mocked(readLaunchMode).mockClear();
+    vi.mocked(readPowerModeForSwitch).mockClear();
+    processMocks.runInternalLaunchInvocation.mockReset();
+    hubMocks.hubDecide.mockReset();
+    hubMocks.hubPublish.mockReset();
+    hubMocks.hubRead.mockReset();
+  });
+
+  afterEach(() => {
+    io.restore();
+    vi.unstubAllGlobals();
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, originalEnv);
+    rmSync(temporary, { recursive: true, force: true });
+  });
+
+  it("tui legacy launch remains Herdr even with malformed power configuration", async () => {
+    process.env.TUT_EVENT_PORT_URL = "http://127.0.0.1:9/agent-event";
+    process.env.TUT_HUB_ROOT = temporary;
+    processMocks.runLaunchEntry.mockResolvedValue(7);
+    expect(await main(["launch", "--fresh", "explicit", "executor", "codex"])).toBe(7);
+    expect(processMocks.runLaunchEntry).toHaveBeenCalledWith({
+      kind: "round", request: { kind: "round", task_id: "explicit", role: "executor", fresh: true, via: "legacy", explicit_route_values: ["codex"] },
+    });
+    expect(readPowerModeForSwitch).not.toHaveBeenCalled();
+    expect(readLaunchMode).toHaveBeenCalledOnce();
+  });
+
+  it("a rejected Hub close never triggers terminal cleanup", async () => {
+    hubMocks.hubDecide.mockRejectedValue(new Error("Hub close refused"));
+    expect(await main(["decide", "unchanged", "--decision", "close", "--by", "host", "--url", "http://hub.test"])).toBe(1);
+    expect(processMocks.runInternalLaunch).not.toHaveBeenCalled();
+    expect(io.err()).toContain("Hub close refused");
+  });
+
+  it("decide close reports a timed-out cleanup with the notifier wording", async () => {
+    hubMocks.hubDecide.mockResolvedValue({ task_id: "cleanup-timeout", status: "closed" });
+    processMocks.runInternalLaunch.mockResolvedValue({
+      code: null,
+      signal: "SIGKILL",
+      stdout: "",
+      stderr: "",
+      timedOut: true,
+    });
+
+    await expect(main([
+      "decide", "cleanup-timeout", "--decision", "close", "--by", "host", "--url", "http://hub.test",
+    ])).resolves.toBe(0);
+
+    expect(io.err()).toContain(
+      `launch --cleanup cleanup-timeout exceeded the child liveness budget (${DEFAULT_CHILD_TIMEOUT_MS}ms) and was killed`,
+    );
+    expect(io.err()).not.toContain("pane cleanup exited with code null");
+    expect(hubMocks.hubDecide.mock.invocationCallOrder[0]).toBeLessThan(processMocks.runInternalLaunch.mock.invocationCallOrder[0]!);
+  });
+
+  it("manual start-next passes the frozen event-port environment to its launcher child", async () => {
+    const eventUrl = "http://127.0.0.1:3105/agent-event";
+    process.env.TUT_EVENT_PORT_URL = eventUrl;
+    process.env.TUT_DRY_RUN = "1";
+    process.env.TUT_PROJECT_ROOT = temporary;
+    process.env.TUT_USER_CONFIG_DIR = path.join(temporary, "user-config");
+    process.env.PATH = [path.resolve(import.meta.dirname, "../../bin"), originalEnv.PATH ?? ""].join(path.delimiter);
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        flow_mode: "manual",
+        tasks: [{
+          task_id: "moved-event-port",
+          status: "implementing",
+          waiting_for: "agent:executor",
+          needs_attention: false,
+          version: 0,
+        }],
+      }),
+    })));
+    hubMocks.hubRead.mockResolvedValue({ task_id: "moved-event-port", versions: [] });
+    hubMocks.hubPublish.mockResolvedValue({ task_id: "moved-event-port", version: 1 });
+    processMocks.runInternalLaunchInvocation.mockResolvedValue({ code: 0, signal: null, stdout: "", stderr: "" });
+
+    await expect(main(["start-next", "moved-event-port", "--url", "http://hub.test"])).resolves.toBe(0);
+
+    expect(processMocks.runInternalLaunchInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({ task_id: "moved-event-port", role: "executor" }),
+      { env: expect.objectContaining({ TUT_EVENT_PORT_URL: eventUrl }) },
+    );
+  });
+});

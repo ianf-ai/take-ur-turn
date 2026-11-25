@@ -257,8 +257,7 @@ export async function resolveWindowsExecutableTarget(
   } finally {
     // The walk's verdict is definitive (native/node-entry/shim, or a
     // terminal failure): a still-scanning fact child stops here —
-    // candidates past the verdict, dead UNC or not, are never probed
-    // (review v8: stop on definitive results).
+    // candidates past the verdict, dead UNC or not, are never probed.
     factTable?.dispose();
   }
 }

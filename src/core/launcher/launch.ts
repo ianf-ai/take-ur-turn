@@ -7,11 +7,12 @@
  * without adding a new content type or state transition.
  */
 
-import { hubPublish, hubRead, type HubPublishResult } from "../hub/hub-client.js";
-import { commandHead, commandArgs } from "../common/agent-command.js";
+import { hubPublish, hubRead, type HubPublishResult } from "../../hub/hub-client.js";
+import { latestStatusFlipVersion } from "../../hub/state-machine.js";
+import { commandHead, commandArgs } from "../../protocol/agent-command.js";
 import { resolveAgentRouteWithSource } from "../common/workspace.js";
 import type { ResolveOptions } from "../common/workspace.js";
-import type { AgentRoute, Cast, CheckoutRoute, ContextRecord, LaunchMarkerProjection, LaunchRouteSource } from "../common/types.js";
+import type { AgentRoute, Cast, CheckoutRoute, ContextRecord, Flow, LaunchMarkerProjection, LaunchRouteSource } from "../../protocol/types.js";
 
 export type LaunchVia = "start-next" | "auto";
 
@@ -19,6 +20,8 @@ export interface LaunchDecision {
   blocked: boolean;
   /** Version of the launch note that blocks the requested role, when blocked. */
   noteVersion?: number;
+  /** Completed notes-only attempt to replace, verified by the detached owner. */
+  recoveryVersion?: number;
 }
 
 /** Internal auto-only context. The caller establishes that this is a new edge;
@@ -59,16 +62,31 @@ function launchMarkerOf(record: ContextRecord): LaunchMarker | undefined {
 /**
  * Decide whether a role has already been launched in the current round.
  *
- * A launch note is valid until the next non-note record, or a verified new
- * note supplied by the auto consumer. Without that context behavior is unchanged. Sorting by
- * version keeps this pure helper deterministic even if a caller supplies the
- * records out of order, matching state-machine derivation semantics.
+ * Round-scoped: only a marker of the CURRENT waiting_for round dedups. The
+ * round boundary is the record that started this round — the most recent
+ * status flip (latestStatusFlipVersion); markers before it belong to earlier
+ * rounds (e.g. the round-0 marker of a now-revising task) and never block.
+ * Inside the round a launch note is valid until the next non-note record, or
+ * a verified new note supplied by the auto consumer. The boundary MUST be
+ * computed with the task's real flow — /state exposes it per task and every
+ * launch consumer threads it here. An omitted flow keeps derivation's own
+ * default table (absent = full) purely as a compatibility fallback for
+ * inputs that genuinely carry no flow: replaying a direct/solo log under the
+ * full table mis-derives the boundary (a plain worker note in a solo
+ * implementing round reads as a reviewing→revising flip) and would wrongly
+ * clear a valid same-round marker. Sorting by version keeps this pure helper
+ * deterministic even if a caller supplies the records out of order, matching
+ * state-machine derivation semantics.
+ * Detached consumers may additionally supply verified completed notes-only
+ * markers. Evidence is scoped to the exact marker version; it never exempts
+ * a newer marker or changes log-only consumers such as Herdr.
  */
-export function launchBlocked(records: readonly ContextRecord[], role: string, noteWake?: NoteWake): LaunchDecision {
+export function launchBlocked(records: readonly ContextRecord[], role: string, noteWake?: NoteWake, flow?: Flow, completedWithoutDelivery?: ReadonlySet<number>): LaunchDecision {
+  const boundary = latestStatusFlipVersion(records, flow);
   let lastContentVersion = 0;
   let latestMarkerVersion: number | undefined;
 
-  const ordered = [...records].sort((a, b) => a.version - b.version);
+  const ordered = [...records].sort((a, b) => a.version - b.version).filter(record => record.version > boundary);
   const candidates = noteWake === undefined ? [] : ordered.filter(record => record.version === noteWake.version);
   // Duplicate versions are corrupt evidence, not an unambiguous wake boundary.
   // The real /state attention gate also withholds such tasks.
@@ -82,9 +100,26 @@ export function launchBlocked(records: readonly ContextRecord[], role: string, n
   }
 
   if (latestMarkerVersion !== undefined && latestMarkerVersion > lastContentVersion) {
+    // Callers without detached run evidence retain the log-only semantics.
+    if (completedWithoutDelivery?.has(latestMarkerVersion)) return { blocked: false, recoveryVersion: latestMarkerVersion };
     return { blocked: true, noteVersion: latestMarkerVersion };
   }
   return { blocked: false };
+}
+
+/** Epoch-ms timestamp of the record that started the current waiting_for
+ *  round (the latest status flip), or undefined while no record ever flipped
+ *  the status (the initial round). Scopes stop-cancellation to the round the
+ *  stop interrupted: a flip strictly after an observed stop starts a
+ *  genuinely new round, and its candidates are not the cancelled ones. Pure
+ *  function; the same flow discipline as launchBlocked. */
+export function currentRoundStartedAt(records: readonly ContextRecord[], flow?: Flow): number | undefined {
+  const flipVersion = latestStatusFlipVersion(records, flow);
+  if (flipVersion <= 0) return undefined;
+  const record = records.find(candidate => candidate.version === flipVersion);
+  if (record === undefined) return undefined;
+  const at = Date.parse(record.timestamp);
+  return Number.isNaN(at) ? undefined : at;
 }
 
 function launchSummary(role: string, baseVersion: number): string {

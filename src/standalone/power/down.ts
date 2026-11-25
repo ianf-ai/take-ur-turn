@@ -1,7 +1,7 @@
 /**
  * `tut down` — stop THIS rig's standalone services (power.mode=standalone).
  *
- * Reads .context-hub/power.json and stops in reverse start order
+ * Reads .context-hub/runtime/power.json and stops in reverse start order
  * (notifier → usage watcher → hub). Signaling is IDENTITY-GATED and
  * GROUP-SCOPED:
  *   - a live pid is not ownership: before any signal to a live recorded
@@ -28,9 +28,9 @@
  */
 
 import { readPowerModeForSwitch } from "../../core/common/config.js";
-import { canonicalRoot, resolveRigRoot, probeHub, probeNotifier, notifierMatches } from "../../core/hub/rig-discovery.js";
-import { RunReadStore, type RunEntry } from "../../core/hub/run-store.js";
-import { powerStatePath, processAlive, groupAlive, processStartToken, readPowerState, writePowerState, readPowerMembers, prunePowerMembers, type ServiceFacts, type PowerState, type PowerMember } from "./standalone-up.js";
+import { canonicalRoot, resolveRigRoot, probeHub, probeNotifier, notifierMatches } from "../../hub/rig-discovery.js";
+import { RunReadStore, type RunEntry } from "../../hub/run-store.js";
+import { assertPowerOwnership, powerStatePath, processAlive, groupAlive, processStartToken, readPowerState, writePowerState, readPowerMembers, prunePowerMembers, type ServiceFacts, type PowerState, type PowerMember } from "./standalone-up.js";
 import path from "node:path";
 import { sleepMs } from "../../core/cli/shared.js";
 import { stopWindowsService } from "./windows.js";
@@ -222,6 +222,11 @@ async function rigFullyStopped(root: string, state: PowerState): Promise<boolean
 
 /** Core engine (no process exit): stop the recorded rig, report facts. */
 export async function stopStandaloneRig(root: string, state: PowerState): Promise<DownReport> {
+  try { await assertPowerOwnership(root, state); }
+  catch (error) {
+    process.stderr.write(`tut: down: ${(error as Error).message}\n`);
+    return { exitCode: 1, services: [], survivors: [] };
+  }
   const storageDir = path.join(root, ".context-hub");
   const runs = await new RunReadStore(storageDir).snapshot().catch(() => [] as RunEntry[]);
   const survivors = survivingRuns(runs);
@@ -315,6 +320,7 @@ export async function runDownCommand(parsed: { root?: string }): Promise<number>
   let state: PowerState | undefined;
   try {
     state = await readPowerState(storageDir);
+    if (state) await assertPowerOwnership(root, state);
   } catch (error) {
     process.stderr.write(`tut: down: ${(error as Error).message}\n`);
     return 1;

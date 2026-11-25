@@ -1,0 +1,2 @@
+import type {Failure} from '../../projection.js';
+export const messages:Partial<Record<string,(f:Failure)=>string>>={SESSION_SELECTOR:()=> 'detached pi route cannot select a session; TUT owns exact session identity',ARGUMENT:f=>`unsupported detached pi positional argument: ${f.token}`,MISSING_VALUE:f=>f.option==='--mode'?'detached pi requires --mode json':`missing value for ${f.option}`,LITERAL:()=> 'detached pi requires --mode json'};

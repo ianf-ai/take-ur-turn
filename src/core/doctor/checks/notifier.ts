@@ -1,4 +1,4 @@
-import { eventEndpoint, discoverWorkspaceNotifiers, notifierOwnership } from "../../hub/rig-discovery.js";
+import { eventEndpoint, discoverWorkspaceNotifiers, notifierOwnership } from "../../../hub/rig-discovery.js";
 import type { DoctorCheck, DoctorContext } from "../types.js";
 import type { HubOutcome } from "./hub.js";
 

@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { Store } from '../../../dist/core/hub/store.js';
+import { Store } from '../../../dist/hub/store.js';
 import { RunStore } from '../../../dist/core/run/store.js';
 import { parse } from '../run.mjs';
-import { piDirectory, bindWindowsPi } from '../lib/paths.mjs';
-import { extract, attribute } from '../lib/rounds.mjs';
-import { readSession } from '../lib/sessions.mjs';
+import { piDirectory, bindWindowsPi } from './helpers.mjs';
+import { extract } from '../lib/rounds.mjs';
+import { attribute, readSession } from './helpers.mjs';
 import { collect, loadUsage, merge } from '../lib/audit.mjs';
 
 const options = { platform: 'win32', home: 'C:\\Users\\测试', piEnv: {} };
@@ -100,6 +100,16 @@ test('Windows exact run association refuses missing, duplicate, route, UUID and 
     bindWindowsPi(rounds, runs);
     assert.equal(rounds[0].problem, reason);
   }
+});
+
+test('Windows delivery labels use registry IDs while frozen route evidence stays exact', () => {
+  const l=launch(1,5);l.payload.launch.route.agent='pi.cmd';
+  const history=task([l,{...delivery(2,30),agent:'Pi'}]),record=run();record.headless.route.agent='pi.cmd';
+  const rounds=extract(history,'C:\\hub',options);bindWindowsPi(rounds,[record]);
+  assert.equal(rounds[0].problem,undefined);assert.equal(rounds[0].agent,'pi');
+  const wrong=structuredClone(record);wrong.headless.route.agent='PI.CMD';
+  const conflicted=extract(history,'C:\\hub',options);bindWindowsPi(conflicted,[wrong]);
+  assert.equal(conflicted[0].problem,'invalid_windows_session');
 });
 
 test('Windows CRLF same-file continuation counts unique assistant IDs once per round, with native null cost', async t => {
@@ -344,4 +354,15 @@ test('Windows multi-root collection keeps per-round candidate scope, explicit ov
   await collect(override, counted);
   assert.ok((await ledgerA()).unresolved.every(u => u.preserved && u.reason === 'ambiguous_sessions'));
   assert.equal((await ledgerA()).total.complete, false);
+});
+
+test('a basic Windows declaration remains unmetered without native target or source guesses',async t=>{
+ const root=await temp(t),store=new Store(path.join(root,'.context-hub'));await store.whenSwept;
+ const created=await store.createTask({title:'basic Windows usage',description:'Protocol fixture only.',creator:'test',role:'human',flow:'direct'});
+ await fs.writeFile(path.join(root,'.context-hub','config.json'),JSON.stringify({flow_mode:'manual',agent_bindings:{'worker-x':{schema_version:1,id:'worker-x',command:{executable:'worker-x',argv:[{slot:'prompt'}]},input:{kind:'argv'}}}}));
+ const marker=launch(1,5);marker.payload.launch.route.agent='binding:worker-x';
+ const history={...task([marker,delivery(2,30)]),task_id:created.task_id};
+ const [report]=await collect({...options,root},{hub:{list:async()=>[{task_id:created.task_id}],read:async()=>history},runs:async()=>{throw Error('no native identity required');},files:async()=>{throw Error('no native source required');}});
+ assert.equal(report.total.rounds,0);assert.equal(report.total.complete,false);
+ assert.equal(report.unresolved[0].capability,'unavailable');assert.equal(report.unresolved[0].reason_code,'not-declared');
 });

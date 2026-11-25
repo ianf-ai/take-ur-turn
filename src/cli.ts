@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /** Stable public entry for the core CLI dispatcher. */
-import { main } from './core/cli.js';
+import { runCli } from './app/cli.js';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-export * from './core/cli.js';
+export * from './app/cli.js';
 
 // Direct-invocation guard (`node dist/cli.js ...`, or the `tut` bin symlink
 // created by `npm link`); imports for tests do not run main. Both sides go
@@ -20,7 +20,7 @@ function invokedAsScript(): boolean {
   }
 }
 if (invokedAsScript()) {
-  void main().then(
+  void runCli().then(
     (code) => {
       process.exitCode = code;
     },

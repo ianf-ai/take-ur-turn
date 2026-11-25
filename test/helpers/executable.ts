@@ -1,8 +1,8 @@
 import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { HeadlessOwnership } from '../../src/core/run/store.js';
-import type { WindowsOwnership } from '../../src/standalone/launcher-headless/windows-plan.js';
-import { resolveDetachedWindowsTarget } from '../../src/standalone/launcher-headless/windows-target.js';
+import type { WindowsOwnership } from '../../src/core/run/windows-launch.js';
+import { resolveDetachedWindowsTarget } from '../../src/standalone/launcher-detached/windows-target.js';
 
 /** Use the real host, even in tests which override process.platform. */
 export function fixtureExecutable(file: string): string {
@@ -34,7 +34,7 @@ export function writePiPackageFixture(bin: string, source = ''): string {
   writeFileSync(path.join(bin, 'pi.cmd'), npmPiShim('node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js'));
   return path.join(bin, 'pi.cmd').replaceAll('\\', '/');
 }
-import { npmPiShim } from '../../src/standalone/launcher-headless/windows-target.js';
+import { npmPiShim } from '../../src/standalone/launcher-detached/windows-target.js';
 
 /** Produce the same frozen Windows envelope as the planner, without starting
  * any model. POSIX fixtures keep their existing producer shape unchanged. */

@@ -1,21 +1,23 @@
+import {stopAfterInputFailure} from './input-stop.js';
+import {consumeInvocation} from './prepared.js';
+import {deliverInput,validateInput,type InvocationInput} from './input.js';
+import {decodeContract,observeSession,legacySessionFromLine} from '../../agents/public/index.js';
 /** One detached supervisor per run. It is deliberately outside the command group. */
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { closeSync, fstatSync, readSync, writeSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { RunStore, delay, probe, type RunMeta, type HeadlessOwnership, type ResumeSource } from './store.js';
 import { CONTROL_PROTOCOL } from './protocol.js';
 import { StopController } from './stop-controller.js';
 import { assertRunIdentity } from './validation.js';
+import { setProcessTitle } from '../common/process-title.js';
 
-export interface StartRequest { root: string; id: string; argv: string[]; cwd: string; task_id?: string; env?: NodeJS.ProcessEnv; headless?: HeadlessOwnership; resume?: ResumeSource; checkout?: string }
+export interface StartRequest { invocation?:import('../../agents/public/index.js').ReadyInvocation; input?:InvocationInput; profile?: string|null; root: string; id: string; argv: string[]; cwd: string; task_id?: string; env?: NodeJS.ProcessEnv; headless?: HeadlessOwnership; resume?: ResumeSource; checkout?: string }
 
-/** Recognize only complete, native Codex JSONL thread-start events. */
-export function sessionFromLine(line: string): string | undefined {
-  try {
-    const event = JSON.parse(line);
-    return event.type === 'thread.started' && typeof event.thread_id === 'string' && /^[a-zA-Z0-9-]{8,128}$/.test(event.thread_id) ? event.thread_id : undefined;
-  } catch { return undefined; }
-}
+/** Recognize native JSONL session evidence; OpenCode frames are route-scoped. */
+export const sessionFromLine=legacySessionFromLine;
+
 async function supervise(r: StartRequest): Promise<void> {
   const store = new RunStore(r.root);
   const log = store.openLog(r.id, true);
@@ -25,12 +27,18 @@ async function supervise(r: StartRequest): Promise<void> {
   let controller: StopController | undefined;
   let outcome: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   try {
-    child = spawn(r.argv[0]!, r.argv.slice(1), { shell: false, detached: true, cwd: r.cwd, env: r.env ?? process.env, stdio: ['ignore', log, log] });
+    const profile=r.profile?decodeContract(r.profile):undefined;
+    r=consumeInvocation(r);
+    validateInput(r.input);
+    child = spawn(r.argv[0]!, r.argv.slice(1), { shell: false, detached: true, cwd: r.cwd, env: r.env ?? process.env, stdio: [r.input?.kind==='stdin'?'pipe':'ignore', log, log] });
     child.once('exit', (code, signal) => { outcome = { code, signal }; });
     await new Promise<void>((resolve, reject) => { child!.once('spawn', resolve); child!.once('error', reject); });
     child.unref();
-    const meta: RunMeta = { run_id: r.id, ...(r.task_id !== undefined ? { task_id: r.task_id } : {}), pid: child.pid!, pgid: child.pid!,
+    const meta: RunMeta = { ...(r.profile!==undefined?{contract:r.profile}:{}),run_id: r.id, ...(r.task_id !== undefined ? { task_id: r.task_id } : {}), pid: child.pid!, pgid: child.pid!,
       argv: r.argv, cwd: r.cwd, supervisor_pid: process.pid, started_at: new Date().toISOString(), status: 'running', control_protocol: CONTROL_PROTOCOL, ...(r.headless ? { headless: r.headless } : {}), ...(r.resume ? { resume: r.resume } : {}), ...(r.checkout !== undefined ? { checkout: r.checkout } : {}) };
+    const delivery=r.input?.kind==='stdin'?deliverInput(child.stdin!,r.input.text):undefined;
+    if(delivery)meta.input_delivery=delivery.state;
+    child.once('exit',()=>delivery?.cancel('target exited before input delivery'));
     await store.initialize(r.id, meta);
     published = true;
     controller = new StopController(store, meta, () => outcome);
@@ -50,7 +58,7 @@ async function supervise(r: StartRequest): Promise<void> {
             pending += part;
             if (pending.length > 1024 * 1024) { overflow = true; pending = ''; }
             if (part.endsWith('\n')) {
-              if (!overflow) session = sessionFromLine(pending) ?? session;
+              if (!overflow) session = (r.profile===null?undefined:profile?observeSession(profile,pending):sessionFromLine(pending, path.basename(r.argv[0]!))) ?? session;
               pending = ''; overflow = false;
             }
           }
@@ -64,6 +72,11 @@ async function supervise(r: StartRequest): Promise<void> {
       if (outcome && !current.root_exited_at) {
         await store.updateMeta(r.id, m => { assertRunIdentity(m, meta); return { ...m, root_exited_at: new Date().toISOString(),
           ...(outcome!.code !== null ? { exit_code: outcome!.code } : {}), ...(outcome!.signal ? { exit_signal: outcome!.signal } : {}) }; });
+      }
+      if(delivery) {
+        if(current.stop_request)delivery.cancel('input cancelled by stop');
+        if(current.input_delivery?.status!==delivery.state.status)await store.updateMeta(r.id,m=>{assertRunIdentity(m,meta);return {...m,input_delivery:delivery.state};});
+        if(delivery.state.status==='failed')await stopAfterInputFailure(store,r.id,meta);
       }
       await controller.step();
       if (outcome && probe(-meta.pgid) === false) {
@@ -91,6 +104,7 @@ async function supervise(r: StartRequest): Promise<void> {
   } finally { try { closeSync(log); } catch { /* already closed */ } closeSync(reader); }
 }
 if (process.argv[2] === '--supervise') {
+  setProcessTitle('tut-run'); // placeholder until the run id arrives over IPC
   const timeout = setTimeout(() => { process.exitCode = 1; process.disconnect?.(); }, 5000);
-  process.once('message', (request: StartRequest) => { clearTimeout(timeout); void supervise(request); });
+  process.once('message', (request: StartRequest) => { clearTimeout(timeout); setProcessTitle(`tut-run.${request.id}`); void supervise(request); });
 }

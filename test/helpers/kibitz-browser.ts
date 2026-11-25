@@ -1,6 +1,6 @@
 import vm from "node:vm";
-import { BOARD_HTML } from "../../src/core/hub/board.js";
-import { BOARD_CORE_SCRIPT } from "../../src/core/hub/board-client.js";
+import { BOARD_HTML } from "../../src/hub/board.js";
+import { BOARD_CORE_SCRIPT } from "../../src/hub/board-client.js";
 interface FocusState { active: Element | null; body: Element | null; }
 export class Element {
   children: Element[] = [];

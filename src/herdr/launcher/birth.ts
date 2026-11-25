@@ -7,8 +7,8 @@
  * bounded root cleanup.  This module never resolves routes or naming values.
  */
 
-import { paneEnvArgs } from "../../core/hub/rig.js";
-import type { LaunchAnchor } from "../../core/common/types.js";
+import { paneEnvArgs } from "./command-context.js";
+import type { LaunchAnchor } from "../../protocol/types.js";
 import type { HerdrCommandResult, HerdrPane } from "./legacy-herdr-client.js";
 
 export interface BirthClient {

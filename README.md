@@ -33,21 +33,40 @@ TUT's answer: put the process memory into the Hub (writes are never rejected on 
 │       ▲                            (memory + state projection)               │
 │       │ launch                          ▲                                    │
 │  Agent Host ──state events──► Notifier ─┘                                    │
-│  (signal source + launcher, pluggable)   │ reads derived state (GET /state)  │
+│  (signal source + launcher)              │ reads derived state (GET /state)  │
+│  two host profiles:                      │                                   │
+│    herdr — agents live in TUI panes      │                                   │
+│    standalone — agents run as detached   │                                   │
+│    supervised runs                       │                                   │
 │                                          │                                   │
 └──────────────────────────────────────────┼───────────────────────────────────┘
                                            ▼ notifications
                                         Channel ──► human
      manual: the human starts the next one | auto: the Notifier starts it via the launcher
+     power layer: tut up / tut down — power.mode picks the host profile (herdr | standalone)
+     watch it read-only (Kibitz): /board · tut ps / attach / live-view
 ```
 
 | Module | Responsibility |
 |--------|---------------|
 | **Context Hub** | Shared memory (append-only log) + state projection (derived view). Exposes MCP tools to agents and a read-only GET /state to the Notifier. **Responsible for memory only — no workflow enforcement** |
 | **coding agent** | Several of them, across three roles (Architect / Executor / Reviewer); the role is a cast (per-task role casting), not a fixed binding |
-| **Agent Host** | The host environment for local agents, with two pluggable parts: signal source (agent state events) + launcher; current implementation: Herdr |
+| **Agent Host** | The host environment for local agents, with two pluggable parts: signal source (agent state events) + launcher. Two host profiles selected by `power.mode` — **herdr** (a TUI rig: agents live in terminal panes) / **standalone** (no terminal multiplexer: services and agent runs are detached process groups) |
 | **Notifier** | The notification and progression hub: polls derived state, notifies the human when it is someone's turn, cross-checks whether agents delivered |
 | **Channel** | Notification output (local desktop notification / webhook) |
+| **Kibitz** | The read-only observation surface: the `/board` page over state and runs, plus `tut ps` / `attach` / `live-view` — no write controls anywhere |
+
+TUT runs entirely on your local machine, organized into three planes around the Context Hub: a **state plane** (shared memory and derived task state), a **runtime plane** (the agent sessions doing the work), and a **monitoring plane** (observation, notification and progression). A **power layer** (`tut up` / `tut down`) provisions the services in one of two host profiles (`power.mode`: `herdr` / `standalone`). Watching all of it is a read-only surface — the Kibitz board and the run-view commands — that never carries write controls.
+
+**State plane.** The Context Hub is a local MCP server acting as shared memory between agents: an append-only task log on local JSON storage. Task state — where things stand, whose move it is — is a pure function of the record sequence, derived on read and never enforced by the Hub. Consumers (the Notifier, the Kibitz board, CLI commands) all read the same view through GET /state; the Hub is responsible for memory only.
+
+**Runtime plane.** Agent sessions are provisioned by the Agent Host's launcher, in one of two places: `tui` launches put each agent in a terminal pane of the Herdr rig, with the kickoff typed into the pane; `detached` launches run agents as supervised detached runs — the run protocol (`tut run / ps / attach / stop / resume`), native non-interactive invocations, precise resume. The backend is selected by `launch_mode`, independently of the power profile; the natural pairings are herdr + tui and standalone + detached. In every case role context reaches agents only through the Hub — sessions never talk to each other directly.
+
+**Power layer.** `tut up` / `tut down` are the power switch for the rig: idempotent up, ordered down. `power.mode` picks the implementation — `herdr` provisions the rig as two system panes; `standalone` raises the Hub and Notifier as detached process groups with their facts in `.context-hub/power.json`, stopped by identity-gated, group-scoped signals — stale or unverifiable groups are never signaled.
+
+**Monitoring plane.** The Notifier polls the derived state (GET /state) and consumes side evidence — pane agent-state events for tui launches, run outcomes for detached ones — then notifies the human through the Channel when it is someone's turn. In manual mode the human starts the next round; in auto mode the Notifier launches the next agent directly, gated by the per-role launch whitelist. Approvals remain a human decision in both modes.
+
+**Read-only observation (Kibitz).** The Kibitz board at `/board` shows approvals first, then warnings, delivery rounds and live runs; `tut ps`, `tut attach` and `tut live-view` give the same read-only stance from the terminal. Watching never becomes acting: stopping a run and approving a task go through the CLI / human workflow.
 
 Task state is derived from the record sequence:
 
@@ -59,177 +78,100 @@ designing → implementing → reviewing ─┬─ pass       → pending_approv
 
 ## Quick Start
 
-Prerequisites: Node.js ≥ 20, Herdr (the Agent Host, providing the terminal panes agents live in; install with `brew install herdr` on macOS/Linux, native binary from the [Herdr releases](https://github.com/herdrdev/herdr/releases) page on Windows), and at least one coding agent CLI. **Platforms: macOS, Linux and Windows** (see [Windows notes](#windows-notes) for setup boundaries).
+Prerequisites: Node.js ≥ 20 and at least one coding agent CLI. The default terminal mode needs Herdr (`brew install herdr` on macOS/Linux; [Herdr releases](https://github.com/herdrdev/herdr/releases) on Windows); use standalone below without Herdr. See [Windows notes](#windows-notes) for platform boundaries.
 
-**Install** — the npm package ships everything TUT needs at runtime (built CLI, role skills, launcher scripts):
+**Install** — the npm package includes the built CLI, role skills and launchers:
 
 ```bash
 npm install -g take-ur-turn
 ```
 
-**From source** (for development):
-
-```bash
-git clone https://github.com/ianf-ai/take-ur-turn.git
-cd take-ur-turn
-npm install
-npm run build
-```
-
-The from-source build output is `dist/cli.js`. Use `npm link` to put the `tut` command on your PATH; if you prefer not to link, `node dist/cli.js <subcommand>` always works (referred to as `tut` below).
-
-**Start the workspace** (the power switch, idempotent — two system panes: hub pane + notify pane):
-
-```bash
-tut up
-```
-
-No Herdr on the machine? Switch the power implementation first: `tut config set power.mode standalone`, then `tut up` raises the same services as detached processes (facts in `.context-hub/power.json`) and `tut down` stops them — see [Command Overview](#command-overview).
-
-**One-time project hookup** — inject the TUT block into the project's `AGENTS.md` (idempotent; the file is created when absent, an existing marked block is refreshed, never duplicated):
+Run the one-time project hookup and start the workspace from the project root (both idempotent):
 
 ```bash
 tut init
+tut up
 ```
 
-For terminal delivery and controlled Enter remediation, see [the Herdr host contract](design/herdr-host.md#32-单次投递).
+Without Herdr, first run `tut config set power.mode standalone`, then `tut config set launch_mode detached` for detached agent launches, followed by `tut up`. Stop standalone services with `tut down`. Connect your agent as described [below](#agent-cli-onboarding-one-time).
 
-**Kick off a task** (two steps on the initiating side — the task exists before any delivery, and the first round is an ordinary round):
+**Kick off a task** — requirements and acceptance live in the Hub; the task exists before its first round starts:
 
 ```bash
 tut create --title "CLI --url flag for mode" \
-           --description "Add a --url flag to the CLI's mode subcommand.\
-Acceptance: the flag reaches the Hub call; both flag forms tested." \
-           --creator <your-name> --role human
-tut start-next <task_id>   # manual: start the first round (auto mode: the Notifier starts it per its whitelist)
+           --description "Add --url to mode; acceptance: reaches the Hub call, both flag forms tested." \
+           --creator your-name --role human
+tut start-next TASK_ID
 ```
 
-`create` takes the workflow (`--flow full|direct|solo`) and the per-task lineup as real flags. Cast values may be legacy bare names (`--cast executor=pi`) or parameterized, ordered commands (`--cast 'executor=codex --model <executor-model> --sandbox workspace-write --search'`); repeat `--cast` for multiple parameterized roles. The legacy comma form (`--cast executor=pi,reviewer=codex`) remains compatible. The requirement and its acceptance criteria live in `title` + `description`, where agents pick them up via `context.read`.
+Replace `TASK_ID` with the returned task_id and `your-name` with your name. `start-next` is for manual mode; auto uses the Notifier's role whitelist. `create` accepts `--flow full|direct|solo` and per-task `--cast`; run `tut` for the full syntax.
 
-From there, agents push the task forward by reading and writing the Hub through MCP tools from their own panes; `tut status` shows the overview, the Notifier notifies you when an approval is due, and you make the call with `tut decide <task_id> --decision approve --by <your-name>`.
+Then use `tut status` for the overview; after an approval notification and checking the delivery, decide with `tut decide TASK_ID --decision approve --by your-name`.
 
-The Notifier's side channels (instant blocked alerts, done cross-checks) rely on Herdr forwarding each pane's agent state changes to `scripts/on-agent-event.sh` — a one-time environment setup (a Herdr plugin); see [Herdr event hookup](#herdr-event-hookup).
+Configure Herdr's [event hookup and terminal delivery](design/herdr-host.md) separately; source installation is under [Development](#development).
 
 ## Local statistics and metadata repair
 
-`tut stats [task_id ...] [--root /path/to/.context-hub] [--json]` reads local
-records and usage audit sidecars through Store, without starting a service or
-writing anything (including temp-file cleanup). With no task IDs, the batch is
-all local tasks, excluding project scope. Reports include each task and the
-batch: strict review pass rate, first-review pass rate, revision deliveries,
-current waiting blockers, and deliveries per recorded role. For these quality metrics, only records that
-advance the existing workflow count; direct reference designs and stray
-out-of-table records do not. `blocked_external` stays separate from verified
-`pass`, and no reviews means `null`/`n/a`. Solo repeat deliveries after rejection
-count as revisions and do not enter the review-rate denominator.
+`tut stats [task_id ...] [--root /path/to/.context-hub] [--json]` is offline and read-only: no Hub startup or file writes. The default batch is all local tasks except project scope; reports cover pass rates, first-review rates, revisions, blockers and role deliveries.
+Quality metrics count workflow-advancing records; `blocked_external` is separate from `pass`, and solo redeliveries count as revisions outside review denominators.
+No reviews means `null`/`n/a`; damaged tasks are separated from denominators; live reads are not an atomic batch snapshot.
+Tokens are grouped by agent, never summed across agents; missing, stale, unresolved or invalid sidecars are coverage gaps, not zero, and unknown cost is `null`.
+Usage follows worker-round attribution independently, including reference designs; see [usage measurement](scripts/usage-audit/README.md) for v1 source/line/window/counter/total constraints. `--json` includes metric definitions.
 
-Tokens are grouped by agent because Pi and Codex use different native
-accounting; there is no combined cross-agent token total. Usage follows the audit's
-worker-round attribution independently of quality metrics, so measured reference
-designs retain their token usage. Sidecars must satisfy the frozen v1 source,
-line-range, window, counter, and total constraints. Missing, stale,
-unresolved, or invalid sidecars are reported as coverage gaps, never assumed
-zero. Unknown cost remains `null`. Damaged tasks are listed separately from
-the statistical denominator. Live reads are best-effort, not an atomic batch
-snapshot. See [usage measurement](scripts/usage-audit/README.md) for attribution
-and native token definitions; `--json` includes the metric definitions.
+`tut repair-meta TASK_ID --from-snapshot /path/to/state.json` repairs corrupt/missing metadata through the running Hub; it refuses readable metadata and leaves records untouched.
+Use a previously saved Notifier `/state` JSON file and check its provenance and age; lost in-memory snapshots cannot be retrieved after corruption.
+Only title/flow/cast are prefilled; explicit flags win (cast per role), while description/checkout need manual input.
+Missing/invalid snapshots warn and retain manual values/defaults; run `tut` for the full syntax.
 
-`tut repair-meta <task_id> --from-snapshot /path/to/state.json` can prefill
-`title`, `flow`, and `cast` from a previously retained Notifier `/state` JSON
-response. The Notifier currently keeps its latest snapshot in memory; this
-mode consumes a saved file, and cannot retrieve lost memory after corruption.
-Check the source and age before using it. Explicit flags override snapshot
-values (cast overrides per role). Missing or invalid snapshots produce a
-warning and leave manual fields and existing defaults in effect. Repair still
-goes through the running Hub and refuses readable metadata. Description and
-checkout must be supplied manually when needed.
-
+`tut prune TASK_ID --by NAME --reason "local space reclamation" [--archive /backup/tasks]` removes one **closed** task through the running Hub, with human authorization. It first copies the entire task to `<archive>/TASK_ID` when requested, then appends and syncs an audit intent (task ID, timestamp, operator, reason, optional archive path, unique prune ID) to `.context-hub/tasks/.pruned.jsonl` before removal. Without `--archive` there is no backup; release-wide records archiving remains a manual operation.
+The archive parent must be outside Hub storage; existing copies are refused. Copy/manifest failures retain the task, and partial archive copies remain for inspection. A removal failure retains its manifest intent, so inspect before retrying. The manifest is append-only, pruned IDs stay reserved, and run archives remain with their original references. `/state` exposes reserved `pruned` IDs and identifiable `prune_events`. The Notifier matches each disappearance to a new intent; restoring a task rearms disappearance alerts, including after a Notifier restart. Historical intents remain in the manifest. `--by` records authorization; it does not grant it.
 
 ## Host Mode: Drive It from a Conversation
 
-The quick start above was the by-hand path — beyond `tut up` and `tut init`, you never have to touch the terminal again: open an interactive coding-agent session (any CLI agent that can read the repo and run shell commands) in the project and tell it to act as TUT Host — it runs `tut skill host`, picks up the [host skill](skills/host.md), and takes the **Host** role, your driver. You talk; the Host checks the environment, shapes your request into a task (`tut create`, requirement + acceptance), presses `tut start-next` at round handoffs, watches state, and reports at approval gates with the three essentials: what changed, how it was verified, and its own spot-check opinion.
-
-**Activate the Host with one sentence** — paste this into the agent session (swap in your request):
+Open an interactive coding-agent session in the project that can read the repo and run commands, then paste:
 
 ```text
-担任 TUT Host，全程驱动这个任务：<你的需求>
-（Act as TUT Host and drive this task end to end: <request>）
+Act as TUT Host and drive this task end to end: <request>
 ```
 
-The phrase is pure intent — no paths, no instructions on how to read the rules. The mechanism is injected into the project's `AGENTS.md` (the marked block `tut init` maintains): an agent receiving such an instruction runs `tut skill host` and picks up the role rules itself, so the activation phrase never has to teach them.
-
-The conversation then looks roughly like this:
-
-> You: "Drive this task end to end: add a --url flag to the mode subcommand."
-> … the Host creates the task, advances the rounds, watches state …
-> Host: "Review passed. 2 files changed (+12/−3), tests green; I spot-checked the diff — no objections. Approve?"
-
-One delegated sentence at kickoff ("drive this task end to end") authorizes the whole progression loop; approvals stay strictly yours — the Host presents, you decide, and each `tut decide` runs only after your explicit consent. In auto mode the Notifier takes over round handoffs and the Host focuses on approval gates and exceptions.
-
-One environment note: some agent CLIs sandbox shell commands with no network by default — the CLI channel (`tut list` etc.) can be silently blocked in such sessions, while the MCP tools go through the agent host process and stay available. The Host skill is therefore written **MCP-first**: a zero-network sandboxed session can still run the whole Host flow (the skill's tool-surface table lists per-command fallbacks).
-
-The boundary that keeps the division of labor honest: **drive, don't do the work** — the Host never writes design / code_changes / review / revision records; those come only from the architect / executor / reviewer sessions in their own panes. (The Host role is unrelated to "Agent Host" in the architecture table — that one is Herdr, the terminal environment agents live in.)
+The AGENTS.md block maintained by `tut init` tells the agent to run `tut skill host` and load the [host skill](skills/host.md). You state the request; the Host checks the environment, shapes requirements and acceptance, creates the task, advances rounds, watches state and reports changes, validation and its spot-check at approval gates.
+The kickoff delegation authorizes ordinary progression; approve/reject/close still need your explicit consent. In auto mode the Notifier launches rounds and the Host focuses on approvals and exceptions.
+The Host **drives, it does not do the work**: worker sessions publish design/code_changes/review/revision. This role differs from the Agent Host runtime in the architecture.
+When a CLI sandbox blocks networking, the Host uses the skill's MCP-first table and fallbacks, handing operations it cannot perform to the human.
 
 ## Agent CLI Onboarding (one-time)
 
-Use the installed `tut mcp` command as a **stdio** MCP server. It discovers the Hub belonging to the current workspace, verifies `hub_root`, and bridges to its Streamable HTTP `/mcp` endpoint. Start that workspace's Hub with `tut up` first.
+Use the [bundled declaration instructions](skills/agent-onboarding.md) to describe
+an installed CLI from its local `--help`; the same JSON can be filled in by hand.
 
-**Codex CLI** (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.tut]
-command = "tut"
-args = ["mcp"]
+```bash
+tut agent add worker-x --from declaration.json  # or --from - for stdin
+tut assign executor binding:worker-x
+tut start-next TASK_ID
 ```
 
-Other stdio MCP clients use the same command and arguments. The client must launch it in the intended workspace. If its working directory is not reliable, pin the owning Hub root with server-level environment configuration (task worktrees can share this root):
+`agent add` saves minimal invocation intent in `.context-hub/config.json` without
+TTY, session/resume samples or model probes. `binding:` is reserved for explicit
+logical references; missing or invalid bindings fail without PATH/profile fallback.
+Existing unprefixed commands retain their meaning. Basic bindings support managed
+invocation with argv or stdin input; saving a declaration alone does not verify a launch or task delivery.
+`agent setup ID [--from FILE]` optionally imports a minimal declaration or full
+native profile. `agent probe ID` explicitly runs native diagnostics in an isolated
+rig, may use the CLI/model, and preserves evidence and saved declarations on failure.
 
-```toml
-[mcp_servers.tut.env]
-TUT_HUB_ROOT = "/absolute/path/to/workspace"
-```
+MCP clients use stdio `command=tut`, `args=["mcp"]` after `tut up`, launched from the intended workspace; if cwd is unreliable, set `TUT_HUB_ROOT` to the workspace directory (not `.context-hub`) and remove/update a global pin when switching projects.
+Do not also configure a fixed URL for that server: it bypasses workspace discovery and can route writes to another rig. Restart the client's MCP connection after configuring it; the bridge does not change user configuration.
 
-Use the workspace directory, not its `.context-hub` subdirectory. A global root pin intentionally selects one workspace; remove or change it when switching projects. `TUT_HUB_URL` can supply a preferred local Hub base URL; ownership still has to match `TUT_HUB_ROOT` or the root derived from cwd. Otherwise the bridge scans the same bounded local Hub ports as the CLI (3001–3199, odd ports).
+The bridge rechecks ownership before each HTTP request and reconnects with five bounded delays (250/500/1000/2000/4000ms), rediscovering the same-root Hub after a restart on another port. It never replays an interrupted tool call: a write may already have landed, so read the task before retrying.
 
-**MCP connection settings:** use the `command` and `args` above, set the root if needed, and restart the client's MCP connection. Do not also configure a fixed `url` for the same server. Fixed URLs are available for HTTP clients, but bypass workspace discovery and can silently route writes to another rig. No user configuration is changed automatically.
-
-The bridge rechecks ownership before HTTP requests and reconnects with five bounded delays (250/500/1000/2000/4000ms), rediscovering a Hub that restarted on another port. It never replays an interrupted tool call: a write may already have landed, so read the task before retrying. Diagnostics go to stderr; stdout is reserved for MCP. Exit codes: 0 on stdin EOF, 1 for usage/internal errors, 2 for initial connection/identity failure, 3 when reconnect attempts run out (130/143 for SIGINT/SIGTERM). After a failure, start the correct Hub and restart the MCP connection.
-
-Once configured, the agent sees 5 tools: `context.create` / `context.publish` / `context.read` / `context.list` / `context.decide`.
-
-**CLIs without MCP support**: use the equivalent CLI channel — the `tut create / publish / read / list / decide` subcommands map one-to-one onto the MCP tools, so an agent can simply call them from the shell (the per-role "tool cheat sheets" in the skills — an MCP | CLI mapping — are made for exactly these CLIs; the two channels can be mixed; on the same task, each role using its own channel is fully compatible).
-
-**Environments with no way to configure MCP** (e.g. sandbox restrictions in some sessions): fall back to the CLI channel as above.
+Diagnostics go to stderr; stdout is reserved for MCP. Exit codes: 0 on stdin EOF, 1 for usage/internal errors, 2 for initial connection/identity failure, 3 when reconnect attempts run out; SIGINT/SIGTERM exit 130/143. After a failure, start the correct Hub and restart the MCP connection. See the [MCP bridge contract](design/system-design.md#431-agent-stdio-接入桥).
+Without MCP configuration, use equivalent `tut create/publish/read/list/decide` commands; [role skills](skills/) map both channels.
 
 ### Herdr event hookup
 
-The Notifier's blocked / done / working event channel requires a one-time Herdr plugin installation. Create `~/.config/herdr/plugins/tut-notify/` and add `herdr-plugin.toml`:
-
-```toml
-id = "tut.notify"
-name = "TUT agent events"
-version = "0.2.0"
-min_herdr_version = "0.7.0"
-description = "Forward agent status changes to TUT herdr-hook.mjs"
-platforms = ["macos", "linux", "windows"]
-
-[[events]]
-on = "pane.agent_status_changed"
-command = ["<ABSOLUTE_NODE>", "<ABSOLUTE_PACKAGE>/scripts/herdr-hook.mjs"]
-```
-
-Replace `<ABSOLUTE_NODE>` with the absolute Node executable path and `<ABSOLUTE_PACKAGE>` with the installed TUT package root. Herdr does not expand shell syntax: use absolute paths without tildes or shebangs. Windows also invokes Node directly; escape backslashes in TOML paths or use forward slashes.
-
-Activate the plugin:
-
-```bash
-herdr plugin link ~/.config/herdr/plugins/tut-notify
-herdr plugin list
-```
-
-The list should show `tut.notify` enabled. Start the Hub and Notifier, run an Agent round in a pane, and check the notify pane log for an event entry.
-
-With `tut notify --event-port <p>`, set `TUT_EVENT_PORT_URL=http://127.0.0.1:<p>/agent-event` in the environment inherited by the Herdr plugin and launcher. Without this setting, producers send to port 3002.
+Create `~/.config/herdr/plugins/tut-notify/herdr-plugin.toml` with top-level fields `id="tut.notify"`, `name="TUT agent events"`, `version="0.2.0"`, `min_herdr_version="0.7.0"`, `description="Forward agent status changes to TUT herdr-hook.mjs"`, `platforms=["macos","linux","windows"]` (one assignment per line).
+Add an `[[events]]` table with `on="pane.agent_status_changed"` and `command=["<ABSOLUTE_NODE>","<ABSOLUTE_PACKAGE>/scripts/herdr-hook.mjs"]`. Substitute real absolute paths, without tilde/shebang/shell expansion; use forward slashes or escaped backslashes in Windows TOML paths.
+Run `herdr plugin link ~/.config/herdr/plugins/tut-notify` and `herdr plugin list` to confirm enabled status. Start Hub/Notifier, run a pane agent and check notify logs for events. For a nondefault `--event-port`, set matching `TUT_EVENT_PORT_URL=http://127.0.0.1:PORT/agent-event` in the plugin/launcher's inherited environment (default 3002). The [signal contract](design/herdr-host.md#4-hook-信号线与通知接线) explains event handling.
 
 ## Read-only board
 
@@ -239,84 +181,7 @@ The board reads `runs/` under the Hub's configured storage root. Missing or corr
 
 ## Command Overview
 
-Running `tut` with no arguments prints the full USAGE. Quoted verbatim:
-
-```
-tut serve [--port <n>] [--root <dir>]
-tut notify [--url <u>] [--interval <s>] [--event-port <p>] [--stall-timeout <m>] [--working-timeout <s>]
-tut mode <manual|auto> [--url <u>]
-tut config get <key> [--root <dir>]
-tut config set <key> <value> [--root <dir>]
-tut start-next [<task_id>] [--url <u>] [--force] [--fresh]
-tut watch [<task_id>] [--url <u>] [--interval <s>]
-tut create --title <t> --description <d> --creator <c> --role <r> [--flow <full|direct|solo>] [--cast <role=command>]... [--url <u>]
-tut publish <task_id> --role <r> --content-type <t> --summary <s>
-             (--body <text> | --payload-file <md>)
-             [--verdict <pass|fail_code|fail_design>] [--commits <a,b>]
-             [--ref-version <n>] [--expected-version <n>] [--agent <a>] [--model <m>] [--url <u>]
-tut read <task_id> [--since-version <n>] [--json] [--url <u>]
-tut list [--status <s>] [--json] [--url <u>]
-tut decide <task_id> --decision <approve|reject|close> --by <b> [--reason <text>] [--url <u>]
-tut assign <role> <command...>
-tut up [--url <u>] [--event-port <p>] [--root <dir>] [--dry-run]
-tut down [--root <dir>]
-tut skill <host|architect|executor|reviewer>
-tut init
-tut ack <task_id> [--note <text>] [--url <u>]
-tut status [--json] [--url <u>]
-tut run [--task <id>] [--fix-preflight] -- <command...>
-tut ps [--json]
-tut attach <run-id>
-tut stop <run-id>
-tut resume <run-id> [instruction] [--fix-preflight]
-tut live-view --layout <json-file>
-tut doctor [--root <dir>] [--url <u>] [--checkout <dir>] [--fix-preflight] [--json]
-```
-
-The agent-side equivalent channel is the 5 MCP tools (`context.create` / `context.publish` / `context.read` / `context.list` / `context.decide`); the CLI subcommands map onto them one-to-one.
-
-### Resuming a stopped run
-
-`tut resume <run-id> [instruction]` continues a COMPLETED run's exact native
-agent session in a NEW run — the old run's log, identity and stop evidence are
-never touched. codex resumes through the session id observed in the run log;
-pi resumes only a session identity that is stored AND verified in this
-project's session store (pi's `--session-id` silently CREATES a missing
-session, so an unverifiable id is refused instead of faked). Cross-process
-admission refuses while any incomplete run or pending startup intent still
-holds the same session (or, for managed runs, the same task). Managed
-(headless-owned) resumes additionally require the same-root Hub online, the
-task still waiting for that role (in both `/state` and the task log), no
-`needs_attention`, not pending_approval/approved/closed, and append a manual
-launch marker before spawn so auto-launch cannot double-start the round. `stdout` carries only the
-new run-id; exit 0 means startup confirmed, not task success.
-
-### Live seat view
-
-`tut live-view --layout <file>` renders a read-only terminal grid of seats.
-A layout declares `schema:1`, `rows`, `columns`, and seats with a selector —
-`{task_id, role}` (explicit headless ownership; the running run takes the
-seat, a conflict is shown when several are incomplete, the latest complete
-run otherwise) or `{run_id}` (fixed). Every pane is this package's `tut
-attach` child with stdin ignored: no typing channel, no stop/resume/decide.
-Ctrl-C closes the view and its attach children only; observed runs keep
-running for any other attach.
-
-### Checkout preflight and close audit
-
-`tut run` / `tut resume` / auto detached launches check the execution checkout
-before spawning: a Node checkout declaring dependencies needs a readable
-`node_modules`, a TUT source checkout needs `dist/`. Missing items refuse the
-launch with the exact absolute path and repair guidance; directories without
-a Node manifest are never gated. `--fix-preflight` (on run/resume/doctor)
-runs only the supported repairs — `npm ci` under a lockfile, `npm run build`
-for TUT dist — bounded, visible (output on stderr; stdout stays the single
-result line), inside the inspected checkout, and a FAILED repair step always
-refuses even when half-applied artifacts exist. `tut doctor`
-gains a ninth check plus `--checkout <dir>` (the inspected directory;
-`--root` keeps its storage meaning). Closing a task now also appends a
-`close-stop` audit note to the closed task recording what the cooperative
-stop actually did (system audit, not a human authorization).
+Run `tut` without arguments for all commands and options; use `tut skill ROLE` (host / architect / executor / reviewer) for role procedures. For resume, read-only seats and checkout preflight, see the help entries for `resume` / `live-view` / `run` / `doctor`. Closing also appends a `close-stop` system audit note with the actual stop outcome; this is not human authorization.
 
 ## Typical Workflow
 
@@ -340,81 +205,65 @@ The diagram above is the default flow, **full**. Variants are chosen when the ta
 
 ## Configuration
 
-Three configuration surfaces, different in nature and in location:
-
-### ① Project runtime config — `.context-hub/config.json` (gitignored, one per project)
-
-Governs Hub and Notifier behavior. Changes take effect on the next polling cycle — no restart needed:
+### ① Project runtime — `.context-hub/config.json` (gitignored)
 
 | Key | Purpose | Default |
 |---|---|---|
-| `flow_mode` | `"manual"` / `"auto"` — who presses the start button at round handoffs (the human, or the Notifier auto-launching via the launcher). Prefer switching with `tut mode <manual\|auto>` | `manual` |
-| `notify` | Notification channels: `channels` (desktop / webhook, etc.) and `webhook_url` | unset = terminal bell plus notify-pane log |
-| `auto.launch_roles` | Launch whitelist for auto mode (keyed by role, e.g. `["executor","reviewer"]`). **Empty by default = every round falls back to notifying the human** — rounds not on the whitelist are never auto-launched and leave no launch trace; the human's manual starts are unaffected | `[]` |
-| `launch_mode` | Launch backend for `start-next` and Notifier: `"tui"` or `"detached"`. The compatibility alias `"headless"` selects the same backend; get returns `detached` without rewriting, and set writes `detached` for either spelling. Missing file/key defaults to `tui`; corrupt files and invalid values fail visibly | `tui` |
-| `power.mode` | Which power implementation `tut up` provisions: `"herdr"` (pane-provisioned rig, unchanged) or `"standalone"` — detached process groups raised by `tut up` itself (pid/pgid/port facts in `.context-hub/power.json`), stopped by `tut down`. Signals are identity-gated and group-scoped: a leftover group whose leader died is cleaned only when a live member verifies against this rig's power member registry (the session marker `TUT_POWER_SESSION` binds to the surviving service instance — reused services keep their session across repeated ups — and rides the services' launch children); stale or unverifiable groups are never signaled. Illegal values (or an unreadable config) fail `up`/`down` visibly before any provisioning | `herdr` |
+| `flow_mode` | manual: human launch / auto: Notifier launch; `tut mode manual` or `tut mode auto` | `manual` |
+| `auto.launch_roles` | Auto-launch role whitelist; empty means notify only, manual starts unaffected | `[]` |
+| `launch_mode` | Launch backend tui / detached, independent of power and flow | `tui` |
+| `power.mode` | `tut up/down` implementation herdr / standalone | `herdr` |
+| `notify` | channels (desktop/webhook), webhook_url; edit JSON | Terminal bell and notify log |
 
-Use `tut config set launch_mode detached` to select detached agent launches; this is independent of `power.mode` and `flow_mode`. The `headless` alias has no scheduled removal and emits no periodic warning. Persisted marker values (`launch_mode: "headless"`, `target_kind: "headless-posix"`) and run `headless` ownership remain protocol identifiers; existing records, runs and usage files are not migrated.
+Run `tut` for supported `config get/set` keys and domains; `config set flow_mode auto` is the offline equivalent of `tut mode auto`. Runtime settings apply on the next request/poll.
+Use `tut config set launch_mode detached` for detached launches; the `headless` alias normalizes to detached on get/set, has no scheduled retirement or periodic warning, and leaves old marker/run/usage protocol identifiers untouched.
+Standalone shutdown verifies identity and leaves independent runs alive; run `tut` for full power behavior and see [Windows notes](#windows-notes) for platform gaps.
+OpenCode 2.2 detached routes require explicit `--auto`, e.g. `--cast 'executor=opencode --model zai-coding-plan/glm-5.3-flash --auto'`; missing it refuses before the marker. Routes cannot select a session or add another prompt; see help for observed-session resume and `start-next --fresh`. Windows is unsupported; usage is currently unattributed and excluded from tokens.
 
-`flow_mode` and `auto.launch_roles` can also be managed without hand-editing JSON: `tut config get <key>` / `tut config set <key> <value>` (validated keys and value domains; `tut config set flow_mode auto` is the offline equivalent of `tut mode`, and it works with the Hub down — same discipline as `tut assign`). The Hub re-reads this file on every request, so writes take effect on the next poll cycle, no restart needed.
+### ② Rig lineup and invocation intent
 
-### ② Workspace lineup — three-level resolution chain (project → user → built-in)
-
-Which Agent CLI serves each role (for tasks created without an explicit `--cast`). Per-field fallback, level by level — a missing or corrupt file simply counts as that level being absent, and each role key falls back on its own:
-
-| Level | Location | Notes |
-|---|---|---|
-| L1 project | `<project>/.context-hub/workspace.json` | Environment state lives with the project (gitignored, next to `config.json`); `tut assign <role> <agent>` writes THIS file (creating it from the currently effective lineup when missing) |
-| L2 user | `~/.config/tut/workspace.json` | Machine-wide default lineup; maintained by hand (`mkdir -p` first). `$TUT_USER_CONFIG_DIR` overrides the whole directory |
-| L3 built-in | `DEFAULT_ROLES` | architect=codex, executor=pi, reviewer=codex — values frozen |
-
-File shape (only what you want to change needs to be present; entries may carry extra keys — the legacy `{ label, agent }` shape is tolerated on read, only `.agent` is read):
+`.context-hub/config.json` is the rig's human intent file. `tut mode`, `tut config set`, `tut assign` and `tut agent add` share a key-preserving, atomic write port with cross-process locking. `flow_mode` and `auto.launch_roles` remain explicit local trust settings; assigning agents does not grant launch permission.
 
 ```json
 {
-  "roles": { "architect": { "agent": "pi" }, "executor": { "agent": "pi" }, "reviewer": { "agent": "codex" } },
-  "naming": { "tab_label": "TUT {role}" }
+  "flow_mode": "manual",
+  "roles": {
+    "architect": {"agent": "codex"},
+    "executor": {"agent": "pi", "args": ["--model", "chosen-model"]},
+    "reviewer": {"agent": "codex"}
+  },
+  "naming": {"tab_label": "TUT {role}"},
+  "agent_bindings": {
+    "custom": {"executable": "custom-cli", "args": ["run", "--quiet"], "prompt": {"kind": "argv", "index": 2}}
+  }
 }
 ```
 
-Parameterized workspace entries use an ordered `args` array, for example
-`"executor": { "agent": "codex", "args": ["--model", "<executor-model>", "--sandbox", "workspace-write", "--search"] }`.
-TUT preserves the legacy bare-string cast shape and does not interpret shell
-quotes, variables, operators, redirects, or globs inside command values. Only
-the command head is checked with `command -v`; the complete argv reaches the
-launcher. Codex receives TUT's update suppression after user args (`-c check_for_update_on_startup=false`), pi receives `env PI_SKIP_VERSION_CHECK=1`, and `TUT_SUPPRESS_AGENT_UPDATE=0` disables these additions.
+Task `--cast` overrides a role. When `config.roles` exists, it is the complete roster: missing seats require an explicit assign or cast, and invalid declarations refuse. Routes and ordered args are consumed as a whole. Corrupt config blocks new launches, including cast launches. A shared rig's intent is selected independently of the execution checkout.
 
-`naming.tab_label` renders the human-facing **tab** label: placeholders `{role}` / `{task}` / `{agent}`, unknown placeholders preserved verbatim, default `TUT {role}`. The **pane** label is the machine addressing key and is never templated: round panes stay `<task_id>.<role>` (event reverse-lookup hits directly). Two fields, two jobs.
+For existing rigs without `config.roles`, the compatibility chain remains project `.context-hub/workspace.json` → user `~/.config/tut/workspace.json` (`TUT_USER_CONFIG_DIR` override) → built-in architect=codex, executor=pi, reviewer=codex. `tut assign` targets the owning rig (`TUT_HUB_ROOT` or the nearest rig), including from task checkouts and subdirectories. First `tut assign ROLE COMMAND...` captures that effective roster into config, preserves project legacy extensions, and refuses conflicting keys. It never edits or removes workspace files; user defaults gain no new inheritance path. Legacy `label` is preserved but has no routing meaning.
 
-**Workspace setup**: use `tut assign <role> <agent>` to customize the project lineup, or adapt the JSON example above and save it as `.context-hub/workspace.json` (project) or `~/.config/tut/workspace.json` (user; create the parent directory first). `tut up` points to this documentation when both L1 and L2 are missing. The `label` fields are ignored on read; `scripts/routes.json` is not read at runtime.
+`naming.tab_label` defaults to `TUT {role}` and supports `{role}`/`{task}`/`{agent}`; the machine pane key stays `<task_id>.<role>`. A present config naming section wins over legacy display settings. Codex gets `-c check_for_update_on_startup=false`, pi gets `env PI_SKIP_VERSION_CHECK=1`; `TUT_SUPPRESS_AGENT_UPDATE=0` disables these additions.
 
-**Upgrading from the bundled seed**: existing project/user workspace files remain valid and need no migration. If you edited only the example inside the installed package, save your customized JSON to one of the locations above before upgrading. Replace setup scripts that copy the bundled example with your own maintained config or `tut assign`; the package no longer ships a seed file.
+`tut agent add custom --prompt argv:2 -- custom-cli run --quiet` saves the declaration above. `--prompt stdin` declares standard input instead; argv indexes are insertion positions among the fixed args, from zero through their length. These declarations can be parsed now; basic launch consumption is a separate work unit. Existing setup/profile launch paths remain in use. Commands use the existing shell-neutral token grammar, preserve argument order and never infer vendor flags.
 
-### ③ Invocation parameters — CLI flags and environment variables
+### ③ Invocation parameters and environment
 
-| Parameter | Applies to | Default |
-|---|---|---|
-| `--port <n>` | listen port for `tut serve` | `3001` |
-| `--url <u>` | Hub address override (for `tut up` and the context/approval commands; accepts loopback addresses with an explicit port only) | `http://127.0.0.1:3001` |
-| `--interval <s>` / `--event-port <p>` / `--stall-timeout <m>` | polling interval / agent event port / stall timeout for `tut notify` (`--event-port` also selects the port `tut up` probes and provisions; the interval is clamped to a 1s floor) | `5s` / `3002` / `30min` |
-| `--working-timeout <s>` | launch-to-working short-fuse timeout for `tut notify`; alerts when no working signal arrives | `300s` |
-| `--root <dir>` | storage root for `tut serve`; rig root (the directory owning `.context-hub`) for `tut up` / `tut down` — default: cwd's rig root | current directory |
-| env `TUT_UP_CLI_SELF` | path of the tut CLI itself, used when `tut up` provisions panes or standalone services | auto-detected (dist layout) |
-| env `TUT_SPLIT_BASE` | birth-anchor escape hatch: pane id whose (workspace, cwd) anchors fresh-pane births when no tut-hub/tut-notify pane is reachable | auto-detected |
-| env `TUT_PROJECT_ROOT` | workspace-chain L1 root override: pins the project whose `.context-hub/workspace.json` the launcher reads (default: the anchor pane's cwd) | auto-detected |
-| env `TUT_USER_CONFIG_DIR` | workspace-chain L2 directory override (default `~/.config/tut`) | auto-detected |
-
-There is also one piece of one-time environment setup: the Herdr event-wiring plugin (see [Herdr event hookup](#herdr-event-hookup)).
+Use the no-argument `tut` help for ports, URLs, polling and timeouts; `--root` means the storage directory for serve/config etc., but the rig directory owning `.context-hub` for up/down.
+Common overrides: `TUT_HUB_ROOT`/`TUT_HUB_URL` select the owning Hub, `TUT_PROJECT_ROOT` overrides legacy lineup L1, `TUT_USER_CONFIG_DIR` overrides L2; `TUT_UP_CLI_SELF` overrides the power CLI, and `TUT_SPLIT_BASE` supplies the Herdr pane birth anchor.
+See [system design](design/system-design.md) and [host documentation](#documentation) for implementation details.
 
 ## Development
 
-Dependencies are listed in [package.json](package.json): the runtime dependencies are @modelcontextprotocol/sdk + zod (zod declared explicitly so it shares a single instance with the SDK); there are no other runtime dependencies.
+Dependencies are listed in [package.json](package.json): the runtime dependencies are @modelcontextprotocol/sdk + zod (zod declared explicitly so it shares a single instance with the SDK); there are no other runtime dependencies. Source builds produce `dist/cli.js`; use `npm link` for `tut`, or run `node dist/cli.js <subcommand>` directly.
 
 ```bash
+git clone https://github.com/ianf-ai/take-ur-turn.git
+cd take-ur-turn
 npm install        # install dependencies
+npm run build      # compile to dist/ before tests and type-checking
 npm test           # run tests (vitest)
 npm run typecheck  # type-check
-npm run build      # compile to dist/
 ```
 
 Behavioral instructions for the agent roles live in [skills/](skills/) (architect / executor / reviewer / host — behavior templates, not identity bindings: any agent that loads one can do that kind of work).
@@ -432,25 +281,23 @@ Design docs and skills are currently Chinese-language; code, CLI output, and com
 
 ### Windows notes
 
-Standalone power (`tut config set power.mode standalone`) starts detached Hub and Notifier services with Node, without Herdr. PowerShell 5.1+ and the CIM/NetTCPIP providers supply process creation tokens and TCP listener ownership. `power.json` records `process_scope: "windows-tree"` and `pgid: null`; `up` and `doctor` report unregistered services, and `up --adopt` explicitly verifies and registers same-workspace listeners (`--dry-run` only previews).
+Standalone power needs no Herdr; it requires Node, PowerShell 5.1+ and CIM/NetTCPIP. `up`/`doctor` report unregistered services; `up --adopt` verifies and adopts same-workspace listeners, while `--dry-run` only previews.
+Service facts use `process_scope: "windows-tree"`, `pgid: null`. Down verifies creation tokens, force-terminates the captured service tree, excludes run roots/supervisors (including in-flight ones), checks endpoints and records per-service completion for partial retries.
+There is no Job Object or POSIX grace period; a leader gone before capture, unreadable identity or corrupt run metadata causes refusal. Orphaned/escaping descendants cannot be guaranteed reclaimed. Power support does not imply run/launch support; run `tut` for details.
+Hub/MCP/CLI/flow driving with Herdr and PowerShell 5.1 have been verified; setup boundaries:
 
-Windows `down` verifies creation identity through a native process handle, force-terminates the captured service tree, excludes recorded run roots/supervisors and in-flight run supervisors, and checks the endpoints afterward. It persists individual service completion so a partial failure can be retried. **Documented gap:** there is no Job Object container or POSIX signal grace period. A leader already gone before capture, unreadable identity or corrupt run metadata causes refusal; descendants orphaned before capture or escaping between snapshots cannot be guaranteed reclaimed. The run/launch Windows implementation is a separate capability; this power support does not enable it.
-
-Native Windows works end to end (hub, MCP, CLI, flow driving were verified against Herdr's Windows build and PowerShell 5.1). Setup boundaries worth knowing:
-
-- **Agent CLIs installed via npm ship as `.cmd` shims**, which TUT deliberately does not execute (spawn-injection hardening). Point the role at a direct Node entry route instead, e.g. `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`, or install an agent that ships a native executable
-- If PowerShell's execution policy blocks script blocks (`tut up` provisions panes by typing commands into panes), run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once
-- `tut up` must run where a current pane context exists (an interactive Herdr pane, or `HERDR_PANE_ID` pointing at a valid pane id); headless runs fail with that named in the error — which also names the standalone escape (`tut config set power.mode standalone` provisions detached processes instead, no herdr required, and `tut down` stops them)
-- Desktop notifications use a native Windows toast through PowerShell; if PowerShell or the toast API is unavailable, TUT falls back to a terminal bell. Known edge: with system notifications suppressed (e.g. Focus Assist / Do Not Disturb), the toast silently does not appear — Windows reports no error back to TUT
-- On each toast attempt, TUT refreshes its per-user AppUserModelID registration under `HKCU`; no administrator install step is required
-- Herdr's Windows zip needs the VC++ runtime (`vc_redist.x64`) — without it the binary exits silently
+- Agent npm `.cmd` shims are not executed; use a native executable or direct Node entry, e.g. `tut assign executor node "%APPDATA%/npm/node_modules/@openai/codex/codex.js"`.
+- If PowerShell blocks scripts, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
+- Herdr power needs a current pane or valid `HERDR_PANE_ID`; use `tut config set power.mode standalone` without one.
+- Unavailable toast falls back to a bell; Do Not Disturb can silently suppress toasts. HKCU user AppUserModelID registration refreshes each attempt, with no admin install.
+- Herdr's Windows zip needs `vc_redist.x64`; without it the binary may exit silently.
 
 **Troubleshooting**:
 
 - **Agent reports it cannot see the context.* tools**: run `tut status` in the intended workspace to verify its Hub is reachable; check that the MCP config runs `tut mcp` in the correct workspace (or pins `TUT_HUB_ROOT`); some CLI sessions may be sandboxed off from localhost loopback — in that case have that agent use the CLI channel (`tut read` / `tut publish`) instead; behavior is fully equivalent
 - **Port 3001 already in use (EADDRINUSE)**: run `tut up` in the intended workspace. It verifies Hub ownership, discovers an existing local Hub for that workspace, or chooses a free Hub/notifier pair starting at 3003/3004 when the default pair is occupied. Ordinary CLI commands also discover the workspace's Hub; an explicit foreign `--url` is rejected. For a manually selected address use `tut serve --port <n>` and `--url`, and use `--event-port` to change the event listener (Hub and event ports must differ). Reusing a Hub does not imply its notifier is on the next port: `up` verifies the notifier's `hub_root` and `hub_url`, preserving both 3101/3002 and automatically assigned pairs. Notifiers must report identity fields to be reused; stop the existing notifier before moving its event port.
 - **Startup lock errors**: `another up (pid N) is provisioning` means wait for that invocation to finish; only after confirming no other `tut up` instance is running may you remove the reported `.context-hub/up.lock` and retry. `cannot verify startup lock` can mean a damaged lock or a race with its initial write: retry first; if it persists, inspect the lock and confirm no other `tut up` is running before removing it. `startup lock recovery in progress` means another invocation is reclaiming a stale lock: retry; if recovery was interrupted, inspect the reported `.context-hub/up.lock.reclaim` directory and remove it only after confirming no other `tut up` is running.
-- **Workspace lineup storage**: the lineup lives in the project (`.context-hub/workspace.json`) or at the user level (`~/.config/tut/`); upgrades never touch either. See [Configuration](#configuration) for the workspace resolution chain
+- **Workspace lineup storage**: new lineup writes use `.context-hub/config.json`; legacy workspace files remain readable until explicitly replaced. See [Configuration](#configuration) for the workspace resolution chain
 
 **Known limitations** (design trade-offs, not bugs):
 
@@ -466,3 +313,5 @@ Agent hosting powered by [Herdr](https://github.com/herdrdev/herdr) — a runtim
 ## License
 
 [Apache-2.0](LICENSE)
+
+[Test environments and gate profiles](test/README.md)

@@ -1,3 +1,4 @@
+import '../src/app/agents.js';
 /**
  * Global test setup — runs once before every test file.
  *

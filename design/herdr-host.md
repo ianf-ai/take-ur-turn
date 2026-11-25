@@ -1,8 +1,10 @@
 # Herdr 宿主
 
-本文实现 [宿主契约](system-design.md#7-宿主契约)。
+本文回答 Herdr 如何供给服务与 pane、驱动轮次、传递状态信号和协作停止，实现 [共享宿主契约](system-design.md#7-宿主契约)。
 
-## 1. 部署与电源
+第 1 章说明服务电源，第 2 章说明执行单元的身份与生命周期，第 3 章说明发车链；其余章节说明宿主专有能力：第 4 章为 hook 与通知接线，第 5 章为 TUI 协作停止。
+
+## 1. 服务电源
 
 Herdr 管理同一窗口中的 Agent pane，sidebar 显示运行状态。状态检测由 screen manifest 规则与 Agent lifecycle hooks 提供；只有屏幕规则时 blocked 可能漏判。`tut up` 供给本 rig 的 Hub / Notifier 系统 pane，Notifier 的 stdout 为运行日志；任务 pane 在轮次交接时按需创建。
 
@@ -179,7 +181,7 @@ agentSession=null 不构成假 working 或未消费证明。
 
 Herdr 插件订阅 pane.agent_status_changed，将完整 UTF-8 JSON 写入 herdr-hook.mjs 的 stdin，command array 不携带 JSON。空 / 坏 payload / 缺字段记 stderr 后退出 0，避免重试风暴。working / blocked / done 直通，idle 仅在前态 working 时映射 done；每次合法 status 更新前态。
 
-hook 用 raw argv 的 herdr pane get 把 pane_id 解析为标签，失败不把 ID 猜成标签。前态按 pane_id SHA-256 存于 HERDR_PLUGIN_STATE_DIR，缺省 os.tmpdir()/tut-herdr-state，temp + rename 更新。随后用 process.execPath spawn 同包 on-agent-event.mjs，传 event / agent / pane 三个 raw 值并继承事件 URL；on-agent-event.sh / hook.sh 仅供 POSIX 转发，Windows 不执行 shim。
+hook 用 raw argv 的 herdr pane get 把 pane_id 解析为标签，失败不把 ID 猜成标签。前态按 pane_id SHA-256 存于 HERDR_PLUGIN_STATE_DIR，缺省 os.tmpdir()/tut-herdr-state，temp + rename 更新。随后用 process.execPath spawn 同包 scripts/agent-event/on-agent-event.mjs，传 event / agent / pane 三个 raw 值并继承事件 URL；scripts/agent-event/on-agent-event.sh / scripts/hook.sh 仅供 POSIX 转发，Windows 不执行 shim。
 
 canonical 入口校验参数，用 JSON.stringify 构造 body，fetch + AbortController 2 秒超时。网络失败 / 超时 / 非成功状态 best-effort 退出 0，调用契约非法退出 1。hook 只产生三个状态事件，delivery_giveup 由启动器直接经同一接口发送。
 
